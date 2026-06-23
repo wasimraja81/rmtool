@@ -1,6 +1,6 @@
 # rmtool
 
-RM synthesis tools for astronomical radio spectro-polarimetry data processing. This package implements Rotation Measure synthesis algorithms for analyzing polarized radio emissions.
+RM (Rotation Measure) synthesis tools for analyzing polarized radio observations. This package implements Rotation Measure synthesis algorithms to decompose linear polarization into RM spectra for radio spectro-polarimetry data.
 
 ## Features
 
@@ -38,27 +38,62 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 
 ## Configuration
 
-RM synthesis is controlled via configuration files in the `cfg/` directory. Key parameters include:
+RM synthesis is controlled via configuration files in the `cfg/` directory. Every configuration must provide required KEY=VALUE pairs for input/output paths, processing parameters, and RM sampling.
+
+**Example:**
 
 ```cfg
-# Input FITS cubes
-q_fits_file = path/to/Q.fits
-u_fits_file = path/to/U.fits
+# Paths and files
+path = /path/to/data/
+infileQ = Q_cube.fits
+infileU = U_cube.fits
+outfile = my_rm_synthesis
 
-# RM synthesis parameters
-rm_min = -500
-rm_max = 500
-rm_step = 5
+# RM sampling (linear grid from beg_rm to end_rm with nrm points)
+beg_rm = -500
+end_rm = 500
+nrm = 101
+use_auto_rm_range = 0      # 0=manual range, 1=auto from data
+ofac = 4                    # Oversampling factor
+fac = 3.14159265358979      # Pi for lambda^2 calculations
+
+# Processing options
+remove_badchan = n          # Remove channels with RFI (y/n)
+badchan_file = unused.txt   # File listing bad channels
+rem_mean = 0                # Remove mean Q/U (0 or 1)
+remove_qu_bias = n          # Remove I-based bias from Q/U (y/n)
+output_mode = ap            # Output format: ap (amp+phase) or ri (real+imag)
+ap_angle_mode = phase       # Phase mode: phase (arg) or pol (0.5*arg)
+
+# Residuals for bias correction
+resiQ = 0.0
+slopeQ = 0.0
+resiU = 0.0
+slopeU = 0.0
 
 # Subimage extraction (optional)
 subim = y
-subim_ra_blc = 1
-subim_ra_trc = 100
-subim_dec_blc = 1
-subim_dec_trc = 100
+subim_ra_blc = 1            # RA first pixel
+subim_ra_trc = 256          # RA last pixel (0 = max)
+subim_ra_inc = 1            # RA step
+subim_dec_blc = 1           # Dec first pixel
+subim_dec_trc = 256         # Dec last pixel (0 = max)
+subim_dec_inc = 1           # Dec step
+subim_chan_blc = 1          # Channel first (0 = first)
+subim_chan_trc = 0          # Channel last (0 = all)
+subim_chan_inc = 1          # Channel step
+
+# Bias correction inputs (required if remove_qu_bias = y)
+path_I = /path/to/data/
+infileI = I_cube.fits
 ```
 
-See [cfg/CONFIG_README.md](cfg/CONFIG_README.md) for complete parameter list.
+For complete documentation, see [cfg/CONFIG_README.md](cfg/CONFIG_README.md).
+
+**Output Files:**
+- `AP + phase mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.PHA.RMCUBE.FITS`
+- `AP + pol mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.POLA.RMCUBE.FITS`
+- `RI mode`: `OUTBASE.REAL.RMCUBE.FITS` and `OUTBASE.IMAG.RMCUBE.FITS`
 
 ## Project Structure
 
