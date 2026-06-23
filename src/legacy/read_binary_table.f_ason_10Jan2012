@@ -1,0 +1,322 @@
+chelp+ 
+      ! ------------------------------------------
+      ! This routine is intended at familiarizing 
+      ! reading of fits binary tables. 
+      !                      --wr, 22 Nov, 2011
+      ! ------------------------------------------
+chelp- 
+
+      implicit none 
+
+      integer*4      maxpts 
+      parameter      (maxpts=655360)
+      integer*4      nrows, ncols 
+      integer*4      nrow_single 
+      integer*4      nchar 
+      integer*4      status, blocksize, rwmode  
+      integer*4      n_hdu, hdu_type 
+      character*172  infile, outfile_1, outfile_2, outfile_3    
+      character*72   comment  
+      !character*80   card 
+      integer*4      nkeys, n_addkeys 
+      integer*4      bitpix 
+      integer*4      i 
+      character*32   kw_str, kval_str 
+      integer*4      use_col 
+      integer*2      col_arr(maxpts)
+      integer*4      frow, felem, nelements 
+      logical        anyflg 
+      real* 4        null_val
+      integer*4      icam_1, icam_2, icam_3, icam_22 
+!      integer*4      cam_1(maxpts), cam_2(maxpts), cam_3(maxpts) 
+      integer*4      int_arr(64)
+
+      null_val = 0.0 
+
+      status = 0 
+      rwmode = 0 
+      blocksize = 1 
+      bitpix = -32  ! default, modify it using input file 
+      write(*,*)"Input file name (w/o path): "
+      write(*,*)"[Inp file expected in DATA/ area]"
+      read(*,*)infile
+
+      infile = infile(1:nchar(infile))
+      write(*,*)"Fits File read: ",infile(1:nchar(infile))
+      outfile_1 = infile(1:nchar(infile))//"_cam1"
+      outfile_2 = infile(1:nchar(infile))//"_cam2"
+      outfile_3 = infile(1:nchar(infile))//"_cam3"
+
+      call FTOPEN(21,infile,rwmode,blocksize,status) 
+      write(*,*)"In file opening Status : ",status
+
+      ! ---------------------------------------------------
+      ! Find out the number of Header Units in the file: 
+      call FTTHDU(21,n_hdu,status)
+      write(*,*)"---------------------------"
+      write(*,*)"Current subroutine: FTTHDU"
+      write(*,*)"TOTAL No. OF HDU: ",n_hdu
+      write(*,*)"STATUS = ",status
+      write(*,*)" "
+      write(*,*)"---------------------------"
+      ! ---------------------------------------------------
+
+      ! Before anything else, JUMP to the relevant HDU : 
+      call FTMAHD(21,n_hdu,hdu_type,status)
+      write(*,*)" "
+
+      ! Count the number of keywords in the current header unit: 
+      call FTGHSP(21, nkeys,n_addkeys,status)
+      write(*,*)"Number of existing keywords: ",nkeys
+      write(*,*)"Number of additional keywords: ",n_addkeys
+
+      ! --------------------------------------------------------
+      ! Display some information: 
+      do i = 1,nkeys
+          call FTGKYN(21,i, kw_str,kval_str,comment,status)
+          kw_str = kw_str(1:nchar(kw_str))
+          kval_str = kval_str(1:nchar(kval_str))
+          write(*,*)kw_str(1:nchar(kw_str)),"  ",
+     -              kval_str(1:nchar(kval_str))
+      enddo
+      ! Count the total number of rows and cols: 
+      call FTGNRW(21,nrows,status)
+      call FTGNCL(21,ncols,status)
+      write(*,*)"nrows,ncols: ",nrows,",",ncols 
+      ! --------------------------------------------------------
+
+
+      ! Do the real Business: 
+      ! Open the output FITS files to be written: 
+      call FTINIT(22,outfile_1,blocksize,status) 
+      if(status.ne.0)then
+              write(*,*)"Error opening unit 22 with Status : ",status
+              stop
+      endif
+      call FTINIT(23,outfile_2,blocksize,status) 
+      if(status.ne.0)then
+              write(*,*)"Error opening unit 23 with Status : ",status
+              stop
+      endif
+      call FTINIT(24,outfile_3,blocksize,status) 
+      if(status.ne.0)then
+              write(*,*)"Error opening unit 24 with Status : ",status
+              stop
+      endif
+
+      ! Copy all the headers to the output files: 
+      write(*,*)"n_hdu: ",n_hdu 
+      do i = 1,n_hdu
+         call FTMAHD(21,i,hdu_type,status)
+         write(*,*)"---------------------------"
+         write(*,*)"CURRENT HDU type: ",hdu_type
+         call FTCPHD(21, 22,status)
+         call FTCPHD(21, 23,status)
+         call FTCPHD(21, 24,status)
+      enddo
+
+      write(*,*)"+++++++++++++++++++++++++++++ "
+      write(*,*)"FYI, HDUTYPE: 0 =>  IMAGE_HDU "
+      write(*,*)"              1 =>  ASCII_TBL "
+      write(*,*)"              2 => BINARY_TBL "
+      write(*,*)"+++++++++++++++++++++++++++++ "
+      write(*,*)" "
+
+      ! Scheme: Copy the data from infile to outfiles, 
+      !         and then delete the irrelevant rows 
+      !         based on our filter (camera numbers)
+      !         Finally update the headers of each 
+      !         output file. 
+      write(*,*)" Copying infile to outfile_1..."
+      call FTCPDT(21,22, status)
+      write(*,*)"status: ",status
+
+      write(*,*)" Copying infile to outfile_2..."
+      call FTCPDT(21,23, status)
+      write(*,*)"status: ",status
+
+      write(*,*)" Copying infile to outfile_2..."
+      call FTCPDT(21,24, status)
+      write(*,*)"status: ",status
+
+      call FTCLOS(22,status)
+      if(status.ne.0)then
+              write(*,*)"Error closing unit 22 with status: ",status
+      endif
+      call FTCLOS(23,status)
+      if(status.ne.0)then
+              write(*,*)"Error closing unit 23 with status: ",status
+      endif
+      call FTCLOS(24,status)
+      if(status.ne.0)then
+              write(*,*)"Error closing unit 24 with status: ",status
+      endif
+
+      rwmode = 1 
+      call FTOPEN(22,outfile_1,rwmode,blocksize,status) 
+      if(status.ne.0)then
+              write(*,*)"Error opening unit 22 with status: ",status
+              stop
+      endif
+      ! Move to the relevant header unit: 
+      call FTMAHD(22,n_hdu,hdu_type,status)
+      if(status.ne.0)then
+              write(*,*)"Unit 22:Error moving to HDU num: ",n_hdu 
+              stop
+      endif
+
+      call FTOPEN(23,outfile_2,rwmode,blocksize,status) 
+      if(status.ne.0)then
+              write(*,*)"Error opening unit 23 with status: ",status
+              stop
+      endif
+      ! Move to the relevant header unit: 
+      call FTMAHD(23,n_hdu,hdu_type,status)
+      if(status.ne.0)then
+              write(*,*)"Unit 23:Error moving to HDU num: ",n_hdu 
+              stop
+      endif
+
+      call FTOPEN(24,outfile_3,rwmode,blocksize,status) 
+      if(status.ne.0)then
+              write(*,*)"Error opening unit 24 with status: ",status
+              stop
+      endif
+      ! Move to the relevant header unit: 
+      call FTMAHD(24,n_hdu,hdu_type,status)
+      if(status.ne.0)then
+              write(*,*)"Unit 24:Error moving to HDU num: ",n_hdu 
+              stop
+      endif
+      ! ------------------------------------------------
+      ! We wish to filter out the data based on the 
+      ! value of a particular column. 
+      ! Example: For the Cas-A light curve from RXTE-ASM 
+      !          (xa_casa_d1_ch2.lc) we wish to separate 
+      !          data for the various cameras. 
+      ! Define the relevant column to be used for 
+      ! filtering: 
+      ! 
+      !-------------------------------------------------
+      ! Incorporate this section in a parfile later: 
+      use_col = 5 
+      !filter_key = 1 
+      frow = 1 
+      felem = 1  
+      nelements = nrows 
+      call FTGCVI(21,use_col,frow,felem,nelements,null_val,
+     -                  col_arr,anyflg,status)
+
+      icam_1 = 1 
+      icam_2 = 1  
+      icam_3 = 1  
+      icam_22 = 1  
+
+      ! TEST: 
+      do i = 1,10
+         write(*,*)"Cam number: ",col_arr(i)
+      enddo
+      do i = 1,nelements 
+         if(col_arr(i) .eq. 1)then
+                 icam_1 = icam_1 + 1 
+                 ! Delete the line from outfile_2 and outfile_3 
+                 call FTDROW(23,icam_2,1, status)
+                 if(status .ne. 0)then
+                         write(*,*)"Error deleting row "
+                         write(*,*)"original Row num: ",i
+                         write(*,*)"Row num in file_2: ",icam_2
+                         write(*,*)"status: ",status
+                         stop 
+                 endif
+                 call FTDROW(24,icam_3,1, status)
+                 if(status .ne. 0)then
+                         write(*,*)"Error deleting row "
+                         write(*,*)"original Row num: ",i
+                         write(*,*)"Row num in file_3: ",icam_3
+                         write(*,*)"status: ",status
+                         stop 
+                 endif
+         else if(col_arr(i) .eq. 2)then
+                 icam_2 = icam_2 + 1 
+                 ! Delete the line from outfile_3 and outfile_1 
+                 call FTDROW(24,icam_3,1, status)
+                 if(status .ne. 0)then
+                         write(*,*)"Error deleting row "
+                         write(*,*)"original Row num: ",i
+                         write(*,*)"Row num in file_3: ",icam_3
+                         write(*,*)"status: ",status
+                         stop 
+                 endif
+                 call FTDROW(22,icam_1,1, status)
+                 if(status .ne. 0)then
+                         write(*,*)"Error deleting row "
+                         write(*,*)"original Row num: ",i
+                         write(*,*)"Row num in file_1: ",icam_1
+                         write(*,*)"status: ",status
+                         stop 
+                 endif
+         else if(col_arr(i) .eq. 3)then
+                 icam_3 = icam_3 + 1 
+                 ! Delete the line from outfile_1 and outfile_2 
+                 call FTDROW(22,icam_1,1, status)
+                 if(status .ne. 0)then
+                         write(*,*)"Error deleting row "
+                         write(*,*)"original Row num: ",i
+                         write(*,*)"Row num in file_1: ",icam_1
+                         write(*,*)"status: ",status
+                         stop 
+                 endif
+                 call FTDROW(23,icam_2,1, status)
+                 if(status .ne. 0)then
+                         write(*,*)"Error deleting row "
+                         write(*,*)"original Row num: ",i
+                         write(*,*)"Row num in file_2: ",icam_2
+                         write(*,*)"status: ",status
+                         stop 
+                 endif
+         else
+                 !write(*,*)"row: ",i," Cam num: ",int(col_arr(i))
+                 !write(*,*)"Unexpected Camera Number found!!"
+                 !write(*,*)" Deleting this row from all outfiles..."
+                 !write(*,*)" "
+                 ! Delete the line from outfile_1 and outfile_2 
+                 icam_22 = icam_22 + 1 
+                 call FTDROW(22,icam_1,1, status)
+                 call FTDROW(23,icam_2,1, status)
+                 call FTDROW(24,icam_3,1, status)
+         endif
+      enddo 
+      write(*,*)"nrows total: ",nelements 
+      write(*,*)"    nrows 1: ",icam_1 - 1 
+      write(*,*)"    nrows 2: ",icam_2 - 1 
+      write(*,*)"    nrows 3: ",icam_3 - 1 
+      write(*,*)"   nrows 22: ",icam_22 - 1 
+
+
+
+
+      ! In case we incorporate the following scheme: 
+      ! Scheme 2: Read optimal number of rows in one go, 
+      !           and then based on the filter, redistribute 
+      !           them into the outfiles. 
+      ! Determine the optimal number of rows to read in one go: 
+      call FTGRSZ(21, nrow_single,status)
+      write(*,*)"Optimal # rows to read at a time: ",nrow_single 
+
+!      call FTGCL(21,use_col,frow,felem,nelements,col_arr,status) 
+      ! SBIJKEDCM
+
+      !-------------------------------------------------
+
+
+
+
+      call FTCLOS(21,status) 
+      call FTCLOS(22,status) 
+      call FTCLOS(23,status) 
+      call FTCLOS(24,status) 
+
+
+      end 
+
+      include '/usr/lib/subroutine_lib/nchar.f'

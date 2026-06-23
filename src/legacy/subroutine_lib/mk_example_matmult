@@ -1,0 +1,1 @@
+f77 -o example_matmult example_matmult.f

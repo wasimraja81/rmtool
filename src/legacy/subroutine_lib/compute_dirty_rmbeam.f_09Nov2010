@@ -1,0 +1,79 @@
+C --------------------------------------------------------------
+! This subroutine computes the dirty rm-beams as a function of 
+! RM. 
+! It is assumed that the signal is of the form:
+!             y(t) = A*exp[i*omega*t]
+
+!  -- wasim, 11 Aug, 2009
+
+
+C --------------------------------------------------------------
+
+
+
+          !--------------------------------------------------------------------
+
+          subroutine compute_dirty_rmbeam(L_sq, W, nchan, RM_in, nrm, 
+     -                                    re_beam, im_beam)
+          
+          implicit none
+
+          !include '../INCLUDE/extract_rm.inc'
+
+          integer*4   nchan, nrm 
+          real*8      L_sq(*), RM_in(*), W(*) 
+          real*8      re_beam(nrm,nrm), im_beam(nrm,nrm) 
+          real*8      ryt(nchan), iyt(nchan)
+
+          real*8      rc_cor, ic_cor, rs_cor, is_cor
+          real*8      ryw_tmp, iyw_tmp, phi_tmp 
+             
+          real*8      c_template(nchan), s_template(nchan)
+
+C COUNTERS:
+          integer*4   i,j,kk
+
+C CONSTANTS:
+          real*8      p_tmp, pmax
+
+
+          do i = 1,nrm ! number of nu's
+             do kk = 1,nchan ! number of channels
+                phi_tmp = RM_in(i)*L_sq(kk)
+                ! Generate the inputs whose response 
+                ! you wish: 
+                ryt(kk) = W(kk)*cos(phi_tmp)
+                iyt(kk) = W(kk)*sin(phi_tmp)
+             enddo
+             pmax = -1.0d0
+             do j = 1,nrm
+                do kk = 1,nchan ! number of channels
+                   phi_tmp = RM_in(j)*L_sq(kk)
+                   c_template(kk) = cos(phi_tmp)
+                   s_template(kk) = sin(phi_tmp)
+                enddo
+
+                call dotproductd(ryt,c_template,rc_cor,nchan)
+                call dotproductd(ryt,s_template,rs_cor,nchan)
+                call dotproductd(iyt,c_template,ic_cor,nchan)
+                call dotproductd(iyt,s_template,is_cor,nchan)
+                rc_cor = rc_cor/dble(nchan)
+                rs_cor = rs_cor/dble(nchan)
+                ic_cor = ic_cor/dble(nchan)
+                is_cor = is_cor/dble(nchan)
+                ! Combine coherently to construct y(w)
+                ryw_tmp = rc_cor - is_cor  ! Real-part of beam
+                iyw_tmp = rs_cor + ic_cor  ! Imag-part of beam
+                p_tmp = sqrt(ryw_tmp**2 + iyw_tmp**2)
+         ! Store the maxima of the power extracted from 
+         ! over-sampled frequencies within a resolution bin
+                if(p_tmp.ge.pmax)then
+                        pmax = p_tmp
+                        re_beam(i,j) = ryw_tmp
+                        im_beam(i,j) = iyw_tmp
+                endif
+             enddo
+          enddo
+          return
+          
+          end
