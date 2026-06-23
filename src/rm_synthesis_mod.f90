@@ -296,6 +296,7 @@ contains
                              subim_ra_blc, subim_ra_trc, subim_ra_inc, &
                              subim_dec_blc, subim_dec_trc, subim_dec_inc, &
                              subim_chan_blc, subim_chan_trc, subim_chan_inc, &
+                             tile_ra, tile_dec, tile_mem_frac, tile_auto, dry_run, &
                              rem_mean, remove_qu_bias, resiQ, slopeQ, resiU, slopeU, &
                              path_I, infileI, ofac, fac, beg_rm, end_rm, nrm_out_par, &
                              use_auto_rm_range, output_mode, &
@@ -309,10 +310,13 @@ contains
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
     integer(int32), intent(inout) :: subim_chan_blc, subim_chan_trc, subim_chan_inc
+    integer(int32), intent(inout) :: tile_ra, tile_dec
     integer(int32), intent(inout) :: rem_mean, ofac, nrm_out_par, use_auto_rm_range
     integer(int32), intent(inout) :: output_mode
     integer(int32), intent(inout) :: ap_angle_mode
+    logical, intent(inout) :: tile_auto, dry_run
     real(sp), intent(inout) :: resiQ, slopeQ, resiU, slopeU, fac, beg_rm, end_rm
+    real(sp), intent(inout) :: tile_mem_frac
     integer(int32), intent(out) :: status
 
     character(len=512) :: line, key, val, key_lc
@@ -324,6 +328,8 @@ contains
     logical :: seen_subim_ra_blc, seen_subim_ra_trc, seen_subim_ra_inc
     logical :: seen_subim_dec_blc, seen_subim_dec_trc, seen_subim_dec_inc
     logical :: seen_subim_chan_blc, seen_subim_chan_trc, seen_subim_chan_inc
+    logical :: seen_tile_ra, seen_tile_dec, seen_tile_mem_frac
+    logical :: seen_tile_auto, seen_dry_run
     logical :: seen_rem_mean, seen_remove_qu_bias
     logical :: seen_resiQ, seen_slopeQ, seen_resiU, seen_slopeU
     logical :: seen_path_I, seen_infileI
@@ -352,6 +358,11 @@ contains
     seen_subim_chan_blc = .false.
     seen_subim_chan_trc = .false.
     seen_subim_chan_inc = .false.
+    seen_tile_ra = .false.
+    seen_tile_dec = .false.
+    seen_tile_mem_frac = .false.
+    seen_tile_auto = .false.
+    seen_dry_run = .false.
     seen_rem_mean = .false.
     seen_remove_qu_bias = .false.
     seen_resiQ = .false.
@@ -387,6 +398,11 @@ contains
     subim_chan_blc = 0
     subim_chan_trc = 0
     subim_chan_inc = 1
+    tile_ra = 0
+    tile_dec = 0
+    tile_mem_frac = 0.25_sp
+    tile_auto = .true.
+    dry_run = .false.
     rem_mean = 0
     remove_qu_bias = .false.
     resiQ = 0.0_sp
@@ -683,6 +699,69 @@ contains
           close(unit_cfg)
           return
         end if
+      case ('tile_ra')
+        if (seen_tile_ra) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_ra'
+          status = -180
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_ra = .true.
+        read(val, *, iostat=io_stat) tile_ra
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading tile_ra at line ', line_no
+          status = -180
+          close(unit_cfg)
+          return
+        end if
+      case ('tile_dec')
+        if (seen_tile_dec) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_dec'
+          status = -181
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_dec = .true.
+        read(val, *, iostat=io_stat) tile_dec
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading tile_dec at line ', line_no
+          status = -181
+          close(unit_cfg)
+          return
+        end if
+      case ('tile_mem_frac')
+        if (seen_tile_mem_frac) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_mem_frac'
+          status = -182
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_mem_frac = .true.
+        read(val, *, iostat=io_stat) tile_mem_frac
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading tile_mem_frac at line ', line_no
+          status = -182
+          close(unit_cfg)
+          return
+        end if
+      case ('tile_auto')
+        if (seen_tile_auto) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_auto'
+          status = -183
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_auto = .true.
+        tile_auto = flag_from_value(val)
+      case ('dry_run')
+        if (seen_dry_run) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': dry_run'
+          status = -184
+          close(unit_cfg)
+          return
+        end if
+        seen_dry_run = .true.
+        dry_run = flag_from_value(val)
       case ('rem_mean')
         if (seen_rem_mean) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': rem_mean'
@@ -991,6 +1070,18 @@ contains
     if (status == 0 .and. ofac < 1) then
       write(*,*) 'Invalid ofac: expected >= 1'
       status = -155
+    end if
+    if (status == 0 .and. tile_ra < 0) then
+      write(*,*) 'Invalid tile_ra: expected >= 0 (0 means auto)'
+      status = -185
+    end if
+    if (status == 0 .and. tile_dec < 0) then
+      write(*,*) 'Invalid tile_dec: expected >= 0 (0 means auto)'
+      status = -186
+    end if
+    if (status == 0 .and. (tile_mem_frac <= 0.0_sp .or. tile_mem_frac > 0.95_sp)) then
+      write(*,*) 'Invalid tile_mem_frac: expected 0 < tile_mem_frac <= 0.95'
+      status = -187
     end if
     if (status == 0 .and. nrm_out_par < 1) then
       write(*,*) 'Invalid nrm: expected >= 1'

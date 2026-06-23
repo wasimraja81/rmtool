@@ -83,10 +83,14 @@ chelp-
       implicit none
       
       
-      real(sp)  data_arrI(maxchan),data_arrQ(maxchan),
-     -          data_arrU(maxchan), specI(max_dec*maxchan),
-     -          specQ(max_dec*maxchan), specU(max_dec*maxchan),
-     -          p_ex_arr(maxnt*max_dec), phi_ex_arr(maxnt*max_dec)
+      real(sp), allocatable :: data_arrI(:)
+      real(sp), allocatable :: data_arrQ(:)
+      real(sp), allocatable :: data_arrU(:)
+      real(sp), allocatable :: specI(:)
+      real(sp), allocatable :: specQ(:)
+      real(sp), allocatable :: specU(:)
+      real(sp), allocatable :: p_tile_arr(:)
+      real(sp), allocatable :: phi_tile_arr(:)
       real(sp)  resiQ, resiU, slopeQ, slopeU  
       logical   remove_QU_bias
       integer   bitpixQ, naxisQ, naxesQ(max_axis)
@@ -109,6 +113,7 @@ chelp-
       integer   subim_ra_blc, subim_ra_trc, subim_ra_inc
       integer   subim_dec_blc, subim_dec_trc, subim_dec_inc
       integer   subim_chan_blc, subim_chan_trc, subim_chan_inc
+      integer   tile_ra, tile_dec
 
       real(sp) cxval_imU, cyval_imU, czval_imU  
       integer   cxpix_imU, cypix_imU, czpix_imU 
@@ -119,7 +124,9 @@ chelp-
       integer   nbuffer, firstpix
 
       integer   fpixels(max_axis), lpixels(max_axis), incs(max_axis)
-      real(sp) L_sq(maxchan),Q_now(maxchan),U_now(maxchan)
+      real(sp), allocatable :: L_sq(:)
+      real(sp), allocatable :: Q_now(:)
+      real(sp), allocatable :: U_now(:)
       character(len=8) :: junkchar
       integer   status
       logical   anyflg
@@ -142,31 +149,49 @@ chelp-
       integer   nx_1st, nx_2nd, ny_1st, ny_2nd, nz_1st, nz_2nd
       integer   nxc, nyc, nzc
     
-      real(sp) xval(max_ra), yval(max_dec), zval(maxchan)
+      real(sp), allocatable :: xval(:)
+      real(sp), allocatable :: yval(:)
+      real(sp), allocatable :: zval(:)
       real(sp) x1, xn, y1, yn, z1, zn
 
       integer   data_precision
       real(sp) nullval
       logical   subim
+      logical   tile_auto, dry_run
       real(sp) conv_fac ! freq-to-lambda conversion factor
+      real(sp) tile_mem_frac
       logical   MHz
       ! various counters and indices:
       integer   i, kk, ix, iy, ixpix_now, iypix_now, irm 
       integer   cnt1, cnt2, tmp_cnt1, tmp_cnt2, tmp_index 
+      integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
+      integer   ix_loc, iy_loc, iz
+      integer   nx_tile, ny_tile
+      integer   ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
+      integer   in_fields
+      integer   mem_unit, ios_mem
+      integer(kind=int64) :: mem_avail_kb, mem_kb_tmp
+      integer(kind=int64) :: mem_safe_bytes, bytes_per_tile_pixel
+      integer(kind=int64) :: tile_pixels_max, tile_bytes_est
+      character(len=256) :: mem_line
 
 
       ! Variables/Parameters for RM-extraction:
-        real(sp) fac, beg_rm, end_rm
-        integer   ofac, rem_mean, nrm_out, nrm_out_par
-        integer   use_auto_rm_range
-        integer   output_mode
+      real(sp) fac, beg_rm, end_rm
+      integer   ofac, rem_mean, nrm_out, nrm_out_par
+      integer   use_auto_rm_range
+      integer   output_mode
       integer   ap_angle_mode
-      real(sp) RM(maxnt),p_ex(maxnt),phi_ex(maxnt)
-      real(sp) cos_arr(maxnt,maxchan), sin_arr(maxnt,maxchan)
+      real(sp), allocatable :: RM(:)
+      real(sp), allocatable :: p_ex(:)
+      real(sp), allocatable :: phi_ex(:)
+      real(sp), allocatable :: cos_arr(:,:)
+      real(sp), allocatable :: sin_arr(:,:)
 
       ! RFI related (list of bad-channels based on apriori info)
-      real(sp) bad_chan(maxchan)
-      integer   nbad_chan, ngood_chan, flag_arr(maxchan)
+        real(sp), allocatable :: bad_chan(:)
+      integer   nbad_chan, ngood_chan
+      integer, allocatable :: flag_arr(:)
       logical   remove_badchan
       character(len=172) :: badchan_file
 
@@ -254,6 +279,7 @@ chelp-
      -          subim_ra_blc,subim_ra_trc,subim_ra_inc,
      -          subim_dec_blc,subim_dec_trc,subim_dec_inc,
      -          subim_chan_blc,subim_chan_trc,subim_chan_inc,
+     -          tile_ra,tile_dec,tile_mem_frac,tile_auto,dry_run,
      -          rem_mean,remove_QU_bias,
      -          resiQ,slopeQ,resiU,slopeU,
      -          path_I,infileI,
@@ -317,32 +343,8 @@ chelp-
       QU_linecutfile(1:) = outfile(1:nchar(outfile))//'.QU.linecut'
         badchan_file(1:) = badchan_file(1:nchar(badchan_file))
 
-      ! Read the BAD-CHANNELS required for FLAGGING them:
-      if(remove_badchan)then
-              open(71,file=badchan_file,status='old',err=701)
-              goto 702
-701           continue
-              write(*,*)" "
-              write(*,*)"Error opening file: ",
-     -                  badchan_file(1:nchar(badchan_file))
-              write(*,*)" "
-              write(*,*)"We shall not attempt to FLAG bad-channels!"
-              remove_badchan = .false.
-              goto 704
-
-702           continue
-              nbad_chan = 0
-              do while(.true.)
-                nbad_chan = nbad_chan + 1
-                read(71,*,end=703)bad_chan(nbad_chan)  ! Reading the BAD-CHANNEL NUMBERS
-                write(*,*)"bad-channels: ",bad_chan(nbad_chan)
-              enddo
-703           continue
-              nbad_chan = nbad_chan - 1
-              write(*,*)"Number of Bad Channels: ",nbad_chan
-              close(71)
-      endif
-704   continue
+                        ! Bad channels will be read after cube dimensions are known
+                        nbad_chan = 0
 
       write(*,*)' ========================================'
       write(*,*)' RM Extraction Parameters from Config:'
@@ -706,6 +708,43 @@ chelp-
        nx_totpix = naxes(1)
        ny_totpix = naxes(2)
        nz_totpix = naxes(3)
+
+      ! Allocate axis and flag arrays now cube dimensions are known
+      allocate(xval(nx_totpix))
+      allocate(yval(ny_totpix))
+      allocate(zval(nz_totpix))
+      allocate(flag_arr(nz_totpix))
+      allocate(bad_chan(nz_totpix))
+
+      ! Read the bad channel list now that nz_totpix is known
+      if(remove_badchan)then
+              open(71,file=badchan_file(1:nchar(badchan_file)),
+     -             status='old',iostat=ios_mem)
+              if(ios_mem .ne. 0)then
+                      write(*,*)"Error opening bad channel file:"
+                      write(*,*)badchan_file(1:nchar(badchan_file))
+                      write(*,*)"Skipping bad channel flagging."
+                      remove_badchan = .false.
+              else
+                      nbad_chan = 0
+                      do while(.true.)
+                              nbad_chan = nbad_chan + 1
+                              if(nbad_chan .gt. nz_totpix)then
+                                      write(*,*)"Too many bad channels"
+                                      write(*,*)"Max by cube:"
+                                      write(*,*)nz_totpix
+                                      close(71)
+                                      stop
+                              endif
+                              read(71,*,end=711)bad_chan(nbad_chan)
+                              write(*,*)"bad-chan: ",bad_chan(nbad_chan)
+                      enddo
+711                   continue
+                      nbad_chan = nbad_chan - 1
+                      write(*,*)"Number of Bad Channels: ",nbad_chan
+                      close(71)
+              endif
+      endif
 
         if(mod(nx_totpix,2) .eq. 0)then   
                 nxc = nx_totpix/2
@@ -1100,46 +1139,14 @@ chelp-
 
       ntot_out = nx_out*ny_out*nz_out
 
-      if (nz_out .gt. maxchan)then
-              if (subim)then
-                      write(*,*)" "
-                      write(*,*)"--------------- WARNING --------------"
-                      write(*,*)"Number of z-pixels in sub-image excee-"
-                      write(*,*)"eded maxchan defined in include file"
-                      write(*,*)" "
-                      write(*,*)"You may need to modify the 'maxchan' "
-                      write(*,*)"parameter in the include file and then"
-                      write(*,*)"recompile the code..."
-                      write(*,*)" "
-                      write(*,*)"Closing the FITS file and Quitting..."
-                      write(*,*)" "
-                      call FTCLOS(21,status)
-                      call FTCLOS(22,status)
-                      call FTCLOS(41,status)
-                      call FTCLOS(42,status)
-                      stop 
-                      !goto 9999
-              else
-                      write(*,*)" "
-                      write(*,*)"-------------- WARNING ---------------"
-                      write(*,*)"Number of z-pixels in image exceeded "
-                      write(*,*)"maxchan defined in include file!"
-                      write(*,*)" "
-                      write(*,*)"You may need to modify the 'maxchan' "
-                      write(*,*)"parameter in the include file and then"
-                      write(*,*)"recompile the code..."
-                      write(*,*)" "
-                      write(*,*)"Closing the FITS file and Quitting..."
-                      write(*,*)" "
-                      call FTCLOS(21,status)
-                      call FTCLOS(22,status)
-                      call FTCLOS(41,status)
-                      call FTCLOS(42,status)
-                      stop 
-                      !goto 9999
+      ! Allocate per-pixel spectrum work buffers sized to actual nz_out
+      allocate(data_arrI(nz_out))
+      allocate(data_arrQ(nz_out))
+      allocate(data_arrU(nz_out))
+      allocate(L_sq(nz_out))
+      allocate(Q_now(nz_out))
+      allocate(U_now(nz_out))
 
-              endif
-      endif
       ! Now generate the axis values:
 
       !Refreshing Standard IX Arithmetic-Series concepts: 
@@ -1253,9 +1260,17 @@ chelp-
       else
            nrm_out = nrm_out_par*ofac
       endif
-        call extract_general_setup(L_sq,ngood_chan,fac,beg_rm,end_rm,
-     -  nrm_out,RM,cos_arr,sin_arr,maxnt,maxchan,use_auto_rm_range,
-     -  ofac)
+
+      ! Allocate RM arrays sized to actual nrm_out and ngood_chan
+      allocate(RM(nrm_out))
+      allocate(p_ex(nrm_out))
+      allocate(phi_ex(nrm_out))
+      allocate(cos_arr(nrm_out, ngood_chan))
+      allocate(sin_arr(nrm_out, ngood_chan))
+
+      call extract_general_setup(L_sq,ngood_chan,fac,beg_rm,end_rm,
+     -  nrm_out,RM,cos_arr,sin_arr,nrm_out,ngood_chan,
+     -  use_auto_rm_range,ofac)
       dRM = (RM(nrm_out) - RM(1))/real(nrm_out - 1)
       open(77,file='sampled_RM.txt',status='unknown')
       write(77,*)"# ofac: ",ofac
@@ -1282,6 +1297,109 @@ chelp-
          write(79,*)zval(i),"    ",atmp,"   ",flag_arr(i) 
       enddo
       close(79)
+
+      !----------------------------------------------------
+      ! Tile planning for memory-efficient cube processing.
+      mem_avail_kb = 0_int64
+      mem_unit = 91
+      open(mem_unit,file='/proc/meminfo',status='old',iostat=ios_mem)
+      if(ios_mem.eq.0)then
+              do
+                      read(mem_unit,'(A)',iostat=ios_mem) mem_line
+                      if(ios_mem.ne.0)exit
+                      if(index(mem_line,'MemAvailable:').eq.1)then
+                              read(mem_line(14:),*,
+     -                             iostat=ios_mem) mem_kb_tmp
+                              if(ios_mem.eq.0)mem_avail_kb = mem_kb_tmp
+                              exit
+                      endif
+              enddo
+              close(mem_unit)
+      endif
+      if(mem_avail_kb.le.0_int64)then
+              mem_avail_kb = 4194304_int64
+      endif
+
+      in_fields = 2
+      if(need_icube)in_fields = 3
+
+      bytes_per_tile_pixel = int(4,kind=int64)*
+     -      (int(in_fields,kind=int64)*int(nz_out,kind=int64) +
+     -       int(2*nrm_out,kind=int64))
+        mem_safe_bytes = int(tile_mem_frac *
+     -      real(mem_avail_kb,kind=dp) * 1024.0_dp,
+     -      kind=int64)
+      if(mem_safe_bytes.le.bytes_per_tile_pixel)then
+              mem_safe_bytes = bytes_per_tile_pixel
+      endif
+      tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel
+      if(tile_pixels_max.lt.1_int64)tile_pixels_max = 1_int64
+
+      if(tile_auto .or. tile_ra.le.0 .or. tile_dec.le.0)then
+              if(tile_pixels_max.ge.16384_int64)then
+                      tile_ra = min(nx_out,128)
+                      tile_dec = min(ny_out,128)
+              else
+                      tile_ra = min(nx_out,
+     -                   max(1,int(sqrt(real(tile_pixels_max,
+     -                   kind=dp)))))
+                      if(tile_ra.lt.1)tile_ra = 1
+                      tile_dec = min(ny_out,
+     -                   max(1,int(tile_pixels_max/
+     -                   int(tile_ra,kind=int64))))
+              endif
+      else
+              tile_ra = max(1,min(tile_ra,nx_out))
+              tile_dec = max(1,min(tile_dec,ny_out))
+      endif
+
+      tile_bytes_est = int(tile_ra,kind=int64) *
+     -                 int(tile_dec,kind=int64) * bytes_per_tile_pixel
+      do while(tile_bytes_est.gt.mem_safe_bytes .and.
+     -         (tile_ra.gt.1 .or. tile_dec.gt.1))
+              if(tile_ra.ge.tile_dec .and. tile_ra.gt.1)then
+                      tile_ra = max(1,tile_ra/2)
+              else if(tile_dec.gt.1)then
+                      tile_dec = max(1,tile_dec/2)
+              endif
+              tile_bytes_est = int(tile_ra,kind=int64) *
+     -                 int(tile_dec,kind=int64) * bytes_per_tile_pixel
+      enddo
+
+      write(*,*)" "
+      write(*,*)"Tile planner (Phase-2):"
+      write(*,*)" MemAvailable(kB): ",mem_avail_kb
+      write(*,*)" tile_mem_frac: ",tile_mem_frac
+      write(*,*)" tile_ra x tile_dec (output px): ",tile_ra,tile_dec
+      write(*,*)" Estimated tile memory (MB): ",
+     -           real(tile_bytes_est,kind=dp)/(1024.0_dp*1024.0_dp)
+
+      if(dry_run)then
+              open(96,file='tile_autotune.cfg',status='unknown')
+              write(96,*)"# Autogenerated tile hints"
+              write(96,*)"# Copy these KEY=VALUE lines to your cfg"
+              write(96,*)"tile_auto=n"
+              write(96,*)"tile_ra=",tile_ra
+              write(96,*)"tile_dec=",tile_dec
+              write(96,*)"tile_mem_frac=",tile_mem_frac
+              write(96,*)"# Suggested subimage chunk for one pass"
+              write(96,*)"subim_ra_blc=",xpix_beg
+              write(96,*)"subim_ra_trc=",min(xpix_end,
+     -             xpix_beg + (tile_ra-1)*incs(1))
+              write(96,*)"subim_dec_blc=",ypix_beg
+              write(96,*)"subim_dec_trc=",min(ypix_end,
+     -             ypix_beg + (tile_dec-1)*incs(2))
+              close(96)
+              write(*,*)"Dry-run mode enabled. Wrote tile_autotune.cfg"
+              write(*,*)"No tomography executed in dry-run mode."
+              goto 9999
+      endif
+
+      allocate(specQ(tile_ra*tile_dec*nz_out))
+      allocate(specU(tile_ra*tile_dec*nz_out))
+      if(need_icube)allocate(specI(tile_ra*tile_dec*nz_out))
+      allocate(p_tile_arr(tile_ra*tile_dec*nrm_out))
+      allocate(phi_tile_arr(tile_ra*tile_dec*nrm_out))
 
 
       ! Irrespective of the total number of output pixels, 
@@ -1586,184 +1704,162 @@ chelp-
       tmp_cnt1 = 0
       tmp_cnt2 = 0
       cnt1 = 0
-      ixpix_now = 0
-      do ix = xpix_beg,xpix_end,incs(1)
-         ixpix_now = ixpix_now + 1
-         write(*,*)"Doing x-plane: ",ix
+      do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
+         ix_tile_end = min(xpix_end,
+     -                     ix_tile_beg + (tile_ra-1)*incs(1))
+         nx_tile = int((ix_tile_end - ix_tile_beg)/incs(1)) + 1
 
-         fpixels(1) = ix
-         lpixels(1) = ix
+         do iy_tile_beg = ypix_beg,ypix_end,tile_dec*incs(2)
+            iy_tile_end = min(ypix_end,
+     -                        iy_tile_beg + (tile_dec-1)*incs(2))
+            ny_tile = int((iy_tile_end - iy_tile_beg)/incs(2)) + 1
 
-         fpixels(2) = ypix_beg
-         lpixels(2) = ypix_end
+            write(*,*)"Doing tile x:[",ix_tile_beg,",",ix_tile_end,
+     -                "] y:[",iy_tile_beg,",",iy_tile_end,"]"
 
-         fpixels(3) = zpix_beg
-         lpixels(3) = zpix_end
+            fpixels(1) = ix_tile_beg
+            lpixels(1) = ix_tile_end
+            fpixels(2) = iy_tile_beg
+            lpixels(2) = iy_tile_end
+            fpixels(3) = zpix_beg
+            lpixels(3) = zpix_end
 
-         !write(*,*)"fpixels: ",(fpixels(i),i = 1,naxis)
-         !write(*,*)"lpixels: ",(lpixels(i),i = 1,naxis)
-         call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
-     -                    nullval,specQ,anyflg,status)
-         call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,
-     -                    nullval,specU,anyflg,status)
-         if(need_icube)then
-                 call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,
-     -                    incs,nullval,specI,anyflg,status)
-         endif
-         ! TEST
-         !do i = 1,ny_out*nz_out
-         !    write(88,*)specQ(i), specU(i)
-         !enddo
-
-         iypix_now = 0 
-         irm = 0 
-         do iy = ypix_beg,ypix_end,incs(2)
-            iypix_now = iypix_now + 1
-            cnt1 = cnt1 + 1
-            !write(87,*)"## RA, Dec",ix,iy
-            do i = 1,nz_out
-               !data_arrQ(i) = specQ(i + (iy-1)*nz_out)
-               !data_arrU(i) = specU(i + (iy-1)*nz_out)
-               data_arrQ(i) = specQ(iypix_now + (i-1)*ny_out)
-               data_arrU(i) = specU(iypix_now + (i-1)*ny_out)
-               if(need_icube)then
-                       data_arrI(i)=specI(iypix_now + (i-1)*ny_out)
-               endif
-               ! TEST
-               !write(87,*)data_arrQ(i), data_arrU(i)
-            enddo
-            !----------------------------------------------------
-            ngood_chan = 0
-            cnt2 = nz_out + 1
-            !do i = zpix_end,zpix_beg,-incs(3)
-            !   cnt2 = cnt2 - 1
-            !   if(flag_arr(i).eq.1)then
-            !           ngood_chan = ngood_chan + 1
-            !           Q_now(ngood_chan) = data_arrQ(cnt2)
-            !           U_now(ngood_chan) = data_arrU(cnt2)
-            !   endif
-            !enddo
-            if(.not.remove_QU_bias)then
-                    do i = zpix_end,zpix_beg,-incs(3)
-                       cnt2 = cnt2 - 1
-                       if(flag_arr(i).eq.1)then
-                          ngood_chan = ngood_chan + 1
-                          Q_now(ngood_chan) = data_arrQ(cnt2) 
-                          U_now(ngood_chan) = data_arrU(cnt2) 
-                       endif
-                    enddo
-            else
-                    do i = zpix_end,zpix_beg,-incs(3)
-                       cnt2 = cnt2 - 1
-                       if(flag_arr(i).eq.1)then
-                          ngood_chan = ngood_chan + 1
-                          if(data_arrQ(cnt2).ge.resiQ)then
-                                  slopeQ = slopeQ
-                          else
-                                  slopeQ = -slopeQ
-                          endif
-                          if(data_arrU(cnt2).ge.resiU)then
-                                  slopeU = slopeU
-                          else
-                                  slopeU = -slopeU
-                          endif
-                          Q_now(ngood_chan) = data_arrQ(cnt2) - 
-     -                               (data_arrI(cnt2)*slopeQ + resiQ) 
-                          U_now(ngood_chan) = data_arrU(cnt2) -  
-     -                               (data_arrI(cnt2)*slopeU + resiU) 
-                       endif
-                    enddo
+            call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
+     -                   nullval,specQ,anyflg,status)
+            call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,
+     -                   nullval,specU,anyflg,status)
+            if(need_icube)then
+                    call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,
+     -                   incs,nullval,specI,anyflg,status)
             endif
-            !----------------------------------------------------
 
-            ! Perform the tomography now:
-!            call extract_general(Q_now,U_now,ngood_chan,
-!     -                           nrm_out, p_ex,phi_ex,
-!     -                           cos_arr,sin_arr, maxnt, maxchan)
-            if (output_mode .eq. 1) then
-                    call extract_general_ri(Q_now,U_now,ngood_chan,
+            do iy_loc = 1,ny_tile
+               iy = iy_tile_beg + (iy_loc-1)*incs(2)
+               do ix_loc = 1,nx_tile
+                  ix = ix_tile_beg + (ix_loc-1)*incs(1)
+                  cnt1 = cnt1 + 1
+
+                  do iz = 1,nz_out
+                     i = iz
+                     tmp_index = ix_loc + (iy_loc-1)*nx_tile +
+     -                          (iz-1)*nx_tile*ny_tile
+                     data_arrQ(i) = specQ(tmp_index)
+                     data_arrU(i) = specU(tmp_index)
+                     if(need_icube)then
+                             data_arrI(i) = specI(tmp_index)
+                     endif
+                  enddo
+
+                  ngood_chan = 0
+                  cnt2 = nz_out + 1
+                  if(.not.remove_QU_bias)then
+                          do i = zpix_end,zpix_beg,-incs(3)
+                             cnt2 = cnt2 - 1
+                             if(flag_arr(i).eq.1)then
+                                     ngood_chan = ngood_chan + 1
+                                     Q_now(ngood_chan) = data_arrQ(cnt2)
+                                     U_now(ngood_chan) = data_arrU(cnt2)
+                             endif
+                          enddo
+                  else
+                          do i = zpix_end,zpix_beg,-incs(3)
+                             cnt2 = cnt2 - 1
+                             if(flag_arr(i).eq.1)then
+                                     ngood_chan = ngood_chan + 1
+                                     if(data_arrQ(cnt2).ge.resiQ)then
+                                             slopeQ = slopeQ
+                                     else
+                                             slopeQ = -slopeQ
+                                     endif
+                                     if(data_arrU(cnt2).ge.resiU)then
+                                             slopeU = slopeU
+                                     else
+                                             slopeU = -slopeU
+                                     endif
+                                     Q_now(ngood_chan) =
+     -                                  data_arrQ(cnt2) -
+     -                                  (data_arrI(cnt2)*slopeQ + resiQ)
+                                     U_now(ngood_chan) =
+     -                                  data_arrU(cnt2) -
+     -                                  (data_arrI(cnt2)*slopeU + resiU)
+                             endif
+                          enddo
+                  endif
+
+                  if (output_mode .eq. 1) then
+                          call extract_general_ri(
+     -                           Q_now,U_now,ngood_chan,
      -                           nrm_out, p_ex,phi_ex,
-     -                           cos_arr,sin_arr, maxnt, maxchan,
+     -                           cos_arr,sin_arr,nrm_out,ngood_chan,
      -                           rem_mean)
-            else
-                    call extract_general(Q_now,U_now,ngood_chan,
+                  else
+                          call extract_general(
+     -                           Q_now,U_now,ngood_chan,
      -                           nrm_out, p_ex,phi_ex,
-     -                           cos_arr,sin_arr, maxnt, maxchan,
+     -                           cos_arr,sin_arr,nrm_out,ngood_chan,
      -                           rem_mean)
-                    if (ap_angle_mode .eq. 1) then
-                            do i = 1,nrm_out
-                                    phi_ex(i) = 0.5*phi_ex(i)
-                            enddo
-                    endif
-            endif
+                          if (ap_angle_mode .eq. 1) then
+                                  do i = 1,nrm_out
+                                          phi_ex(i) = 0.5*phi_ex(i)
+                                  enddo
+                          endif
+                  endif
 
-            ! Fill up p_ex and phi_ex arrays for writing out 
-            ! later (we wish to optimally access FITS FILES and 
-            ! save time:)
-            do i = 1,nrm_out
-               irm = irm + 1
-               p_ex_arr(iypix_now + (i-1)*ny_out) = p_ex(i)
-               phi_ex_arr(iypix_now + (i-1)*ny_out) = phi_ex(i)
-               !p_ex_arr(irm) = p_ex(i)
-               !phi_ex_arr(irm) = phi_ex(i)
+                  do i = 1,nrm_out
+                     tmp_index = ix_loc + (iy_loc-1)*nx_tile +
+     -                          (i-1)*nx_tile*ny_tile
+                     p_tile_arr(tmp_index) = p_ex(i)
+                     phi_tile_arr(tmp_index) = phi_ex(i)
+                  enddo
+
+                  if(line_cut)then
+                          tmp_cnt1 = tmp_cnt1 + 1
+                          write(16,rec=tmp_cnt1)
+     -                    (Q_now(i),i=ngood_chan,1,-1)
+                          tmp_cnt1 = tmp_cnt1 + 1
+                          write(16,rec=tmp_cnt1)
+     -                    (U_now(i),i=ngood_chan,1,-1)
+
+                          tmp_cnt2 = tmp_cnt2 + 1
+                          write(17,rec=tmp_cnt2)(p_ex(i),i=1,nrm_out)
+                          tmp_cnt2 = tmp_cnt2 + 1
+                          write(17,rec=tmp_cnt2)(phi_ex(i),i=1,nrm_out)
+                          write(121,*)"## ix, iy: ",ix,iy
+                          do i = 1,nrm_out
+                                  write(121,*)p_ex(i), phi_ex(i)
+                          enddo
+                  endif
+
+                  if(mod(cnt1-1,1000).eq.0)then
+                       write(*,*)"doing ",cnt1," out of",nx_out*ny_out
+                  endif
+               enddo
             enddo
 
-            !--------------------------------------------------
-            ! Write Q and U in ascending order of frequency and 
-            ! not ascending order of wavelength-squared: 
-            ! Q(i) and U(i) correspond to i-th Freq channel
-            ! p_ex(i) and phi_ex(i) correspond to i-th RM-bin
-            if(line_cut)then
-                    tmp_cnt1 = tmp_cnt1 + 1
-                    write(16,rec=tmp_cnt1)(Q_now(i),i=ngood_chan,1,-1)
-                    tmp_cnt1 = tmp_cnt1 + 1
-                    write(16,rec=tmp_cnt1)(U_now(i),i=ngood_chan,1,-1)
+            ix_out_beg = int((ix_tile_beg - xpix_beg)/incs(1)) + 1
+            ix_out_end = ix_out_beg + nx_tile - 1
+            iy_out_beg = int((iy_tile_beg - ypix_beg)/incs(2)) + 1
+            iy_out_end = iy_out_beg + ny_tile - 1
 
-                    tmp_cnt2 = tmp_cnt2 + 1
-                    write(17,rec=tmp_cnt2)(p_ex(i),i=1,nrm_out)
-                    tmp_cnt2 = tmp_cnt2 + 1
-                    write(17,rec=tmp_cnt2)(phi_ex(i),i=1,nrm_out)
-                    ! TEST : 
-                    ! Readily output the RM-spectra if a single pixel 
-                    ! tomography done: 
-                    write(121,*)"## ix, iy: ",ix,iy
-                    do i = 1,nrm_out
-                      write(121,*)p_ex(i), phi_ex(i)
-                    enddo
+            fpixels(1) = ix_out_beg
+            lpixels(1) = ix_out_end
+            fpixels(2) = iy_out_beg
+            lpixels(2) = iy_out_end
+            fpixels(3) = 1
+            lpixels(3) = nrm_out
+
+            call ftpsse(41,group,3,naxes_out,fpixels,lpixels,
+     -                  p_tile_arr,status)
+            if(status.gt.0)then
+                    call printerror(status)
             endif
-            !! Write the FITS RM-CUBE now:
-            if(mod(cnt1-1,1000).eq.0)then
-                 write(*,*)"doing ",cnt1," out of",nx_out*ny_out 
+            call ftpsse(42,group,3,naxes_out,fpixels,lpixels,
+     -                  phi_tile_arr,status)
+            if(status.gt.0)then
+                    call printerror(status)
             endif
-         enddo     ! end of iy loop
-         !--------------------------------------------------
-         ! Write the FITS CUBES now: 
-         fpixels(1) = ixpix_now
-         lpixels(1) = ixpix_now
-         !write(*,*)"nx_out: ",nx_out
-
-         fpixels(2) = 1 
-         lpixels(2) = ny_out !ypix_end - ypix_beg + 1
-
-         fpixels(3) = 1
-         lpixels(3) = nrm_out
-
-         !write(*,*)"fpixels: ",(fpixels(i),i = 1,naxis)
-         !write(*,*)"lpixels: ",(lpixels(i),i = 1,naxis)
-
-         call ftpsse(41,group,3,naxes_out,fpixels,lpixels,
-     -                  p_ex_arr,status)
-         if(status.gt.0)then
-                 call printerror(status) 
-         endif
-         call ftpsse(42,group,3,naxes_out,fpixels,lpixels,
-     -                  phi_ex_arr,status)
-         if(status.gt.0)then
-                 call printerror(status) 
-         endif
-         !write(*,*)"TEST I am here..."
-         !--------------------------------------------------
-      enddo        ! end of ix loop
+         enddo
+      enddo
       if(line_cut)then
               close(121) 
       endif
@@ -1802,6 +1898,28 @@ chelp-
       write(*,*)"       dRM: ", dRM
       !=======================================================
 
+
+      ! Deallocate all dynamically allocated arrays
+      if(allocated(xval)) deallocate(xval)
+      if(allocated(yval)) deallocate(yval)
+      if(allocated(zval)) deallocate(zval)
+      if(allocated(flag_arr)) deallocate(flag_arr)
+      if(allocated(data_arrI)) deallocate(data_arrI)
+      if(allocated(data_arrQ)) deallocate(data_arrQ)
+      if(allocated(data_arrU)) deallocate(data_arrU)
+      if(allocated(L_sq)) deallocate(L_sq)
+      if(allocated(Q_now)) deallocate(Q_now)
+      if(allocated(U_now)) deallocate(U_now)
+      if(allocated(RM)) deallocate(RM)
+      if(allocated(p_ex)) deallocate(p_ex)
+      if(allocated(phi_ex)) deallocate(phi_ex)
+      if(allocated(cos_arr)) deallocate(cos_arr)
+      if(allocated(sin_arr)) deallocate(sin_arr)
+      if(allocated(specQ)) deallocate(specQ)
+      if(allocated(specU)) deallocate(specU)
+      if(allocated(specI)) deallocate(specI)
+      if(allocated(p_tile_arr)) deallocate(p_tile_arr)
+      if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)
 
 9999  continue
       if(line_cut)then
