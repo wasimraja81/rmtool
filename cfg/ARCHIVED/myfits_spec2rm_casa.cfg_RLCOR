@@ -1,0 +1,15 @@
+# Configuration file for setting up the parameters for extract_qu_data.f routines.
+/media/GMRT_CASA/DATA/POLCAL/IMAGES/CUBES/RLCOR_USING_3C345/MY_CASA/ ; PATH to DATA
+MY_CASA.QCL001.1.RLCOR.FITSCUBE    ; Q-FITS cube
+MY_CASA.UCL001.1.RLCOR.FITSCUBE    ; U-FITS cube
+MY_CASA.RLCOR.QU_BIAS_REMOVED      ; outfile name (generic, with NO extension, several files will be written)
+y                            ; whether an apriori list of bad channels is to be used for rejection? (y/n)
+gmrt_casa_final.burdies      ; file containing the list of BAD CHANNELS
+y                            ; whether subimage of image to be used 
+CASA.par                     ; file containing the parameters for the subimage
+0                            ; remove mean from Q and U spectra? (0/1) 
+n                            ; Do you wish to remove the global bias in Q and U? 
+0.00537290191,  0.022        ; Q bias , Q-slope: if Q > Q_bias, slope = +|Qslope|, else slope = -|Qslope|
+0.00996285584,  0.03         ; U bias , U-slope: if U > U_bias, slope = +|Uslope|, else slope = -|Uslope|
+MY_CASA.ICL001.1.RLCOR.FITSCUBE    ; I-FITS cube
+
