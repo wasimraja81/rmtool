@@ -1,0 +1,141 @@
+***********************************************************************
+***** This is a general subroutine which uses pgplot's subroutines to 
+***** plot a 2-dimensional array as an image.
+***** Variables to be passed :
+**    1. X-array              --  real*4
+**    2. Y-array              --  real*4
+**    3. No. of points        --  integer*4
+**    4. xlabel,ylabel,title  --  character*80
+**    5. plot_dev             --  character*120
+**    6. mode                 --  character*120
+**       ("default" or "interactive")
+***********************************************************************
+
+
+
+        subroutine pgplot_imag(plot_arr,maxrow,maxcol,i1,i2,j1,j2,
+     -             xmin,xmax,
+     -             ymin,ymax,thresh,xlabel,ylabel,title,plot_dev,
+     -             tagline)
+
+        implicit none
+        integer*4 maxrow, maxcol
+!        parameter (maxrec = 32768, max_reclen = 2048)
+        integer*4 i,j,i1,i2,j1,j2
+        real*4    plot_arr(maxrow,maxcol),xmin,xmax,ymin,ymax,
+     -            tr(6),amin,amax,xstep,ystep
+        character xlabel*(*),ylabel*(*),title*(*),plot_dev*(*)
+        logical bw_plot
+        real*4 thresh
+        real*4 mu, sigma, accum
+        real*4 data_min, data_max
+        integer*4 kk, nchar 
+        character tagline*(*) 
+
+
+        bw_plot = .false.
+
+        ! Added by wasim to fix amin & amax using threshold
+        ! If ILL-DEFINED threshold is provided, then min/max 
+        ! of image will be used as amin & amax
+
+        ! Do a little more:
+        ! Compute the min and max of the image and compare with the
+        ! amin and amax obtained using +/- thresh*rms. Depending on 
+        ! the values, decide to replace the amin and amax according 
+        ! to the data min/max or thresh values.
+
+
+        ! Find the min/max in data first:
+        data_min = 9.0e28
+        data_max = -data_min
+        do i = i1,i2
+           do j = j1,j2
+              data_min = min(data_min,plot_arr(i,j))
+              data_max = max(data_max,plot_arr(i,j))
+           end do
+        end do
+
+        ! Find the limits based on threshold :
+        accum = 0.0
+        kk = 0
+        do i = i1,i2
+           do j = j1,j2
+              kk = kk + 1
+              accum = accum + plot_arr(i,j)
+           end do
+        end do
+        mu = accum/kk  ! Mean computed
+        
+        accum = 0.0
+        do i = i1,i2
+          do j = j1,j2
+               accum = accum + (plot_arr(i,j) - mu)**2
+          end do
+        enddo
+        sigma = sqrt(accum/kk)  ! rms computed
+
+        amin = -1.0*thresh*sigma
+        amax = 1.0*thresh*sigma
+        ! Now choose to use the appropriate limits:
+
+        if(amin.eq.amax.or.thresh.le.0)then ! use the min/max of data; 
+                                            ! basically takes care of 
+                                            ! improperly input thresh!
+                amin = data_min
+                amax = data_max  
+        else 
+                if(amin.lt.data_min)then
+                        amin = data_min
+                else
+                        amin = amin
+                endif
+                if(amax.gt.data_max)then
+                        amax = data_max
+                else
+                        amax = amax
+                endif
+        endif
+
+        !write(*,*)"data_min,data_max:",data_min, data_max
+        !write(*,*)"amin,amax:",amin, amax
+
+        xstep = (xmax - xmin)/real(i2 - i1 + 1)
+        ystep = (ymax - ymin)/real(j2 - j1 + 1)
+        tr(1) = xmin
+        tr(2) = xstep
+        tr(3) = 0.0
+        tr(4) = ymin 
+        tr(5) = 0.0
+        tr(6) = ystep
+
+        !amin = 0.0
+        !amax = 0.1
+        title = title(1:nchar(title)) 
+!        title = title(1:nchar(title))//
+!     -          " ["//tagline(1:nchar(tagline))//"]"
+        call pgbegin(0,plot_dev,1,1)
+        call pgenv(xmin,xmax,ymin,ymax,0,1)
+        call pgsch(1.2) 
+        call pglabel(xlabel,ylabel,title)
+
+
+        !write(*,*)"amin,amax in data: ",amin,amax
+        !write(*,*)"amin/amax: ",amin/amax
+        !write(*,*)"amax - amin: ",amax-amin
+        call set_colours(bw_plot,amin,amax)
+
+        call pgimag(plot_arr,maxrow,maxcol,i1,i2,j1,j2,amin,amax,tr)
+        CALL PGSCH(1.2)
+        CALL PGWEDG('RI', 1.0, 3.0, amin, amax,' ')
+        call pgend
+        return
+        end
+
+C+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++        
+*************************************************************************
+** include files
+c        include 'nchar_lin.f'
+        include 'set_colours.f'
+        include 'upcase.f'
+*************************************************************************

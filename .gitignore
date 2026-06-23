@@ -1,0 +1,24 @@
+# Build artifacts
+/build/
+/bin/
+*.o
+*.mod
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Scratch test outputs
+/scratch/*.FITS
+/scratch/*.fits
+/scratch/*.log
+/scratch/rm_spec.txt
+/scratch/sampled_*.txt
+/scratch/test_no_subim.cfg
+
+# Editor / OS junk
+*~
+*.swp
+.DS_Store
