@@ -46,7 +46,8 @@ contains
     
     real(sp) :: freq_MHz(npts), f1, f2, Lsq1, Lsq2, dfreq
     real(sp) :: t_span, d_nu, nu_span, omega, h_tmp, phi_tmp, beg_eff, end_eff
-    integer(int32) :: i, j, kk
+    real(sp) :: neg_span, pos_span, span_ratio
+    integer(int32) :: i, j, kk, nneg, npos, zero_idx
     real(sp), parameter :: pi = 3.14159265358979, twopi = 6.28318530717959
     
     ! Generate temporal frequencies from L_sq data
@@ -82,6 +83,22 @@ contains
 
     if (nout <= 1) then
       nu(1) = beg_eff
+    else if (nout >= 3 .and. beg_eff < 0.0_sp .and. end_eff > 0.0_sp) then
+      neg_span = abs(beg_eff)
+      pos_span = abs(end_eff)
+      span_ratio = neg_span / (neg_span + pos_span)
+
+      nneg = nint(real(nout - 1, kind=sp) * span_ratio)
+      nneg = max(1_int32, min(nout - 2, nneg))
+      npos = (nout - 1) - nneg
+
+      h_tmp = min(neg_span / real(nneg, kind=sp), &
+                  pos_span / real(npos, kind=sp))
+      zero_idx = nneg + 1
+
+      do i = 1, nout
+        nu(i) = real(i - zero_idx, kind=sp) * h_tmp
+      end do
     else
       h_tmp = (end_eff - beg_eff) / real(nout - 1)
       do i = 1, nout
