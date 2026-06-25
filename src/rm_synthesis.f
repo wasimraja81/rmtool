@@ -124,6 +124,7 @@ chelp-
       integer   nbuffer, firstpix
 
       integer   fpixels(max_axis), lpixels(max_axis), incs(max_axis)
+        integer   fpixels_out(3), lpixels_out(3)
       real(sp), allocatable :: L_sq(:)
       real(sp), allocatable :: Q_now(:)
       real(sp), allocatable :: U_now(:)
@@ -132,6 +133,8 @@ chelp-
       logical   anyflg
       logical   cubeQ
       logical   cubeU
+      logical   out_amp_open, out_ang_open, out_exists
+      integer   freq_axis, freq_axisQ, freq_axisU
 
       character(len=64) :: ctype 
       character(len=72) :: comment
@@ -173,6 +176,7 @@ chelp-
       integer(kind=int64) :: mem_avail_kb, mem_kb_tmp
       integer(kind=int64) :: mem_safe_bytes, bytes_per_tile_pixel
       integer(kind=int64) :: tile_pixels_max, tile_bytes_est
+      integer(kind=int64) :: image_pixels_total
       character(len=256) :: mem_line
 
 
@@ -380,7 +384,7 @@ chelp-
      -           cxval_imQ,cxpix_imQ,xinc_imQ,
      -           cyval_imQ,cypix_imQ,yinc_imQ,
      -           czval_imQ,czpix_imQ,zinc_imQ,
-     -           cubeQ,message,status)
+     -           freq_axisQ,cubeQ,message,status)
 
       if (status.eq.0)then
               write(*,*)"Q-cube opened:",infileQ(1:nchar(infileQ))
@@ -400,6 +404,7 @@ chelp-
               write(*,*)"         zinc:",zinc_imQ
               write(*,*)" "
               write(*,*)"        cubeQ:",cubeQ
+              write(*,*)"   freq-axisQ:",freq_axisQ
               write(*,*)"      message:",message(1:nchar(message))
               do i = 1,naxisQ
                  write(*,*)"naxesQ(",i,") = ",naxesQ(i)
@@ -409,7 +414,7 @@ chelp-
               write(*,*)"something went wrong with the "
               write(*,*)"'myfits_info' subroutine call"
               write(*,*)"with the Q-cube file as infile"
-              write(*,*)"Check if the file exists..."
+              write(*,*)"message:",message(1:nchar(message))
               write(*,*)"Quitting now..."
               stop
               !goto 9999
@@ -420,7 +425,7 @@ chelp-
      -           cxval_imU,cxpix_imU,xinc_imU,
      -           cyval_imU,cypix_imU,yinc_imU,
      -           czval_imU,czpix_imU,zinc_imU,
-     -           cubeU,message,status)
+     -           freq_axisU,cubeU,message,status)
 
       if (status.eq.0)then
               write(*,*)"U-cube opened:",infileU(1:nchar(infileU))
@@ -440,6 +445,7 @@ chelp-
               write(*,*)"         zinc:",zinc_imU
               write(*,*)" "
               write(*,*)"        cubeU:",cubeU
+              write(*,*)"   freq-axisU:",freq_axisU
               write(*,*)"      message:",message(1:nchar(message))
               do i = 1,naxisU
                  write(*,*)"naxesU(",i,") = ",naxesU(i)
@@ -449,7 +455,7 @@ chelp-
               write(*,*)"something went wrong with the "
               write(*,*)"'myfits_info' subroutine call"
               write(*,*)"with the U-cube file as infile"
-              write(*,*)"Check if the file exists..."
+              write(*,*)"message:",message(1:nchar(message))
               write(*,*)"Quitting now..."
               stop
               !goto 9999
@@ -458,21 +464,32 @@ chelp-
       write(*,*)"Beginning sanity checks..."
       write(*,*)" "
       if (.not.cubeQ)then
-              write(*,*)'ERROR: Image Type mis-match!'
-              write(*,*)'    The Q-file is not a cube'
+              write(*,*)'ERROR: Missing spectral axis in Q-file!'
+              write(*,*)'    No CTYPE*=FREQ axis detected.'
               write(*,*)' '
               write(*,*)'Please ensure that you have input'
-              write(*,*)'the right cube-files! '
+              write(*,*)'a FITS file with a frequency axis. '
               write(*,*)' '
               write(*,*)'Quitting now... '
               stop
               !goto 9999
       else if (.not.cubeU)then
-              write(*,*)'ERROR: Image Type mis-match!'
-              write(*,*)'    The U-file is not a cube'
+              write(*,*)'ERROR: Missing spectral axis in U-file!'
+              write(*,*)'    No CTYPE*=FREQ axis detected.'
               write(*,*)' '
               write(*,*)'Please ensure that you have input'
-              write(*,*)'the right cube-files! '
+              write(*,*)'a FITS file with a frequency axis. '
+              write(*,*)' '
+              write(*,*)'Quitting now... '
+              stop
+              !goto 9999
+      else if (freq_axisQ.ne.freq_axisU)then
+              write(*,*)'ERROR: Frequency-axis index mis-match!'
+              write(*,*)'    Q FREQ axis = ',freq_axisQ
+              write(*,*)'    U FREQ axis = ',freq_axisU
+              write(*,*)' '
+              write(*,*)'Please reorder Q and U cubes to use'
+              write(*,*)'the same frequency-axis placement.'
               write(*,*)' '
               write(*,*)'Quitting now... '
               stop
@@ -505,6 +522,7 @@ chelp-
               enddo
               write(*,*)' '
       endif
+      freq_axis = freq_axisQ
 
       ! Check to see if there is a pixel to pixel matching...
       if (cxval_imQ.ne.cxval_imU)then 
@@ -707,7 +725,7 @@ chelp-
 
        nx_totpix = naxes(1)
        ny_totpix = naxes(2)
-       nz_totpix = naxes(3)
+       nz_totpix = naxes(freq_axis)
 
       ! Allocate axis and flag arrays now cube dimensions are known
       allocate(xval(nx_totpix))
@@ -977,6 +995,8 @@ chelp-
       nbuffer = naxes(1)
       rwmode = 1
       blocksize = 1
+      out_amp_open = .false.
+      out_ang_open = .false.
       ! Open the Image/Cube Fits file:
 
       ! Initialise STATUS to zero:
@@ -1006,11 +1026,50 @@ chelp-
       endif
 
 
-      !  Create the new RM FITS files. The blocksize parameter is a
-      !  historical artifact and the value is ignored by FITSIO.
+      !  Create the new RM FITS files unless this is a dry-run.
+      !  Also pre-check for output file collisions before calling FITSIO.
+      if(.not.dry_run)then
+              inquire(file=outfileAMP(1:nchar(outfileAMP)),
+     -                exist=out_exists)
+              if(out_exists)then
+                      write(*,*)" "
+                      write(*,*)"ERROR: Output file already exists:"
+                      write(*,*)outfileAMP(1:nchar(outfileAMP))
+                      write(*,*)"Refusing to overwrite existing file."
+                      write(*,*)"Please remove/rename it and run again."
+                      stop
+              endif
+              inquire(file=outfileANG(1:nchar(outfileANG)),
+     -                exist=out_exists)
+              if(out_exists)then
+                      write(*,*)" "
+                      write(*,*)"ERROR: Output file already exists:"
+                      write(*,*)outfileANG(1:nchar(outfileANG))
+                      write(*,*)"Refusing to overwrite existing file."
+                      write(*,*)"Please remove/rename it and run again."
+                      stop
+              endif
 
-        call ftinit(41,outfileAMP,blocksize,status)
-        call ftinit(42,outfileANG,blocksize,status)
+              status = 0
+              call ftinit(41,outfileAMP,blocksize,status)
+              if(status.ne.0)then
+                      write(*,*)"Error creating RM output file:"
+                      write(*,*)outfileAMP(1:nchar(outfileAMP))
+                      call printerror(status)
+                      stop
+              endif
+              out_amp_open = .true.
+
+              status = 0
+              call ftinit(42,outfileANG,blocksize,status)
+              if(status.ne.0)then
+                      write(*,*)"Error creating PA output file:"
+                      write(*,*)outfileANG(1:nchar(outfileANG))
+                      call printerror(status)
+                      stop
+              endif
+              out_ang_open = .true.
+      endif
 
 
       !=======================================================
@@ -1029,18 +1088,36 @@ chelp-
                  lpixels(i) = naxes(i)
                  incs(i) = 1
               enddo
+
+              ! Keep only RA/Dec/frequency varying in extraction.
+              do i = 1,naxis
+                 if(i.ne.1 .and. i.ne.2 .and. i.ne.freq_axis)then
+                        fpixels(i) = 1
+                        lpixels(i) = 1
+                        incs(i) = 1
+                 endif
+              enddo
       else
               write(*,*)" "
               write(*,*)"Sub-section of Q and U-cubes will be used"
               write(*,*)"for the tomography... "
               write(*,*)" "
 
-                          ! Initialize all axes; this is required for naxis=4 cubes.
-                          do i = 1,naxis
-                                 fpixels(i) = 1
-                                 lpixels(i) = naxes(i)
-                                 incs(i) = 1
-                          enddo
+              ! Initialize all axes; this is required for naxis=4 cubes.
+              do i = 1,naxis
+                 fpixels(i) = 1
+                 lpixels(i) = naxes(i)
+                 incs(i) = 1
+              enddo
+
+              ! Keep only RA/Dec/frequency varying in extraction.
+              do i = 1,naxis
+                 if(i.ne.1 .and. i.ne.2 .and. i.ne.freq_axis)then
+                         fpixels(i) = 1
+                         lpixels(i) = 1
+                         incs(i) = 1
+                 endif
+              enddo
               
               ! Use subimage parameters directly from config
               if (subim_ra_blc .eq. 0) then
@@ -1068,24 +1145,25 @@ chelp-
               incs(2) = subim_dec_inc
               
               if (subim_chan_blc .eq. 0) then
-                  fpixels(3) = 1
+                  fpixels(freq_axis) = 1
               else
-                  fpixels(3) = subim_chan_blc
+                  fpixels(freq_axis) = subim_chan_blc
               endif
               if (subim_chan_trc .eq. 0) then
-                  lpixels(3) = naxes(3)
+                  lpixels(freq_axis) = naxes(freq_axis)
               else
-                  lpixels(3) = subim_chan_trc
+                  lpixels(freq_axis) = subim_chan_trc
               endif
-              incs(3) = subim_chan_inc
+              incs(freq_axis) = subim_chan_inc
               
               write(*,*)"Using subimage from config:"
               write(*,*)"RA: ",fpixels(1)," to ",lpixels(1),
      -          " step ",incs(1)
               write(*,*)"Dec: ",fpixels(2)," to ",lpixels(2),
      -          " step ",incs(2)
-              write(*,*)"Chan: ",fpixels(3)," to ",lpixels(3),
-     -          " step ",incs(3)
+              write(*,*)"Chan(axis",freq_axis,"): ",
+     -          fpixels(freq_axis)," to ",lpixels(freq_axis),
+     -          " step ",incs(freq_axis)
               
               ! Validate subimage bounds
               do i = 1,naxis
@@ -1133,9 +1211,9 @@ chelp-
       ypix_end = lpixels(2)
       ny_out = int((ypix_end - ypix_beg)/incs(2)) + 1
 
-      zpix_beg = fpixels(3)
-      zpix_end = lpixels(3)
-      nz_out = int((zpix_end - zpix_beg)/incs(3)) + 1
+      zpix_beg = fpixels(freq_axis)
+      zpix_end = lpixels(freq_axis)
+      nz_out = int((zpix_end - zpix_beg)/incs(freq_axis)) + 1
 
       ntot_out = nx_out*ny_out*nz_out
 
@@ -1247,7 +1325,7 @@ chelp-
       !    ascending order of lambda_sq: 
       ! Count the good channels: 
       ngood_chan = 0
-      do i = zpix_end,zpix_beg,-incs(3)
+      do i = zpix_end,zpix_beg,-incs(freq_axis)
          if(flag_arr(i).eq.1)then
                  ngood_chan = ngood_chan + 1
                  L_sq(ngood_chan) = (conv_fac/zval(i))**2
@@ -1292,7 +1370,7 @@ chelp-
 
       open(79,file='sampled_freq.txt',status='unknown')
       write(79,*)"# freq       L_sq       flag"
-      do i = zpix_end,zpix_beg,-incs(3)
+      do i = zpix_end,zpix_beg,-incs(freq_axis)
          atmp = (conv_fac/zval(i))**2
          write(79,*)zval(i),"    ",atmp,"   ",flag_arr(i) 
       enddo
@@ -1334,19 +1412,23 @@ chelp-
       endif
       tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel
       if(tile_pixels_max.lt.1_int64)tile_pixels_max = 1_int64
+      image_pixels_total = nx_out
+      image_pixels_total = image_pixels_total * ny_out
 
       if(tile_auto .or. tile_ra.le.0 .or. tile_dec.le.0)then
-              if(tile_pixels_max.ge.16384_int64)then
-                      tile_ra = min(nx_out,128)
-                      tile_dec = min(ny_out,128)
+              if(tile_pixels_max.ge.image_pixels_total)then
+                      tile_ra = nx_out
+                      tile_dec = ny_out
               else
                       tile_ra = min(nx_out,
      -                   max(1,int(sqrt(real(tile_pixels_max,
-     -                   kind=dp)))))
+     -                   kind=dp)*real(nx_out,kind=dp)/
+     -                   real(ny_out,kind=dp)))))
                       if(tile_ra.lt.1)tile_ra = 1
                       tile_dec = min(ny_out,
      -                   max(1,int(tile_pixels_max/
      -                   int(tile_ra,kind=int64))))
+                      if(tile_dec.lt.1)tile_dec = 1
               endif
       else
               tile_ra = max(1,min(tile_ra,nx_out))
@@ -1390,7 +1472,14 @@ chelp-
               write(96,*)"subim_dec_trc=",min(ypix_end,
      -             ypix_beg + (tile_dec-1)*incs(2))
               close(96)
+              call write_runtime_estimate('runtime_estimate.txt',
+     -        image_pixels_total,
+     -             nz_totpix,ngood_chan,nbad_chan,nrm_out,output_mode,
+     -             tile_ra,tile_dec,nx_out,ny_out,tile_bytes_est,
+     -             tile_mem_frac,status)
               write(*,*)"Dry-run mode enabled. Wrote tile_autotune.cfg"
+              write(*,*)"Dry-run mode enabled."
+              write(*,*)"Wrote runtime_estimate.txt"
               write(*,*)"No tomography executed in dry-run mode."
               goto 9999
       endif
@@ -1409,7 +1498,8 @@ chelp-
 
       write(*,*)"xpix-beg,xpix-end,inc: ",xpix_beg,xpix_end,incs(1)
       write(*,*)"ypix-beg,ypix-end,inc: ",ypix_beg,ypix_end,incs(2)
-      write(*,*)"zpix-beg,zpix-end,inc: ",zpix_beg,zpix_end,incs(3)
+      write(*,*)"zpix-beg,zpix-end,inc: ",
+     -          zpix_beg,zpix_end,incs(freq_axis)
 
       !  Initialize parameters about the output FITS CUBES
       !  The EXTEND = TRUE parameter indicates that the FITS file
@@ -1589,6 +1679,9 @@ chelp-
 !      !stop
       ! =================== CTYPE-3 =======================
 
+      ! Reset status before writing output-header keywords.
+      status = 0
+
       call ftpkys(41,"ctype3","RM-rd/m2","3rd axis type",status)
       call ftpkys(42,"ctype3","RM-rd/m2","3rd axis type",status)
 
@@ -1605,7 +1698,13 @@ chelp-
       call ftpkye(42,"cdelt3",dRM,decimals,"Pixel size in world coordina
      -te units",status)
 
+      status = 0
       call ftgkys(21,"BUNIT",ctype,comment,status)
+      if(status.ne.0)then
+              ctype = 'UNKNOWN'
+              comment = 'Input BUNIT missing'
+              status = 0
+      endif
       call ftpkys(41,"BUNIT",ctype(1:nchar(ctype)),"Units of Pixel Data"
      -,status)
       call ftpkys(42,"BUNIT","radians","Units of Pixel Data",status)
@@ -1632,7 +1731,13 @@ chelp-
       call ftpkyd(41,"EPOCH",cval,decimals,comment,status)
       call ftpkyd(42,"EPOCH",cval,decimals,comment,status)
       ! Object/Field name: 
+      status = 0
       call ftgkys(21,"OBJECT",ctype,comment,status)
+      if(status.ne.0)then
+              ctype = 'UNKNOWN'
+              comment = 'Input OBJECT missing'
+              status = 0
+      endif
       call ftpkys(41,"OBJECT",ctype(1:nchar(ctype)),comment,status)
       call ftpkys(42,"OBJECT",ctype(1:nchar(ctype)),comment,status)
       ! Scaling if any required: 
@@ -1641,11 +1746,23 @@ chelp-
       call ftpkye(41,"BZERO",0.0,decimals," ",status)
       call ftpkye(42,"BZERO",0.0,decimals,comment,status)
       ! Observer name: 
+      status = 0
       call ftgkys(21,"OBSERVER",ctype,comment,status)
+      if(status.ne.0)then
+              ctype = 'UNKNOWN'
+              comment = 'Input OBSERVER missing'
+              status = 0
+      endif
       call ftpkys(41,"OBSERVER",ctype(1:nchar(ctype)),comment,status)
       call ftpkys(42,"OBSERVER",ctype(1:nchar(ctype)),comment,status)
       ! TELESCOPE name: 
+      status = 0
       call ftgkys(21,"TELESCOP",ctype,comment,status)
+      if(status.ne.0)then
+              ctype = 'UNKNOWN'
+              comment = 'Input TELESCOP missing'
+              status = 0
+      endif
       call ftpkys(41,"TELESCOP",ctype(1:nchar(ctype)),comment,status)
       call ftpkys(42,"TELESCOP",ctype(1:nchar(ctype)),comment,status)
 
@@ -1721,8 +1838,8 @@ chelp-
             lpixels(1) = ix_tile_end
             fpixels(2) = iy_tile_beg
             lpixels(2) = iy_tile_end
-            fpixels(3) = zpix_beg
-            lpixels(3) = zpix_end
+            fpixels(freq_axis) = zpix_beg
+            lpixels(freq_axis) = zpix_end
 
             call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
      -                   nullval,specQ,anyflg,status)
@@ -1753,7 +1870,8 @@ chelp-
                   ngood_chan = 0
                   cnt2 = nz_out + 1
                   if(.not.remove_QU_bias)then
-                          do i = zpix_end,zpix_beg,-incs(3)
+                          do i = zpix_end,zpix_beg,
+     -                         -incs(freq_axis)
                              cnt2 = cnt2 - 1
                              if(flag_arr(i).eq.1)then
                                      ngood_chan = ngood_chan + 1
@@ -1762,7 +1880,8 @@ chelp-
                              endif
                           enddo
                   else
-                          do i = zpix_end,zpix_beg,-incs(3)
+                          do i = zpix_end,zpix_beg,
+     -                         -incs(freq_axis)
                              cnt2 = cnt2 - 1
                              if(flag_arr(i).eq.1)then
                                      ngood_chan = ngood_chan + 1
@@ -1841,19 +1960,19 @@ chelp-
             iy_out_beg = int((iy_tile_beg - ypix_beg)/incs(2)) + 1
             iy_out_end = iy_out_beg + ny_tile - 1
 
-            fpixels(1) = ix_out_beg
-            lpixels(1) = ix_out_end
-            fpixels(2) = iy_out_beg
-            lpixels(2) = iy_out_end
-            fpixels(3) = 1
-            lpixels(3) = nrm_out
+            fpixels_out(1) = ix_out_beg
+            lpixels_out(1) = ix_out_end
+            fpixels_out(2) = iy_out_beg
+            lpixels_out(2) = iy_out_end
+            fpixels_out(3) = 1
+            lpixels_out(3) = nrm_out
 
-            call ftpsse(41,group,3,naxes_out,fpixels,lpixels,
+            call ftpsse(41,group,3,naxes_out,fpixels_out,lpixels_out,
      -                  p_tile_arr,status)
             if(status.gt.0)then
                     call printerror(status)
             endif
-            call ftpsse(42,group,3,naxes_out,fpixels,lpixels,
+            call ftpsse(42,group,3,naxes_out,fpixels_out,lpixels_out,
      -                  phi_tile_arr,status)
             if(status.gt.0)then
                     call printerror(status)
@@ -1942,16 +2061,22 @@ chelp-
 !              call printerror(status)
 !      endif
 !      if(.not.line_cut)then
+      if(out_amp_open)then
+              status = 0
               call FTCLOS(41,status)
               if (status .gt. 0)then
                       write(*,*)"Problem closing RM-file"
                       call printerror(status)
               endif
+      endif
+      if(out_ang_open)then
+              status = 0
               call FTCLOS(42,status)
               if (status .gt. 0)then
                       write(*,*)"Problem closing PA-file"
                       call printerror(status)
               endif
+      endif
 !      endif
 
       ! -----------------------------------------------------------------

@@ -16,14 +16,14 @@ C     -           > bitpix,naxis,naxes,
 C     -           cxval_im,cxpix_im,xinc_im
 C     -           cyval_im,cypix_im,yinc_im
 C     -           czval_im,czpix_im,zinc_im
-C     -           cube,message,status)
+C     -           freq_axis,cube,message,status)
 C
       subroutine myfits_info(infile,
      -           bitpix,naxis,naxes,
      -           cxval_im,cxpix_im,xinc_im,
      -           cyval_im,cypix_im,yinc_im,
      -           czval_im,czpix_im,zinc_im,
-     -           cube,message,status)
+     -           freq_axis,cube,message,status)
       implicit none
       integer*4 maxdim
       parameter(maxdim = 100)
@@ -35,10 +35,14 @@ C
       integer*4 rwmode
       character infile*(*), message*(*)
       character*172 comment
+      character*72 ctype_i
+      character*8 keyname
 
       real*4 cxval_im, cyval_im, czval_im 
       integer*4 cxpix_im, cypix_im, czpix_im 
       real*4 xinc_im, yinc_im, zinc_im
+      integer*4 freq_axis
+      integer*4 i, tmp_status
 
       ! Some useless fitsio legacy stuff:
       integer*4 group, blocksize
@@ -82,10 +86,26 @@ C
       ! Determine the SIZE along each dimension of the image:
       call FTGISZ(11,maxdim,naxes,status)
 
-      if (naxes(1).gt.1.and.naxes(2).gt.1.and.naxes(3).gt.1)then
-              cube = .true.
-      else if (naxes(1).gt.1.and.naxes(2).gt.1.and.naxes(3).eq.1)then
-              cube = .false.
+      cube = .false.
+      freq_axis = 0
+      do i = 1,naxis
+              write(keyname,'("CTYPE",I0)')i
+              ctype_i = ' '
+              tmp_status = 0
+              call FTGKYS(11,keyname,ctype_i,comment,tmp_status)
+              if(tmp_status.eq.0)then
+                      if(index(ctype_i,'FREQ').gt.0 .or.
+     -                   index(ctype_i,'freq').gt.0)then
+                              freq_axis = i
+                              cube = .true.
+                              exit
+                      endif
+              endif
+      enddo
+      if(freq_axis.eq.0)then
+              message(1:) = 'No frequency axis (CTYPE*=FREQ) found'
+              status = -2002
+              goto 9999
       endif
 
       !=======================================================
@@ -110,14 +130,19 @@ C
         zinc_im = 0.0
         if (cube)then
                 ! Get the Spectral Channels :
-                call FTGKYE(11,"crval3",czval_im,comment,status) ! reference "value" of 
+                write(keyname,'("CRVAL",I0)')freq_axis
+                call FTGKYE(11,keyname,czval_im,comment,status) ! reference "value" of 
                                                                  ! axis(3) or Dec-centre
-                call FTGKYJ(11,"crpix3",czpix_im,comment,status) ! reference "pixel" of 
+                write(keyname,'("CRPIX",I0)')freq_axis
+                call FTGKYJ(11,keyname,czpix_im,comment,status) ! reference "pixel" of 
                                                                  ! axis(3) i.e,Frequency
-                call FTGKYE(11,"cdelt3",zinc_im,comment,status)  ! increment in between 
+                write(keyname,'("CDELT",I0)')freq_axis
+                call FTGKYE(11,keyname,zinc_im,comment,status)  ! increment in between 
                                                                  ! pixels of axis(3)
         endif
-        message(1:) = 'basic info-extraction okay!'
+        if(status.eq.0)then
+                message(1:) = 'basic info-extraction okay!'
+        endif
   
 9999  continue
       ! CLOSE THE FITS FILE:

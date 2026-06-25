@@ -22,3 +22,6 @@ compile_commands.json
 *~
 *.swp
 .DS_Store
+
+# local run artifacts
+scratch/

@@ -10,6 +10,7 @@ module rm_synthesis_mod
   public :: extract_general_setup, extract_general, extract_general_ri
   public :: linspace, nchar
   public :: read_cfg_keyval
+  public :: write_runtime_estimate
   public :: sp, dp, int32, int64
   
   ! Include file parameters for RM-synthesis
@@ -130,7 +131,7 @@ contains
     real(sp), intent(out) :: p_ex(*), phi_ex(*)
     real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
     
-    real(sp) :: ryt(npts), iyt(npts), c_template(npts), s_template(npts)
+    real(sp) :: ryt(npts), iyt(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
     integer(int32) :: i, kk
     
@@ -149,17 +150,20 @@ contains
       end do
     end if
     
-    ! Extract using pre-computed templates
+    ! Extract using pre-computed templates.
+    ! One fused loop reduces memory traffic versus copying template vectors
+    ! and calling 4 separate dot products per RM bin.
     do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
       do kk = 1, npts
-        c_template(kk) = cos_arr(i, kk)
-        s_template(kk) = sin_arr(i, kk)
+        rc_cor = rc_cor + ryt(kk) * cos_arr(i, kk)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(i, kk)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(i, kk)
+        is_cor = is_cor + iyt(kk) * sin_arr(i, kk)
       end do
-      
-      call dot_product_custom(ryt, c_template, rc_cor, npts)
-      call dot_product_custom(ryt, s_template, rs_cor, npts)
-      call dot_product_custom(iyt, c_template, ic_cor, npts)
-      call dot_product_custom(iyt, s_template, is_cor, npts)
       
       rc_cor = rc_cor / dble(npts)
       rs_cor = rs_cor / dble(npts)
@@ -185,7 +189,7 @@ contains
     real(sp), intent(out) :: re_ex(*), im_ex(*)
     real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
 
-    real(sp) :: ryt(npts), iyt(npts), c_template(npts), s_template(npts)
+    real(sp) :: ryt(npts), iyt(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
     integer(int32) :: i, kk
 
@@ -204,15 +208,16 @@ contains
     end if
 
     do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
       do kk = 1, npts
-        c_template(kk) = cos_arr(i, kk)
-        s_template(kk) = sin_arr(i, kk)
+        rc_cor = rc_cor + ryt(kk) * cos_arr(i, kk)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(i, kk)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(i, kk)
+        is_cor = is_cor + iyt(kk) * sin_arr(i, kk)
       end do
-
-      call dot_product_custom(ryt, c_template, rc_cor, npts)
-      call dot_product_custom(ryt, s_template, rs_cor, npts)
-      call dot_product_custom(iyt, c_template, ic_cor, npts)
-      call dot_product_custom(iyt, s_template, is_cor, npts)
 
       rc_cor = rc_cor / dble(npts)
       rs_cor = rs_cor / dble(npts)
@@ -1133,6 +1138,93 @@ contains
 
     close(unit_cfg)
   end subroutine read_cfg_keyval
+
+  subroutine write_runtime_estimate(report_file, npix_total, nchan_total, nchan_good, &
+                                    nbad_chan, nrm_out, output_mode, tile_ra, tile_dec, &
+                                    nx_out, ny_out, tile_bytes_est, tile_mem_frac, status)
+    !! Write a dry-run runtime estimate table.
+    implicit none
+    character(len=*), intent(in) :: report_file
+    integer(int64), intent(in) :: npix_total
+    integer(int32), intent(in) :: nchan_total, nchan_good, nbad_chan, nrm_out, output_mode
+    integer(int32), intent(in) :: tile_ra, tile_dec, nx_out, ny_out
+    integer(int64), intent(in) :: tile_bytes_est
+    real(sp), intent(in) :: tile_mem_frac
+    integer(int32), intent(out) :: status
+
+    integer(int32) :: unit_out, i
+    integer(int64) :: tiles_x, tiles_y, total_tiles
+    real(dp) :: pix_dp, nchan_dp, nrm_dp
+    real(dp) :: flops_total, flops_kernel, flops_per_term, flops_per_rm
+    real(dp) :: gflops_rates(5), hours_est(5), seconds_est(5)
+    character(len=16) :: mode_name
+
+    status = 0
+    unit_out = 97
+    open(unit_out, file=report_file, status='replace', action='write', iostat=status)
+    if (status /= 0) return
+
+    pix_dp = real(npix_total, dp)
+    nchan_dp = real(nchan_good, dp)
+    nrm_dp = real(nrm_out, dp)
+
+    ! Lower-bound arithmetic model for the current implementation.
+    ! Dot products dominate, so we count 8 FLOPs per channel/RM term.
+    flops_per_term = 8.0_dp
+    if (output_mode == 1) then
+      mode_name = 'RI'
+      flops_per_rm = 4.0_dp
+    else
+      mode_name = 'AP'
+      flops_per_rm = 12.0_dp
+    end if
+
+    flops_kernel = pix_dp * nchan_dp * nrm_dp * flops_per_term
+    flops_total = flops_kernel + pix_dp * nrm_dp * flops_per_rm
+
+    gflops_rates = [1.0_dp, 2.0_dp, 4.0_dp, 8.0_dp, 12.0_dp]
+    do i = 1, size(gflops_rates)
+      seconds_est(i) = flops_total / (gflops_rates(i) * 1.0d9)
+      hours_est(i) = seconds_est(i) / 3600.0_dp
+    end do
+
+    write(unit_out,'(A)') 'RM-synthesis dry-run runtime estimate'
+    write(unit_out,'(A)') '-------------------------------------'
+    write(unit_out,'(A,1X,I0)') 'Total pixels:', npix_total
+    write(unit_out,'(A,1X,I0)') 'Total frequency channels in cube:', nchan_total
+    write(unit_out,'(A,1X,I0)') 'Good frequency channels used:', nchan_good
+    write(unit_out,'(A,1X,I0)') 'Explicit bad channels masked:', nbad_chan
+    write(unit_out,'(A,1X,I0)') 'RM samples:', nrm_out
+    write(unit_out,'(A,1X,A)') 'Output mode:', trim(mode_name)
+    write(unit_out,'(A,1X,F8.3)') 'Tile memory fraction target:', tile_mem_frac
+    write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Tile size (x by y):', tile_ra, 'x', tile_dec
+    write(unit_out,'(A,1X,ES16.6)') 'Tile memory (bytes):', real(tile_bytes_est,dp)
+    tiles_x = (int(nx_out,kind=int64) + int(tile_ra,kind=int64) - 1_int64) / &
+              int(tile_ra,kind=int64)
+    tiles_y = (int(ny_out,kind=int64) + int(tile_dec,kind=int64) - 1_int64) / &
+              int(tile_dec,kind=int64)
+    total_tiles = tiles_x * tiles_y
+    write(unit_out,'(A,1X,I0,1X,A,1X,I0,1X,A,1X,I0)') 'Tiles across x/y/total:', &
+      tiles_x, 'x', tiles_y, '=>', total_tiles
+    write(unit_out,'(A)') ' '
+    if (nchan_good < nchan_total) then
+      write(unit_out,'(A)') 'Note: the code does not NaN-filter channels.'
+      write(unit_out,'(A)') 'Channel reduction comes from explicit masking or channel selection.'
+    else
+      write(unit_out,'(A)') 'All channels in the selected span are used.'
+    end if
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A,1X,ES16.6)') 'Kernel FLOPs (dot products):', flops_kernel
+    write(unit_out,'(A,1X,ES16.6)') 'Total estimated FLOPs:', flops_total
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'Estimated wall time at sustained throughput:'
+    write(unit_out,'(A)') '   GFLOP/s        seconds          hours'
+    do i = 1, size(gflops_rates)
+      write(unit_out,'(F8.1,2X,F12.3,2X,F10.3)') gflops_rates(i), seconds_est(i), hours_est(i)
+    end do
+
+    close(unit_out)
+  end subroutine write_runtime_estimate
 
   subroutine split_key_value(raw_line, key, val, has_kv)
     implicit none
