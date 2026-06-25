@@ -1343,8 +1343,8 @@ chelp-
       allocate(RM(nrm_out))
       allocate(p_ex(nrm_out))
       allocate(phi_ex(nrm_out))
-      allocate(cos_arr(nrm_out, ngood_chan))
-      allocate(sin_arr(nrm_out, ngood_chan))
+        allocate(cos_arr(ngood_chan, nrm_out))
+        allocate(sin_arr(ngood_chan, nrm_out))
 
       call extract_general_setup(L_sq,ngood_chan,fac,beg_rm,end_rm,
      -  nrm_out,RM,cos_arr,sin_arr,nrm_out,ngood_chan,
