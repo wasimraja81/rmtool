@@ -80,6 +80,7 @@ chelp-
       !
 
       use rm_synthesis_mod
+      use omp_lib, only: omp_get_num_devices
       implicit none
       
       
@@ -177,6 +178,7 @@ chelp-
       logical   subim
       logical   tile_auto, dry_run
       logical   write_mask_output, write_nvalid_output
+      logical   use_gpu
       real(sp) conv_fac ! freq-to-lambda conversion factor
       real(sp) tile_mem_frac
       logical   MHz
@@ -195,7 +197,8 @@ chelp-
       integer   naxes_mask(3), naxes_nvalid(2)
       logical   nan_check_on, chan_valid
       logical   use_input_mask, in_mask_open
-        logical   use_gpu_actual
+      logical   use_gpu_actual
+      integer   gpu_devices
       real(sp)  mask_val
       integer   in_fields
       integer   mem_unit, ios_mem
@@ -322,12 +325,33 @@ chelp-
      -          mask_input_cube_file,
      -          mask_trust_mode,
      -          write_mask_output,
-     -          write_nvalid_output,status)
+     -          write_nvalid_output,use_gpu,status)
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
               write(*,*)"Quitting now..."
               stop
+      endif
+
+      use_gpu_actual = .false.
+      gpu_devices = 0
+      if(use_gpu)then
+#ifdef USE_GPU
+              gpu_devices = omp_get_num_devices()
+              if(gpu_devices.gt.0)then
+                      use_gpu_actual = .true.
+                      write(*,*)"GPU enabled (OpenMP targets): ",
+     -                     gpu_devices
+              else
+                      write(*,*)"WARNING: use_gpu requested but no "
+                      write(*,*)"OpenMP target devices found; "
+                      write(*,*)"falling back to CPU."
+              endif
+#else
+              write(*,*)"WARNING: use_gpu requested but this binary "
+              write(*,*)"was built without USE_GPU; "
+              write(*,*)"falling back to CPU."
+#endif
       endif
 
       if (rem_mean.gt.0)then
@@ -410,6 +434,16 @@ chelp-
               write(*,*)' write_nvalid_output: y'
       else
               write(*,*)' write_nvalid_output: n'
+      endif
+      if(use_gpu)then
+              write(*,*)' use_gpu: y'
+      else
+              write(*,*)' use_gpu: n'
+      endif
+      if(use_gpu_actual)then
+              write(*,*)' use_gpu_actual: y'
+      else
+              write(*,*)' use_gpu_actual: n'
       endif
       if(output_mode.eq.1)then
               write(*,*)' output_mode: ri'
@@ -2178,11 +2212,6 @@ chelp-
       tmp_cnt1 = 0
       tmp_cnt2 = 0
       cnt1 = 0
-#ifdef USE_GPU
-        use_gpu_actual = .true.
-#else
-        use_gpu_actual = .false.
-#endif
       progress_total = nx_out*ny_out
       progress_step = max(1, progress_total/10)
       progress_next_pct = 10

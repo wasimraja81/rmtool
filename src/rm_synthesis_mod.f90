@@ -717,7 +717,7 @@ contains
                              ap_angle_mode, mask_cube_file, &
                              mask_input_cube_file, &
                              mask_trust_mode, write_mask_output, &
-                             write_nvalid_output, status)
+                             write_nvalid_output, use_gpu, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
@@ -728,6 +728,7 @@ contains
     character(len=*), intent(inout) :: mask_trust_mode
     logical, intent(inout) :: write_mask_output
     logical, intent(inout) :: write_nvalid_output
+    logical, intent(inout) :: use_gpu
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -762,6 +763,7 @@ contains
     logical :: seen_mask_cube_file, seen_mask_input_cube_file
     logical :: seen_mask_trust_mode
     logical :: seen_write_mask_output, seen_write_nvalid_output
+    logical :: seen_use_gpu
 
     status = 0
     line_no = 0
@@ -809,6 +811,7 @@ contains
     seen_mask_trust_mode = .false.
     seen_write_mask_output = .false.
     seen_write_nvalid_output = .false.
+    seen_use_gpu = .false.
 
     ! Defaults can be overridden by the config.
     path = '../DATA/'
@@ -854,6 +857,7 @@ contains
     mask_trust_mode = 'safe'
     write_mask_output = .true.
     write_nvalid_output = .true.
+    use_gpu = .false.
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -1485,6 +1489,15 @@ contains
         end if
         seen_write_nvalid_output = .true.
         write_nvalid_output = flag_from_value(val)
+      case ('use_gpu', 'use_gpus')
+        if (seen_use_gpu) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': use_gpu/use_gpus'
+          status = -189
+          close(unit_cfg)
+          return
+        end if
+        seen_use_gpu = .true.
+        use_gpu = flag_from_value(val)
       case default
         write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
         status = -131
