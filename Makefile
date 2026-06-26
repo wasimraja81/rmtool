@@ -5,26 +5,47 @@
 
 # Compiler and flags
 FC := gfortran
-FFLAGS := -std=gnu -fallow-argument-mismatch -ffree-line-length-none
-OPTFLAGS := -O3 -march=native
-DEBUGFLAGS := -g -fbacktrace -fbounds-check
+GPU_FC ?= nvfortran
+CPPFLAGS := -cpp
+BASEFLAGS := $(CPPFLAGS) -std=gnu -fallow-argument-mismatch -ffree-line-length-none
+CPU_OPTFLAGS := -O3 -march=native
+CPU_DEBUGFLAGS := -g -fbacktrace -fbounds-check
+CPU_OMPFLAGS := -fopenmp
+GPU_NVFLAGS := -cpp -O3 -mp=gpu -gpu=cc80,managed -DUSE_GPU
+GPU_GNUFLAGS := $(BASEFLAGS) -O3 -fopenmp -foffload=nvptx-none -DUSE_GPU
+
+FFLAGS := $(BASEFLAGS)
 
 # Build mode: release or debug
 MODE ?= release
-ifeq ($(MODE),debug)
-  FFLAGS += $(DEBUGFLAGS)
-else
-  FFLAGS += $(OPTFLAGS)
-endif
-
 # Optional OpenMP support (set OMP=1 to enable)
 OMP ?= 0
-ifeq ($(OMP),1)
-	FFLAGS += -fopenmp
+
+# Optional GPU/offload build (set GPU=1 to enable)
+GPU ?= 0
+
+ifeq ($(GPU_FC),gfortran)
+	GPUFLAGS := $(GPU_GNUFLAGS)
+else
+	GPUFLAGS := $(GPU_NVFLAGS)
 endif
 
-# Mode/OMP specific artifact tag so build outputs do not conflict
-MODE_TAG := $(MODE)_omp$(OMP)
+ifeq ($(GPU),1)
+	FC := $(GPU_FC)
+	FFLAGS := $(GPUFLAGS)
+else
+	ifeq ($(MODE),debug)
+	  FFLAGS += $(CPU_DEBUGFLAGS)
+	else
+	  FFLAGS += $(CPU_OPTFLAGS)
+	endif
+	ifeq ($(OMP),1)
+		FFLAGS += $(CPU_OMPFLAGS)
+	endif
+endif
+
+# Mode/OMP/GPU specific artifact tag so build outputs do not conflict
+MODE_TAG := $(MODE)_omp$(OMP)_gpu$(GPU)
 
 # Directories
 SRCDIR := src
@@ -51,19 +72,33 @@ EXECUTABLE := $(BINDIR)/rm_synthesis
 # Default target
 all: $(EXECUTABLE)
 
+ifeq ($(GPU),1)
+CHECK_GPU_COMPILER := check_gpu_compiler
+else
+CHECK_GPU_COMPILER :=
+endif
+
+check_gpu_compiler:
+	@command -v $(FC) >/dev/null 2>&1 || \
+	  { echo "ERROR: GPU compiler '$(FC)' not found in PATH."; \
+	    echo "       Set GPU_FC=<compiler> explicitly, e.g. GPU_FC=gfortran or GPU_FC=nvfortran."; \
+	    echo "       nvfortran uses flags: $(GPU_NVFLAGS)"; \
+	    echo "       gfortran uses flags:  $(GPU_GNUFLAGS)"; \
+	    exit 127; }
+
 $(BUILDDIR):
 	@mkdir -p $(BUILDDIR) $(MODDIR) $(BINDIR)
 
 # Module compilation
-$(BUILDDIR)/rm_synthesis_mod.o: $(MODSRC) | $(BUILDDIR)
+$(BUILDDIR)/rm_synthesis_mod.o: $(MODSRC) | $(BUILDDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
 
 # Main program compilation
-$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(BUILDDIR)/rm_synthesis_mod.o | $(BUILDDIR)
+$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(BUILDDIR)/rm_synthesis_mod.o | $(BUILDDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -I$(MODDIR) -J$(MODDIR) -c $< -o $@
 
 # Linking
-$(EXECUTABLE_MODE): $(OBJFILES) | $(BINDIR)
+$(EXECUTABLE_MODE): $(OBJFILES) | $(BINDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -o $@ $^ $(LIBS)
 	@cp -f $@ $(EXECUTABLE)
 	@echo "✓ Executable created: $@"
@@ -97,27 +132,32 @@ uninstall:
 help:
 	@echo "RM-Synthesis Build System"
 	@echo "========================="
-	@echo "Usage: make [target] [MODE=debug|release] [OMP=0|1]"
+	@echo "Usage: make [target] [MODE=debug|release] [OMP=0|1] [GPU=0|1]"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make                         - Build executable (default, release mode)"
 	@echo "  make MODE=debug              - Build with debug symbols and checks"
-	@echo "  make OMP=1                   - Build with OpenMP enabled"
-	@echo "  make clean [MODE=.. OMP=..]  - Remove artifacts for selected mode/OMP"
-	@echo "  make clean-all               - Remove all mode/OMP build artifacts"
+	@echo "  make OMP=1                   - Build with OpenMP enabled CPU backend"
+	@echo "  make GPU=1                   - Build GPU/offload backend (nvfortran by default)"
+	@echo "  make GPU=1 GPU_FC=gfortran   - Build GPU/offload backend with GNU offload"
+	@echo "  make clean [MODE=.. OMP=.. GPU=..] - Remove artifacts for selected mode/OMP/GPU"
+	@echo "  make clean-all               - Remove all mode/OMP/GPU build artifacts"
 	@echo "  make install      - Install to /usr/local/bin"
 	@echo "  make uninstall    - Remove installation"
 	@echo "  make help         - Show this message"
 	@echo ""
-	@echo "Note: Artifacts are mode-specific under build/<mode>_omp<0|1>."
-	@echo "      Switching MODE/OMP does not require make clean."
+	@echo "Note: Artifacts are mode-specific under build/<mode>_omp<0|1>_gpu<0|1>."
+	@echo "      Switching MODE/OMP/GPU does not require make clean."
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                            # Build release version"
 	@echo "  make MODE=debug                 # Build debug version"
-	@echo "  make MODE=release OMP=1         # Build OpenMP-enabled release version"
-	@echo "  make MODE=debug OMP=1           # Build OpenMP-enabled debug version"
-	@echo "  make clean MODE=debug OMP=1     # Clean only debug+OMP artifacts"
+	@echo "  make MODE=release OMP=1         # Build OpenMP-enabled CPU release version"
+	@echo "  make MODE=debug OMP=1           # Build OpenMP-enabled CPU debug version"
+	@echo "  make GPU=1                      # Build GPU/offload binary"
+	@echo "  make GPU=1 GPU_FC=nvfortran     # Select GPU compiler explicitly"
+	@echo "  make GPU=1 GPU_FC=gfortran      # Use GNU OpenMP offload backend"
+	@echo "  make clean MODE=debug OMP=1 GPU=0 # Clean only debug+OMP CPU artifacts"
 	@echo "  make clean-all                  # Clean everything"
 	@echo "  make install                    # Install to system"
 	@echo "  CFITSIO_LIB=-lcfitsio make  # Specify CFITSIO library"
