@@ -174,6 +174,7 @@ chelp-
       real(sp) nullval
       logical   subim
       logical   tile_auto, dry_run
+      logical   write_mask_output, write_nvalid_output
       real(sp) conv_fac ! freq-to-lambda conversion factor
       real(sp) tile_mem_frac
       logical   MHz
@@ -312,9 +313,12 @@ chelp-
      -          path_I,infileI,
      -          ofac,fac,beg_rm,end_rm,nrm_out_par,
      -          use_auto_rm_range,output_mode,
-     -          ap_angle_mode,mask_cube_file,
+     -          ap_angle_mode,
+     -          mask_cube_file,
      -          mask_input_cube_file,
-     -          mask_trust_mode,status)
+     -          mask_trust_mode,
+     -          write_mask_output,
+     -          write_nvalid_output,status)
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
@@ -393,6 +397,16 @@ chelp-
 
       write(*,*)' ========================================'
       write(*,*)' RM Extraction Parameters from Config:'
+      if(write_mask_output)then
+              write(*,*)' write_mask_output: y'
+      else
+              write(*,*)' write_mask_output: n'
+      endif
+      if(write_nvalid_output)then
+              write(*,*)' write_nvalid_output: y'
+      else
+              write(*,*)' write_nvalid_output: n'
+      endif
       if(output_mode.eq.1)then
               write(*,*)' output_mode: ri'
       else
@@ -1126,25 +1140,37 @@ chelp-
                       write(*,*)"Please remove/rename it and run again."
                       stop
               endif
-              inquire(file=outfileMASK(1:nchar(outfileMASK)),
-     -                exist=out_exists)
-              if(out_exists)then
-                      write(*,*)" "
-                      write(*,*)"ERROR: Output file already exists:"
-                      write(*,*)outfileMASK(1:nchar(outfileMASK))
-                      write(*,*)"Refusing to overwrite existing file."
-                      write(*,*)"Please remove/rename it and run again."
-                      stop
+              if(write_mask_output)then
+                      inquire(file=outfileMASK(1:nchar(outfileMASK)),
+     -                      exist=out_exists)
+                      if(out_exists)then
+                              write(*,*)" "
+                              write(*,*)"ERROR: Output file already"
+     -                          //" exists:"
+                              write(*,*)outfileMASK(
+     -                          1:nchar(outfileMASK))
+                              write(*,*)"Refusing to overwrite"
+     -                          //" existing file."
+                              write(*,*)"Please remove/rename it and"
+     -                          //" run again."
+                              stop
+                      endif
               endif
-              inquire(file=outfileNVALID(1:nchar(outfileNVALID)),
-     -                exist=out_exists)
-              if(out_exists)then
-                      write(*,*)" "
-                      write(*,*)"ERROR: Output file already exists:"
-                      write(*,*)outfileNVALID(1:nchar(outfileNVALID))
-                      write(*,*)"Refusing to overwrite existing file."
-                      write(*,*)"Please remove/rename it and run again."
-                      stop
+              if(write_nvalid_output)then
+                      inquire(file=outfileNVALID(
+     -                      1:nchar(outfileNVALID)),exist=out_exists)
+                      if(out_exists)then
+                              write(*,*)" "
+                              write(*,*)"ERROR: Output file already"
+     -                          //" exists:"
+                              write(*,*)outfileNVALID(
+     -                          1:nchar(outfileNVALID))
+                              write(*,*)"Refusing to overwrite"
+     -                          //" existing file."
+                              write(*,*)"Please remove/rename it and"
+     -                          //" run again."
+                              stop
+                      endif
               endif
 
               status = 0
@@ -1167,25 +1193,33 @@ chelp-
               endif
               out_ang_open = .true.
 
-              status = 0
-              call ftinit(43,outfileMASK,blocksize,status)
-              if(status.ne.0)then
-                      write(*,*)"Error creating MASK output file:"
-                      write(*,*)outfileMASK(1:nchar(outfileMASK))
-                      call printerror(status)
-                      stop
+              if(write_mask_output)then
+                      status = 0
+                      call ftinit(43,outfileMASK,blocksize,status)
+                      if(status.ne.0)then
+                              write(*,*)"Error creating MASK output"
+     -                          //" file:"
+                              write(*,*)outfileMASK(
+     -                          1:nchar(outfileMASK))
+                              call printerror(status)
+                              stop
+                      endif
+                      out_mask_open = .true.
               endif
-              out_mask_open = .true.
 
-              status = 0
-              call ftinit(44,outfileNVALID,blocksize,status)
-              if(status.ne.0)then
-                      write(*,*)"Error creating NVALID output file:"
-                      write(*,*)outfileNVALID(1:nchar(outfileNVALID))
-                      call printerror(status)
-                      stop
+              if(write_nvalid_output)then
+                      status = 0
+                      call ftinit(44,outfileNVALID,blocksize,status)
+                      if(status.ne.0)then
+                              write(*,*)"Error creating NVALID"
+     -                          //" output file:"
+                              write(*,*)outfileNVALID(
+     -                          1:nchar(outfileNVALID))
+                              call printerror(status)
+                              stop
+                      endif
+                      out_nvalid_open = .true.
               endif
-              out_nvalid_open = .true.
       endif
 
 
@@ -1658,8 +1692,12 @@ chelp-
       naxes_nvalid(2) = ny_out
       call ftphpr(41,simple,bitpix,3,naxes_out,0,1,extend,status)
       call ftphpr(42,simple,bitpix,3,naxes_out,0,1,extend,status)
-      call ftphpr(43,simple,8,3,naxes_mask,0,1,extend,status)
-      call ftphpr(44,simple,16,2,naxes_nvalid,0,1,extend,status)
+      if(out_mask_open)then
+              call ftphpr(43,simple,8,3,naxes_mask,0,1,extend,status)
+      endif
+      if(out_nvalid_open)then
+              call ftphpr(44,simple,16,2,naxes_nvalid,0,1,extend,status)
+      endif
 
 !  Put (append) a new keyword of the appropriate datatype into the CHU
 !  subroutine ftpky[e,d,f,g](ounit,keywrd,rval,decim,comm,status)
@@ -1694,28 +1732,38 @@ chelp-
       call ftgkys(21,'ctype1',ctype,comment,status)
       call ftpkys(41,'ctype1',ctype(1:nchar(ctype)),' ',status)
       call ftpkys(42,'ctype1',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(43,'ctype1',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(44,'ctype1',ctype(1:nchar(ctype)),' ',status)
+      if(out_mask_open)then
+              call ftpkys(43,'ctype1',ctype(1:nchar(ctype)),' ',status)
+      endif
+      if(out_nvalid_open)then
+              call ftpkys(44,'ctype1',ctype(1:nchar(ctype)),' ',status)
+      endif
       status = 0
 
       ! --- Axis 1: CRVAL passthrough, CRPIX offset, CDELT scaled ---
       call ftgkyd(21,'crval1',cval,comment,status)
       call ftpkyd(41,'crval1',cval,decimals,' ',status)
       call ftpkyd(42,'crval1',cval,decimals,' ',status)
-      call ftpkyd(43,'crval1',cval,decimals,' ',status)
-      call ftpkyd(44,'crval1',cval,decimals,' ',status)
+        if(out_mask_open)call ftpkyd(43,'crval1',cval,decimals,
+     -     ' ',status)
+        if(out_nvalid_open)call ftpkyd(44,'crval1',cval,decimals,
+     -     ' ',status)
       call ftgkyd(21,'crpix1',atmp8,comment,status)
       atmp8 = (atmp8 - dble(xpix_beg)) / dble(incs(1)) + 1.0d0
       call ftpkyd(41,'crpix1',atmp8,decimals,' ',status)
       call ftpkyd(42,'crpix1',atmp8,decimals,' ',status)
-      call ftpkyd(43,'crpix1',atmp8,decimals,' ',status)
-      call ftpkyd(44,'crpix1',atmp8,decimals,' ',status)
+        if(out_mask_open)call ftpkyd(43,'crpix1',atmp8,decimals,
+     -     ' ',status)
+        if(out_nvalid_open)call ftpkyd(44,'crpix1',atmp8,decimals,
+     -     ' ',status)
       call ftgkyd(21,'cdelt1',cdelt,comment,status)
       cdelt = dble(incs(1)) * cdelt
       call ftpkyd(41,'cdelt1',cdelt,decimals,' ',status)
       call ftpkyd(42,'cdelt1',cdelt,decimals,' ',status)
-      call ftpkyd(43,'cdelt1',cdelt,decimals,' ',status)
-      call ftpkyd(44,'cdelt1',cdelt,decimals,' ',status)
+        if(out_mask_open)call ftpkyd(43,'cdelt1',cdelt,decimals,
+     -     ' ',status)
+        if(out_nvalid_open)call ftpkyd(44,'cdelt1',cdelt,decimals,
+     -     ' ',status)
       status = 0
 
       ! --- Axis 1: CUNIT passthrough if present ---
@@ -1723,8 +1771,14 @@ chelp-
       if(status.eq.0)then
               call ftpkys(41,'cunit1',ctype(1:nchar(ctype)),' ',status)
               call ftpkys(42,'cunit1',ctype(1:nchar(ctype)),' ',status)
-              call ftpkys(43,'cunit1',ctype(1:nchar(ctype)),' ',status)
-              call ftpkys(44,'cunit1',ctype(1:nchar(ctype)),' ',status)
+              if(out_mask_open)then
+                      call ftpkys(43,'cunit1',ctype(1:nchar(ctype)),
+     -                    ' ',status)
+              endif
+              if(out_nvalid_open)then
+                      call ftpkys(44,'cunit1',ctype(1:nchar(ctype)),
+     -                    ' ',status)
+              endif
       endif
       status = 0
 
@@ -1732,28 +1786,40 @@ chelp-
       call ftgkys(21,'ctype2',ctype,comment,status)
       call ftpkys(41,'ctype2',ctype(1:nchar(ctype)),' ',status)
       call ftpkys(42,'ctype2',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(43,'ctype2',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(44,'ctype2',ctype(1:nchar(ctype)),' ',status)
+      if(out_mask_open)then
+                call ftpkys(43,'ctype2', ctype(1:nchar(ctype)),
+     -             ' ',status)
+       endif
+      if(out_nvalid_open)then
+                call ftpkys(44,'ctype2', ctype(1:nchar(ctype)),
+     -             ' ',status)
+      endif
       status = 0
 
       ! --- Axis 2: CRVAL passthrough, CRPIX offset, CDELT scaled ---
       call ftgkyd(21,'crval2',cval,comment,status)
       call ftpkyd(41,'crval2',cval,decimals,' ',status)
       call ftpkyd(42,'crval2',cval,decimals,' ',status)
-      call ftpkyd(43,'crval2',cval,decimals,' ',status)
-      call ftpkyd(44,'crval2',cval,decimals,' ',status)
+        if(out_mask_open)call ftpkyd(43,'crval2',cval,decimals,
+     -     ' ',status)
+        if(out_nvalid_open)call ftpkyd(44,'crval2',cval,decimals,
+     -     ' ',status)
       call ftgkyd(21,'crpix2',atmp8,comment,status)
       atmp8 = (atmp8 - dble(ypix_beg)) / dble(incs(2)) + 1.0d0
       call ftpkyd(41,'crpix2',atmp8,decimals,' ',status)
       call ftpkyd(42,'crpix2',atmp8,decimals,' ',status)
-      call ftpkyd(43,'crpix2',atmp8,decimals,' ',status)
-      call ftpkyd(44,'crpix2',atmp8,decimals,' ',status)
+        if(out_mask_open)call ftpkyd(43,'crpix2',atmp8,decimals,
+     -     ' ',status)
+        if(out_nvalid_open)call ftpkyd(44,'crpix2',atmp8,decimals,
+     -     ' ',status)
       call ftgkyd(21,'cdelt2',cdelt,comment,status)
       cdelt = dble(incs(2)) * cdelt
       call ftpkyd(41,'cdelt2',cdelt,decimals,' ',status)
       call ftpkyd(42,'cdelt2',cdelt,decimals,' ',status)
-      call ftpkyd(43,'cdelt2',cdelt,decimals,' ',status)
-      call ftpkyd(44,'cdelt2',cdelt,decimals,' ',status)
+        if(out_mask_open)call ftpkyd(43,'cdelt2',cdelt,decimals,
+     -     ' ',status)
+        if(out_nvalid_open)call ftpkyd(44,'cdelt2',cdelt,decimals,
+     -     ' ',status)
       status = 0
 
       ! --- Axis 2: CUNIT passthrough if present ---
@@ -1761,8 +1827,14 @@ chelp-
       if(status.eq.0)then
               call ftpkys(41,'cunit2',ctype(1:nchar(ctype)),' ',status)
               call ftpkys(42,'cunit2',ctype(1:nchar(ctype)),' ',status)
-              call ftpkys(43,'cunit2',ctype(1:nchar(ctype)),' ',status)
-              call ftpkys(44,'cunit2',ctype(1:nchar(ctype)),' ',status)
+              if(out_mask_open)then
+                      call ftpkys(43,'cunit2',ctype(1:nchar(ctype)),
+     -                    ' ',status)
+              endif
+              if(out_nvalid_open)then
+                      call ftpkys(44,'cunit2',ctype(1:nchar(ctype)),
+     -                    ' ',status)
+              endif
       endif
       status = 0
 
@@ -1779,13 +1851,19 @@ chelp-
       call ftpkyd(42,'crpix3',1.0d0,decimals,'Reference pixel',status)
       call ftpkyd(41,'cdelt3',dble(dRM),decimals,'RM spacing',status)
       call ftpkyd(42,'cdelt3',dble(dRM),decimals,'RM spacing',status)
-      call ftpkys(43,'ctype3','FREQ','Frequency axis',status)
-      call ftpkys(43,'cunit3','Hz','Frequency axis units',status)
-      call ftpkyd(43,'crval3',dble(zval(zpix_beg)),decimals,
+      if(out_mask_open)then
+            call ftpkys(43,'ctype3','FREQ',
+     -            'Frequency axis',status)
+            call ftpkys(43,'cunit3','Hz','Frequency axis units',
+     -            status)
+            call ftpkyd(43,'crval3',dble(zval(zpix_beg)),decimals,
      -            'Reference frequency',status)
-      call ftpkyd(43,'crpix3',1.0d0,decimals,'Reference pixel',status)
-      call ftpkyd(43,'cdelt3',dble(incs(freq_axis))*dble(zinc_im),
-     -            decimals,'Frequency spacing',status)
+            call ftpkyd(43,'crpix3',1.0d0,decimals,
+     -            'Reference pixel',status)
+            call ftpkyd(43,'cdelt3',
+     -            dble(incs(freq_axis))*dble(zinc_im),decimals,
+     -            'Frequency spacing',status)
+      endif
       status = 0
 
       ! --- PC rotation matrix: passthrough if present in input ---
@@ -1793,32 +1871,40 @@ chelp-
       if(status.eq.0)then
               call ftpkyd(41,'pc1_1',cval,decimals,' ',status)
               call ftpkyd(42,'pc1_1',cval,decimals,' ',status)
-              call ftpkyd(43,'pc1_1',cval,decimals,' ',status)
-              call ftpkyd(44,'pc1_1',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'pc1_1',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'pc1_1',cval,
+     -             decimals,' ',status)
       endif
       status = 0
       call ftgkyd(21,'pc1_2',cval,comment,status)
       if(status.eq.0)then
               call ftpkyd(41,'pc1_2',cval,decimals,' ',status)
               call ftpkyd(42,'pc1_2',cval,decimals,' ',status)
-              call ftpkyd(43,'pc1_2',cval,decimals,' ',status)
-              call ftpkyd(44,'pc1_2',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'pc1_2',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'pc1_2',cval,
+     -             decimals,' ',status)
       endif
       status = 0
       call ftgkyd(21,'pc2_1',cval,comment,status)
       if(status.eq.0)then
               call ftpkyd(41,'pc2_1',cval,decimals,' ',status)
               call ftpkyd(42,'pc2_1',cval,decimals,' ',status)
-              call ftpkyd(43,'pc2_1',cval,decimals,' ',status)
-              call ftpkyd(44,'pc2_1',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'pc2_1',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'pc2_1',cval,
+     -             decimals,' ',status)
       endif
       status = 0
       call ftgkyd(21,'pc2_2',cval,comment,status)
       if(status.eq.0)then
               call ftpkyd(41,'pc2_2',cval,decimals,' ',status)
               call ftpkyd(42,'pc2_2',cval,decimals,' ',status)
-              call ftpkyd(43,'pc2_2',cval,decimals,' ',status)
-              call ftpkyd(44,'pc2_2',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'pc2_2',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'pc2_2',cval,
+     -             decimals,' ',status)
       endif
       status = 0
 
@@ -1829,36 +1915,48 @@ chelp-
      -                    ' ',status)
               call ftpkys(42,'radesys',ctype(1:nchar(ctype)),
      -                    ' ',status)
-              call ftpkys(43,'radesys',ctype(1:nchar(ctype)),
+              if(out_mask_open)then
+                      call ftpkys(43,'radesys',ctype(1:nchar(ctype)),
      -                    ' ',status)
-              call ftpkys(44,'radesys',ctype(1:nchar(ctype)),
+              endif
+              if(out_nvalid_open)then
+                      call ftpkys(44,'radesys',ctype(1:nchar(ctype)),
      -                    ' ',status)
+              endif
       endif
       status = 0
       call ftgkyd(21,'equinox',cval,comment,status)
       if(status.eq.0)then
               call ftpkyd(41,'equinox',cval,decimals,' ',status)
               call ftpkyd(42,'equinox',cval,decimals,' ',status)
-              call ftpkyd(43,'equinox',cval,decimals,' ',status)
-              call ftpkyd(44,'equinox',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'equinox',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'equinox',cval,
+     -             decimals,' ',status)
       else
               status = 0
               call ftgkyd(21,'epoch',cval,comment,status)
               if(status.eq.0)then
                       call ftpkyd(41,'epoch',cval,decimals,' ',status)
                       call ftpkyd(42,'epoch',cval,decimals,' ',status)
-                      call ftpkyd(43,'epoch',cval,decimals,' ',status)
-                      call ftpkyd(44,'epoch',cval,decimals,' ',status)
+                      if(out_mask_open)call ftpkyd(43,'epoch',cval,
+     -                    decimals,' ',status)
+                      if(out_nvalid_open)call ftpkyd(44,'epoch',cval,
+     -                    decimals,' ',status)
               else
                       write(*,*)'WCS: no EQUINOX/EPOCH; default J2000'
                       call ftpkyd(41,'equinox',2000.0d0,decimals,
      -                             'Coord equinox',status)
                       call ftpkyd(42,'equinox',2000.0d0,decimals,
      -                             'Coord equinox',status)
-                      call ftpkyd(43,'equinox',2000.0d0,decimals,
-     -                             'Coord equinox',status)
-                      call ftpkyd(44,'equinox',2000.0d0,decimals,
-     -                             'Coord equinox',status)
+                      if(out_mask_open)then
+                              call ftpkyd(43,'equinox',2000.0d0,
+     -                             decimals,'Coord equinox',status)
+                      endif
+                      if(out_nvalid_open)then
+                              call ftpkyd(44,'equinox',2000.0d0,
+     -                             decimals,'Coord equinox',status)
+                      endif
               endif
       endif
 
@@ -1868,16 +1966,20 @@ chelp-
       if(status.eq.0)then
               call ftpkyd(41,'lonpole',cval,decimals,' ',status)
               call ftpkyd(42,'lonpole',cval,decimals,' ',status)
-              call ftpkyd(43,'lonpole',cval,decimals,' ',status)
-              call ftpkyd(44,'lonpole',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'lonpole',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'lonpole',cval,
+     -             decimals,' ',status)
       endif
       status = 0
       call ftgkyd(21,'latpole',cval,comment,status)
       if(status.eq.0)then
               call ftpkyd(41,'latpole',cval,decimals,' ',status)
               call ftpkyd(42,'latpole',cval,decimals,' ',status)
-              call ftpkyd(43,'latpole',cval,decimals,' ',status)
-              call ftpkyd(44,'latpole',cval,decimals,' ',status)
+              if(out_mask_open)call ftpkyd(43,'latpole',cval,
+     -             decimals,' ',status)
+              if(out_nvalid_open)call ftpkyd(44,'latpole',cval,
+     -             decimals,' ',status)
       endif
 
       ! --- BUNIT: passthrough for cube 1 (amp/re); set for cube 2 ---
@@ -1891,10 +1993,14 @@ chelp-
      -            'Pixel data units',status)
       call ftpkys(42,'bunit','rad',
      -            'Pixel data units (angle)',status)
-      call ftpkys(43,'bunit','FLAG',
+      if(out_mask_open)then
+              call ftpkys(43,'bunit','FLAG',
      -            'Mask value: 0 bad, 1 good',status)
-      call ftpkys(44,'bunit','COUNT',
+      endif
+      if(out_nvalid_open)then
+              call ftpkys(44,'bunit','COUNT',
      -            'Number of valid channels',status)
+      endif
 
       ! --- Metadata: OBJECT, OBSERVER, TELESCOP ---
       status = 0
@@ -1905,8 +2011,10 @@ chelp-
       endif
       call ftpkys(41,'object',ctype(1:nchar(ctype)),' ',status)
       call ftpkys(42,'object',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(43,'object',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(44,'object',ctype(1:nchar(ctype)),' ',status)
+      if(out_mask_open)call ftpkys(43,'object',ctype(1:nchar(ctype)),
+     -     ' ',status)
+      if(out_nvalid_open)call ftpkys(44,'object',
+     -     ctype(1:nchar(ctype)),' ',status)
       status = 0
       call ftgkys(21,'observer',ctype,comment,status)
       if(status.ne.0)then
@@ -1915,8 +2023,10 @@ chelp-
       endif
       call ftpkys(41,'observer',ctype(1:nchar(ctype)),' ',status)
       call ftpkys(42,'observer',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(43,'observer',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(44,'observer',ctype(1:nchar(ctype)),' ',status)
+      if(out_mask_open)call ftpkys(43,'observer',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_nvalid_open)call ftpkys(44,'observer',
+     -     ctype(1:nchar(ctype)),' ',status)
       status = 0
       call ftgkys(21,'telescop',ctype,comment,status)
       if(status.ne.0)then
@@ -1925,46 +2035,68 @@ chelp-
       endif
       call ftpkys(41,'telescop',ctype(1:nchar(ctype)),' ',status)
       call ftpkys(42,'telescop',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(43,'telescop',ctype(1:nchar(ctype)),' ',status)
-      call ftpkys(44,'telescop',ctype(1:nchar(ctype)),' ',status)
+      if(out_mask_open)call ftpkys(43,'telescop',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_nvalid_open)call ftpkys(44,'telescop',
+     -     ctype(1:nchar(ctype)),' ',status)
       status = 0
 
       call ftpkys(41,'MASKSRC',masksrc_key(1:nchar(masksrc_key)),
      -            'Mask source: generated/input/combined',status)
       call ftpkys(42,'MASKSRC',masksrc_key(1:nchar(masksrc_key)),
      -            'Mask source: generated/input/combined',status)
-      call ftpkys(43,'MASKSRC',masksrc_key(1:nchar(masksrc_key)),
+      if(out_mask_open)then
+              call ftpkys(43,'MASKSRC',masksrc_key(
+     -            1:nchar(masksrc_key)),
      -            'Mask source: generated/input/combined',status)
-      call ftpkys(44,'MASKSRC',masksrc_key(1:nchar(masksrc_key)),
+      endif
+      if(out_nvalid_open)then
+              call ftpkys(44,'MASKSRC',masksrc_key(
+     -            1:nchar(masksrc_key)),
      -            'Mask source: generated/input/combined',status)
+      endif
       call ftpkyj(41,'NBADGLOB',nbad_chan,
      -            'No. of globally bad channels',status)
       call ftpkyj(42,'NBADGLOB',nbad_chan,
      -            'No. of globally bad channels',status)
-      call ftpkyj(43,'NBADGLOB',nbad_chan,
+      if(out_mask_open)then
+              call ftpkyj(43,'NBADGLOB',nbad_chan,
      -            'No. of globally bad channels',status)
-      call ftpkyj(44,'NBADGLOB',nbad_chan,
+      endif
+      if(out_nvalid_open)then
+              call ftpkyj(44,'NBADGLOB',nbad_chan,
      -            'No. of globally bad channels',status)
+      endif
       call ftpkys(41,'NANCHK',nanchk_key(1:nchar(nanchk_key)),
      -            'NaN validity check on/off',status)
       call ftpkys(42,'NANCHK',nanchk_key(1:nchar(nanchk_key)),
      -            'NaN validity check on/off',status)
-      call ftpkys(43,'NANCHK',nanchk_key(1:nchar(nanchk_key)),
+      if(out_mask_open)then
+              call ftpkys(43,'NANCHK',nanchk_key(
+     -            1:nchar(nanchk_key)),
      -            'NaN validity check on/off',status)
-      call ftpkys(44,'NANCHK',nanchk_key(1:nchar(nanchk_key)),
+      endif
+      if(out_nvalid_open)then
+              call ftpkys(44,'NANCHK',nanchk_key(
+     -            1:nchar(nanchk_key)),
      -            'NaN validity check on/off',status)
+      endif
       call ftpkys(41,'MASKTRUS',
      -            mask_trust_mode(1:nchar(mask_trust_mode)),
      -            'Mask trust mode: safe/strict',status)
       call ftpkys(42,'MASKTRUS',
      -            mask_trust_mode(1:nchar(mask_trust_mode)),
      -            'Mask trust mode: safe/strict',status)
-      call ftpkys(43,'MASKTRUS',
+      if(out_mask_open)then
+              call ftpkys(43,'MASKTRUS',
      -            mask_trust_mode(1:nchar(mask_trust_mode)),
      -            'Mask trust mode: safe/strict',status)
-      call ftpkys(44,'MASKTRUS',
+      endif
+      if(out_nvalid_open)then
+              call ftpkys(44,'MASKTRUS',
      -            mask_trust_mode(1:nchar(mask_trust_mode)),
      -            'Mask trust mode: safe/strict',status)
+      endif
         status = 0
 
 
@@ -2278,22 +2410,27 @@ chelp-
                     call printerror(status)
             endif
 
-            fpixels_out(3) = 1
-            lpixels_out(3) = nz_out
-            call ftpssb(43,group,3,naxes_mask,fpixels_out,lpixels_out,
-     -                  mask_tile_arr,status)
-            if(status.gt.0)then
-                    call printerror(status)
+            if(out_mask_open)then
+                    fpixels_out(3) = 1
+                    lpixels_out(3) = nz_out
+                    call ftpssb(43,group,3,naxes_mask,
+     -                  fpixels_out,lpixels_out,mask_tile_arr,status)
+                    if(status.gt.0)then
+                            call printerror(status)
+                    endif
             endif
 
-            fpixels_nvalid(1) = ix_out_beg
-            lpixels_nvalid(1) = ix_out_end
-            fpixels_nvalid(2) = iy_out_beg
-            lpixels_nvalid(2) = iy_out_end
-            call ftpssi(44,group,2,naxes_nvalid,fpixels_nvalid,
-     -                  lpixels_nvalid,nvalid_tile_arr,status)
-            if(status.gt.0)then
-                    call printerror(status)
+            if(out_nvalid_open)then
+                    fpixels_nvalid(1) = ix_out_beg
+                    lpixels_nvalid(1) = ix_out_end
+                    fpixels_nvalid(2) = iy_out_beg
+                    lpixels_nvalid(2) = iy_out_end
+                    call ftpssi(44,group,2,naxes_nvalid,
+     -                  fpixels_nvalid,lpixels_nvalid,
+     -                  nvalid_tile_arr,status)
+                    if(status.gt.0)then
+                            call printerror(status)
+                    endif
             endif
         enddo
       enddo

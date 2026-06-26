@@ -496,7 +496,8 @@ contains
                              use_auto_rm_range, output_mode, &
                              ap_angle_mode, mask_cube_file, &
                              mask_input_cube_file, &
-                             mask_trust_mode, status)
+                             mask_trust_mode, write_mask_output, &
+                             write_nvalid_output, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
@@ -505,6 +506,8 @@ contains
     character(len=*), intent(inout) :: mask_cube_file
     character(len=*), intent(inout) :: mask_input_cube_file
     character(len=*), intent(inout) :: mask_trust_mode
+    logical, intent(inout) :: write_mask_output
+    logical, intent(inout) :: write_nvalid_output
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -538,6 +541,7 @@ contains
     logical :: seen_ap_angle_mode
     logical :: seen_mask_cube_file, seen_mask_input_cube_file
     logical :: seen_mask_trust_mode
+    logical :: seen_write_mask_output, seen_write_nvalid_output
 
     status = 0
     line_no = 0
@@ -583,6 +587,8 @@ contains
     seen_mask_cube_file = .false.
     seen_mask_input_cube_file = .false.
     seen_mask_trust_mode = .false.
+    seen_write_mask_output = .false.
+    seen_write_nvalid_output = .false.
 
     ! Defaults can be overridden by the config.
     path = '../DATA/'
@@ -626,6 +632,8 @@ contains
     mask_cube_file = ''
     mask_input_cube_file = ''
     mask_trust_mode = 'safe'
+    write_mask_output = .true.
+    write_nvalid_output = .true.
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -1239,6 +1247,24 @@ contains
           close(unit_cfg)
           return
         end select
+      case ('write_mask_output')
+        if (seen_write_mask_output) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': write_mask_output'
+          status = -187
+          close(unit_cfg)
+          return
+        end if
+        seen_write_mask_output = .true.
+        write_mask_output = flag_from_value(val)
+      case ('write_nvalid_output')
+        if (seen_write_nvalid_output) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': write_nvalid_output'
+          status = -188
+          close(unit_cfg)
+          return
+        end if
+        seen_write_nvalid_output = .true.
+        write_nvalid_output = flag_from_value(val)
       case default
         write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
         status = -131
