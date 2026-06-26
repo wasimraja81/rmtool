@@ -22,44 +22,52 @@ FFLAGS := $(BASEFLAGS)
 MODE ?= release
 # Optional OpenMP support (set OMP=1 to enable)
 OMP ?= 0
+OMP_EFFECTIVE := $(OMP)
 
 # Optional GPU/offload build (set GPU=1 to enable)
 GPU ?= 0
 
+ifeq ($(GPU),1)
+  ifneq ($(OMP),0)
+    $(warning GPU=1 forces OMP=0; ignoring requested OMP=$(OMP))
+  endif
+  OMP_EFFECTIVE := 0
+endif
+
 # Auto-select GPU compiler only when user did not explicitly set GPU_FC.
 # Preference order: nvfortran, then gfortran.
 ifeq ($(GPU),1)
-	ifeq ($(origin GPU_FC),file)
-		ifneq ($(NVFORTRAN_PATH),)
-			GPU_FC := nvfortran
-		else ifneq ($(GFORTRAN_PATH),)
-			GPU_FC := gfortran
-		endif
-	endif
+  ifeq ($(origin GPU_FC),file)
+    ifneq ($(NVFORTRAN_PATH),)
+      GPU_FC := nvfortran
+    else ifneq ($(GFORTRAN_PATH),)
+      GPU_FC := gfortran
+    endif
+  endif
 endif
 
 ifeq ($(GPU_FC),gfortran)
-	GPUFLAGS := $(GPU_GNUFLAGS)
+  GPUFLAGS := $(GPU_GNUFLAGS)
 else
-	GPUFLAGS := $(GPU_NVFLAGS)
+  GPUFLAGS := $(GPU_NVFLAGS)
 endif
 
 ifeq ($(GPU),1)
-	FC := $(GPU_FC)
-	FFLAGS := $(GPUFLAGS)
+  FC := $(GPU_FC)
+  FFLAGS := $(GPUFLAGS)
 else
-	ifeq ($(MODE),debug)
-	  FFLAGS += $(CPU_DEBUGFLAGS)
-	else
-	  FFLAGS += $(CPU_OPTFLAGS)
-	endif
-	ifeq ($(OMP),1)
-		FFLAGS += $(CPU_OMPFLAGS)
-	endif
+  ifeq ($(MODE),debug)
+    FFLAGS += $(CPU_DEBUGFLAGS)
+  else
+    FFLAGS += $(CPU_OPTFLAGS)
+  endif
+  ifeq ($(OMP_EFFECTIVE),1)
+    FFLAGS += $(CPU_OMPFLAGS)
+  endif
 endif
 
 # Mode/OMP/GPU specific artifact tag so build outputs do not conflict
-MODE_TAG := $(MODE)_omp$(OMP)_gpu$(GPU)
+MODE_TAG := $(MODE)_omp$(OMP_EFFECTIVE)_gpu$(GPU)
 
 # Directories
 SRCDIR := src
@@ -162,6 +170,7 @@ help:
 	@echo "  make help         - Show this message"
 	@echo ""
 	@echo "Note: Artifacts are mode-specific under build/<mode>_omp<0|1>_gpu<0|1>."
+	@echo "      When GPU=1, OMP is forced to 0 (OMP flag is ignored)."
 	@echo "      Switching MODE/OMP/GPU does not require make clean."
 	@echo ""
 	@echo "Examples:"
