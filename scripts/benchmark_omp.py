@@ -147,6 +147,7 @@ def main() -> int:
     print(f"[bench] cfg={cfg}")
     print(f"[bench] cwd={cwd}")
     print(f"[bench] threads={threads}")
+    print(f"[bench] OMP_PLACES=cores (physical cores only, no hyperthreads)")
 
     raw: List[Tuple[int, float]] = []
     for t in threads:
