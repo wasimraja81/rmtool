@@ -1590,8 +1590,8 @@ chelp-
       status = 0
 
       ! --- Axis 3: RM synthesised axis ---
-      call ftpkys(41,'ctype3','RM-rd/m2','Faraday depth',status)
-      call ftpkys(42,'ctype3','RM-rd/m2','Faraday depth',status)
+        call ftpkys(41,'ctype3','FDEP','Faraday depth',status)
+        call ftpkys(42,'ctype3','FDEP','Faraday depth',status)
       call ftpkys(41,'cunit3','rad/m**2','RM axis units',status)
       call ftpkys(42,'cunit3','rad/m**2','RM axis units',status)
       call ftpkyd(41,'crval3',dble(RM(1)),decimals,
