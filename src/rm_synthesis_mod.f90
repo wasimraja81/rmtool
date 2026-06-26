@@ -43,7 +43,7 @@ contains
     integer(int32), intent(in) :: ofac
     real(sp), intent(in) :: t(*), fac, beg_rm, end_rm
     real(sp), intent(out) :: nu(*)
-    real(sp), intent(out) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+    real(sp), intent(out) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
     
     real(sp) :: freq_MHz(npts), f1, f2, Lsq1, Lsq2, dfreq
     real(sp) :: t_span, d_nu, nu_span, omega, h_tmp, phi_tmp, beg_eff, end_eff
@@ -112,8 +112,8 @@ contains
       omega = 2.0_sp * nu(i)
       do kk = 1, npts
         phi_tmp = omega * t(kk)
-        cos_arr(kk, i) = cos(phi_tmp)
-        sin_arr(kk, i) = -sin(phi_tmp)
+        cos_arr(i, kk) = cos(phi_tmp)
+        sin_arr(i, kk) = -sin(phi_tmp)
       end do
     end do
     
@@ -129,7 +129,7 @@ contains
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
     real(sp), intent(in) :: ryt_in(*), iyt_in(*)
     real(sp), intent(out) :: p_ex(*), phi_ex(*)
-    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
     
     real(sp) :: ryt(npts), iyt(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
@@ -162,10 +162,10 @@ contains
       is_cor = 0.0_sp
       !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
       do kk = 1, npts
-        rc_cor = rc_cor + ryt(kk) * cos_arr(kk, i)
-        rs_cor = rs_cor + ryt(kk) * sin_arr(kk, i)
-        ic_cor = ic_cor + iyt(kk) * cos_arr(kk, i)
-        is_cor = is_cor + iyt(kk) * sin_arr(kk, i)
+        rc_cor = rc_cor + ryt(kk) * cos_arr(i, kk)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(i, kk)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(i, kk)
+        is_cor = is_cor + iyt(kk) * sin_arr(i, kk)
       end do
       
       rc_cor = rc_cor / dble(npts)
@@ -191,7 +191,7 @@ contains
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
     real(sp), intent(in) :: ryt_in(*), iyt_in(*)
     real(sp), intent(out) :: re_ex(*), im_ex(*)
-    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
 
     real(sp) :: ryt(npts), iyt(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
@@ -220,10 +220,10 @@ contains
       is_cor = 0.0_sp
       !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
       do kk = 1, npts
-        rc_cor = rc_cor + ryt(kk) * cos_arr(kk, i)
-        rs_cor = rs_cor + ryt(kk) * sin_arr(kk, i)
-        ic_cor = ic_cor + iyt(kk) * cos_arr(kk, i)
-        is_cor = is_cor + iyt(kk) * sin_arr(kk, i)
+        rc_cor = rc_cor + ryt(kk) * cos_arr(i, kk)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(i, kk)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(i, kk)
+        is_cor = is_cor + iyt(kk) * sin_arr(i, kk)
       end do
 
       rc_cor = rc_cor / dble(npts)
@@ -1162,19 +1162,16 @@ contains
 
     integer(int32) :: unit_out, i
     integer(int64) :: tiles_x, tiles_y, total_tiles
-    integer(int64) :: tile_pixels_cur, bytes_per_tile_pixel
-    integer(int64) :: gpu_mem_mib, gpu_mem_bytes, budget_bytes
-    integer(int64) :: cand_pixels, cand_tiles_x, cand_tiles_y, cand_tiles_tot
-    integer(int64) :: user_tiles_x, user_tiles_y, user_tiles_tot
-    integer(int32) :: cand_side, side_limit, side_aligned, gpu_status
-    integer(int32) :: user_side, rec_idx, rec_side
+    integer(int64) :: tile_bytes_local
     real(dp) :: pix_dp, nchan_dp, nrm_dp
     real(dp) :: flops_total, flops_kernel, flops_per_term, flops_per_rm
     real(dp) :: gflops_rates(5), hours_est(5), seconds_est(5)
-    real(dp) :: gpu_budget_fracs(3)
-    real(dp) :: user_mem_fracs(5), frac_ratio, tile_side_geom, cur_gpu_frac
-    integer(int32) :: cand_sides(3)
-    integer(int64) :: cand_tot_tiles(3), user_tile_bytes
+    real(dp) :: mem_fracs(5), gpu_budgets(3)
+    real(dp) :: tile_scale, tile_side, gpu_mem_mib, gpu_mem_bytes
+    real(dp) :: bytes_per_tile_pixel, frac_use
+    integer(int32) :: tile_side_i, gpu_side_i
+    integer(int32) :: env_len, env_stat, io_stat
+    character(len=128) :: env_gpu_mem
     character(len=16) :: mode_name
 
     status = 0
@@ -1217,13 +1214,6 @@ contains
     write(unit_out,'(A,1X,F8.3)') 'Tile memory fraction target:', tile_mem_frac
     write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Tile size (x by y):', tile_ra, 'x', tile_dec
     write(unit_out,'(A,1X,ES16.6)') 'Tile memory (bytes):', real(tile_bytes_est,dp)
-    tile_pixels_cur = int(tile_ra,kind=int64) * int(tile_dec,kind=int64)
-    if (tile_pixels_cur > 0_int64) then
-      bytes_per_tile_pixel = (tile_bytes_est + tile_pixels_cur - 1_int64) / tile_pixels_cur
-    else
-      bytes_per_tile_pixel = 0_int64
-    end if
-    side_limit = min(nx_out, ny_out)
     tiles_x = (int(nx_out,kind=int64) + int(tile_ra,kind=int64) - 1_int64) / &
               int(tile_ra,kind=int64)
     tiles_y = (int(ny_out,kind=int64) + int(tile_dec,kind=int64) - 1_int64) / &
@@ -1233,7 +1223,6 @@ contains
       tiles_x, 'x', tiles_y, '=>', total_tiles
     write(unit_out,'(A)') ' '
     if (nchan_good < nchan_total) then
-      write(unit_out,'(A)') 'Note: the code does not NaN-filter channels.'
       write(unit_out,'(A)') 'Channel reduction comes from explicit masking or channel selection.'
     else
       write(unit_out,'(A)') 'All channels in the selected span are used.'
@@ -1260,148 +1249,80 @@ contains
     write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Current planner tile:', tile_ra, 'x', tile_dec
     write(unit_out,'(A)') ' '
     write(unit_out,'(A)') '   mem_frac   tile(x=y)   tile bytes     x-tiles   y-tiles   total'
-    user_mem_fracs = [0.05_dp, 0.10_dp, 0.20_dp, 0.30_dp, 0.40_dp]
-    tile_side_geom = sqrt(real(max(1_int64, tile_pixels_cur), dp))
-    do i = 1, size(user_mem_fracs)
-      frac_ratio = user_mem_fracs(i) / max(real(tile_mem_frac, dp), 1.0d-6)
-      user_side = int(tile_side_geom * sqrt(frac_ratio), kind=int32)
-      user_side = max(1_int32, min(side_limit, user_side))
-
-      if (side_limit >= 32) then
-        side_aligned = (user_side / 32) * 32
-        if (side_aligned < 32) side_aligned = 32
-        user_side = min(side_limit, side_aligned)
-      end if
-
-      user_tiles_x = (int(nx_out,kind=int64) + int(user_side,kind=int64) - 1_int64) / &
-                     int(user_side,kind=int64)
-      user_tiles_y = (int(ny_out,kind=int64) + int(user_side,kind=int64) - 1_int64) / &
-                     int(user_side,kind=int64)
-      user_tiles_tot = user_tiles_x * user_tiles_y
-      user_tile_bytes = int(user_side,kind=int64) * int(user_side,kind=int64) * bytes_per_tile_pixel
-
-      write(unit_out,'(F8.2,5X,I0,4X,ES12.4,2X,I0,6X,I0,6X,I0)') &
-        user_mem_fracs(i), user_side, real(user_tile_bytes, dp), &
-        user_tiles_x, user_tiles_y, user_tiles_tot
+    mem_fracs = [0.05_dp, 0.10_dp, 0.20_dp, 0.30_dp, 0.40_dp]
+    do i = 1, size(mem_fracs)
+      tile_scale = sqrt(mem_fracs(i)/max(1.0e-6_dp, real(tile_mem_frac,dp)))
+      tile_side = tile_scale * sqrt(real(tile_ra*tile_dec,dp))
+      tile_side_i = int(tile_side)
+      if (tile_side_i < 16) tile_side_i = 16
+      if (tile_side_i > nx_out) tile_side_i = nx_out
+      if (tile_side_i > ny_out) tile_side_i = ny_out
+      tile_bytes_local = int(tile_side_i,kind=int64) * int(tile_side_i,kind=int64) * &
+        tile_bytes_est / max(1_int64, int(tile_ra,kind=int64) * int(tile_dec,kind=int64))
+      tiles_x = (int(nx_out,kind=int64) + int(tile_side_i,kind=int64) - 1_int64) / int(tile_side_i,kind=int64)
+      tiles_y = (int(ny_out,kind=int64) + int(tile_side_i,kind=int64) - 1_int64) / int(tile_side_i,kind=int64)
+      total_tiles = tiles_x * tiles_y
+      write(unit_out,'(F8.2,5X,I4,6X,ES11.4,2X,I3,6X,I3,6X,I5)') mem_fracs(i), tile_side_i, &
+        real(tile_bytes_local,dp), int(tiles_x), int(tiles_y), int(total_tiles)
     end do
     write(unit_out,'(A)') 'Rule: tile area scales approximately with tile_mem_frac.'
 
     write(unit_out,'(A)') ' '
     write(unit_out,'(A)') 'GPU tile advisory (square tiles)'
     write(unit_out,'(A)') '-------------------------------'
-    call query_gpu_memory_mib(gpu_mem_mib, gpu_status)
-    if (gpu_status == 0 .and. gpu_mem_mib > 0_int64 .and. bytes_per_tile_pixel > 0_int64) then
-      gpu_mem_bytes = gpu_mem_mib * 1048576_int64
-      gpu_budget_fracs = [0.20_dp, 0.35_dp, 0.50_dp]
-      side_limit = min(nx_out, ny_out)
-      write(unit_out,'(A,1X,I0,1X,A)') 'Detected GPU memory:', gpu_mem_mib, 'MiB'
-      write(unit_out,'(A,1X,I0)') 'Estimated bytes per tile pixel:', bytes_per_tile_pixel
-      write(unit_out,'(A)') 'How to read this section:'
-      write(unit_out,'(A)') '- gpu_budget% is the share of on-board VRAM used by one tile.'
-      write(unit_out,'(A)') '- tile(x=y) is the recommended square tile side in output pixels.'
-      write(unit_out,'(A)') '- lower total means fewer tile launches and less host/device traffic.'
-      write(unit_out,'(A)') ' '
-      write(unit_out,'(A)') 'Candidate sizes at GPU memory budgets:'
-      write(unit_out,'(A)') ' gpu_budget% tile(x=y)    tile bytes     x-tiles   y-tiles   total'
-      do i = 1, size(gpu_budget_fracs)
-        budget_bytes = int(gpu_budget_fracs(i) * real(gpu_mem_bytes, dp), kind=int64)
-        cand_pixels = max(1_int64, budget_bytes / bytes_per_tile_pixel)
-        cand_side = int(sqrt(real(cand_pixels, dp)), kind=int32)
-        cand_side = max(1_int32, min(side_limit, cand_side))
-
-        if (side_limit >= 32) then
-          side_aligned = (cand_side / 32) * 32
-          if (side_aligned < 32) side_aligned = 32
-          cand_side = min(side_limit, side_aligned)
-        end if
-
-        cand_tiles_x = (int(nx_out,kind=int64) + int(cand_side,kind=int64) - 1_int64) / &
-                       int(cand_side,kind=int64)
-        cand_tiles_y = (int(ny_out,kind=int64) + int(cand_side,kind=int64) - 1_int64) / &
-                       int(cand_side,kind=int64)
-        cand_tiles_tot = cand_tiles_x * cand_tiles_y
-        cand_sides(i) = cand_side
-        cand_tot_tiles(i) = cand_tiles_tot
-
-        write(unit_out,'(F8.1,3X,I0,4X,ES12.4,2X,I0,6X,I0,6X,I0)') &
-          gpu_budget_fracs(i) * 100.0_dp, cand_side, &
-          real(int(cand_side,kind=int64) * int(cand_side,kind=int64) * bytes_per_tile_pixel, dp), &
-          cand_tiles_x, cand_tiles_y, cand_tiles_tot
-      end do
-      write(unit_out,'(A)') ' '
-      write(unit_out,'(A)') 'Optimal setup suggestion for this run:'
-      rec_idx = 2
-      rec_side = cand_sides(rec_idx)
-      cur_gpu_frac = real(tile_bytes_est, dp) / real(max(1_int64, gpu_mem_bytes), dp)
-      write(unit_out,'(A,1X,F6.2,1X,A)') 'Current planner tile uses about', cur_gpu_frac * 100.0_dp, '% of GPU VRAM per tile.'
-      write(unit_out,'(A,1X,I0,1X,A,1X,I0,1X,A,1X,F4.1,1X,A)') &
-        'Recommended GPU starting tile:', rec_side, 'x', rec_side, 'at', &
-        gpu_budget_fracs(rec_idx) * 100.0_dp, '% VRAM budget.'
-      write(unit_out,'(A)') 'Suggested cfg for a first GPU-oriented run:'
-      write(unit_out,'(A)') '  tile_auto=n'
-      write(unit_out,'(A,1X,I0)') '  tile_ra=', rec_side
-      write(unit_out,'(A,1X,I0)') '  tile_dec=', rec_side
-      write(unit_out,'(A)') 'For CPU-only runs, keeping tile_auto=y with your chosen tile_mem_frac is preferred.'
-    else
-      write(unit_out,'(A)') 'GPU memory could not be detected automatically.'
-      write(unit_out,'(A)') 'Set RMTOOL_GPU_MEM_MIB to include GPU tile recommendations.'
+    gpu_mem_mib = 6144.0_dp
+    env_gpu_mem = ' '
+    env_len = 0
+    env_stat = 0
+    call get_environment_variable('RM_GPU_MEM_MIB', env_gpu_mem, env_len, env_stat)
+    if (env_stat == 0 .and. env_len > 0) then
+      read(env_gpu_mem(1:env_len), *, iostat=io_stat) gpu_mem_mib
+      if (io_stat /= 0 .or. gpu_mem_mib <= 0.0_dp) gpu_mem_mib = 6144.0_dp
     end if
+    gpu_mem_bytes = gpu_mem_mib * 1024.0_dp * 1024.0_dp
+    bytes_per_tile_pixel = real(tile_bytes_est,dp) / max(1.0_dp, real(tile_ra*tile_dec,dp))
+    write(unit_out,'(A,1X,I0,1X,A)') 'Detected GPU memory:', int(gpu_mem_mib), 'MiB'
+    write(unit_out,'(A,1X,I0)') 'Estimated bytes per tile pixel:', int(bytes_per_tile_pixel)
+    write(unit_out,'(A)') 'How to read this section:'
+    write(unit_out,'(A)') '- gpu_budget% is the share of on-board VRAM used by one tile.'
+    write(unit_out,'(A)') '- tile(x=y) is the recommended square tile side in output pixels.'
+    write(unit_out,'(A)') '- lower total means fewer tile launches and less host/device traffic.'
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'Candidate sizes at GPU memory budgets:'
+    write(unit_out,'(A)') ' gpu_budget% tile(x=y)    tile bytes     x-tiles   y-tiles   total'
+    gpu_budgets = [20.0_dp, 35.0_dp, 50.0_dp]
+    do i = 1, size(gpu_budgets)
+      tile_bytes_local = int((gpu_budgets(i)/100.0_dp) * gpu_mem_bytes, kind=int64)
+      gpu_side_i = int(sqrt(real(tile_bytes_local,dp)/max(1.0_dp,bytes_per_tile_pixel)))
+      if (gpu_side_i < 16) gpu_side_i = 16
+      if (gpu_side_i > nx_out) gpu_side_i = nx_out
+      if (gpu_side_i > ny_out) gpu_side_i = ny_out
+      tile_bytes_local = int(gpu_side_i,kind=int64) * int(gpu_side_i,kind=int64) * &
+        int(bytes_per_tile_pixel,kind=int64)
+      tiles_x = (int(nx_out,kind=int64) + int(gpu_side_i,kind=int64) - 1_int64) / int(gpu_side_i,kind=int64)
+      tiles_y = (int(ny_out,kind=int64) + int(gpu_side_i,kind=int64) - 1_int64) / int(gpu_side_i,kind=int64)
+      total_tiles = tiles_x * tiles_y
+      write(unit_out,'(F8.1,3X,I4,6X,ES11.4,2X,I3,6X,I3,6X,I5)') gpu_budgets(i), gpu_side_i, &
+        real(tile_bytes_local,dp), int(tiles_x), int(tiles_y), int(total_tiles)
+    end do
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'Optimal setup suggestion for this run:'
+    frac_use = 100.0_dp * real(tile_bytes_est,dp) / max(1.0_dp,gpu_mem_bytes)
+    write(unit_out,'(A,F6.2,A)') 'Current planner tile uses about ', frac_use, ' % of GPU VRAM per tile.'
+    tile_bytes_local = int((35.0_dp/100.0_dp) * gpu_mem_bytes, kind=int64)
+    gpu_side_i = int(sqrt(real(tile_bytes_local,dp)/max(1.0_dp,bytes_per_tile_pixel)))
+    if (gpu_side_i < 16) gpu_side_i = 16
+    if (gpu_side_i > nx_out) gpu_side_i = nx_out
+    if (gpu_side_i > ny_out) gpu_side_i = ny_out
+    write(unit_out,'(A,I0,A,I0,A)') 'Recommended GPU starting tile: ', gpu_side_i, ' x ', gpu_side_i, ' at 35.0 % VRAM budget.'
+    write(unit_out,'(A)') 'Suggested cfg for a first GPU-oriented run:'
+    write(unit_out,'(A)') '  tile_auto=n'
+    write(unit_out,'(A,I0)') '  tile_ra=', gpu_side_i
+    write(unit_out,'(A,I0)') '  tile_dec=', gpu_side_i
+    write(unit_out,'(A)') 'For CPU-only runs, keeping tile_auto=y with your chosen tile_mem_frac is preferred.'
 
     close(unit_out)
   end subroutine write_runtime_estimate
-
-  subroutine query_gpu_memory_mib(mem_mib, status)
-    implicit none
-    integer(int64), intent(out) :: mem_mib
-    integer(int32), intent(out) :: status
-
-    character(len=64) :: env_val
-    character(len=512) :: cmd
-    character(len=256) :: line, line_trimmed
-    integer(int32) :: env_len, env_stat, io_stat, cmd_exit
-    integer :: unit_in
-
-    mem_mib = 0_int64
-    status = -1
-
-    call get_environment_variable('RMTOOL_GPU_MEM_MIB', value=env_val, length=env_len, status=env_stat)
-    if (env_stat == 0 .and. env_len > 0) then
-      read(env_val(1:env_len), *, iostat=io_stat) mem_mib
-      if (io_stat == 0 .and. mem_mib > 0_int64) then
-        status = 0
-        return
-      end if
-    end if
-
-    cmd = 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits > .rmtool_gpu_mem_query.tmp 2>/dev/null'
-    call execute_command_line(trim(cmd), wait=.true., exitstat=cmd_exit)
-    if (cmd_exit /= 0) then
-      status = -2
-      return
-    end if
-
-    unit_in = 98
-    open(unit_in, file='.rmtool_gpu_mem_query.tmp', status='old', action='read', iostat=io_stat)
-    if (io_stat /= 0) then
-      status = -3
-      return
-    end if
-
-    read(unit_in, '(A)', iostat=io_stat) line
-    if (io_stat == 0) then
-      line_trimmed = trim(adjustl(line))
-      read(line_trimmed, *, iostat=io_stat) mem_mib
-      if (io_stat == 0 .and. mem_mib > 0_int64) then
-        status = 0
-      else
-        status = -4
-      end if
-    else
-      status = -5
-    end if
-
-    close(unit_in, status='delete')
-  end subroutine query_gpu_memory_mib
 
   subroutine split_key_value(raw_line, key, val, has_kv)
     implicit none
