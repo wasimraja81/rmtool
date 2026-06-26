@@ -98,6 +98,7 @@ chelp-
       logical   remove_QU_bias
       integer   bitpixQ, naxisQ, naxesQ(max_axis)
       integer   bitpixU, naxisU, naxesU(max_axis)
+      integer   bitpixM, naxisM, naxesM(max_axis)
       integer   bitpix, naxis, naxes(max_axis), naxes_out(max_axis)
       logical   simple, extend
       integer   decimals
@@ -121,6 +122,9 @@ chelp-
       real(sp) cxval_imU, cyval_imU, czval_imU  
       integer   cxpix_imU, cypix_imU, czpix_imU 
       real(sp) xinc_imU, yinc_imU, zinc_imU
+      real(sp) cxval_imM, cyval_imM, czval_imM
+      integer   cxpix_imM, cypix_imM, czpix_imM
+      real(sp) xinc_imM, yinc_imM, zinc_imM
 
       integer   nx_totpix, ny_totpix, nz_totpix 
       integer   nx_out, ny_out, nz_out, ntot_out
@@ -136,9 +140,11 @@ chelp-
       logical   anyflg
       logical   cubeQ
       logical   cubeU
-        logical   out_amp_open, out_ang_open, out_exists
-        logical   out_mask_open, out_nvalid_open
+      logical   cubeM
+      logical   out_amp_open, out_ang_open, out_exists
+      logical   out_mask_open, out_nvalid_open
       integer   freq_axis, freq_axisQ, freq_axisU
+      integer   freq_axisM
 
       character(len=64) :: ctype 
       character(len=72) :: comment
@@ -557,6 +563,59 @@ chelp-
               write(*,*)' '
       endif
       freq_axis = freq_axisQ
+
+      if(use_input_mask)then
+              status = 0
+              call myfits_info(mask_input_cube_file,
+     -           bitpixM,naxisM,naxesM,
+     -           cxval_imM,cxpix_imM,xinc_imM,
+     -           cyval_imM,cypix_imM,yinc_imM,
+     -           czval_imM,czpix_imM,zinc_imM,
+     -           freq_axisM,cubeM,message,status)
+              if(status.ne.0)then
+                      write(*,*)"status = ",status
+                      write(*,*)"Mask cube info read failed"
+                      write(*,*)mask_input_cube_file(
+     -                         1:nchar(mask_input_cube_file))
+                      write(*,*)"message:",message(1:nchar(message))
+                      stop
+              endif
+              if(.not.cubeM)then
+                      write(*,*)'ERROR: Missing FREQ axis in mask cube!'
+                      write(*,*)'No CTYPE*=FREQ axis detected.'
+                      stop
+              endif
+              if(freq_axisM.ne.freq_axis)then
+                      write(*,*)'ERROR: Mask/Q-U FREQ axis mismatch!'
+                      write(*,*)'Mask FREQ axis = ',freq_axisM
+                      write(*,*)'Q/U  FREQ axis = ',freq_axis
+                      stop
+              endif
+              if(naxisM.ne.3 .and. naxisM.ne.naxisQ)then
+                      write(*,*)'ERROR: Unsupported mask NAXIS!'
+                      write(*,*)'Mask NAXIS = ',naxisM
+                      write(*,*)'Expected NAXIS = 3 or ',naxisQ
+                      stop
+              endif
+              if(naxesM(1).ne.naxesQ(1))then
+                      write(*,*)'ERROR: Mask RA size mismatch!'
+                      write(*,*)'Mask RA length = ',naxesM(1)
+                      write(*,*)'Q/U  RA length = ',naxesQ(1)
+                      stop
+              endif
+              if(naxesM(2).ne.naxesQ(2))then
+                      write(*,*)'ERROR: Mask Dec size mismatch!'
+                      write(*,*)'Mask Dec length = ',naxesM(2)
+                      write(*,*)'Q/U  Dec length = ',naxesQ(2)
+                      stop
+              endif
+              if(naxesM(freq_axisM).ne.naxesQ(freq_axis))then
+                      write(*,*)'ERROR: Mask FREQ size mismatch!'
+                      write(*,*)'Mask FREQ length = ',naxesM(freq_axisM)
+                      write(*,*)'Q/U  FREQ length = ',naxesQ(freq_axis)
+                      stop
+              endif
+      endif
 
       ! Check to see if there is a pixel to pixel matching...
       if (cxval_imQ.ne.cxval_imU)then 
