@@ -195,6 +195,7 @@ chelp-
       integer   naxes_mask(3), naxes_nvalid(2)
       logical   nan_check_on, chan_valid
       logical   use_input_mask, in_mask_open
+        logical   use_gpu_actual
       real(sp)  mask_val
       integer   in_fields
       integer   mem_unit, ios_mem
@@ -221,6 +222,7 @@ chelp-
         real(sp), allocatable :: bad_chan(:)
       integer   nbad_chan, ngood_chan
       integer, allocatable :: flag_arr(:)
+      integer, allocatable :: flag_arr_out(:)
       logical   remove_badchan
       character(len=172) :: global_badchan_file
       character(len=16) :: masksrc_key, nanchk_key
@@ -1374,6 +1376,7 @@ chelp-
       allocate(data_arrI(nz_out))
       allocate(data_arrQ(nz_out))
       allocate(data_arrU(nz_out))
+      allocate(flag_arr_out(nz_out))
       allocate(L_sq(nz_out))
 
       ! Now generate the axis values:
@@ -1481,6 +1484,11 @@ chelp-
                  ngood_chan = ngood_chan + 1
                  L_sq(ngood_chan) = (conv_fac/zval(i))**2
          endif
+      enddo
+      cnt2 = 0
+      do i = zpix_end,zpix_beg,-incs(freq_axis)
+         cnt2 = cnt2 + 1
+         flag_arr_out(cnt2) = flag_arr(i)
       enddo
       ! Use explicit flag to select RM extraction mode
       if (use_auto_rm_range .eq. 1) then
@@ -2170,6 +2178,11 @@ chelp-
       tmp_cnt1 = 0
       tmp_cnt2 = 0
       cnt1 = 0
+#ifdef USE_GPU
+        use_gpu_actual = .true.
+#else
+        use_gpu_actual = .false.
+#endif
       progress_total = nx_out*ny_out
       progress_step = max(1, progress_total/10)
       progress_next_pct = 10
@@ -2207,6 +2220,15 @@ chelp-
      -                   incs,nullval,specI,anyflg,status)
             endif
 
+            call tile_extract_gpu(specQ,specU,specMask,specI,
+     -           flag_arr_out,cos_arr,sin_arr,Q_tile,U_tile,wts_tile,
+     -           ngood_tile,p_tile_arr,phi_tile_arr,mask_tile_arr,
+     -           nvalid_tile_arr,nx_tile,ny_tile,nz_out,nrm_out,
+     -           use_gpu_actual,
+     -           remove_qu_bias,use_input_mask,nan_check_on,
+     -           resiQ,slopeQ,resiU,slopeU,rem_mean,
+     -           output_mode,ap_angle_mode)
+
             do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)
                do ix_loc = 1,nx_tile
@@ -2214,163 +2236,7 @@ chelp-
                   cnt1 = cnt1 + 1
                   ipix_tile = ix_loc + (iy_loc-1)*nx_tile
                   pix_base = (ipix_tile-1)*nz_out
-
-                  do iz = 1,nz_out
-                     i = iz
-                     tmp_index = ix_loc + (iy_loc-1)*nx_tile +
-     -                          (iz-1)*nx_tile*ny_tile
-                     data_arrQ(i) = specQ(tmp_index)
-                     data_arrU(i) = specU(tmp_index)
-                     if(need_icube)then
-                             data_arrI(i) = specI(tmp_index)
-                     endif
-                  enddo
-
-                  ngood_chan = 0
-                  cnt_good = 0
-                  cnt2 = nz_out + 1
-                  if(.not.remove_QU_bias)then
-                          do i = zpix_end,zpix_beg,
-     -                         -incs(freq_axis)
-                             cnt2 = cnt2 - 1
-                             chan_valid = (flag_arr(i).eq.1)
-                             if(use_input_mask)then
-                                     tmp_index = ix_loc +
-     -                                  (iy_loc-1)*nx_tile +
-     -                                  (cnt2-1)*nx_tile*ny_tile
-                                     mask_val = specMask(tmp_index)
-                                     if(mask_val.le.0.5)then
-                                             chan_valid = .false.
-                                     endif
-                             endif
-                             if(nan_check_on)then
-                                     if(data_arrQ(cnt2).ne.
-     -                                  data_arrQ(cnt2))then
-                                             chan_valid = .false.
-                                     endif
-                                     if(data_arrU(cnt2).ne.
-     -                                  data_arrU(cnt2))then
-                                             chan_valid = .false.
-                                     endif
-                             endif
-                             if(chan_valid)then
-                                     ngood_chan = ngood_chan + 1
-                                     cnt_good = cnt_good + 1
-                                     Q_tile(pix_base+ngood_chan) =
-     -                                  data_arrQ(cnt2)
-                                     U_tile(pix_base+ngood_chan) =
-     -                                  data_arrU(cnt2)
-                                     wts_tile(pix_base+ngood_chan) =
-     -                                  1.0
-                             endif
-                             tmp_index = ix_loc + (iy_loc-1)*nx_tile +
-     -                                (cnt2-1)*nx_tile*ny_tile
-                             if(chan_valid)then
-                                     mask_tile_arr(tmp_index) = 1
-                             else
-                                     mask_tile_arr(tmp_index) = 0
-                             endif
-                          enddo
-                  else
-                          do i = zpix_end,zpix_beg,
-     -                         -incs(freq_axis)
-                             cnt2 = cnt2 - 1
-                             chan_valid = (flag_arr(i).eq.1)
-                             if(use_input_mask)then
-                                     tmp_index = ix_loc +
-     -                                  (iy_loc-1)*nx_tile +
-     -                                  (cnt2-1)*nx_tile*ny_tile
-                                     mask_val = specMask(tmp_index)
-                                     if(mask_val.le.0.5)then
-                                             chan_valid = .false.
-                                     endif
-                             endif
-                             if(nan_check_on)then
-                                     if(data_arrQ(cnt2).ne.
-     -                                  data_arrQ(cnt2))then
-                                             chan_valid = .false.
-                                     endif
-                                     if(data_arrU(cnt2).ne.
-     -                                  data_arrU(cnt2))then
-                                             chan_valid = .false.
-                                     endif
-                             endif
-                             if(chan_valid)then
-                                     ngood_chan = ngood_chan + 1
-                                     cnt_good = cnt_good + 1
-                                     if(data_arrQ(cnt2).ge.resiQ)then
-                                             slopeQ = slopeQ
-                                     else
-                                             slopeQ = -slopeQ
-                                     endif
-                                     if(data_arrU(cnt2).ge.resiU)then
-                                             slopeU = slopeU
-                                     else
-                                             slopeU = -slopeU
-                                     endif
-                                     Q_tile(pix_base+ngood_chan) =
-     -                                  data_arrQ(cnt2) -
-     -                                  (data_arrI(cnt2)*slopeQ + resiQ)
-                                     U_tile(pix_base+ngood_chan) =
-     -                                  data_arrU(cnt2) -
-     -                                  (data_arrI(cnt2)*slopeU + resiU)
-                                     wts_tile(pix_base+ngood_chan) =
-     -                                  1.0
-                             endif
-                             tmp_index = ix_loc + (iy_loc-1)*nx_tile +
-     -                                (cnt2-1)*nx_tile*ny_tile
-                             if(chan_valid)then
-                                     mask_tile_arr(tmp_index) = 1
-                             else
-                                     mask_tile_arr(tmp_index) = 0
-                             endif
-                          enddo
-                  endif
-
-                  nvalid_pix = cnt_good
-                  ngood_tile(ipix_tile) = ngood_chan
-                  tmp_index = ix_loc + (iy_loc-1)*nx_tile
-                  nvalid_tile_arr(tmp_index) = nvalid_pix
-
-                  if(ngood_chan.le.0)then
-                          do i = 1,nrm_out
-                                  p_ex(i) = 0.0
-                                  phi_ex(i) = 0.0
-                          enddo
-                  else
-                          if (output_mode .eq. 1) then
-                                  call extract_general_ri_w(
-     -                               Q_tile(pix_base+1),
-     -                               U_tile(pix_base+1),
-     -                               wts_tile(pix_base+1),
-     -                               ngood_chan,
-     -                               nrm_out,p_ex,phi_ex,
-     -                               cos_arr,sin_arr,nrm_out,ngood_chan,
-     -                               rem_mean)
-                          else
-                                  call extract_general_w(
-     -                               Q_tile(pix_base+1),
-     -                               U_tile(pix_base+1),
-     -                               wts_tile(pix_base+1),
-     -                               ngood_chan,
-     -                               nrm_out,p_ex,phi_ex,
-     -                               cos_arr,sin_arr,nrm_out,ngood_chan,
-     -                               rem_mean)
-                                  if (ap_angle_mode .eq. 1) then
-                                          do i = 1,nrm_out
-                                                  phi_ex(i) =
-     -                                          0.5*phi_ex(i)
-                                          enddo
-                                  endif
-                          endif
-                  endif
-
-                  do i = 1,nrm_out
-                     tmp_index = ix_loc + (iy_loc-1)*nx_tile +
-     -                          (i-1)*nx_tile*ny_tile
-                     p_tile_arr(tmp_index) = p_ex(i)
-                     phi_tile_arr(tmp_index) = phi_ex(i)
-                  enddo
+                  ngood_chan = ngood_tile(ipix_tile)
 
                   if(line_cut)then
                           tmp_cnt1 = tmp_cnt1 + 1
@@ -2381,12 +2247,20 @@ chelp-
      -                    (U_tile(pix_base+i),i=ngood_chan,1,-1)
 
                           tmp_cnt2 = tmp_cnt2 + 1
-                          write(17,rec=tmp_cnt2)(p_ex(i),i=1,nrm_out)
+                          write(17,rec=tmp_cnt2)
+     -                    (p_tile_arr(ix_loc + (iy_loc-1)*nx_tile +
+     -                    (i-1)*nx_tile*ny_tile),i=1,nrm_out)
                           tmp_cnt2 = tmp_cnt2 + 1
-                          write(17,rec=tmp_cnt2)(phi_ex(i),i=1,nrm_out)
+                          write(17,rec=tmp_cnt2)
+     -                    (phi_tile_arr(ix_loc + (iy_loc-1)*nx_tile +
+     -                    (i-1)*nx_tile*ny_tile),i=1,nrm_out)
                           write(121,*)"## ix, iy: ",ix,iy
                           do i = 1,nrm_out
-                                  write(121,*)p_ex(i), phi_ex(i)
+                                  tmp_index = ix_loc +
+     -                               (iy_loc-1)*nx_tile +
+     -                               (i-1)*nx_tile*ny_tile
+                                  write(121,*)p_tile_arr(tmp_index),
+     -                                   phi_tile_arr(tmp_index)
                           enddo
                   endif
 
@@ -2501,6 +2375,7 @@ chelp-
       if(allocated(yval)) deallocate(yval)
       if(allocated(zval)) deallocate(zval)
       if(allocated(flag_arr)) deallocate(flag_arr)
+      if(allocated(flag_arr_out)) deallocate(flag_arr_out)
       if(allocated(data_arrI)) deallocate(data_arrI)
       if(allocated(data_arrQ)) deallocate(data_arrQ)
       if(allocated(data_arrU)) deallocate(data_arrU)
