@@ -1,12 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run RM-synthesis CASA Q/U test from scratch/
-# This script uses cfg/test_my_casa_q_u.cfg
+# RM-synthesis RM-cube generation runner
+# Requires: config file (mandatory), optional thread count
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <config_file> [num_threads]
+
+Positional Arguments:
+  <config_file>    Config file name (relative to cfg/); required
+  [num_threads]    Number of OMP threads (default: 6)
+
+Examples:
+  $(basename "$0") rmsynth-casa.fullim.cfg
+  $(basename "$0") rmsynth-casa.fullim.cfg 8
+  $(basename "$0") cfg/benchmark.cfg 4
+
+Environment:
+  OMP_PROC_BIND=close  (hardcoded to avoid hyperthreading)
+  OMP_PLACES=cores     (hardcoded to avoid hyperthreading)
+
+Binary:
+  Uses: bin/rm_synthesis_release_omp1 (release + OpenMP)
+
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  echo "ERROR: missing required argument <config_file>" >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ "${1}" == "-h" || "${1}" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXE="${ROOT_DIR}/bin/rm_synthesis"
-CFG_NAME="test_my_casa_q_u.cfg"
+EXE="${ROOT_DIR}/bin/rm_synthesis_release_omp1"
+CFG_NAME="${1}"
+OMP_NUM_THREADS="${2:-6}"
 CFG_PATH="${ROOT_DIR}/cfg/${CFG_NAME}"
 CFG_ARG="../cfg/${CFG_NAME}"
 
@@ -59,8 +94,13 @@ fi
 
 rm -f "${OUT_BASE}.AMP.RMCUBE.FITS" "${ANGLE_FILE}"
 
-# Run standard test
-"${EXE}" "${CFG_ARG}"
+# Run with OMP settings and timing
+export OMP_NUM_THREADS="${OMP_NUM_THREADS}"
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+
+echo "[runFile] Running with OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+/usr/bin/time -v "${EXE}" "${CFG_ARG}"
 
 if [[ ! -s "${OUT_BASE}.AMP.RMCUBE.FITS" || ! -s "${ANGLE_FILE}" ]]; then
   echo "[runFile] ERROR: run did not produce expected output cubes." >&2
