@@ -95,6 +95,66 @@ Notes:
 Commit message: "step4/gpu: add omp target offload to tile_extract_gpu"
 
 
+COMPILATION STRATEGY — DUAL BACKEND OPTIMALITY
+-----------------------------------------------
+The GPU refactor flips the parallelism level:
+  current CPU:  !$omp parallel do over RM bins (nout) inside each pixel call
+  after refactor: parallelise over pixels (nx_tile*ny_tile) for both backends
+Pixels >> RM bins in a typical tile, so the refactor also improves CPU.
+
+Three build modes:
+
+  GPU=0 OMP=1 (pure CPU, maximum CPU performance)
+  ---------------------------------------------------
+  FC = gfortran
+  FFLAGS = -O3 -march=native -fopenmp
+  DEFINES = (none; USE_GPU not defined)
+  Result: preprocessor strips all !$omp target; plain !$omp parallel do over
+          pixels; full AVX2/AVX-512 SIMD; zero offload overhead.
+  use_gpu is ignored even if set y in cfg (omp_get_num_devices returns 0).
+
+  GPU=1 (GPU offload build)
+  ---------------------------------------------------
+  FC = nvfortran           (preferred; excellent CPU codegen for fallback too)
+  FFLAGS = -O3 -mp=gpu -gpu=cc80,managed
+  DEFINES = -DUSE_GPU
+  Fallback FC = gfortran -O3 -fopenmp -foffload=nvptx-none -DUSE_GPU
+  Result: !$omp target teams distribute compiled for GPU; host path also
+          compiled at -O3 by nvfortran.
+
+  GPU=1 binary, no GPU found at runtime (the fallback case)
+  -----------------------------------------------------------
+  use_gpu_actual = .false. (set by omp_get_num_devices() == 0 check)
+  !$omp target if(.false.) teams distribute parallel do
+    -> OpenMP spec mandates host execution; threads spread over pixels
+  Performance: near-native with nvfortran; within ~5% of GPU=0 build.
+  For a CPU-only HPC node, best practice is to submit with GPU=0 binary.
+  The GPU=1 fallback is a convenience safety net, not the performance target.
+
+Source-level guard (in tile_extract_gpu and rm_synthesis_mod.f90):
+  #ifdef USE_GPU
+    !$omp target teams distribute parallel do if(use_gpu_actual) &
+    !$omp& map(to: specQ,specU,cos_arr,sin_arr,flag_arr) &
+    !$omp& map(from: p_tile_arr,phi_tile_arr,mask_tile_arr,nvalid_tile_arr)
+  #else
+    !$omp parallel do default(none) shared(...) private(ipix,...)
+  #endif
+    do ipix = 1, nx_tile*ny_tile
+      ...
+    end do
+  #ifdef USE_GPU
+    !$omp end target teams distribute parallel do
+  #else
+    !$omp end parallel do
+  #endif
+
+This ensures:
+  - GPU=0 binary: maximum CPU performance, no offload overhead at all
+  - GPU=1 binary + GPU present: full device offload
+  - GPU=1 binary + no GPU: safe host fallback with warning, close to CPU perf
+  - User experience: compile once for target, run anywhere without crashes
+
+
 STEP 5 — cfg key + Makefile GPU target  [rm_synthesis_mod.f90, rm_synthesis.f, Makefile]
 ------------------------------------------------------------------------------------------
 Config key (default n, backward compatible):
