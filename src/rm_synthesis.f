@@ -148,7 +148,8 @@ chelp-
       character(len=272) :: infileI, infileQ, infileU, message
       character(len=272) :: outfile, outfileAMP, outfileANG
       character(len=272) :: outfileMASK, outfileNVALID
-      character(len=272) :: mask_cube_file
+        character(len=272) :: mask_cube_file, mask_badchan_file,
+     -                      mask_trust_mode
       character(len=272) :: RMfile, QU_linecutfile
       character(len=272) :: subim_parfile, cfgfile, cfgfile_in
       character(len=172) :: path, path_I 
@@ -296,7 +297,8 @@ chelp-
      -          path_I,infileI,
      -          ofac,fac,beg_rm,end_rm,nrm_out_par,
      -          use_auto_rm_range,output_mode,
-     -          ap_angle_mode,status)
+     -          ap_angle_mode,mask_cube_file,mask_badchan_file,
+     -          mask_trust_mode,status)
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
@@ -1590,8 +1592,8 @@ chelp-
       status = 0
 
       ! --- Axis 3: RM synthesised axis ---
-        call ftpkys(41,'ctype3','FDEP','Faraday depth',status)
-        call ftpkys(42,'ctype3','FDEP','Faraday depth',status)
+      call ftpkys(41,'ctype3','FDEP','Faraday depth',status)
+      call ftpkys(42,'ctype3','FDEP','Faraday depth',status)
       call ftpkys(41,'cunit3','rad/m**2','RM axis units',status)
       call ftpkys(42,'cunit3','rad/m**2','RM axis units',status)
       call ftpkyd(41,'crval3',dble(RM(1)),decimals,

@@ -240,6 +240,169 @@ contains
 
   end subroutine extract_general_ri
 
+  subroutine extract_general_w(ryt_in, iyt_in, wts_in, npts, nout, p_ex, phi_ex, &
+                               cos_arr, sin_arr, maxout, maxpts, mean_rem)
+    !! Weighted RM extraction (AP mode).
+    !! Channels with zero weight are ignored via weighted sums.
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
+    real(sp), intent(in) :: ryt_in(*), iyt_in(*), wts_in(*)
+    real(sp), intent(out) :: p_ex(*), phi_ex(*)
+    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+
+    real(sp) :: ryt(npts), iyt(npts), wts(npts)
+    real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
+    real(sp) :: wsum, mean_q, mean_u
+    integer(int32) :: i, kk
+
+    do kk = 1, npts
+      wts(kk) = max(0.0_sp, wts_in(kk))
+    end do
+
+    wsum = 0.0_sp
+    !$omp simd reduction(+:wsum)
+    do kk = 1, npts
+      wsum = wsum + wts(kk)
+    end do
+
+    if (mean_rem > 0 .and. wsum > 0.0_sp) then
+      mean_q = 0.0_sp
+      mean_u = 0.0_sp
+      !$omp simd reduction(+:mean_q,mean_u)
+      do kk = 1, npts
+        mean_q = mean_q + wts(kk) * ryt_in(kk)
+        mean_u = mean_u + wts(kk) * iyt_in(kk)
+      end do
+      mean_q = mean_q / wsum
+      mean_u = mean_u / wsum
+      do i = 1, npts
+        ryt(i) = ryt_in(i) - mean_q
+        iyt(i) = iyt_in(i) - mean_u
+      end do
+    else
+      do i = 1, npts
+        ryt(i) = ryt_in(i)
+        iyt(i) = iyt_in(i)
+      end do
+    end if
+
+    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,p_ex,phi_ex)
+    do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
+      !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
+      do kk = 1, npts
+        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(i, kk)
+        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(i, kk)
+        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(i, kk)
+        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(i, kk)
+      end do
+
+      if (wsum > 0.0_sp) then
+        rc_cor = rc_cor / wsum
+        rs_cor = rs_cor / wsum
+        ic_cor = ic_cor / wsum
+        is_cor = is_cor / wsum
+      else
+        rc_cor = 0.0_sp
+        rs_cor = 0.0_sp
+        ic_cor = 0.0_sp
+        is_cor = 0.0_sp
+      end if
+
+      ryw_tmp = rc_cor - is_cor
+      iyw_tmp = rs_cor + ic_cor
+      p_ex(i) = sqrt(ryw_tmp**2 + iyw_tmp**2)
+      phi_ex(i) = atan2(iyw_tmp, ryw_tmp)
+    end do
+    !$omp end parallel do
+
+  end subroutine extract_general_w
+
+  subroutine extract_general_ri_w(ryt_in, iyt_in, wts_in, npts, nout, re_ex, im_ex, &
+                                  cos_arr, sin_arr, maxout, maxpts, mean_rem)
+    !! Weighted RM extraction (RI mode).
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
+    real(sp), intent(in) :: ryt_in(*), iyt_in(*), wts_in(*)
+    real(sp), intent(out) :: re_ex(*), im_ex(*)
+    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+
+    real(sp) :: ryt(npts), iyt(npts), wts(npts)
+    real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
+    real(sp) :: wsum, mean_q, mean_u
+    integer(int32) :: i, kk
+
+    do kk = 1, npts
+      wts(kk) = max(0.0_sp, wts_in(kk))
+    end do
+
+    wsum = 0.0_sp
+    !$omp simd reduction(+:wsum)
+    do kk = 1, npts
+      wsum = wsum + wts(kk)
+    end do
+
+    if (mean_rem > 0 .and. wsum > 0.0_sp) then
+      mean_q = 0.0_sp
+      mean_u = 0.0_sp
+      !$omp simd reduction(+:mean_q,mean_u)
+      do kk = 1, npts
+        mean_q = mean_q + wts(kk) * ryt_in(kk)
+        mean_u = mean_u + wts(kk) * iyt_in(kk)
+      end do
+      mean_q = mean_q / wsum
+      mean_u = mean_u / wsum
+      do i = 1, npts
+        ryt(i) = ryt_in(i) - mean_q
+        iyt(i) = iyt_in(i) - mean_u
+      end do
+    else
+      do i = 1, npts
+        ryt(i) = ryt_in(i)
+        iyt(i) = iyt_in(i)
+      end do
+    end if
+
+    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,re_ex,im_ex)
+    do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
+      !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
+      do kk = 1, npts
+        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(i, kk)
+        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(i, kk)
+        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(i, kk)
+        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(i, kk)
+      end do
+
+      if (wsum > 0.0_sp) then
+        rc_cor = rc_cor / wsum
+        rs_cor = rs_cor / wsum
+        ic_cor = ic_cor / wsum
+        is_cor = is_cor / wsum
+      else
+        rc_cor = 0.0_sp
+        rs_cor = 0.0_sp
+        ic_cor = 0.0_sp
+        is_cor = 0.0_sp
+      end if
+
+      ryw_tmp = rc_cor - is_cor
+      iyw_tmp = rs_cor + ic_cor
+      re_ex(i) = ryw_tmp
+      im_ex(i) = iyw_tmp
+    end do
+    !$omp end parallel do
+
+  end subroutine extract_general_ri_w
+
   subroutine compute_mean(arr, n, mean_val)
     !! Compute mean of array
     integer(int32), intent(in) :: n
@@ -330,12 +493,14 @@ contains
                              rem_mean, remove_qu_bias, resiQ, slopeQ, resiU, slopeU, &
                              path_I, infileI, ofac, fac, beg_rm, end_rm, nrm_out_par, &
                              use_auto_rm_range, output_mode, &
-                             ap_angle_mode, status)
+                             ap_angle_mode, mask_cube_file, mask_badchan_file, &
+                             mask_trust_mode, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
     character(len=*), intent(inout) :: path, infileQ, infileU, outfile
     character(len=*), intent(inout) :: badchan_file, subim_parfile, path_I, infileI
+    character(len=*), intent(inout) :: mask_cube_file, mask_badchan_file, mask_trust_mode
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -367,6 +532,7 @@ contains
     logical :: seen_use_auto_rm_range
     logical :: seen_output_mode
     logical :: seen_ap_angle_mode
+    logical :: seen_mask_cube_file, seen_mask_badchan_file, seen_mask_trust_mode
 
     status = 0
     line_no = 0
@@ -409,6 +575,9 @@ contains
     seen_use_auto_rm_range = .false.
     seen_output_mode = .false.
     seen_ap_angle_mode = .false.
+    seen_mask_cube_file = .false.
+    seen_mask_badchan_file = .false.
+    seen_mask_trust_mode = .false.
 
     ! Defaults can be overridden by the config.
     path = '../DATA/'
@@ -449,6 +618,9 @@ contains
     use_auto_rm_range = 1
     output_mode = 0
     ap_angle_mode = 0
+    mask_cube_file = ''
+    mask_badchan_file = ''
+    mask_trust_mode = 'safe'
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -1021,6 +1193,44 @@ contains
           write(*,*) 'Invalid ap_angle_mode at cfg line ', line_no
           write(*,*) 'Allowed values: phase, pol'
           status = -160
+          close(unit_cfg)
+          return
+        end select
+      case ('mask_cube_file')
+        if (seen_mask_cube_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_cube_file'
+          status = -162
+          close(unit_cfg)
+          return
+        end if
+        seen_mask_cube_file = .true.
+        mask_cube_file = trim(val)
+      case ('mask_badchan_file')
+        if (seen_mask_badchan_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_badchan_file'
+          status = -163
+          close(unit_cfg)
+          return
+        end if
+        seen_mask_badchan_file = .true.
+        mask_badchan_file = trim(val)
+      case ('mask_trust_mode')
+        if (seen_mask_trust_mode) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_trust_mode'
+          status = -164
+          close(unit_cfg)
+          return
+        end if
+        seen_mask_trust_mode = .true.
+        select case (trim(lower_ascii(val)))
+        case ('safe')
+          mask_trust_mode = 'safe'
+        case ('strict')
+          mask_trust_mode = 'strict'
+        case default
+          write(*,*) 'Invalid mask_trust_mode at cfg line ', line_no
+          write(*,*) 'Allowed values: safe, strict'
+          status = -164
           close(unit_cfg)
           return
         end select
