@@ -91,7 +91,9 @@ chelp-
       real(sp), allocatable :: specU(:)
       real(sp), allocatable :: p_tile_arr(:)
       real(sp), allocatable :: phi_tile_arr(:)
-      real(sp)  resiQ, resiU, slopeQ, slopeU  
+      real(sp), allocatable :: mask_tile_arr(:)
+      real(sp), allocatable :: nvalid_tile_arr(:)
+      real(sp)  resiQ, resiU, slopeQ, slopeU
       logical   remove_QU_bias
       integer   bitpixQ, naxisQ, naxesQ(max_axis)
       integer   bitpixU, naxisU, naxesU(max_axis)
@@ -133,17 +135,20 @@ chelp-
       logical   anyflg
       logical   cubeQ
       logical   cubeU
-      logical   out_amp_open, out_ang_open, out_exists
+        logical   out_amp_open, out_ang_open, out_exists
+        logical   out_mask_open, out_nvalid_open
       integer   freq_axis, freq_axisQ, freq_axisU
 
       character(len=64) :: ctype 
       character(len=72) :: comment
-      real(dp) cval,cdelt, sec_delta, pi 
+      real(dp) cval,cdelt, pi 
       real(sp) cpix, dRM
 
       integer   rwmode
       character(len=272) :: infileI, infileQ, infileU, message
       character(len=272) :: outfile, outfileAMP, outfileANG
+      character(len=272) :: outfileMASK, outfileNVALID
+      character(len=272) :: mask_cube_file
       character(len=272) :: RMfile, QU_linecutfile
       character(len=272) :: subim_parfile, cfgfile, cfgfile_in
       character(len=172) :: path, path_I 
@@ -167,6 +172,8 @@ chelp-
       ! various counters and indices:
       integer   i, kk, ix, iy, ixpix_now, iypix_now, irm 
       integer   cnt1, cnt2, tmp_cnt1, tmp_cnt2, tmp_index 
+      integer   progress_total, progress_step
+      integer   progress_next_pct, progress_next_count
       integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
       integer   ix_loc, iy_loc, iz
       integer   nx_tile, ny_tile
@@ -325,7 +332,7 @@ chelp-
       infileU(1:) = path(1:nchar(path))//infileU(1:nchar(infileU))
       if(need_icube)then
               infileI(1:)=path_I(1:nchar(path_I))//
-     -             infileI(1:nchar(infileI))
+     -       infileI(1:nchar(infileI))
               write(*,*)"I-fitscube in: ",infileI(1:nchar(infileI))
       endif
 
@@ -344,10 +351,15 @@ chelp-
      -                      '.PHA.RMCUBE.FITS'
               endif
       endif
+      outfileMASK(1:) = outfile(1:nchar(outfile))//'.MASK.CUBE.FITS'
+      if(nchar(mask_cube_file).gt.0)then
+              outfileMASK(1:) = mask_cube_file(1:nchar(mask_cube_file))
+      endif
+      outfileNVALID(1:) = outfile(1:nchar(outfile))//'.NVALID.MAP.FITS'
       QU_linecutfile(1:) = outfile(1:nchar(outfile))//'.QU.linecut'
         badchan_file(1:) = badchan_file(1:nchar(badchan_file))
 
-                        ! Bad channels will be read after cube dimensions are known
+      ! Bad channels will be read after cube dimensions are known
                         nbad_chan = 0
 
       write(*,*)' ========================================'
@@ -376,7 +388,6 @@ chelp-
               write(*,*)' beg/end/nrm are auto-derived from data'
       endif
       write(*,*)' ========================================'
-
 
       ! Extract Some basic INFO from the FITS files:
       call myfits_info(infileQ,
@@ -666,50 +677,10 @@ chelp-
       !
 
 
-      write(*,*)"! -----------------------------------------------------
-     ------------" 
-      write(*,*)"! Final sanity checks..."
-      write(*,*)"! "      
-      write(*,*)"! NOTE: It appeared to me that it's a practice to make 
-     -the central" 
-      write(*,*)"! RA and DEC pixels as the reference pixels,  whereas, 
-     -in case of "
-      write(*,*)"! the frequency axis, it is the 1st pixel that is taken
-     - as the "  
-      write(*,*)"! reference. It was later found that intermediate AIPS/
-     -MIRIAD tasks"
-      write(*,*)"! when used to write out FITS files, do not religiously
-     - follow such" 
-      write(*,*)"! conventions! The reference pixel can be any pixel -- 
-     -I am not aware"
-      write(*,*)"! on what determines the choice of the reference pixel 
-     -though. "
-      write(*,*)"! Maybe the programmer's bias..."
-      write(*,*)"! "
-      write(*,*)"! In this code, we check whether the reference pixels o
-     -f all the "
-      write(*,*)"! axes are indeed the central pixels, and WARN the user
-     - if otherwise."
-      write(*,*)"! "
-      write(*,*)"! We further check for the C-Fortran index conventions 
-     -in"
-      write(*,*)"! cases where the reference pixel, if happens to be the
-     - 1st pixel,"
-      write(*,*)"! whether a 0 is assigned to it, or a 1."
-      write(*,*)"! C-programmers usually refer to the 1st pixel as the 0
-     --th pixel,"
-      write(*,*)"! whereas Fortran programmers assign index 1 to the 1st
-     - pixel."
-      write(*,*)"! Hence we will assume the reference pixels to be 1 in 
-     -cases where"
-      write(*,*)"! we find the reference values tagged to pixel number 0
-     - in the "
-      write(*,*)"! FITS file."
-      write(*,*)"! Feel free to correct me in case I have missed somethi
-     -ng:"
-      write(*,*)"!               wasim@rri.res.in"
-      write(*,*)"! -----------------------------------------------------
-     ------------" 
+        write(*,*)"! -----------------------------------------------"
+        write(*,*)"! Final sanity checks..."
+        write(*,*)"! Reference-pixel conventions are validated below."
+        write(*,*)"! -----------------------------------------------"
 
         ! Check if the reference pixel is indeed at the centre of the 
         ! image array and also find out the number of points leading 
@@ -1343,8 +1314,8 @@ chelp-
       allocate(RM(nrm_out))
       allocate(p_ex(nrm_out))
       allocate(phi_ex(nrm_out))
-        allocate(cos_arr(ngood_chan, nrm_out))
-        allocate(sin_arr(ngood_chan, nrm_out))
+      allocate(cos_arr(nrm_out, ngood_chan))
+      allocate(sin_arr(nrm_out, ngood_chan))
 
       call extract_general_setup(L_sq,ngood_chan,fac,beg_rm,end_rm,
      -  nrm_out,RM,cos_arr,sin_arr,nrm_out,ngood_chan,
@@ -1551,220 +1522,194 @@ chelp-
 !       status  i  output error status (0 = ok)
 
       ! Problems related to axis mismatch noticed in the RM 
-      ! planes along the direction of RA. 
-      ! We will keep the RA/Dec reference pixels as it was 
-      ! in the original frequency data cube, and shall only 
-      ! change the "cdelt" values depending on the "incs" 
-      ! input by user: 
+      ! planes along the direction of RA.
+      ! WCS header for output RM cubes (FITS Paper I/II standard).
+      ! Axes 1+2: CRVAL unchanged (passthrough), CRPIX offset by
+      !           subimage start, CDELT scaled by stride only.
+      !           No sec(delta) - SIN/TAN projection handles geometry.
+      ! Axis  3: RM synthesised axis; CTYPE and CUNIT set explicitly.
+      ! Frame:   RADESYS/EQUINOX preferred; EPOCH as legacy fallback.
+      ! Rotation: PC matrix elements passthrough if present in input.
       decimals = 13
-
-      ! =================== CTYPE-2 =======================
-      call ftgkys(21,"ctype2",ctype,comment,status)
-      call ftpkys(41,"ctype2",ctype(1:nchar(ctype)),comment(1:nchar(comm
-     -ent)),status)
-      call ftpkys(42,"ctype2",ctype(1:nchar(ctype)),comment(1:nchar(comm
-     -ent)),status)
-
-      call ftgkyd(21,"crval2",cval,comment,status)
-      call ftgkyd(21,"cdelt2",cdelt,comment,status)
-      call ftgkye(21,"crpix2",cpix,comment,status)
-
-      atmp8 = cval - (dble(cpix) - 1.0d0)*cdelt     ! Value of the 1st pix 
-                                                    ! in input image 
-      cval = atmp8 + (dble(ypix_beg) - 1.0d0)*cdelt ! Value of the 1st pix 
-                                                    ! in output image 
-
-      ! Now compute the values of center pixel to be used
-      ! as the reference for the output image: 
-      if(mod(ny_out,2).eq.0)then 
-              cpix = real(ny_out/2)
-      else
-              cpix = real((ny_out+1)/2)
-      endif
-      cval = cval + dble(cpix - 1)*cdelt*dble(incs(2)) 
-!      write(*,'(a,f15.11)')" Ref val Dec in output: ",cval 
-!      write(*,'(a,f15.11)')" Ref pix Dec in output: ",cpix 
-!      write(*,'(a,f15.11)')" Ref del Dec in output: ",cdelt 
-
-
-      call ftpkyd(41,"crval2",cval,decimals,comment(1:nchar(comment)),
-     -status)
-      call ftpkyd(42,"crval2",cval,decimals,comment(1:nchar(comment)),
-     -status)
-
-!      call ftpkye(41,"crpix2",1.0,decimals,comment(1:nchar(comment)),
-!     -status)
-!      call ftpkye(42,"crpix2",1.0,decimals,comment(1:nchar(comment)),
-!     -status)
-      call ftpkye(41,"crpix2",cpix,decimals,comment(1:nchar(comment)),
-     -status)
-      call ftpkye(42,"crpix2",cpix,decimals,comment(1:nchar(comment)),
-     -status)
-
-      !cdelt = real(ny_totpix - 1)/real(ny_out - 1)*cdelt
-      cdelt = dble(incs(2))*cdelt
-      call ftpkyd(41,"cdelt2",cdelt,decimals,comment(1:nchar(comment)),
-     -status)
-      call ftpkyd(42,"cdelt2",cdelt,decimals,comment(1:nchar(comment)),
-     -status)
-
-      ! =================== CTYPE-1 =======================
-      ! You need to scale the dRA by secant-delta: 
-      cval = cval*pi/180.0d0     ! assuming cval is in degrees (dble
-                                 ! precision)
-      sec_delta = 1.0d0/cos(cval) ! Computed at the reference dec of
-                                  ! output image 
-      if(sec_delta.ne.sec_delta)then
-              write(*,*)"WARNING: "
-              write(*,*)"You may be close to the Poles..."
-              write(*,*)"We will quit now, since I'm too busy to "
-              write(*,*)"think on dealing with this issue now!!"
-              stop
-      endif
-
-      call ftgkys(21,"ctype1",ctype,comment,status)
-      call ftpkys(41,"ctype1",ctype(1:nchar(ctype)),comment(1:nchar(comm
-     -ent)),status)
-      call ftpkys(42,"ctype1",ctype(1:nchar(ctype)),comment(1:nchar(comm
-     -ent)),status)
-
-      call ftgkyd(21,"crval1",cval,comment,status)
-!      write(*,'(a,f15.11)')" Ref val RA in input: ",cval 
-      call ftgkyd(21,"cdelt1",cdelt,comment,status)
-!      write(*,'(a,f15.11)')"Ref delt RA in input: ",cdelt 
-      call ftgkye(21,"crpix1",cpix,comment,status)
-!      write(*,'(a,f15.11)')" Ref pix RA in input: ",cpix 
-       
-      ! You need to scale the dRA by secant-delta: 
-
-      atmp8 = cval - (dble(cpix) - 1.0d0)*cdelt*sec_delta     ! Value of the 1st pix 
-                                                              ! in input image at the 
-                                                              ! reference declination 
-      cval = atmp8 + (dble(xpix_beg) - 1.0d0)*cdelt*sec_delta ! Value of the 1st pix 
-                                                              ! in output image at the 
-                                                              ! reference declination 
-!      write(*,'(a,f15.11)')" 1st val RA in output: ", cval 
-
-      ! Now compute the values of center pixel to be used
-      ! as the reference for the output image: 
-      if(mod(nx_out,2).eq.0)then 
-              cpix = real(nx_out/2)
-      else
-              cpix = real((nx_out+1)/2)
-      endif
-      cval = cval + dble(cpix - 1)*cdelt*incs(1)*sec_delta 
-
-      call ftpkyd(41,"crval1",cval,decimals,comment(1:nchar(comment)),
-     -status)
-      call ftpkyd(42,"crval1",cval,decimals,comment(1:nchar(comment)),
-     -status)
-!      call ftpkye(41,"crpix1",1.0,decimals,comment(1:nchar(comment)),
-!     -status)
-!      call ftpkye(42,"crpix1",1.0,decimals,comment(1:nchar(comment)),
-!     -status)
-      call ftpkye(41,"crpix1",cpix,decimals,comment(1:nchar(comment)),
-     -status)
-      call ftpkye(42,"crpix1",cpix,decimals,comment(1:nchar(comment)),
-     -status)
-
-      !cdelt = real(nx_totpix - 1)/real(nx_out - 1)*cdelt
-      cdelt = dble(incs(1))*cdelt
-      call ftpkyd(41,"cdelt1",cdelt,decimals,comment(1:nchar(comment)),
-     -status)
-      call ftpkyd(42,"cdelt1",cdelt,decimals,comment(1:nchar(comment)),
-     -status)
-!      write(*,'(a,f15.11)')" Ref val RA in output: ",cval 
-!      write(*,'(a,f15.11)')"Ref delt RA in output: ",cdelt 
-!      write(*,'(a,f15.11)')" Ref pix RA in output: ",cpix 
-!      !stop
-      ! =================== CTYPE-3 =======================
-
-      ! Reset status before writing output-header keywords.
       status = 0
 
-      call ftpkys(41,"ctype3","RM-rd/m2","3rd axis type",status)
-      call ftpkys(42,"ctype3","RM-rd/m2","3rd axis type",status)
-
-      call ftpkye(41,"crval3",RM(1),decimals,"Reference Pixel value",
-     -status)
-      call ftpkye(42,"crval3",RM(1),decimals,"Reference Pixel value",
-     -status)
-
-      call ftpkye(41,"crpix3",1.0,decimals,"Reference Pixel",status)
-      call ftpkye(42,"crpix3",1.0,decimals,"Reference Pixel",status)
-
-      call ftpkye(41,"cdelt3",dRM,decimals,"Pixel size in world coordina
-     -te units",status)
-      call ftpkye(42,"cdelt3",dRM,decimals,"Pixel size in world coordina
-     -te units",status)
-
+      ! --- Axis 1 (RA): CTYPE passthrough ---
+      call ftgkys(21,'ctype1',ctype,comment,status)
+      call ftpkys(41,'ctype1',ctype(1:nchar(ctype)),' ',status)
+      call ftpkys(42,'ctype1',ctype(1:nchar(ctype)),' ',status)
       status = 0
-      call ftgkys(21,"BUNIT",ctype,comment,status)
-      if(status.ne.0)then
-              ctype = 'UNKNOWN'
-              comment = 'Input BUNIT missing'
+
+      ! --- Axis 1: CRVAL passthrough, CRPIX offset, CDELT scaled ---
+      call ftgkyd(21,'crval1',cval,comment,status)
+      call ftpkyd(41,'crval1',cval,decimals,' ',status)
+      call ftpkyd(42,'crval1',cval,decimals,' ',status)
+      call ftgkyd(21,'crpix1',atmp8,comment,status)
+      atmp8 = (atmp8 - dble(xpix_beg)) / dble(incs(1)) + 1.0d0
+      call ftpkyd(41,'crpix1',atmp8,decimals,' ',status)
+      call ftpkyd(42,'crpix1',atmp8,decimals,' ',status)
+      call ftgkyd(21,'cdelt1',cdelt,comment,status)
+      cdelt = dble(incs(1)) * cdelt
+      call ftpkyd(41,'cdelt1',cdelt,decimals,' ',status)
+      call ftpkyd(42,'cdelt1',cdelt,decimals,' ',status)
+      status = 0
+
+      ! --- Axis 1: CUNIT passthrough if present ---
+      call ftgkys(21,'cunit1',ctype,comment,status)
+      if(status.eq.0)then
+              call ftpkys(41,'cunit1',ctype(1:nchar(ctype)),' ',status)
+              call ftpkys(42,'cunit1',ctype(1:nchar(ctype)),' ',status)
+      endif
+      status = 0
+
+      ! --- Axis 2 (Dec): CTYPE passthrough ---
+      call ftgkys(21,'ctype2',ctype,comment,status)
+      call ftpkys(41,'ctype2',ctype(1:nchar(ctype)),' ',status)
+      call ftpkys(42,'ctype2',ctype(1:nchar(ctype)),' ',status)
+      status = 0
+
+      ! --- Axis 2: CRVAL passthrough, CRPIX offset, CDELT scaled ---
+      call ftgkyd(21,'crval2',cval,comment,status)
+      call ftpkyd(41,'crval2',cval,decimals,' ',status)
+      call ftpkyd(42,'crval2',cval,decimals,' ',status)
+      call ftgkyd(21,'crpix2',atmp8,comment,status)
+      atmp8 = (atmp8 - dble(ypix_beg)) / dble(incs(2)) + 1.0d0
+      call ftpkyd(41,'crpix2',atmp8,decimals,' ',status)
+      call ftpkyd(42,'crpix2',atmp8,decimals,' ',status)
+      call ftgkyd(21,'cdelt2',cdelt,comment,status)
+      cdelt = dble(incs(2)) * cdelt
+      call ftpkyd(41,'cdelt2',cdelt,decimals,' ',status)
+      call ftpkyd(42,'cdelt2',cdelt,decimals,' ',status)
+      status = 0
+
+      ! --- Axis 2: CUNIT passthrough if present ---
+      call ftgkys(21,'cunit2',ctype,comment,status)
+      if(status.eq.0)then
+              call ftpkys(41,'cunit2',ctype(1:nchar(ctype)),' ',status)
+              call ftpkys(42,'cunit2',ctype(1:nchar(ctype)),' ',status)
+      endif
+      status = 0
+
+      ! --- Axis 3: RM synthesised axis ---
+      call ftpkys(41,'ctype3','RM-rd/m2','Faraday depth',status)
+      call ftpkys(42,'ctype3','RM-rd/m2','Faraday depth',status)
+      call ftpkys(41,'cunit3','rad/m**2','RM axis units',status)
+      call ftpkys(42,'cunit3','rad/m**2','RM axis units',status)
+      call ftpkyd(41,'crval3',dble(RM(1)),decimals,
+     -            'Reference RM (rad/m^2)',status)
+      call ftpkyd(42,'crval3',dble(RM(1)),decimals,
+     -            'Reference RM (rad/m^2)',status)
+      call ftpkyd(41,'crpix3',1.0d0,decimals,'Reference pixel',status)
+      call ftpkyd(42,'crpix3',1.0d0,decimals,'Reference pixel',status)
+      call ftpkyd(41,'cdelt3',dble(dRM),decimals,'RM spacing',status)
+      call ftpkyd(42,'cdelt3',dble(dRM),decimals,'RM spacing',status)
+      status = 0
+
+      ! --- PC rotation matrix: passthrough if present in input ---
+      call ftgkyd(21,'pc1_1',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'pc1_1',cval,decimals,' ',status)
+              call ftpkyd(42,'pc1_1',cval,decimals,' ',status)
+      endif
+      status = 0
+      call ftgkyd(21,'pc1_2',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'pc1_2',cval,decimals,' ',status)
+              call ftpkyd(42,'pc1_2',cval,decimals,' ',status)
+      endif
+      status = 0
+      call ftgkyd(21,'pc2_1',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'pc2_1',cval,decimals,' ',status)
+              call ftpkyd(42,'pc2_1',cval,decimals,' ',status)
+      endif
+      status = 0
+      call ftgkyd(21,'pc2_2',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'pc2_2',cval,decimals,' ',status)
+              call ftpkyd(42,'pc2_2',cval,decimals,' ',status)
+      endif
+      status = 0
+
+      ! --- Coordinate frame: RADESYS/EQUINOX preferred, EPOCH fallback ---
+      call ftgkys(21,'radesys',ctype,comment,status)
+      if(status.eq.0)then
+              call ftpkys(41,'radesys',ctype(1:nchar(ctype)),
+     -                    ' ',status)
+              call ftpkys(42,'radesys',ctype(1:nchar(ctype)),
+     -                    ' ',status)
+      endif
+      status = 0
+      call ftgkyd(21,'equinox',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'equinox',cval,decimals,' ',status)
+              call ftpkyd(42,'equinox',cval,decimals,' ',status)
+      else
               status = 0
-      endif
-      call ftpkys(41,"BUNIT",ctype(1:nchar(ctype)),"Units of Pixel Data"
-     -,status)
-      call ftpkys(42,"BUNIT","radians","Units of Pixel Data",status)
-
-      ! A few more useful header info: 
-      ! EPOCH of the coordinates:
-      call ftgkyd(21,"EPOCH",cval,comment,status)
-      if(status.ne.0)then
-              write(*,*)"Keyword 'EPOCH' missing in "
-              write(*,*)"input files' FITS HEADER!"
-              write(*,*)" "
-              write(*,*)"Default EPOCH assumed: 2000.0"
-              write(*,*)"Shall we proceed with default epoch (y/n)? "
-              read(*,"(a,$)")yorn
-              if(yorn.eq.'y' .or. yorn .eq.'Y')then
-                      cval = 2000.0d0
+              call ftgkyd(21,'epoch',cval,comment,status)
+              if(status.eq.0)then
+                      call ftpkyd(41,'epoch',cval,decimals,' ',status)
+                      call ftpkyd(42,'epoch',cval,decimals,' ',status)
               else
-                      write(*,*)"Enter correct EPOCH (decimal Year): "
-                      read(*,*)cval
+                      write(*,*)'WCS: no EQUINOX/EPOCH; default J2000'
+                      call ftpkyd(41,'equinox',2000.0d0,decimals,
+     -                             'Coord equinox',status)
+                      call ftpkyd(42,'equinox',2000.0d0,decimals,
+     -                             'Coord equinox',status)
               endif
-              ! Force status to 0
-              status = 0
       endif
-      call ftpkyd(41,"EPOCH",cval,decimals,comment,status)
-      call ftpkyd(42,"EPOCH",cval,decimals,comment,status)
-      ! Object/Field name: 
+
+      ! --- LONPOLE/LATPOLE: passthrough if present ---
       status = 0
-      call ftgkys(21,"OBJECT",ctype,comment,status)
+      call ftgkyd(21,'lonpole',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'lonpole',cval,decimals,' ',status)
+              call ftpkyd(42,'lonpole',cval,decimals,' ',status)
+      endif
+      status = 0
+      call ftgkyd(21,'latpole',cval,comment,status)
+      if(status.eq.0)then
+              call ftpkyd(41,'latpole',cval,decimals,' ',status)
+              call ftpkyd(42,'latpole',cval,decimals,' ',status)
+      endif
+
+      ! --- BUNIT: passthrough for cube 1 (amp/re); set for cube 2 ---
+      status = 0
+      call ftgkys(21,'bunit',ctype,comment,status)
       if(status.ne.0)then
               ctype = 'UNKNOWN'
-              comment = 'Input OBJECT missing'
               status = 0
       endif
-      call ftpkys(41,"OBJECT",ctype(1:nchar(ctype)),comment,status)
-      call ftpkys(42,"OBJECT",ctype(1:nchar(ctype)),comment,status)
-      ! Scaling if any required: 
-      call ftpkye(41,"BSCALE",1.0,decimals," ",status)
-      call ftpkye(42,"BSCALE",1.0,decimals,comment,status)
-      call ftpkye(41,"BZERO",0.0,decimals," ",status)
-      call ftpkye(42,"BZERO",0.0,decimals,comment,status)
-      ! Observer name: 
+      call ftpkys(41,'bunit',ctype(1:nchar(ctype)),
+     -            'Pixel data units',status)
+      call ftpkys(42,'bunit','rad',
+     -            'Pixel data units (angle)',status)
+
+      ! --- Metadata: OBJECT, OBSERVER, TELESCOP ---
       status = 0
-      call ftgkys(21,"OBSERVER",ctype,comment,status)
+      call ftgkys(21,'object',ctype,comment,status)
       if(status.ne.0)then
               ctype = 'UNKNOWN'
-              comment = 'Input OBSERVER missing'
               status = 0
       endif
-      call ftpkys(41,"OBSERVER",ctype(1:nchar(ctype)),comment,status)
-      call ftpkys(42,"OBSERVER",ctype(1:nchar(ctype)),comment,status)
-      ! TELESCOPE name: 
+      call ftpkys(41,'object',ctype(1:nchar(ctype)),' ',status)
+      call ftpkys(42,'object',ctype(1:nchar(ctype)),' ',status)
       status = 0
-      call ftgkys(21,"TELESCOP",ctype,comment,status)
+      call ftgkys(21,'observer',ctype,comment,status)
       if(status.ne.0)then
               ctype = 'UNKNOWN'
-              comment = 'Input TELESCOP missing'
               status = 0
       endif
-      call ftpkys(41,"TELESCOP",ctype(1:nchar(ctype)),comment,status)
-      call ftpkys(42,"TELESCOP",ctype(1:nchar(ctype)),comment,status)
+      call ftpkys(41,'observer',ctype(1:nchar(ctype)),' ',status)
+      call ftpkys(42,'observer',ctype(1:nchar(ctype)),' ',status)
+      status = 0
+      call ftgkys(21,'telescop',ctype,comment,status)
+      if(status.ne.0)then
+              ctype = 'UNKNOWN'
+              status = 0
+      endif
+      call ftpkys(41,'telescop',ctype(1:nchar(ctype)),' ',status)
+      call ftpkys(42,'telescop',ctype(1:nchar(ctype)),' ',status)
+      status = 0
 
 
 
@@ -1821,12 +1766,16 @@ chelp-
       tmp_cnt1 = 0
       tmp_cnt2 = 0
       cnt1 = 0
+      progress_total = nx_out*ny_out
+      progress_step = max(1, progress_total/10)
+      progress_next_pct = 10
+      progress_next_count = progress_step
       do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
-         ix_tile_end = min(xpix_end,
+        ix_tile_end = min(xpix_end,
      -                     ix_tile_beg + (tile_ra-1)*incs(1))
-         nx_tile = int((ix_tile_end - ix_tile_beg)/incs(1)) + 1
+        nx_tile = int((ix_tile_end - ix_tile_beg)/incs(1)) + 1
 
-         do iy_tile_beg = ypix_beg,ypix_end,tile_dec*incs(2)
+        do iy_tile_beg = ypix_beg,ypix_end,tile_dec*incs(2)
             iy_tile_end = min(ypix_end,
      -                        iy_tile_beg + (tile_dec-1)*incs(2))
             ny_tile = int((iy_tile_end - iy_tile_beg)/incs(2)) + 1
@@ -1949,9 +1898,16 @@ chelp-
                           enddo
                   endif
 
-                  if(mod(cnt1-1,1000).eq.0)then
-                       write(*,*)"doing ",cnt1," out of",nx_out*ny_out
-                  endif
+                  if(progress_total.gt.0)then
+                        do while(cnt1.ge.progress_next_count .and.
+     -                     progress_next_pct.le.100)
+                           write(*,*)'Progress: ',progress_next_pct,
+     -                        '% (',cnt1,' out of ',progress_total,')'
+                           progress_next_pct = progress_next_pct + 10
+                           progress_next_count = progress_next_count +
+     -                        progress_step
+                        enddo
+                endif
                enddo
             enddo
 
@@ -1977,7 +1933,7 @@ chelp-
             if(status.gt.0)then
                     call printerror(status)
             endif
-         enddo
+        enddo
       enddo
       if(line_cut)then
               close(121) 
