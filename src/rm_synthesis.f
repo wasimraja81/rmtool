@@ -90,10 +90,14 @@ chelp-
       real(sp), allocatable :: specI(:)
       real(sp), allocatable :: specQ(:)
       real(sp), allocatable :: specU(:)
+      real(sp), allocatable :: Q_tile(:)
+      real(sp), allocatable :: U_tile(:)
+      real(sp), allocatable :: wts_tile(:)
       real(sp), allocatable :: p_tile_arr(:)
       real(sp), allocatable :: phi_tile_arr(:)
       integer*1, allocatable :: mask_tile_arr(:)
       integer*2, allocatable :: nvalid_tile_arr(:)
+      integer, allocatable :: ngood_tile(:)
       real(sp)  resiQ, resiU, slopeQ, slopeU
       logical   remove_QU_bias
       integer   bitpixQ, naxisQ, naxesQ(max_axis)
@@ -133,8 +137,6 @@ chelp-
       integer   fpixels(max_axis), lpixels(max_axis), incs(max_axis)
         integer   fpixels_out(3), lpixels_out(3)
       real(sp), allocatable :: L_sq(:)
-      real(sp), allocatable :: Q_now(:)
-      real(sp), allocatable :: U_now(:)
       character(len=8) :: junkchar
       integer   status
       logical   anyflg
@@ -186,6 +188,7 @@ chelp-
       integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
       integer   ix_loc, iy_loc, iz
       integer   nx_tile, ny_tile
+      integer   ipix_tile, pix_base
       integer   ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
       integer   cnt_good, nvalid_pix
       integer   fpixels_nvalid(2), lpixels_nvalid(2)
@@ -213,7 +216,6 @@ chelp-
       real(sp), allocatable :: phi_ex(:)
       real(sp), allocatable :: cos_arr(:,:)
       real(sp), allocatable :: sin_arr(:,:)
-      real(sp), allocatable :: wts_now(:)
 
       ! RFI related (list of bad-channels based on apriori info)
         real(sp), allocatable :: bad_chan(:)
@@ -1373,8 +1375,6 @@ chelp-
       allocate(data_arrQ(nz_out))
       allocate(data_arrU(nz_out))
       allocate(L_sq(nz_out))
-      allocate(Q_now(nz_out))
-      allocate(U_now(nz_out))
 
       ! Now generate the axis values:
 
@@ -1643,7 +1643,10 @@ chelp-
       allocate(phi_tile_arr(tile_ra*tile_dec*nrm_out))
       allocate(mask_tile_arr(tile_ra*tile_dec*nz_out))
       allocate(nvalid_tile_arr(tile_ra*tile_dec))
-      allocate(wts_now(ngood_chan))
+      allocate(ngood_tile(tile_ra*tile_dec))
+      allocate(Q_tile(tile_ra*tile_dec*nz_out))
+      allocate(U_tile(tile_ra*tile_dec*nz_out))
+      allocate(wts_tile(tile_ra*tile_dec*nz_out))
 
 
       ! Irrespective of the total number of output pixels, 
@@ -2209,6 +2212,8 @@ chelp-
                do ix_loc = 1,nx_tile
                   ix = ix_tile_beg + (ix_loc-1)*incs(1)
                   cnt1 = cnt1 + 1
+                  ipix_tile = ix_loc + (iy_loc-1)*nx_tile
+                  pix_base = (ipix_tile-1)*nz_out
 
                   do iz = 1,nz_out
                      i = iz
@@ -2251,9 +2256,12 @@ chelp-
                              if(chan_valid)then
                                      ngood_chan = ngood_chan + 1
                                      cnt_good = cnt_good + 1
-                                     Q_now(ngood_chan) = data_arrQ(cnt2)
-                                     U_now(ngood_chan) = data_arrU(cnt2)
-                                     wts_now(ngood_chan) = 1.0
+                                     Q_tile(pix_base+ngood_chan) =
+     -                                  data_arrQ(cnt2)
+                                     U_tile(pix_base+ngood_chan) =
+     -                                  data_arrU(cnt2)
+                                     wts_tile(pix_base+ngood_chan) =
+     -                                  1.0
                              endif
                              tmp_index = ix_loc + (iy_loc-1)*nx_tile +
      -                                (cnt2-1)*nx_tile*ny_tile
@@ -2300,13 +2308,14 @@ chelp-
                                      else
                                              slopeU = -slopeU
                                      endif
-                                     Q_now(ngood_chan) =
+                                     Q_tile(pix_base+ngood_chan) =
      -                                  data_arrQ(cnt2) -
      -                                  (data_arrI(cnt2)*slopeQ + resiQ)
-                                     U_now(ngood_chan) =
+                                     U_tile(pix_base+ngood_chan) =
      -                                  data_arrU(cnt2) -
      -                                  (data_arrI(cnt2)*slopeU + resiU)
-                                     wts_now(ngood_chan) = 1.0
+                                     wts_tile(pix_base+ngood_chan) =
+     -                                  1.0
                              endif
                              tmp_index = ix_loc + (iy_loc-1)*nx_tile +
      -                                (cnt2-1)*nx_tile*ny_tile
@@ -2319,6 +2328,7 @@ chelp-
                   endif
 
                   nvalid_pix = cnt_good
+                  ngood_tile(ipix_tile) = ngood_chan
                   tmp_index = ix_loc + (iy_loc-1)*nx_tile
                   nvalid_tile_arr(tmp_index) = nvalid_pix
 
@@ -2330,13 +2340,19 @@ chelp-
                   else
                           if (output_mode .eq. 1) then
                                   call extract_general_ri_w(
-     -                               Q_now,U_now,wts_now,ngood_chan,
+     -                               Q_tile(pix_base+1),
+     -                               U_tile(pix_base+1),
+     -                               wts_tile(pix_base+1),
+     -                               ngood_chan,
      -                               nrm_out,p_ex,phi_ex,
      -                               cos_arr,sin_arr,nrm_out,ngood_chan,
      -                               rem_mean)
                           else
                                   call extract_general_w(
-     -                               Q_now,U_now,wts_now,ngood_chan,
+     -                               Q_tile(pix_base+1),
+     -                               U_tile(pix_base+1),
+     -                               wts_tile(pix_base+1),
+     -                               ngood_chan,
      -                               nrm_out,p_ex,phi_ex,
      -                               cos_arr,sin_arr,nrm_out,ngood_chan,
      -                               rem_mean)
@@ -2359,10 +2375,10 @@ chelp-
                   if(line_cut)then
                           tmp_cnt1 = tmp_cnt1 + 1
                           write(16,rec=tmp_cnt1)
-     -                    (Q_now(i),i=ngood_chan,1,-1)
+     -                    (Q_tile(pix_base+i),i=ngood_chan,1,-1)
                           tmp_cnt1 = tmp_cnt1 + 1
                           write(16,rec=tmp_cnt1)
-     -                    (U_now(i),i=ngood_chan,1,-1)
+     -                    (U_tile(pix_base+i),i=ngood_chan,1,-1)
 
                           tmp_cnt2 = tmp_cnt2 + 1
                           write(17,rec=tmp_cnt2)(p_ex(i),i=1,nrm_out)
@@ -2489,8 +2505,6 @@ chelp-
       if(allocated(data_arrQ)) deallocate(data_arrQ)
       if(allocated(data_arrU)) deallocate(data_arrU)
       if(allocated(L_sq)) deallocate(L_sq)
-      if(allocated(Q_now)) deallocate(Q_now)
-      if(allocated(U_now)) deallocate(U_now)
       if(allocated(RM)) deallocate(RM)
       if(allocated(p_ex)) deallocate(p_ex)
       if(allocated(phi_ex)) deallocate(phi_ex)
@@ -2500,11 +2514,14 @@ chelp-
       if(allocated(specU)) deallocate(specU)
       if(allocated(specMask)) deallocate(specMask)
       if(allocated(specI)) deallocate(specI)
+      if(allocated(Q_tile)) deallocate(Q_tile)
+      if(allocated(U_tile)) deallocate(U_tile)
+      if(allocated(wts_tile)) deallocate(wts_tile)
       if(allocated(p_tile_arr)) deallocate(p_tile_arr)
       if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)
       if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)
       if(allocated(nvalid_tile_arr)) deallocate(nvalid_tile_arr)
-      if(allocated(wts_now)) deallocate(wts_now)
+      if(allocated(ngood_tile)) deallocate(ngood_tile)
 
 9999  continue
       if(line_cut)then
