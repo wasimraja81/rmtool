@@ -44,7 +44,7 @@ contains
     integer(int32), intent(in) :: ofac
     real(sp), intent(in) :: t(*), fac, beg_rm, end_rm
     real(sp), intent(out) :: nu(*)
-    real(sp), intent(out) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+    real(sp), intent(out) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
     
     real(sp) :: freq_MHz(npts), f1, f2, Lsq1, Lsq2, dfreq
     real(sp) :: t_span, d_nu, nu_span, omega, h_tmp, phi_tmp, beg_eff, end_eff
@@ -113,8 +113,8 @@ contains
       omega = 2.0_sp * nu(i)
       do kk = 1, npts
         phi_tmp = omega * t(kk)
-        cos_arr(i, kk) = cos(phi_tmp)
-        sin_arr(i, kk) = -sin(phi_tmp)
+        cos_arr(kk, i) = cos(phi_tmp)
+        sin_arr(kk, i) = -sin(phi_tmp)
       end do
     end do
     
@@ -130,7 +130,7 @@ contains
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
     real(sp), intent(in) :: ryt_in(*), iyt_in(*)
     real(sp), intent(out) :: p_ex(*), phi_ex(*)
-    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
     
     real(sp) :: ryt(npts), iyt(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
@@ -163,10 +163,10 @@ contains
       is_cor = 0.0_sp
       !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
       do kk = 1, npts
-        rc_cor = rc_cor + ryt(kk) * cos_arr(i, kk)
-        rs_cor = rs_cor + ryt(kk) * sin_arr(i, kk)
-        ic_cor = ic_cor + iyt(kk) * cos_arr(i, kk)
-        is_cor = is_cor + iyt(kk) * sin_arr(i, kk)
+        rc_cor = rc_cor + ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + iyt(kk) * sin_arr(kk, i)
       end do
       
       rc_cor = rc_cor / dble(npts)
@@ -192,7 +192,7 @@ contains
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
     real(sp), intent(in) :: ryt_in(*), iyt_in(*)
     real(sp), intent(out) :: re_ex(*), im_ex(*)
-    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
 
     real(sp) :: ryt(npts), iyt(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
@@ -221,10 +221,10 @@ contains
       is_cor = 0.0_sp
       !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
       do kk = 1, npts
-        rc_cor = rc_cor + ryt(kk) * cos_arr(i, kk)
-        rs_cor = rs_cor + ryt(kk) * sin_arr(i, kk)
-        ic_cor = ic_cor + iyt(kk) * cos_arr(i, kk)
-        is_cor = is_cor + iyt(kk) * sin_arr(i, kk)
+        rc_cor = rc_cor + ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + iyt(kk) * sin_arr(kk, i)
       end do
 
       rc_cor = rc_cor / dble(npts)
@@ -249,7 +249,7 @@ contains
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
     real(sp), intent(in) :: ryt_in(*), iyt_in(*), wts_in(*)
     real(sp), intent(out) :: p_ex(*), phi_ex(*)
-    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
 
     real(sp) :: ryt(npts), iyt(npts), wts(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
@@ -296,10 +296,10 @@ contains
       is_cor = 0.0_sp
       !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
       do kk = 1, npts
-        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(i, kk)
-        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(i, kk)
-        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(i, kk)
-        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(i, kk)
+        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(kk, i)
       end do
 
       if (wsum > 0.0_sp) then
@@ -330,7 +330,7 @@ contains
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
     real(sp), intent(in) :: ryt_in(*), iyt_in(*), wts_in(*)
     real(sp), intent(out) :: re_ex(*), im_ex(*)
-    real(sp), intent(in) :: cos_arr(maxout, maxpts), sin_arr(maxout, maxpts)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
 
     real(sp) :: ryt(npts), iyt(npts), wts(npts)
     real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
@@ -377,10 +377,10 @@ contains
       is_cor = 0.0_sp
       !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
       do kk = 1, npts
-        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(i, kk)
-        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(i, kk)
-        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(i, kk)
-        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(i, kk)
+        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(kk, i)
       end do
 
       if (wsum > 0.0_sp) then
