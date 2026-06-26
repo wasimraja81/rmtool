@@ -8,6 +8,7 @@ module rm_synthesis_mod
   
   private
   public :: extract_general_setup, extract_general, extract_general_ri
+  public :: extract_general_w, extract_general_ri_w
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
