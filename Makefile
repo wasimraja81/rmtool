@@ -6,6 +6,8 @@
 # Compiler and flags
 FC := gfortran
 GPU_FC ?= nvfortran
+NVFORTRAN_PATH := $(shell command -v nvfortran 2>/dev/null)
+GFORTRAN_PATH := $(shell command -v gfortran 2>/dev/null)
 CPPFLAGS := -cpp
 BASEFLAGS := $(CPPFLAGS) -std=gnu -fallow-argument-mismatch -ffree-line-length-none
 CPU_OPTFLAGS := -O3 -march=native
@@ -23,6 +25,18 @@ OMP ?= 0
 
 # Optional GPU/offload build (set GPU=1 to enable)
 GPU ?= 0
+
+# Auto-select GPU compiler only when user did not explicitly set GPU_FC.
+# Preference order: nvfortran, then gfortran.
+ifeq ($(GPU),1)
+	ifeq ($(origin GPU_FC),file)
+		ifneq ($(NVFORTRAN_PATH),)
+			GPU_FC := nvfortran
+		else ifneq ($(GFORTRAN_PATH),)
+			GPU_FC := gfortran
+		endif
+	endif
+endif
 
 ifeq ($(GPU_FC),gfortran)
 	GPUFLAGS := $(GPU_GNUFLAGS)
@@ -81,6 +95,7 @@ endif
 check_gpu_compiler:
 	@command -v $(FC) >/dev/null 2>&1 || \
 	  { echo "ERROR: GPU compiler '$(FC)' not found in PATH."; \
+	    echo "       Auto-select order (when GPU_FC not set): nvfortran -> gfortran"; \
 	    echo "       Set GPU_FC=<compiler> explicitly, e.g. GPU_FC=gfortran or GPU_FC=nvfortran."; \
 	    echo "       nvfortran uses flags: $(GPU_NVFLAGS)"; \
 	    echo "       gfortran uses flags:  $(GPU_GNUFLAGS)"; \
@@ -138,7 +153,7 @@ help:
 	@echo "  make                         - Build executable (default, release mode)"
 	@echo "  make MODE=debug              - Build with debug symbols and checks"
 	@echo "  make OMP=1                   - Build with OpenMP enabled CPU backend"
-	@echo "  make GPU=1                   - Build GPU/offload backend (nvfortran by default)"
+	@echo "  make GPU=1                   - Build GPU/offload backend (auto: nvfortran -> gfortran)"
 	@echo "  make GPU=1 GPU_FC=gfortran   - Build GPU/offload backend with GNU offload"
 	@echo "  make clean [MODE=.. OMP=.. GPU=..] - Remove artifacts for selected mode/OMP/GPU"
 	@echo "  make clean-all               - Remove all mode/OMP/GPU build artifacts"
@@ -154,7 +169,7 @@ help:
 	@echo "  make MODE=debug                 # Build debug version"
 	@echo "  make MODE=release OMP=1         # Build OpenMP-enabled CPU release version"
 	@echo "  make MODE=debug OMP=1           # Build OpenMP-enabled CPU debug version"
-	@echo "  make GPU=1                      # Build GPU/offload binary"
+	@echo "  make GPU=1                      # Build GPU/offload binary (auto compiler)"
 	@echo "  make GPU=1 GPU_FC=nvfortran     # Select GPU compiler explicitly"
 	@echo "  make GPU=1 GPU_FC=gfortran      # Use GNU OpenMP offload backend"
 	@echo "  make clean MODE=debug OMP=1 GPU=0 # Clean only debug+OMP CPU artifacts"
