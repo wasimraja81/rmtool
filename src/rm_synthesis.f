@@ -86,6 +86,7 @@ chelp-
       real(sp), allocatable :: data_arrI(:)
       real(sp), allocatable :: data_arrQ(:)
       real(sp), allocatable :: data_arrU(:)
+      real(sp), allocatable :: specMask(:)
       real(sp), allocatable :: specI(:)
       real(sp), allocatable :: specQ(:)
       real(sp), allocatable :: specU(:)
@@ -148,7 +149,7 @@ chelp-
       character(len=272) :: infileI, infileQ, infileU, message
       character(len=272) :: outfile, outfileAMP, outfileANG
       character(len=272) :: outfileMASK, outfileNVALID
-      character(len=272) :: mask_cube_file, mask_badchan_file,
+      character(len=272) :: mask_cube_file, mask_input_cube_file,
      -                      mask_trust_mode
       character(len=272) :: RMfile, QU_linecutfile
       character(len=272) :: subim_parfile, cfgfile, cfgfile_in
@@ -183,6 +184,8 @@ chelp-
       integer   fpixels_nvalid(2), lpixels_nvalid(2)
       integer   naxes_mask(3), naxes_nvalid(2)
       logical   nan_check_on, chan_valid
+      logical   use_input_mask, in_mask_open
+      real(sp)  mask_val
       integer   in_fields
       integer   mem_unit, ios_mem
       integer(kind=int64) :: mem_avail_kb, mem_kb_tmp
@@ -210,7 +213,7 @@ chelp-
       integer   nbad_chan, ngood_chan
       integer, allocatable :: flag_arr(:)
       logical   remove_badchan
-      character(len=172) :: badchan_file
+      character(len=172) :: global_badchan_file
       character(len=16) :: masksrc_key, nanchk_key
 
       ! processing related:
@@ -292,7 +295,7 @@ chelp-
 
       call read_cfg_keyval(cfgfile,
      -          path,infileQ,infileU,outfile,
-     -          remove_badchan,badchan_file,
+     -          remove_badchan,global_badchan_file,
      -          subim,subim_parfile,
      -          subim_ra_blc,subim_ra_trc,subim_ra_inc,
      -          subim_dec_blc,subim_dec_trc,subim_dec_inc,
@@ -303,7 +306,8 @@ chelp-
      -          path_I,infileI,
      -          ofac,fac,beg_rm,end_rm,nrm_out_par,
      -          use_auto_rm_range,output_mode,
-     -          ap_angle_mode,mask_cube_file,mask_badchan_file,
+     -          ap_angle_mode,mask_cube_file,
+     -          mask_input_cube_file,
      -          mask_trust_mode,status)
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
@@ -338,6 +342,16 @@ chelp-
 
       infileQ(1:) = path(1:nchar(path))//infileQ(1:nchar(infileQ))
       infileU(1:) = path(1:nchar(path))//infileU(1:nchar(infileU))
+      if(nchar(mask_input_cube_file).gt.0)then
+              inquire(file=mask_input_cube_file(
+     -               1:nchar(mask_input_cube_file)),exist=anyflg)
+              if(.not.anyflg)then
+                      mask_input_cube_file(1:) =
+     -                      path(1:nchar(path))//
+     -                      mask_input_cube_file(
+     -                      1:nchar(mask_input_cube_file))
+              endif
+      endif
       if(need_icube)then
               infileI(1:)=path_I(1:nchar(path_I))//
      -       infileI(1:nchar(infileI))
@@ -365,7 +379,8 @@ chelp-
       endif
       outfileNVALID(1:) = outfile(1:nchar(outfile))//'.NVALID.MAP.FITS'
       QU_linecutfile(1:) = outfile(1:nchar(outfile))//'.QU.linecut'
-        badchan_file(1:) = badchan_file(1:nchar(badchan_file))
+        global_badchan_file(1:) = global_badchan_file(
+     -                       1:nchar(global_badchan_file))
 
       ! Bad channels will be read after cube dimensions are known
                         nbad_chan = 0
@@ -715,11 +730,13 @@ chelp-
 
       ! Read the bad channel list now that nz_totpix is known
       if(remove_badchan)then
-              open(71,file=badchan_file(1:nchar(badchan_file)),
+              open(71,file=global_badchan_file(
+     -                 1:nchar(global_badchan_file)),
      -             status='old',iostat=ios_mem)
               if(ios_mem .ne. 0)then
                       write(*,*)"Error opening bad channel file:"
-                      write(*,*)badchan_file(1:nchar(badchan_file))
+                      write(*,*)global_badchan_file(
+     -                         1:nchar(global_badchan_file))
                       write(*,*)"Skipping bad channel flagging."
                       remove_badchan = .false.
               else
@@ -742,6 +759,11 @@ chelp-
                       close(71)
               endif
       endif
+
+      masksrc_key = 'generated'
+      if(use_input_mask)masksrc_key = 'input'
+      if(use_input_mask .and. remove_badchan .and.
+     -   nbad_chan.gt.0)masksrc_key = 'combined'
 
         if(mod(nx_totpix,2) .eq. 0)then   
                 nxc = nx_totpix/2
@@ -978,10 +1000,14 @@ chelp-
       out_ang_open = .false.
       out_mask_open = .false.
       out_nvalid_open = .false.
+      in_mask_open = .false.
+      use_input_mask = .false.
       masksrc_key = 'generated'
-      if(nchar(mask_cube_file).gt.0)masksrc_key = 'input'
-      if(nchar(mask_badchan_file).gt.0 .and.
-     -   nchar(mask_cube_file).gt.0)masksrc_key = 'combined'
+      if(nchar(mask_input_cube_file).gt.0)then
+              use_input_mask = .true.
+              masksrc_key = 'input'
+      endif
+      if(remove_badchan .and. use_input_mask)masksrc_key = 'combined'
       nanchk_key = 'on'
       nan_check_on = .true.
       if(index(mask_trust_mode,'strict').gt.0 .or.
@@ -1518,6 +1544,7 @@ chelp-
 
       allocate(specQ(tile_ra*tile_dec*nz_out))
       allocate(specU(tile_ra*tile_dec*nz_out))
+      if(use_input_mask)allocate(specMask(tile_ra*tile_dec*nz_out))
       if(need_icube)allocate(specI(tile_ra*tile_dec*nz_out))
       allocate(p_tile_arr(tile_ra*tile_dec*nrm_out))
       allocate(phi_tile_arr(tile_ra*tile_dec*nrm_out))
@@ -1928,6 +1955,19 @@ chelp-
       if(need_icube)then
               call FTOPEN(40,infileI,rwmode,blocksize,status)
       endif
+      if(use_input_mask)then
+              status = 0
+              call FTOPEN(45,mask_input_cube_file,
+     -                    rwmode,blocksize,status)
+              if(status.ne.0)then
+                      write(*,*)"Error opening input mask cube:"
+                      write(*,*)mask_input_cube_file(
+     -                         1:nchar(mask_input_cube_file))
+                      call printerror(status)
+                      stop
+              endif
+              in_mask_open = .true.
+      endif
 
       if(line_cut)then
               open(121,file='rm_spec.txt')
@@ -1964,6 +2004,10 @@ chelp-
      -                   nullval,specQ,anyflg,status)
             call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,
      -                   nullval,specU,anyflg,status)
+             if(use_input_mask)then
+                      call FTGSVE(45,group,naxis,naxes,fpixels,lpixels,
+     -                   incs,nullval,specMask,anyflg,status)
+             endif
             if(need_icube)then
                     call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,
      -                   incs,nullval,specI,anyflg,status)
@@ -1994,6 +2038,15 @@ chelp-
      -                         -incs(freq_axis)
                              cnt2 = cnt2 - 1
                              chan_valid = (flag_arr(i).eq.1)
+                             if(use_input_mask)then
+                                     tmp_index = ix_loc +
+     -                                  (iy_loc-1)*nx_tile +
+     -                                  (cnt2-1)*nx_tile*ny_tile
+                                     mask_val = specMask(tmp_index)
+                                     if(mask_val.le.0.5)then
+                                             chan_valid = .false.
+                                     endif
+                             endif
                              if(nan_check_on)then
                                      if(data_arrQ(cnt2).ne.
      -                                  data_arrQ(cnt2))then
@@ -2024,6 +2077,15 @@ chelp-
      -                         -incs(freq_axis)
                              cnt2 = cnt2 - 1
                              chan_valid = (flag_arr(i).eq.1)
+                             if(use_input_mask)then
+                                     tmp_index = ix_loc +
+     -                                  (iy_loc-1)*nx_tile +
+     -                                  (cnt2-1)*nx_tile*ny_tile
+                                     mask_val = specMask(tmp_index)
+                                     if(mask_val.le.0.5)then
+                                             chan_valid = .false.
+                                     endif
+                             endif
                              if(nan_check_on)then
                                      if(data_arrQ(cnt2).ne.
      -                                  data_arrQ(cnt2))then
@@ -2204,6 +2266,13 @@ chelp-
                       write(*,*)"FITS Icube..."
               endif
       endif
+      if(in_mask_open)then
+              call FTCLOS(45,status)
+              if (status .gt. 0)then
+                      write(*,*)"Problem closing input MASK-file"
+                      call printerror(status)
+              endif
+      endif
       write(*,*)" ================================"
       write(*,*)"      fac :",fac
       write(*,*)"ngood_chan: ", ngood_chan 
@@ -2233,6 +2302,7 @@ chelp-
       if(allocated(sin_arr)) deallocate(sin_arr)
       if(allocated(specQ)) deallocate(specQ)
       if(allocated(specU)) deallocate(specU)
+      if(allocated(specMask)) deallocate(specMask)
       if(allocated(specI)) deallocate(specI)
       if(allocated(p_tile_arr)) deallocate(p_tile_arr)
       if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)

@@ -494,14 +494,17 @@ contains
                              rem_mean, remove_qu_bias, resiQ, slopeQ, resiU, slopeU, &
                              path_I, infileI, ofac, fac, beg_rm, end_rm, nrm_out_par, &
                              use_auto_rm_range, output_mode, &
-                             ap_angle_mode, mask_cube_file, mask_badchan_file, &
+                             ap_angle_mode, mask_cube_file, &
+                             mask_input_cube_file, &
                              mask_trust_mode, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
     character(len=*), intent(inout) :: path, infileQ, infileU, outfile
     character(len=*), intent(inout) :: badchan_file, subim_parfile, path_I, infileI
-    character(len=*), intent(inout) :: mask_cube_file, mask_badchan_file, mask_trust_mode
+    character(len=*), intent(inout) :: mask_cube_file
+    character(len=*), intent(inout) :: mask_input_cube_file
+    character(len=*), intent(inout) :: mask_trust_mode
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -533,7 +536,8 @@ contains
     logical :: seen_use_auto_rm_range
     logical :: seen_output_mode
     logical :: seen_ap_angle_mode
-    logical :: seen_mask_cube_file, seen_mask_badchan_file, seen_mask_trust_mode
+    logical :: seen_mask_cube_file, seen_mask_input_cube_file
+    logical :: seen_mask_trust_mode
 
     status = 0
     line_no = 0
@@ -577,7 +581,7 @@ contains
     seen_output_mode = .false.
     seen_ap_angle_mode = .false.
     seen_mask_cube_file = .false.
-    seen_mask_badchan_file = .false.
+    seen_mask_input_cube_file = .false.
     seen_mask_trust_mode = .false.
 
     ! Defaults can be overridden by the config.
@@ -620,7 +624,7 @@ contains
     output_mode = 0
     ap_angle_mode = 0
     mask_cube_file = ''
-    mask_badchan_file = ''
+    mask_input_cube_file = ''
     mask_trust_mode = 'safe'
 
     unit_cfg = 11
@@ -686,9 +690,9 @@ contains
         end if
         seen_remove_badchan = .true.
         remove_badchan = flag_from_value(val)
-      case ('badchan_file')
+      case ('badchan_file', 'global_badchan_file')
         if (seen_badchan_file) then
-          write(*,*) 'Duplicate key in cfg at line ', line_no, ': badchan_file'
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': global_badchan_file'
           status = -105
           close(unit_cfg)
           return
@@ -1206,15 +1210,15 @@ contains
         end if
         seen_mask_cube_file = .true.
         mask_cube_file = trim(val)
-      case ('mask_badchan_file')
-        if (seen_mask_badchan_file) then
-          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_badchan_file'
+      case ('mask_input_cube_file')
+        if (seen_mask_input_cube_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_input_cube_file'
           status = -163
           close(unit_cfg)
           return
         end if
-        seen_mask_badchan_file = .true.
-        mask_badchan_file = trim(val)
+        seen_mask_input_cube_file = .true.
+        mask_input_cube_file = trim(val)
       case ('mask_trust_mode')
         if (seen_mask_trust_mode) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_trust_mode'
@@ -1266,7 +1270,7 @@ contains
       write(*,*) 'Missing required cfg key: remove_badchan'
       status = -137
     else if (.not. seen_badchan_file) then
-      write(*,*) 'Missing required cfg key: badchan_file'
+      write(*,*) 'Missing required cfg key: global_badchan_file'
       status = -138
     else if (.not. seen_subim) then
       write(*,*) 'Missing required cfg key: subim'
