@@ -35,9 +35,16 @@ def parse_threads(spec: str) -> List[int]:
 
 
 def run_one(exe: Path, cfg: Path, threads: int, cwd: Path, outbase: str) -> float:
-    amp = cwd / f"{outbase}.AMP.RMCUBE.FITS"
-    pha = cwd / f"{outbase}.PHA.RMCUBE.FITS"
-    for p in (amp, pha):
+    outputs = [
+        cwd / f"{outbase}.AMP.RMCUBE.FITS",
+        cwd / f"{outbase}.REAL.RMCUBE.FITS",
+        cwd / f"{outbase}.PHA.RMCUBE.FITS",
+        cwd / f"{outbase}.POLA.RMCUBE.FITS",
+        cwd / f"{outbase}.IMAG.RMCUBE.FITS",
+        cwd / f"{outbase}.MASK.CUBE.FITS",
+        cwd / f"{outbase}.NVALID.MAP.FITS",
+    ]
+    for p in outputs:
         if p.exists():
             p.unlink()
 
