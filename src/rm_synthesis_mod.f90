@@ -478,11 +478,11 @@ contains
 
       do cnt2 = 1, nz_out
         iz = nz_out - cnt2 + 1
-        tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (cnt2 - 1) * nx_tile * ny_tile
+        tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (iz - 1) * nx_tile * ny_tile
 
         q_now = specQ(tmp_index)
         u_now = specU(tmp_index)
-        chan_valid = (flag_arr(iz) == 1)
+        chan_valid = (flag_arr(cnt2) == 1)
 
         if (use_input_mask) then
           mask_val = specMask(tmp_index)
