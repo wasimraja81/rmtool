@@ -442,6 +442,7 @@ contains
     integer(int32) :: ipix, ix_loc, iy_loc, pix_base
     integer(int32) :: i, iz, cnt2, tmp_index, kk
     integer(int32) :: ngood_chan, cnt_good, nvalid_pix
+    integer(int32) :: gpu_num_teams, gpu_thread_limit
     logical :: chan_valid
     real(sp) :: mask_val, q_now, u_now
     real(sp) :: slopeQ_run, slopeU_run
@@ -452,9 +453,12 @@ contains
 
     slopeQ_run = slopeQ
     slopeU_run = slopeU
+    gpu_num_teams = 1
+    gpu_thread_limit = 1
 
 #ifdef USE_GPU
-    !$omp target teams distribute parallel do if(use_gpu_actual) &
+  !$omp target teams distribute if(use_gpu_actual) &
+    !$omp num_teams(gpu_num_teams) thread_limit(gpu_thread_limit) &
     !$omp map(to:specQ,specU,specMask,specI,flag_arr,cos_arr,sin_arr, &
     !$omp        remove_qu_bias,use_input_mask,nan_check_on,resiQ,resiU, &
     !$omp        rem_mean,output_mode,ap_angle_mode,nx_tile,ny_tile,nz_out,nrm_out) &
@@ -615,7 +619,7 @@ contains
       end do
     end do
 #ifdef USE_GPU
-    !$omp end target teams distribute parallel do
+    !$omp end target teams distribute
 #else
     !$omp end parallel do
 #endif
