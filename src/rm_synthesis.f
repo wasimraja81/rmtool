@@ -242,6 +242,11 @@ chelp-
 
 
       pi = acos(-1.0d0)
+      ! Initialise logicals early to prevent undefined-variable reads
+      ! before the rwmode section sets them properly later.
+      use_input_mask = .false.
+      in_mask_open   = .false.
+      nan_check_on   = .true.
 !-------------------------------------------------------------------
       ! SANITY CHECKS:
       ! Compare the files containing the Q and U Cubes
@@ -1525,8 +1530,8 @@ chelp-
       allocate(RM(nrm_out))
       allocate(p_ex(nrm_out))
       allocate(phi_ex(nrm_out))
-      allocate(cos_arr(nrm_out, ngood_chan))
-      allocate(sin_arr(nrm_out, ngood_chan))
+      allocate(cos_arr(ngood_chan, nrm_out))
+      allocate(sin_arr(ngood_chan, nrm_out))
 
       call extract_general_setup(L_sq,ngood_chan,fac,beg_rm,end_rm,
      -  nrm_out,RM,cos_arr,sin_arr,nrm_out,ngood_chan,
@@ -2241,11 +2246,9 @@ chelp-
             call tile_extract_gpu(specQ,specU,specMask,specI,
      -           flag_arr_out,cos_arr,sin_arr,Q_tile,U_tile,wts_tile,
      -           ngood_tile,p_tile_arr,phi_tile_arr,mask_tile_arr,
-     -           nvalid_tile_arr,nx_tile,ny_tile,nz_out,nrm_out,
-     -           use_gpu_actual,
-     -           remove_qu_bias,use_input_mask,nan_check_on,
-     -           resiQ,slopeQ,resiU,slopeU,rem_mean,
-     -           output_mode,ap_angle_mode)
+     -           nvalid_tile_arr,nx_tile,ny_tile,nz_out,ngood_chan,
+     -           nrm_out,use_gpu_actual,use_input_mask,nan_check_on,
+     -           rem_mean,output_mode,ap_angle_mode)
 
             do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)

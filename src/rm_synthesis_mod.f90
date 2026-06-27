@@ -407,28 +407,39 @@ contains
 
   subroutine tile_extract_gpu(specQ, specU, specMask, specI, flag_arr, cos_arr, sin_arr, &
                               Q_tile, U_tile, wts_tile, ngood_tile, p_tile_arr, phi_tile_arr, &
-                              mask_tile_arr, nvalid_tile_arr, nx_tile, ny_tile, nz_out, nrm_out, &
+                              mask_tile_arr, nvalid_tile_arr, &
+                              nx_tile, ny_tile, nz_out, n_chan_tmpl, nrm_out, &
                               use_gpu_actual, &
-                              remove_qu_bias, use_input_mask, nan_check_on, resiQ, slopeQ, &
-                              resiU, slopeU, rem_mean, output_mode, ap_angle_mode)
-    !! CPU Step-2 extraction kernel over a flat pixel index.
-    !! Keeps per-pixel channel selection and RM extraction logic together,
-    !! preparing this region for a later OpenMP target offload path.
+                              use_input_mask, nan_check_on, rem_mean, output_mode, ap_angle_mode)
+    !! CPU/GPU extraction kernel over a flat pixel index.
+    !!
+    !! Weight-based channel handling:
+    !!   - Globally-bad channels (flag_arr==0) are skipped — they have no template entry.
+    !!   - Per-pixel bad channels (NaN or mask cube) get wts_tile=0 and contribute zero
+    !!     to the DFT sums. The template dimension n_chan_tmpl is therefore FIXED for all
+    !!     pixels and no dense packing is required.
+    !!
+    !! cos/sin templates are explicit-shape (n_chan_tmpl, nrm_out), matching the storage
+    !! layout written by extract_general_setup (channel as leading dimension).
+    !!
+    !! ngood_tile(ipix) stores n_chan_tmpl (fixed) so the calling code can size line-cut
+    !! writes; nvalid_tile_arr stores the per-pixel valid-channel count.
+    !!
+    !! specI is accepted but currently unused (reserved for future bias removal).
     implicit none
 
-    integer(int32), intent(in) :: nx_tile, ny_tile, nz_out, nrm_out
+    integer(int32), intent(in) :: nx_tile, ny_tile, nz_out, n_chan_tmpl, nrm_out
     integer(int32), intent(in) :: rem_mean, output_mode, ap_angle_mode
     logical, intent(in) :: use_gpu_actual
-    logical, intent(in) :: remove_qu_bias, use_input_mask, nan_check_on
-    real(sp), intent(in) :: resiQ, resiU
-    real(sp), intent(inout) :: slopeQ, slopeU
+    logical, intent(in) :: use_input_mask, nan_check_on
 
     real(sp), intent(in) :: specQ(nx_tile*ny_tile*nz_out)
     real(sp), intent(in) :: specU(nx_tile*ny_tile*nz_out)
     real(sp), intent(in) :: specMask(nx_tile*ny_tile*nz_out)
     real(sp), intent(in) :: specI(nx_tile*ny_tile*nz_out)
     integer(int32), intent(in) :: flag_arr(nz_out)
-    real(sp), intent(in) :: cos_arr(:, :), sin_arr(:, :)
+    real(sp), intent(in) :: cos_arr(n_chan_tmpl, nrm_out)
+    real(sp), intent(in) :: sin_arr(n_chan_tmpl, nrm_out)
 
     real(sp), intent(inout) :: Q_tile(nx_tile*ny_tile*nz_out)
     real(sp), intent(inout) :: U_tile(nx_tile*ny_tile*nz_out)
@@ -440,109 +451,114 @@ contains
     integer(int16), intent(inout) :: nvalid_tile_arr(nx_tile*ny_tile)
 
     integer(int32) :: ipix, ix_loc, iy_loc, pix_base
-    integer(int32) :: i, iz, cnt2, tmp_index, kk
-    integer(int32) :: ngood_chan, cnt_good, nvalid_pix
-    integer(int32) :: gpu_num_teams, gpu_thread_limit
-    logical :: chan_valid
+    integer(int32) :: i, iz, cnt2, kk, tmp_index
+    integer(int32) :: nvalid_pix
+    logical :: per_pix_valid
     real(sp) :: mask_val, q_now, u_now
-    real(sp) :: slopeQ_run, slopeU_run
     real(sp) :: rc_cor, rs_cor, ic_cor, is_cor
     real(sp) :: ryw_tmp, iyw_tmp, wsum, mean_q, mean_u
     real(sp) :: q_eff, u_eff
     real(sp) :: p_ex(nrm_out), phi_ex(nrm_out)
 
-    slopeQ_run = slopeQ
-    slopeU_run = slopeU
-    gpu_num_teams = 1
-    gpu_thread_limit = 1
-
 #ifdef USE_GPU
-  !$omp target teams distribute if(use_gpu_actual) &
-    !$omp num_teams(gpu_num_teams) thread_limit(gpu_thread_limit) &
-    !$omp map(to:specQ,specU,specMask,specI,flag_arr,cos_arr,sin_arr, &
-    !$omp        remove_qu_bias,use_input_mask,nan_check_on,resiQ,resiU, &
-    !$omp        rem_mean,output_mode,ap_angle_mode,nx_tile,ny_tile,nz_out,nrm_out) &
-    !$omp map(tofrom:Q_tile,U_tile,wts_tile,ngood_tile,p_tile_arr,phi_tile_arr, &
-    !$omp            mask_tile_arr,nvalid_tile_arr,slopeQ_run,slopeU_run)
+    !$omp target teams distribute parallel do if(use_gpu_actual)     &
+    !$omp     map(to: specQ, specU, specMask, specI, flag_arr,        &
+    !$omp             cos_arr, sin_arr,                               &
+    !$omp             use_input_mask, nan_check_on,                   &
+    !$omp             rem_mean, output_mode, ap_angle_mode,           &
+    !$omp             nx_tile, ny_tile, nz_out, n_chan_tmpl, nrm_out) &
+    !$omp     map(tofrom: Q_tile, U_tile, wts_tile, ngood_tile,       &
+    !$omp                 p_tile_arr, phi_tile_arr,                   &
+    !$omp                 mask_tile_arr, nvalid_tile_arr)              &
+    !$omp     private(ipix, ix_loc, iy_loc, pix_base,                 &
+    !$omp             cnt2, iz, kk, tmp_index,                        &
+    !$omp             q_now, u_now, per_pix_valid, mask_val,          &
+    !$omp             nvalid_pix, wsum, mean_q, mean_u,               &
+    !$omp             rc_cor, rs_cor, ic_cor, is_cor,                 &
+    !$omp             ryw_tmp, iyw_tmp, q_eff, u_eff,                 &
+    !$omp             p_ex, phi_ex, i)
 #else
-    !$omp parallel do default(none) private(ipix,ix_loc,iy_loc,pix_base,i,iz,cnt2,tmp_index,kk,ngood_chan,cnt_good,nvalid_pix,chan_valid,mask_val,q_now,u_now,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp,wsum,mean_q,mean_u,q_eff,u_eff,p_ex,phi_ex) &
-    !$omp shared(nx_tile,ny_tile,nz_out,nrm_out,specQ,specU,specMask,specI,flag_arr,cos_arr,sin_arr,Q_tile,U_tile,wts_tile,ngood_tile,p_tile_arr,phi_tile_arr,mask_tile_arr,nvalid_tile_arr,remove_qu_bias,use_input_mask,nan_check_on,resiQ,resiU,rem_mean,output_mode,ap_angle_mode,slopeQ_run,slopeU_run)
+    !$omp parallel do default(none)                                   &
+    !$omp     private(ipix, ix_loc, iy_loc, pix_base,                 &
+    !$omp             cnt2, iz, kk, tmp_index,                        &
+    !$omp             q_now, u_now, per_pix_valid, mask_val,          &
+    !$omp             nvalid_pix, wsum, mean_q, mean_u,               &
+    !$omp             rc_cor, rs_cor, ic_cor, is_cor,                 &
+    !$omp             ryw_tmp, iyw_tmp, q_eff, u_eff,                 &
+    !$omp             p_ex, phi_ex, i)                                &
+    !$omp     shared(nx_tile, ny_tile, nz_out, n_chan_tmpl, nrm_out,  &
+    !$omp            specQ, specU, specMask, specI, flag_arr,          &
+    !$omp            cos_arr, sin_arr, Q_tile, U_tile, wts_tile,      &
+    !$omp            ngood_tile, p_tile_arr, phi_tile_arr,             &
+    !$omp            mask_tile_arr, nvalid_tile_arr,                   &
+    !$omp            use_input_mask, nan_check_on,                     &
+    !$omp            rem_mean, output_mode, ap_angle_mode)
 #endif
     do ipix = 1, nx_tile*ny_tile
       iy_loc = ((ipix - 1) / nx_tile) + 1
       ix_loc = ipix - (iy_loc - 1) * nx_tile
       pix_base = (ipix - 1) * nz_out
 
-      ngood_chan = 0
-      cnt_good = 0
-
+      ! --- Channel selection: fixed-length weight-based loop ---
+      ! Globally-bad channels (flag_arr==0) are skipped; their mask entry is set to 0.
+      ! Per-pixel bad channels (NaN/mask) are included in the tile but with wts=0.
+      ! Template index kk advances only for globally-good channels — it always maps
+      ! to the same lambda^2 as cos_arr(kk,i), regardless of per-pixel masking.
+      kk = 0
+      nvalid_pix = 0
       do cnt2 = 1, nz_out
         iz = nz_out - cnt2 + 1
         tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (iz - 1) * nx_tile * ny_tile
 
-        q_now = specQ(tmp_index)
-        u_now = specU(tmp_index)
-        chan_valid = (flag_arr(cnt2) == 1)
+        if (flag_arr(cnt2) == 1) then
+          kk = kk + 1
+          q_now = specQ(tmp_index)
+          u_now = specU(tmp_index)
 
-        if (use_input_mask) then
-          mask_val = specMask(tmp_index)
-          if (mask_val <= 0.5_sp) chan_valid = .false.
-        end if
-
-        if (nan_check_on) then
-          if (q_now /= q_now) chan_valid = .false.
-          if (u_now /= u_now) chan_valid = .false.
-        end if
-
-        if (chan_valid) then
-          ngood_chan = ngood_chan + 1
-          cnt_good = cnt_good + 1
-
-          if (remove_qu_bias) then
-            if (q_now >= resiQ) then
-              slopeQ_run = slopeQ_run
-            else
-              slopeQ_run = -slopeQ_run
-            end if
-            if (u_now >= resiU) then
-              slopeU_run = slopeU_run
-            else
-              slopeU_run = -slopeU_run
-            end if
-            Q_tile(pix_base + ngood_chan) = q_now - (specI(tmp_index) * slopeQ_run + resiQ)
-            U_tile(pix_base + ngood_chan) = u_now - (specI(tmp_index) * slopeU_run + resiU)
-          else
-            Q_tile(pix_base + ngood_chan) = q_now
-            U_tile(pix_base + ngood_chan) = u_now
+          per_pix_valid = .true.
+          if (use_input_mask) then
+            mask_val = specMask(tmp_index)
+            if (mask_val <= 0.5_sp) per_pix_valid = .false.
+          end if
+          if (nan_check_on) then
+            if (q_now /= q_now) per_pix_valid = .false.
+            if (u_now /= u_now) per_pix_valid = .false.
           end if
 
-          wts_tile(pix_base + ngood_chan) = 1.0_sp
-          mask_tile_arr(tmp_index) = 1
+          Q_tile(pix_base + kk) = q_now
+          U_tile(pix_base + kk) = u_now
+          wts_tile(pix_base + kk) = merge(1.0_sp, 0.0_sp, per_pix_valid)
+          mask_tile_arr(tmp_index) = merge(1_int8, 0_int8, per_pix_valid)
+          if (per_pix_valid) nvalid_pix = nvalid_pix + 1
         else
-          mask_tile_arr(tmp_index) = 0
+          mask_tile_arr(tmp_index) = 0_int8
         end if
       end do
 
-      nvalid_pix = cnt_good
-      ngood_tile(ipix) = ngood_chan
-      nvalid_tile_arr(ix_loc + (iy_loc - 1) * nx_tile) = nvalid_pix
+      ! ngood_tile stores n_chan_tmpl (same for every pixel) for line-cut sizing.
+      ! nvalid_tile_arr stores the per-pixel count of actually valid (wts>0) channels.
+      ngood_tile(ipix) = n_chan_tmpl
+      nvalid_tile_arr(ix_loc + (iy_loc - 1) * nx_tile) = int(nvalid_pix, kind=int16)
 
-      if (ngood_chan <= 0) then
+      ! Sum of weights — used for early exit and normalisation
+      wsum = 0.0_sp
+      do kk = 1, n_chan_tmpl
+        wsum = wsum + wts_tile(pix_base + kk)
+      end do
+
+      if (wsum <= 0.0_sp) then
         do i = 1, nrm_out
           p_ex(i) = 0.0_sp
           phi_ex(i) = 0.0_sp
         end do
       else
-#ifdef USE_GPU
-        wsum = 0.0_sp
-        do kk = 1, ngood_chan
-          wsum = wsum + wts_tile(pix_base + kk)
-        end do
 
+#ifdef USE_GPU
+        ! Hoist weighted mean once before the RM loop (branch-free inner reduction)
         mean_q = 0.0_sp
         mean_u = 0.0_sp
-        if (rem_mean > 0 .and. wsum > 0.0_sp) then
-          do kk = 1, ngood_chan
+        if (rem_mean > 0) then
+          do kk = 1, n_chan_tmpl
             mean_q = mean_q + wts_tile(pix_base + kk) * Q_tile(pix_base + kk)
             mean_u = mean_u + wts_tile(pix_base + kk) * U_tile(pix_base + kk)
           end do
@@ -550,36 +566,24 @@ contains
           mean_u = mean_u / wsum
         end if
 
+        ! Inline weighted DFT (GPU path — no subroutine call inside target region)
         do i = 1, nrm_out
           rc_cor = 0.0_sp
           rs_cor = 0.0_sp
           ic_cor = 0.0_sp
           is_cor = 0.0_sp
-          do kk = 1, ngood_chan
-            if (rem_mean > 0 .and. wsum > 0.0_sp) then
-              q_eff = Q_tile(pix_base + kk) - mean_q
-              u_eff = U_tile(pix_base + kk) - mean_u
-            else
-              q_eff = Q_tile(pix_base + kk)
-              u_eff = U_tile(pix_base + kk)
-            end if
+          do kk = 1, n_chan_tmpl
+            q_eff = Q_tile(pix_base + kk) - mean_q
+            u_eff = U_tile(pix_base + kk) - mean_u
             rc_cor = rc_cor + wts_tile(pix_base + kk) * q_eff * cos_arr(kk, i)
             rs_cor = rs_cor + wts_tile(pix_base + kk) * q_eff * sin_arr(kk, i)
             ic_cor = ic_cor + wts_tile(pix_base + kk) * u_eff * cos_arr(kk, i)
             is_cor = is_cor + wts_tile(pix_base + kk) * u_eff * sin_arr(kk, i)
           end do
-
-          if (wsum > 0.0_sp) then
-            rc_cor = rc_cor / wsum
-            rs_cor = rs_cor / wsum
-            ic_cor = ic_cor / wsum
-            is_cor = is_cor / wsum
-          else
-            rc_cor = 0.0_sp
-            rs_cor = 0.0_sp
-            ic_cor = 0.0_sp
-            is_cor = 0.0_sp
-          end if
+          rc_cor = rc_cor / wsum
+          rs_cor = rs_cor / wsum
+          ic_cor = ic_cor / wsum
+          is_cor = is_cor / wsum
 
           ryw_tmp = rc_cor - is_cor
           iyw_tmp = rs_cor + ic_cor
@@ -589,20 +593,22 @@ contains
           else
             p_ex(i) = sqrt(ryw_tmp**2 + iyw_tmp**2)
             phi_ex(i) = atan2(iyw_tmp, ryw_tmp)
-            if (ap_angle_mode == 1) then
-              phi_ex(i) = 0.5_sp * phi_ex(i)
-            end if
+            if (ap_angle_mode == 1) phi_ex(i) = 0.5_sp * phi_ex(i)
           end if
         end do
 #else
+        ! CPU path: delegate to existing weighted extraction subroutines.
+        ! Mean removal is handled internally by extract_general_w / extract_general_ri_w.
         if (output_mode == 1) then
           call extract_general_ri_w(Q_tile(pix_base + 1), U_tile(pix_base + 1), &
-                                    wts_tile(pix_base + 1), ngood_chan, nrm_out, p_ex, phi_ex, &
-                                    cos_arr, sin_arr, nrm_out, ngood_chan, rem_mean)
+                                    wts_tile(pix_base + 1), n_chan_tmpl, nrm_out, &
+                                    p_ex, phi_ex, cos_arr, sin_arr, &
+                                    nrm_out, n_chan_tmpl, rem_mean)
         else
           call extract_general_w(Q_tile(pix_base + 1), U_tile(pix_base + 1), &
-                                 wts_tile(pix_base + 1), ngood_chan, nrm_out, p_ex, phi_ex, &
-                                 cos_arr, sin_arr, nrm_out, ngood_chan, rem_mean)
+                                 wts_tile(pix_base + 1), n_chan_tmpl, nrm_out, &
+                                 p_ex, phi_ex, cos_arr, sin_arr, &
+                                 nrm_out, n_chan_tmpl, rem_mean)
           if (ap_angle_mode == 1) then
             do i = 1, nrm_out
               phi_ex(i) = 0.5_sp * phi_ex(i)
@@ -619,13 +625,11 @@ contains
       end do
     end do
 #ifdef USE_GPU
-    !$omp end target teams distribute
+    !$omp end target teams distribute parallel do
 #else
     !$omp end parallel do
 #endif
 
-    slopeQ = slopeQ_run
-    slopeU = slopeU_run
   end subroutine tile_extract_gpu
 
   subroutine compute_mean(arr, n, mean_val)

@@ -1,0 +1,26 @@
+# Template cfg for RM-synthesis validation tests.
+# Placeholders __DATADIR__, __OUTPREFIX__, __USE_GPU__ are filled by run_tests.sh.
+path                = __DATADIR__/
+infileQ             = TEST.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE
+outfile             = __OUTPREFIX__
+remove_badchan      = n
+global_badchan_file = /dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0
+slopeQ              = 0.0
+resiU               = 0.0
+slopeU              = 0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = n
+write_nvalid_output = n
+use_gpu             = __USE_GPU__
