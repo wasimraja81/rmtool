@@ -1,0 +1,130 @@
+ No bias removal from Q and U...
+  ========================================
+  RM Extraction Parameters from Config:
+  write_mask_output: n
+  write_nvalid_output: n
+  use_gpu: n
+  use_gpu_actual: n
+  output_mode: ap
+  ofac:            1
+  fac:     3.14159274    
+  use_auto_rm_range:            0
+  ap_angle_mode: phase
+  beg_rm:   -50.0000000    
+  end_rm:    50.0000000    
+  nrm:          201
+  nrm_out (nrm*ofac):          201
+  ========================================
+ Q-cube opened:/home/wasim/softwares/rmtool/tests/data/TEST.Q.FITSCUBE
+       bitpixQ:         -32
+        naxisQ:           4
+  
+    ref. x-val:   180.000000    
+    ref. x-pix:          17
+          xinc:  -1.00000005E-03
+  
+    ref. y-val:   0.00000000    
+    ref. y-pix:          17
+          yinc:   1.00000005E-03
+  
+    ref. z-val:   550000000.    
+    ref. z-pix:           1
+          zinc:   1000000.00    
+  
+         cubeQ: T
+    freq-axisQ:           3
+       message:basic info-extraction okay!
+ naxesQ(           1 ) =           32
+ naxesQ(           2 ) =           32
+ naxesQ(           3 ) =          200
+ naxesQ(           4 ) =            1
+ U-cube opened:/home/wasim/softwares/rmtool/tests/data/TEST.U.FITSCUBE
+       bitpixU:         -32
+        naxisU:           4
+  
+    ref. x-val:   180.000000    
+    ref. x-pix:          17
+          xinc:  -1.00000005E-03
+  
+    ref. y-val:   0.00000000    
+    ref. y-pix:          17
+          yinc:   1.00000005E-03
+  
+    ref. z-val:   550000000.    
+    ref. z-pix:           1
+          zinc:   1000000.00    
+  
+         cubeU: T
+    freq-axisU:           3
+       message:basic info-extraction okay!
+ naxesU(           1 ) =           32
+ naxesU(           2 ) =           32
+ naxesU(           3 ) =          200
+ naxesU(           4 ) =            1
+ Beginning sanity checks...
+  
+  
+ Q and U-Cubes seem compatible.
+ We will proceed with the tomography now...
+  
+ ! -----------------------------------------------
+ ! Final sanity checks...
+ ! Reference-pixel conventions are validated below.
+ ! -----------------------------------------------
+ ------------------------------
+            WARNING            
+ centre z-pixel is offset from 
+ actual centre of the image... 
+  
+ Total z-pixels in image:          200
+ Expected z-centre :          100 or         101
+ Found z-centre at :            1
+  
+ Proceed with the fact that the
+ z-reference pix is offset from
+ the centre of image... 
+  
+ Sanity checks performed successfully...
+  
+  
+ Q-infile chosen:/home/wasim/softwares/rmtool/tests/data/TEST.Q.FITSCUBE
+ U-infile chosen:/home/wasim/softwares/rmtool/tests/data/TEST.U.FITSCUBE
+  
+ Entire Q and U-cubes will be used...
+  
+ reference-frequency:    550000000.    
+ Assuming frequency in Hz
+  
+  
+ Tile planner (Phase-2):
+  MemAvailable(kB):              55801132
+  tile_mem_frac:   0.250000000    
+  tile_ra x tile_dec (output px):           32          32
+  Estimated tile memory (MB):    3.1328125000000000     
+ xpix-beg,xpix-end,inc:            1          32           1
+ ypix-beg,ypix-end,inc:            1          32           1
+ zpix-beg,zpix-end,inc:            1         200           1
+  
+ Successfully read and closed FITS Qcube...
+ Successfully read and closed FITS Ucube...
+ Doing tile x:[           1 ,          32 ] y:[           1 ,          32 ]
+ Progress:           10 % (         102  out of         1024 )
+ Progress:           20 % (         204  out of         1024 )
+ Progress:           30 % (         306  out of         1024 )
+ Progress:           40 % (         408  out of         1024 )
+ Progress:           50 % (         510  out of         1024 )
+ Progress:           60 % (         612  out of         1024 )
+ Progress:           70 % (         714  out of         1024 )
+ Progress:           80 % (         816  out of         1024 )
+ Progress:           90 % (         918  out of         1024 )
+ Progress:          100 % (        1020  out of         1024 )
+ Successfully read and closed FITS Qcube...
+ Successfully read and closed FITS Ucube...
+  ================================
+       fac :   3.14159274    
+ ngood_chan:          200
+    nRM_out:          201
+       cnt1:         1024
+        RM1:   -50.0000000    
+        RM2:    50.0000000    
+        dRM:   0.500000000    
