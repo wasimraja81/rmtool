@@ -80,7 +80,6 @@ chelp-
       !
 
       use rm_synthesis_mod
-      use omp_lib, only: omp_get_num_devices
       implicit none
       
       
@@ -198,7 +197,6 @@ chelp-
       logical   nan_check_on, chan_valid
       logical   use_input_mask, in_mask_open
       logical   use_gpu_actual
-      integer   gpu_devices
       real(sp)  mask_val
       integer   in_fields
       integer   mem_unit, ios_mem
@@ -334,19 +332,10 @@ chelp-
       endif
 
       use_gpu_actual = .false.
-      gpu_devices = 0
       if(use_gpu)then
 #ifdef USE_GPU
-              gpu_devices = omp_get_num_devices()
-              if(gpu_devices.gt.0)then
-                      use_gpu_actual = .true.
-                      write(*,*)"GPU enabled (OpenMP targets): ",
-     -                     gpu_devices
-              else
-                      write(*,*)"WARNING: use_gpu requested but no "
-                      write(*,*)"OpenMP target devices found; "
-                      write(*,*)"falling back to CPU."
-              endif
+              use_gpu_actual = .true.
+              write(*,*)"GPU requested: attempting OpenMP offload."
 #else
               write(*,*)"WARNING: use_gpu requested but this binary "
               write(*,*)"was built without USE_GPU; "

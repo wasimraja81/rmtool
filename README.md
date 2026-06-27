@@ -7,6 +7,7 @@ RM (Rotation Measure) synthesis tools for analyzing polarized radio observations
 - **Config-driven RM synthesis** — Use flexible KEY=VALUE configuration files
 - **Subimage support** — Extract and process spatial/spectral subsets via config parameters
 - **FITS I/O** — Native support for FITS format using CFITSIO
+- **GPU offload toggle** — Enable OpenMP target offload with `use_gpu=y` in config
 - **Dual build systems** — Makefile for development, CMake for distribution
 - **Fortran 77/90** — High-performance numerical code
 
@@ -62,6 +63,7 @@ remove_badchan = n          # Remove channels with RFI (y/n)
 badchan_file = unused.txt   # File listing bad channels
 rem_mean = 0                # Remove mean Q/U (0 or 1)
 remove_qu_bias = n          # Remove I-based bias from Q/U (y/n)
+use_gpu = n                 # GPU offload request (y/n). Alias: use_gpus
 output_mode = ap            # Output format: ap (amp+phase) or ri (real+imag)
 ap_angle_mode = phase       # Phase mode: phase (arg) or pol (0.5*arg)
 
@@ -89,6 +91,29 @@ infileI = I_cube.fits
 ```
 
 For complete documentation, see [cfg/CONFIG_README.md](cfg/CONFIG_README.md).
+
+## GPU Runtime Behavior
+
+- `use_gpu=n` runs host execution.
+- `use_gpu=y` requests GPU execution when running a GPU-capable binary (`make GPU=1`).
+- If `use_gpu=y` is used with a CPU-only binary, the run prints a warning and falls back to CPU.
+
+Useful runtime env vars for GPU runs:
+
+```bash
+OMP_TARGET_OFFLOAD=MANDATORY   # fail if offload cannot run
+OMP_DEFAULT_DEVICE=0           # choose target device
+```
+
+Build examples:
+
+```bash
+# CPU-only OpenMP binary
+make GPU=0 OMP=1
+
+# GPU/offload-capable binary
+make GPU=1
+```
 
 **Output Files:**
 - `AP + phase mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.PHA.RMCUBE.FITS`
