@@ -168,10 +168,16 @@ if [[ "${USE_GPU_MODE}" == "y" ]]; then
 fi
 /usr/bin/time -v "${EXE}" "${CFG_ARG}"
 
-if [[ ! -s "${OUT_FILE_1}" || ! -s "${OUT_FILE_2}" ]]; then
-  echo "[runFile] ERROR: run did not produce expected output cubes." >&2
-  echo "[runFile] Expected: ${PWD}/${OUT_FILE_1} and ${PWD}/${OUT_FILE_2}" >&2
-  exit 2
-fi
+DRY_RUN_CFG="$(awk -F= '/^dry_run[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print tolower($2); exit}' "${CFG_PATH}")"
 
-echo "[runFile] Test run finished."
+if [[ "${DRY_RUN_CFG}" == "y" || "${DRY_RUN_CFG}" == "yes" || "${DRY_RUN_CFG}" == "1" ]]; then
+  echo "[runFile] Dry-run mode: no output cubes expected."
+  echo "[runFile] Dry-run finished. Check scratch/tile_autotune.cfg and scratch/runtime_estimate.txt"
+else
+  if [[ ! -s "${OUT_FILE_1}" || ! -s "${OUT_FILE_2}" ]]; then
+    echo "[runFile] ERROR: run did not produce expected output cubes." >&2
+    echo "[runFile] Expected: ${PWD}/${OUT_FILE_1} and ${PWD}/${OUT_FILE_2}" >&2
+    exit 2
+  fi
+  echo "[runFile] Test run finished."
+fi
