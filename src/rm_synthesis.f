@@ -1584,6 +1584,12 @@ chelp-
 
       !----------------------------------------------------
       ! Tile planning for memory-efficient cube processing.
+      ! Budget is a fraction (mem_frac_ram) of TOTAL system RAM, not the
+      ! instantaneously-available RAM. This makes the chosen tile size
+      ! deterministic for a given config/cube (reproducible across runs)
+      ! rather than fluctuating with whatever else the machine is doing.
+      ! NOTE: on a busy/shared node, a large mem_frac_ram can over-commit
+      ! since memory used by other jobs is not subtracted here.
       mem_avail_kb = 0_int64
       mem_unit = 91
       open(mem_unit,file='/proc/meminfo',status='old',iostat=ios_mem)
@@ -1591,8 +1597,11 @@ chelp-
               do
                       read(mem_unit,'(A)',iostat=ios_mem) mem_line
                       if(ios_mem.ne.0)exit
-                      if(index(mem_line,'MemAvailable:').eq.1)then
-                              read(mem_line(14:),*,
+                      if(index(mem_line,'MemTotal:').eq.1)then
+                              ! Parse the integer after the colon; offset
+                              ! by the ':' position so the code is robust
+                              ! to the exact label length.
+                              read(mem_line(index(mem_line,':')+1:),*,
      -                             iostat=ios_mem) mem_kb_tmp
                               if(ios_mem.eq.0)mem_avail_kb = mem_kb_tmp
                               exit
@@ -1758,7 +1767,7 @@ chelp-
 
       write(*,*)" "
       write(*,*)"Tile planner (Phase-2):"
-      write(*,*)" MemAvailable(kB): ",mem_avail_kb
+      write(*,*)" MemTotal(kB): ",mem_avail_kb
       write(*,*)" mem_frac_ram: ",mem_frac_ram
       write(*,*)" tile_ra x tile_dec (RAM read px): ",tile_ra,tile_dec
       write(*,*)" Estimated RAM block memory (MB): ",
