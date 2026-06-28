@@ -1607,9 +1607,26 @@ chelp-
       in_fields = 2
       if(need_icube)in_fields = 3
 
+      ! Per-output-pixel memory budget. This MUST count every array that
+      ! is allocated at RAM-block scale, otherwise the planner picks a
+      ! tile that overflows physical RAM and the run aborts on allocate
+      ! (leaving 0-byte output cubes).
+      !
+      ! Allocated at tile_ra*tile_dec scale:
+      !   read spectra : specQ, specU [, specI][, specMask] = in_fields*nz
+      !                  (in_fields counts I-cube; add mask below)
+      !   work spectra : Q_tile, U_tile, wts_tile           = 3*nz
+      !   outputs      : p_tile_arr, phi_tile_arr           = 2*nrm
+      !   mask (int8)  : mask_tile_arr                       = nz bytes
+      ! Staging buffers (sized tile_ra*ny_sub, ny_sub<=tile_dec) are
+      ! budgeted conservatively as a full extra tile copy so the plan
+      ! never under-counts:
+      !   stQ,stU,stQwork,stUwork,stWts (5*nz) + stMaskOut (nz int8)
+      !   + stP,stPhi (2*nrm)
       bytes_per_tile_pixel = int(4,kind=int64)*
-     -      (int(in_fields,kind=int64)*int(nz_out,kind=int64) +
-     -       int(2*nrm_out,kind=int64))
+     -      (int(in_fields + 3 + 5,kind=int64)*int(nz_out,kind=int64) +
+     -       int(2 + 2,kind=int64)*int(nrm_out,kind=int64)) +
+     -      int(2,kind=int64)*int(nz_out,kind=int64)
         mem_safe_bytes = int(mem_frac_ram *
      -      real(mem_avail_kb,kind=dp) * 1024.0_dp,
      -      kind=int64)
@@ -1812,35 +1829,72 @@ chelp-
               goto 9999
       endif
 
-      allocate(specQ(tile_ra*tile_dec*nz_out))
-      allocate(specU(tile_ra*tile_dec*nz_out))
-      if(use_input_mask)allocate(specMask(tile_ra*tile_dec*nz_out))
-      if(need_icube)allocate(specI(tile_ra*tile_dec*nz_out))
-      allocate(p_tile_arr(tile_ra*tile_dec*nrm_out))
-      allocate(phi_tile_arr(tile_ra*tile_dec*nrm_out))
-      allocate(mask_tile_arr(tile_ra*tile_dec*nz_out))
-      allocate(nvalid_tile_arr(tile_ra*tile_dec))
-      allocate(ngood_tile(tile_ra*tile_dec))
-      allocate(Q_tile(tile_ra*tile_dec*nz_out))
-      allocate(U_tile(tile_ra*tile_dec*nz_out))
-      allocate(wts_tile(tile_ra*tile_dec*nz_out))
+      ! Allocate tile work arrays with an explicit status check. On a
+      ! memory-starved run (tile too big for physical RAM) a bare
+      ! allocate would abort and leave 0-byte output cubes; here we
+      ! fail loudly with guidance instead.
+      ios_mem = 0
+      allocate(specQ(tile_ra*tile_dec*nz_out),
+     -         specU(tile_ra*tile_dec*nz_out),
+     -         p_tile_arr(tile_ra*tile_dec*nrm_out),
+     -         phi_tile_arr(tile_ra*tile_dec*nrm_out),
+     -         mask_tile_arr(tile_ra*tile_dec*nz_out),
+     -         nvalid_tile_arr(tile_ra*tile_dec),
+     -         ngood_tile(tile_ra*tile_dec),
+     -         Q_tile(tile_ra*tile_dec*nz_out),
+     -         U_tile(tile_ra*tile_dec*nz_out),
+     -         wts_tile(tile_ra*tile_dec*nz_out),
+     -         stat=ios_mem)
+      if(ios_mem.eq.0 .and. use_input_mask)then
+              allocate(specMask(tile_ra*tile_dec*nz_out),stat=ios_mem)
+      endif
+      if(ios_mem.eq.0 .and. need_icube)then
+              allocate(specI(tile_ra*tile_dec*nz_out),stat=ios_mem)
+      endif
 
       ! Compact staging buffers sized to one VRAM sub-block (Dec strip).
       ! These hold a contiguous (nx_tile x ny_sub) region so the offload
       ! kernel maps a small, bounded array to device memory.
-      if(use_staging)then
-              allocate(stQ(tile_ra*ny_sub*nz_out))
-              allocate(stU(tile_ra*ny_sub*nz_out))
-              if(use_input_mask)allocate(stMask(tile_ra*ny_sub*nz_out))
-              if(need_icube)allocate(stI(tile_ra*ny_sub*nz_out))
-              allocate(stP(tile_ra*ny_sub*nrm_out))
-              allocate(stPhi(tile_ra*ny_sub*nrm_out))
-              allocate(stQwork(tile_ra*ny_sub*nz_out))
-              allocate(stUwork(tile_ra*ny_sub*nz_out))
-              allocate(stWts(tile_ra*ny_sub*nz_out))
-              allocate(stMaskOut(tile_ra*ny_sub*nz_out))
-              allocate(stNvalid(tile_ra*ny_sub))
-              allocate(stNgood(tile_ra*ny_sub))
+      if(ios_mem.eq.0 .and. use_staging)then
+              allocate(stQ(tile_ra*ny_sub*nz_out),
+     -                 stU(tile_ra*ny_sub*nz_out),
+     -                 stP(tile_ra*ny_sub*nrm_out),
+     -                 stPhi(tile_ra*ny_sub*nrm_out),
+     -                 stQwork(tile_ra*ny_sub*nz_out),
+     -                 stUwork(tile_ra*ny_sub*nz_out),
+     -                 stWts(tile_ra*ny_sub*nz_out),
+     -                 stMaskOut(tile_ra*ny_sub*nz_out),
+     -                 stNvalid(tile_ra*ny_sub),
+     -                 stNgood(tile_ra*ny_sub),
+     -                 stat=ios_mem)
+              if(ios_mem.eq.0 .and. use_input_mask)then
+                      allocate(stMask(tile_ra*ny_sub*nz_out),
+     -                         stat=ios_mem)
+              endif
+              if(ios_mem.eq.0 .and. need_icube)then
+                      allocate(stI(tile_ra*ny_sub*nz_out),stat=ios_mem)
+              endif
+      endif
+
+      if(ios_mem.ne.0)then
+              write(*,*)" "
+              write(*,*)"ERROR: Failed to allocate tile work arrays."
+              write(*,*)"Chosen tile too large for available RAM."
+              write(*,*)" tile_ra x tile_dec: ",tile_ra,tile_dec
+              write(*,*)" Estimated tile memory (MB): ",
+     -           real(tile_bytes_est,kind=dp)/(1024.0_dp*1024.0_dp)
+              write(*,*)"Lower mem_frac_ram in the cfg (e.g. 0.15), or"
+              write(*,*)"set tile_auto=n with a smaller tile_dec."
+              write(*,*)"Closing and removing any output files..."
+              ! Remove just-created (empty) output cubes so a failed run
+              ! does not leave behind 0-byte FITS files.
+              if(out_amp_open)call ftdelt(41,status)
+              if(out_ang_open)call ftdelt(42,status)
+              if(out_mask_open)call ftdelt(43,status)
+              if(out_nvalid_open)call ftdelt(44,status)
+              call FTCLOS(21,status)
+              call FTCLOS(22,status)
+              stop
       endif
 
 
