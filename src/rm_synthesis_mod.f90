@@ -1702,13 +1702,9 @@ contains
 
     integer(int32) :: unit_out, i
     integer(int64) :: tiles_x, tiles_y, total_tiles
-    integer(int64) :: tile_bytes_local
     real(dp) :: pix_dp, nchan_dp, nrm_dp
     real(dp) :: flops_total, flops_kernel, flops_per_term, flops_per_rm
     real(dp) :: gflops_rates(5), hours_est(5), seconds_est(5)
-    real(dp) :: mem_fracs(5)
-    real(dp) :: tile_scale, tile_side
-    integer(int32) :: tile_side_i
     character(len=16) :: mode_name
 
     status = 0
@@ -1775,34 +1771,22 @@ contains
     end do
 
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A)') 'User tiling advice from mem_frac_ram'
-    write(unit_out,'(A)') '-------------------------------------'
-    write(unit_out,'(A)') 'How to read this section:'
-    write(unit_out,'(A)') '- mem_frac is your config mem_frac_ram target.'
-    write(unit_out,'(A)') '- tile(x=y) is an equivalent square tile estimate for that mem_frac.'
-    write(unit_out,'(A)') '- total tiles is how many tiles cover the full output image.'
+    write(unit_out,'(A)') 'RAM read tiling (full-RA Dec strips)'
+    write(unit_out,'(A)') '------------------------------------'
+    write(unit_out,'(A)') 'The cube is read in full-RA Dec strips (RA is the'
+    write(unit_out,'(A)') 'contiguous FITS axis), sized so one strip fits the'
+    write(unit_out,'(A)') 'mem_frac_ram budget. These are the ACTUAL values for'
+    write(unit_out,'(A)') 'this run:'
+    write(unit_out,'(A,1X,F8.3)') '  mem_frac_ram:', mem_frac_ram
+    write(unit_out,'(A,1X,I0,1X,A,1X,I0)') '  RAM strip (RA x Dec) px:', &
+      tile_ra, 'x', tile_dec
+    write(unit_out,'(A,1X,ES12.5,1X,A)') '  RAM strip size:', &
+      real(tile_bytes_est,dp)/(1024.0_dp*1024.0_dp), 'MB'
+    write(unit_out,'(A,1X,I0)') '  Dec strips to cover image:', int(tiles_y)
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A,1X,F8.3)') 'Current mem_frac_ram:', mem_frac_ram
-    write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Current planner tile:', tile_ra, 'x', tile_dec
-    write(unit_out,'(A)') ' '
-    write(unit_out,'(A)') '   mem_frac   tile(x=y)   tile bytes     x-tiles   y-tiles   total'
-    mem_fracs = [0.05_dp, 0.10_dp, 0.20_dp, 0.30_dp, 0.40_dp]
-    do i = 1, size(mem_fracs)
-      tile_scale = sqrt(mem_fracs(i)/max(1.0e-6_dp, real(mem_frac_ram,dp)))
-      tile_side = tile_scale * sqrt(real(tile_ra*tile_dec,dp))
-      tile_side_i = int(tile_side)
-      if (tile_side_i < 16) tile_side_i = 16
-      if (tile_side_i > nx_out) tile_side_i = nx_out
-      if (tile_side_i > ny_out) tile_side_i = ny_out
-      tile_bytes_local = int(tile_side_i,kind=int64) * int(tile_side_i,kind=int64) * &
-        tile_bytes_est / max(1_int64, int(tile_ra,kind=int64) * int(tile_dec,kind=int64))
-      tiles_x = (int(nx_out,kind=int64) + int(tile_side_i,kind=int64) - 1_int64) / int(tile_side_i,kind=int64)
-      tiles_y = (int(ny_out,kind=int64) + int(tile_side_i,kind=int64) - 1_int64) / int(tile_side_i,kind=int64)
-      total_tiles = tiles_x * tiles_y
-      write(unit_out,'(F8.2,5X,I4,6X,ES11.4,2X,I3,6X,I3,6X,I5)') mem_fracs(i), tile_side_i, &
-        real(tile_bytes_local,dp), int(tiles_x), int(tiles_y), int(total_tiles)
-    end do
-    write(unit_out,'(A)') 'Rule: tile area scales approximately with mem_frac_ram.'
+    write(unit_out,'(A)') 'To use larger/smaller strips, change mem_frac_ram'
+    write(unit_out,'(A)') '(fraction of total system RAM) or set tile_auto=n with'
+    write(unit_out,'(A)') 'explicit tile_ra/tile_dec.'
 
     write(unit_out,'(A)') ' '
     write(unit_out,'(A)') 'GPU memory advisory (two-level tiling)'
