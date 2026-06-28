@@ -179,7 +179,9 @@ chelp-
       logical   write_mask_output, write_nvalid_output
       logical   use_gpu
       real(sp) conv_fac ! freq-to-lambda conversion factor
-      real(sp) tile_mem_frac
+      real(sp) mem_frac_ram, mem_frac_vram
+      integer   gpu_vram_mib
+      logical   io_overlap
       logical   MHz
       ! various counters and indices:
       integer   i, kk, ix, iy, ixpix_now, iypix_now, irm 
@@ -317,7 +319,8 @@ chelp-
      -          subim_ra_blc,subim_ra_trc,subim_ra_inc,
      -          subim_dec_blc,subim_dec_trc,subim_dec_inc,
      -          subim_chan_blc,subim_chan_trc,subim_chan_inc,
-     -          tile_ra,tile_dec,tile_mem_frac,tile_auto,dry_run,
+     -          tile_ra,tile_dec,mem_frac_ram,mem_frac_vram,
+     -          gpu_vram_mib,tile_auto,dry_run,
      -          rem_mean,remove_QU_bias,
      -          resiQ,slopeQ,resiU,slopeU,
      -          path_I,infileI,
@@ -328,7 +331,7 @@ chelp-
      -          mask_input_cube_file,
      -          mask_trust_mode,
      -          write_mask_output,
-     -          write_nvalid_output,use_gpu,status)
+     -          write_nvalid_output,use_gpu,io_overlap,status)
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
@@ -1591,7 +1594,7 @@ chelp-
       bytes_per_tile_pixel = int(4,kind=int64)*
      -      (int(in_fields,kind=int64)*int(nz_out,kind=int64) +
      -       int(2*nrm_out,kind=int64))
-        mem_safe_bytes = int(tile_mem_frac *
+        mem_safe_bytes = int(mem_frac_ram *
      -      real(mem_avail_kb,kind=dp) * 1024.0_dp,
      -      kind=int64)
       if(mem_safe_bytes.le.bytes_per_tile_pixel)then
@@ -1638,7 +1641,7 @@ chelp-
       write(*,*)" "
       write(*,*)"Tile planner (Phase-2):"
       write(*,*)" MemAvailable(kB): ",mem_avail_kb
-      write(*,*)" tile_mem_frac: ",tile_mem_frac
+      write(*,*)" mem_frac_ram: ",mem_frac_ram
       write(*,*)" tile_ra x tile_dec (output px): ",tile_ra,tile_dec
       write(*,*)" Estimated tile memory (MB): ",
      -           real(tile_bytes_est,kind=dp)/(1024.0_dp*1024.0_dp)
@@ -1650,7 +1653,7 @@ chelp-
               write(96,*)"tile_auto=n"
               write(96,*)"tile_ra=",tile_ra
               write(96,*)"tile_dec=",tile_dec
-              write(96,*)"tile_mem_frac=",tile_mem_frac
+              write(96,*)"mem_frac_ram=",mem_frac_ram
               write(96,*)"# Suggested subimage chunk for one pass"
               write(96,*)"subim_ra_blc=",xpix_beg
               write(96,*)"subim_ra_trc=",min(xpix_end,
@@ -1663,7 +1666,7 @@ chelp-
      -        image_pixels_total,
      -             nz_totpix,ngood_chan,nbad_chan,nrm_out,output_mode,
      -             tile_ra,tile_dec,nx_out,ny_out,tile_bytes_est,
-     -             tile_mem_frac,status)
+     -             mem_frac_ram,status)
               write(*,*)"Dry-run mode enabled. Wrote tile_autotune.cfg"
               write(*,*)"Dry-run mode enabled."
               write(*,*)"Wrote runtime_estimate.txt"

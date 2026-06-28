@@ -718,14 +718,15 @@ contains
                              subim_ra_blc, subim_ra_trc, subim_ra_inc, &
                              subim_dec_blc, subim_dec_trc, subim_dec_inc, &
                              subim_chan_blc, subim_chan_trc, subim_chan_inc, &
-                             tile_ra, tile_dec, tile_mem_frac, tile_auto, dry_run, &
+                             tile_ra, tile_dec, mem_frac_ram, mem_frac_vram, &
+                             gpu_vram_mib, tile_auto, dry_run, &
                              rem_mean, remove_qu_bias, resiQ, slopeQ, resiU, slopeU, &
                              path_I, infileI, ofac, fac, beg_rm, end_rm, nrm_out_par, &
                              use_auto_rm_range, output_mode, &
                              ap_angle_mode, mask_cube_file, &
                              mask_input_cube_file, &
                              mask_trust_mode, write_mask_output, &
-                             write_nvalid_output, use_gpu, status)
+                             write_nvalid_output, use_gpu, io_overlap, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
@@ -737,6 +738,7 @@ contains
     logical, intent(inout) :: write_mask_output
     logical, intent(inout) :: write_nvalid_output
     logical, intent(inout) :: use_gpu
+    logical, intent(inout) :: io_overlap
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -747,7 +749,8 @@ contains
     integer(int32), intent(inout) :: ap_angle_mode
     logical, intent(inout) :: tile_auto, dry_run
     real(sp), intent(inout) :: resiQ, slopeQ, resiU, slopeU, fac, beg_rm, end_rm
-    real(sp), intent(inout) :: tile_mem_frac
+    real(sp), intent(inout) :: mem_frac_ram, mem_frac_vram
+    integer(int32), intent(inout) :: gpu_vram_mib
     integer(int32), intent(out) :: status
 
     character(len=512) :: line, key, val, key_lc
@@ -759,7 +762,8 @@ contains
     logical :: seen_subim_ra_blc, seen_subim_ra_trc, seen_subim_ra_inc
     logical :: seen_subim_dec_blc, seen_subim_dec_trc, seen_subim_dec_inc
     logical :: seen_subim_chan_blc, seen_subim_chan_trc, seen_subim_chan_inc
-    logical :: seen_tile_ra, seen_tile_dec, seen_tile_mem_frac
+    logical :: seen_tile_ra, seen_tile_dec
+    logical :: seen_mem_frac_ram, seen_mem_frac_vram, seen_gpu_vram_mib
     logical :: seen_tile_auto, seen_dry_run
     logical :: seen_rem_mean, seen_remove_qu_bias
     logical :: seen_resiQ, seen_slopeQ, seen_resiU, seen_slopeU
@@ -772,6 +776,7 @@ contains
     logical :: seen_mask_trust_mode
     logical :: seen_write_mask_output, seen_write_nvalid_output
     logical :: seen_use_gpu
+    logical :: seen_io_overlap
 
     status = 0
     line_no = 0
@@ -795,7 +800,9 @@ contains
     seen_subim_chan_inc = .false.
     seen_tile_ra = .false.
     seen_tile_dec = .false.
-    seen_tile_mem_frac = .false.
+    seen_mem_frac_ram = .false.
+    seen_mem_frac_vram = .false.
+    seen_gpu_vram_mib = .false.
     seen_tile_auto = .false.
     seen_dry_run = .false.
     seen_rem_mean = .false.
@@ -820,6 +827,7 @@ contains
     seen_write_mask_output = .false.
     seen_write_nvalid_output = .false.
     seen_use_gpu = .false.
+    seen_io_overlap = .false.
 
     ! Defaults can be overridden by the config.
     path = '../DATA/'
@@ -841,7 +849,9 @@ contains
     subim_chan_inc = 1
     tile_ra = 0
     tile_dec = 0
-    tile_mem_frac = 0.25_sp
+    mem_frac_ram = 0.25_sp
+    mem_frac_vram = 0.70_sp
+    gpu_vram_mib = 0
     tile_auto = .true.
     dry_run = .false.
     rem_mean = 0
@@ -866,6 +876,7 @@ contains
     write_mask_output = .true.
     write_nvalid_output = .true.
     use_gpu = .false.
+    io_overlap = .false.
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -1176,18 +1187,48 @@ contains
           close(unit_cfg)
           return
         end if
-      case ('tile_mem_frac')
-        if (seen_tile_mem_frac) then
-          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_mem_frac'
+      case ('mem_frac_ram')
+        if (seen_mem_frac_ram) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mem_frac_ram'
           status = -182
           close(unit_cfg)
           return
         end if
-        seen_tile_mem_frac = .true.
-        read(val, *, iostat=io_stat) tile_mem_frac
+        seen_mem_frac_ram = .true.
+        read(val, *, iostat=io_stat) mem_frac_ram
         if (io_stat /= 0) then
-          write(*,*) 'Error reading tile_mem_frac at line ', line_no
+          write(*,*) 'Error reading mem_frac_ram at line ', line_no
           status = -182
+          close(unit_cfg)
+          return
+        end if
+      case ('mem_frac_vram')
+        if (seen_mem_frac_vram) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mem_frac_vram'
+          status = -190
+          close(unit_cfg)
+          return
+        end if
+        seen_mem_frac_vram = .true.
+        read(val, *, iostat=io_stat) mem_frac_vram
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading mem_frac_vram at line ', line_no
+          status = -190
+          close(unit_cfg)
+          return
+        end if
+      case ('gpu_vram_mib')
+        if (seen_gpu_vram_mib) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': gpu_vram_mib'
+          status = -191
+          close(unit_cfg)
+          return
+        end if
+        seen_gpu_vram_mib = .true.
+        read(val, *, iostat=io_stat) gpu_vram_mib
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading gpu_vram_mib at line ', line_no
+          status = -191
           close(unit_cfg)
           return
         end if
@@ -1506,6 +1547,15 @@ contains
         end if
         seen_use_gpu = .true.
         use_gpu = flag_from_value(val)
+      case ('io_overlap')
+        if (seen_io_overlap) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_overlap'
+          status = -192
+          close(unit_cfg)
+          return
+        end if
+        seen_io_overlap = .true.
+        io_overlap = flag_from_value(val)
       case default
         write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
         status = -131
@@ -1591,9 +1641,17 @@ contains
       write(*,*) 'Invalid tile_dec: expected >= 0 (0 means auto)'
       status = -186
     end if
-    if (status == 0 .and. (tile_mem_frac <= 0.0_sp .or. tile_mem_frac > 0.95_sp)) then
-      write(*,*) 'Invalid tile_mem_frac: expected 0 < tile_mem_frac <= 0.95'
+    if (status == 0 .and. (mem_frac_ram <= 0.0_sp .or. mem_frac_ram > 0.95_sp)) then
+      write(*,*) 'Invalid mem_frac_ram: expected 0 < mem_frac_ram <= 0.95'
       status = -187
+    end if
+    if (status == 0 .and. (mem_frac_vram <= 0.0_sp .or. mem_frac_vram > 0.95_sp)) then
+      write(*,*) 'Invalid mem_frac_vram: expected 0 < mem_frac_vram <= 0.95'
+      status = -190
+    end if
+    if (status == 0 .and. gpu_vram_mib < 0) then
+      write(*,*) 'Invalid gpu_vram_mib: expected >= 0 (0 means auto-detect)'
+      status = -191
     end if
     if (status == 0 .and. nrm_out_par < 1) then
       write(*,*) 'Invalid nrm: expected >= 1'
@@ -1631,7 +1689,7 @@ contains
 
   subroutine write_runtime_estimate(report_file, npix_total, nchan_total, nchan_good, &
                                     nbad_chan, nrm_out, output_mode, tile_ra, tile_dec, &
-                                    nx_out, ny_out, tile_bytes_est, tile_mem_frac, status)
+                                    nx_out, ny_out, tile_bytes_est, mem_frac_ram, status)
     !! Write a dry-run runtime estimate table.
     implicit none
     character(len=*), intent(in) :: report_file
@@ -1639,7 +1697,7 @@ contains
     integer(int32), intent(in) :: nchan_total, nchan_good, nbad_chan, nrm_out, output_mode
     integer(int32), intent(in) :: tile_ra, tile_dec, nx_out, ny_out
     integer(int64), intent(in) :: tile_bytes_est
-    real(sp), intent(in) :: tile_mem_frac
+    real(sp), intent(in) :: mem_frac_ram
     integer(int32), intent(out) :: status
 
     integer(int32) :: unit_out, i
@@ -1693,7 +1751,7 @@ contains
     write(unit_out,'(A,1X,I0)') 'Explicit bad channels masked:', nbad_chan
     write(unit_out,'(A,1X,I0)') 'RM samples:', nrm_out
     write(unit_out,'(A,1X,A)') 'Output mode:', trim(mode_name)
-    write(unit_out,'(A,1X,F8.3)') 'Tile memory fraction target:', tile_mem_frac
+    write(unit_out,'(A,1X,F8.3)') 'RAM memory fraction target (mem_frac_ram):', mem_frac_ram
     write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Tile size (x by y):', tile_ra, 'x', tile_dec
     write(unit_out,'(A,1X,ES16.6)') 'Tile memory (bytes):', real(tile_bytes_est,dp)
     tiles_x = (int(nx_out,kind=int64) + int(tile_ra,kind=int64) - 1_int64) / &
@@ -1720,20 +1778,20 @@ contains
     end do
 
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A)') 'User tiling advice from tile_mem_frac'
+    write(unit_out,'(A)') 'User tiling advice from mem_frac_ram'
     write(unit_out,'(A)') '-------------------------------------'
     write(unit_out,'(A)') 'How to read this section:'
-    write(unit_out,'(A)') '- mem_frac is your config tile_mem_frac target.'
+    write(unit_out,'(A)') '- mem_frac is your config mem_frac_ram target.'
     write(unit_out,'(A)') '- tile(x=y) is an equivalent square tile estimate for that mem_frac.'
     write(unit_out,'(A)') '- total tiles is how many tiles cover the full output image.'
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A,1X,F8.3)') 'Current tile_mem_frac:', tile_mem_frac
+    write(unit_out,'(A,1X,F8.3)') 'Current mem_frac_ram:', mem_frac_ram
     write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Current planner tile:', tile_ra, 'x', tile_dec
     write(unit_out,'(A)') ' '
     write(unit_out,'(A)') '   mem_frac   tile(x=y)   tile bytes     x-tiles   y-tiles   total'
     mem_fracs = [0.05_dp, 0.10_dp, 0.20_dp, 0.30_dp, 0.40_dp]
     do i = 1, size(mem_fracs)
-      tile_scale = sqrt(mem_fracs(i)/max(1.0e-6_dp, real(tile_mem_frac,dp)))
+      tile_scale = sqrt(mem_fracs(i)/max(1.0e-6_dp, real(mem_frac_ram,dp)))
       tile_side = tile_scale * sqrt(real(tile_ra*tile_dec,dp))
       tile_side_i = int(tile_side)
       if (tile_side_i < 16) tile_side_i = 16
@@ -1747,7 +1805,7 @@ contains
       write(unit_out,'(F8.2,5X,I4,6X,ES11.4,2X,I3,6X,I3,6X,I5)') mem_fracs(i), tile_side_i, &
         real(tile_bytes_local,dp), int(tiles_x), int(tiles_y), int(total_tiles)
     end do
-    write(unit_out,'(A)') 'Rule: tile area scales approximately with tile_mem_frac.'
+    write(unit_out,'(A)') 'Rule: tile area scales approximately with mem_frac_ram.'
 
     write(unit_out,'(A)') ' '
     write(unit_out,'(A)') 'GPU tile advisory (square tiles)'
@@ -1801,7 +1859,7 @@ contains
     write(unit_out,'(A)') '  tile_auto=n'
     write(unit_out,'(A,I0)') '  tile_ra=', gpu_side_i
     write(unit_out,'(A,I0)') '  tile_dec=', gpu_side_i
-    write(unit_out,'(A)') 'For CPU-only runs, keeping tile_auto=y with your chosen tile_mem_frac is preferred.'
+    write(unit_out,'(A)') 'For CPU-only runs, keeping tile_auto=y with your chosen mem_frac_ram is preferred.'
 
     close(unit_out)
   end subroutine write_runtime_estimate

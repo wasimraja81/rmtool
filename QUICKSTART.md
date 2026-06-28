@@ -227,12 +227,18 @@ JENNIFER_TOO_FULLIM_TEST.NVALID.MAP.FITS
 ```
 
 **Tip — memory tuning for large ASKAP cubes:**  
-The config already has `tile_auto=y` and `tile_mem_frac=0.30` which uses 30% of
-available RAM per tile. On machines with ≥64 GB RAM this is usually fine. If you
-see out-of-memory errors, lower it:
+The config has `mem_frac_ram=0.30`, which uses 30% of available **host RAM** per
+read block. On machines with ≥64 GB RAM this is usually fine. If you see host
+out-of-memory errors, lower it:
 ```
-tile_mem_frac=0.15
+mem_frac_ram=0.15
 ```
+For **GPU** runs, the device-memory footprint is controlled separately by
+`mem_frac_vram` (fraction of VRAM used per offload block) and `gpu_vram_mib`
+(VRAM size in MiB; 0 = auto-detect, else override). If you hit a GPU
+out-of-memory (`nvptx_alloc error`), lower `mem_frac_vram` (e.g. 0.4) or set
+`gpu_vram_mib` to your card's size. `io_overlap=y` opts into overlapped
+read/compute (requires a reentrant libcfitsio build; default `n`).
 Or run a dry-run first to read the auto-tuned tile hint:
 ```bash
 # Temporarily set dry_run=y in cfg, then:
