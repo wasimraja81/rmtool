@@ -1706,12 +1706,9 @@ contains
     real(dp) :: pix_dp, nchan_dp, nrm_dp
     real(dp) :: flops_total, flops_kernel, flops_per_term, flops_per_rm
     real(dp) :: gflops_rates(5), hours_est(5), seconds_est(5)
-    real(dp) :: mem_fracs(5), gpu_budgets(3)
-    real(dp) :: tile_scale, tile_side, gpu_mem_mib, gpu_mem_bytes
-    real(dp) :: bytes_per_tile_pixel, frac_use
-    integer(int32) :: tile_side_i, gpu_side_i
-    integer(int32) :: env_len, env_stat, io_stat
-    character(len=128) :: env_gpu_mem
+    real(dp) :: mem_fracs(5)
+    real(dp) :: tile_scale, tile_side
+    integer(int32) :: tile_side_i
     character(len=16) :: mode_name
 
     status = 0
@@ -1808,58 +1805,26 @@ contains
     write(unit_out,'(A)') 'Rule: tile area scales approximately with mem_frac_ram.'
 
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A)') 'GPU tile advisory (square tiles)'
-    write(unit_out,'(A)') '-------------------------------'
-    gpu_mem_mib = 6144.0_dp
-    env_gpu_mem = ' '
-    env_len = 0
-    env_stat = 0
-    call get_environment_variable('RM_GPU_MEM_MIB', env_gpu_mem, env_len, env_stat)
-    if (env_stat == 0 .and. env_len > 0) then
-      read(env_gpu_mem(1:env_len), *, iostat=io_stat) gpu_mem_mib
-      if (io_stat /= 0 .or. gpu_mem_mib <= 0.0_dp) gpu_mem_mib = 6144.0_dp
-    end if
-    gpu_mem_bytes = gpu_mem_mib * 1024.0_dp * 1024.0_dp
-    bytes_per_tile_pixel = real(tile_bytes_est,dp) / max(1.0_dp, real(tile_ra*tile_dec,dp))
-    write(unit_out,'(A,1X,I0,1X,A)') 'Detected GPU memory:', int(gpu_mem_mib), 'MiB'
-    write(unit_out,'(A,1X,I0)') 'Estimated bytes per tile pixel:', int(bytes_per_tile_pixel)
-    write(unit_out,'(A)') 'How to read this section:'
-    write(unit_out,'(A)') '- gpu_budget% is the share of on-board VRAM used by one tile.'
-    write(unit_out,'(A)') '- tile(x=y) is the recommended square tile side in output pixels.'
-    write(unit_out,'(A)') '- lower total means fewer tile launches and less host/device traffic.'
+    write(unit_out,'(A)') 'GPU memory advisory (two-level tiling)'
+    write(unit_out,'(A)') '--------------------------------------'
+    write(unit_out,'(A)') 'Under two-level tiling the read tile and the GPU'
+    write(unit_out,'(A)') 'offload unit are DECOUPLED, so the read tile does'
+    write(unit_out,'(A)') 'NOT need to fit in VRAM:'
+    write(unit_out,'(A)') '  - tile_ra / tile_dec size the host RAM read block'
+    write(unit_out,'(A)') '    (bigger is better for disk I/O). Control it with'
+    write(unit_out,'(A)') '    mem_frac_ram (or set tile_auto=n, tile_ra/tile_dec).'
+    write(unit_out,'(A)') '  - The GPU footprint is bounded SEPARATELY by the VRAM'
+    write(unit_out,'(A)') '    sub-block, controlled by mem_frac_vram and gpu_vram_mib.'
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A)') 'Candidate sizes at GPU memory budgets:'
-    write(unit_out,'(A)') ' gpu_budget% tile(x=y)    tile bytes     x-tiles   y-tiles   total'
-    gpu_budgets = [20.0_dp, 35.0_dp, 50.0_dp]
-    do i = 1, size(gpu_budgets)
-      tile_bytes_local = int((gpu_budgets(i)/100.0_dp) * gpu_mem_bytes, kind=int64)
-      gpu_side_i = int(sqrt(real(tile_bytes_local,dp)/max(1.0_dp,bytes_per_tile_pixel)))
-      if (gpu_side_i < 16) gpu_side_i = 16
-      if (gpu_side_i > nx_out) gpu_side_i = nx_out
-      if (gpu_side_i > ny_out) gpu_side_i = ny_out
-      tile_bytes_local = int(gpu_side_i,kind=int64) * int(gpu_side_i,kind=int64) * &
-        int(bytes_per_tile_pixel,kind=int64)
-      tiles_x = (int(nx_out,kind=int64) + int(gpu_side_i,kind=int64) - 1_int64) / int(gpu_side_i,kind=int64)
-      tiles_y = (int(ny_out,kind=int64) + int(gpu_side_i,kind=int64) - 1_int64) / int(gpu_side_i,kind=int64)
-      total_tiles = tiles_x * tiles_y
-      write(unit_out,'(F8.1,3X,I4,6X,ES11.4,2X,I3,6X,I3,6X,I5)') gpu_budgets(i), gpu_side_i, &
-        real(tile_bytes_local,dp), int(tiles_x), int(tiles_y), int(total_tiles)
-    end do
+    write(unit_out,'(A)') 'If you hit a GPU out-of-memory (nvptx_alloc error):'
+    write(unit_out,'(A)') '  - do NOT shrink tile_ra/tile_dec for VRAM;'
+    write(unit_out,'(A)') '  - lower mem_frac_vram (e.g. 0.4), and/or'
+    write(unit_out,'(A)') '  - set gpu_vram_mib to your card size in MiB'
+    write(unit_out,'(A)') '    (cfg > GPU_MEM_MIB env > built-in default).'
     write(unit_out,'(A)') ' '
-    write(unit_out,'(A)') 'Optimal setup suggestion for this run:'
-    frac_use = 100.0_dp * real(tile_bytes_est,dp) / max(1.0_dp,gpu_mem_bytes)
-    write(unit_out,'(A,F6.2,A)') 'Current planner tile uses about ', frac_use, ' % of GPU VRAM per tile.'
-    tile_bytes_local = int((35.0_dp/100.0_dp) * gpu_mem_bytes, kind=int64)
-    gpu_side_i = int(sqrt(real(tile_bytes_local,dp)/max(1.0_dp,bytes_per_tile_pixel)))
-    if (gpu_side_i < 16) gpu_side_i = 16
-    if (gpu_side_i > nx_out) gpu_side_i = nx_out
-    if (gpu_side_i > ny_out) gpu_side_i = ny_out
-    write(unit_out,'(A,I0,A,I0,A)') 'Recommended GPU starting tile: ', gpu_side_i, ' x ', gpu_side_i, ' at 35.0 % VRAM budget.'
-    write(unit_out,'(A)') 'Suggested cfg for a first GPU-oriented run:'
-    write(unit_out,'(A)') '  tile_auto=n'
-    write(unit_out,'(A,I0)') '  tile_ra=', gpu_side_i
-    write(unit_out,'(A,I0)') '  tile_dec=', gpu_side_i
-    write(unit_out,'(A)') 'For CPU-only runs, keeping tile_auto=y with your chosen mem_frac_ram is preferred.'
+    write(unit_out,'(A)') 'See the "Two-level memory tiling (RAM -> VRAM)" section'
+    write(unit_out,'(A)') 'appended below for the actual RAM-block and VRAM'
+    write(unit_out,'(A)') 'sub-block sizes computed for this run.'
 
     close(unit_out)
   end subroutine write_runtime_estimate
