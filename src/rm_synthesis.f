@@ -207,6 +207,22 @@ chelp-
       integer(kind=int64) :: tile_pixels_max, tile_bytes_est
       integer(kind=int64) :: image_pixels_total
       character(len=256) :: mem_line
+      ! VRAM sub-block planning (Phase-1 two-level tiling):
+      integer(kind=int64) :: vram_bytes_avail, vram_safe_bytes
+      integer(kind=int64) :: template_bytes, sub_px_max
+      integer   gpu_vram_mib_eff, ny_sub
+      integer   iy_sub_beg, iy_sub_end, ny_sub_now
+      integer   iyl, src_idx, dst_idx, ipix_full, ipix_sub
+      integer   env_len, env_stat, ios_env
+      character(len=128) :: env_vram
+      ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
+      real(sp), allocatable :: stQ(:), stU(:), stMask(:), stI(:)
+      real(sp), allocatable :: stP(:), stPhi(:)
+      real(sp), allocatable :: stQwork(:), stUwork(:), stWts(:)
+      integer*1, allocatable :: stMaskOut(:)
+      integer*2, allocatable :: stNvalid(:)
+      integer, allocatable :: stNgood(:)
+      logical   use_staging
 
 
       ! Variables/Parameters for RM-extraction:
@@ -1638,13 +1654,89 @@ chelp-
      -                 int(tile_dec,kind=int64) * bytes_per_tile_pixel
       enddo
 
+      !----------------------------------------------------
+      ! VRAM sub-block planning (Phase-1 two-level tiling).
+      ! The RAM block (tile_ra x tile_dec) is the disk-read unit.
+      ! Each RAM block is processed in Dec-strip sub-blocks sized to
+      ! fit a fraction (mem_frac_vram) of GPU VRAM, so the per-offload
+      ! device footprint is bounded independently of the read size.
+      !
+      ! VRAM size precedence: gpu_vram_mib (cfg) -> device query
+      ! (TODO: cudaMemGetInfo, nvfortran only) -> GPU_MEM_MIB env ->
+      ! default. On CPU-only runs with nothing specified, no
+      ! subdivision occurs (sub-block == RAM block) so output is
+      ! bit-identical to the single-level path.
+      gpu_vram_mib_eff = 0
+      if(gpu_vram_mib.gt.0)then
+              gpu_vram_mib_eff = gpu_vram_mib
+              write(*,*)" VRAM size from cfg gpu_vram_mib (MiB): ",
+     -                  gpu_vram_mib_eff
+      else
+              ! TODO(device-query): when built with nvfortran, call
+              ! cudaMemGetInfo here to auto-detect free VRAM. Not
+              ! available via gfortran/libgomp offload; fall back.
+              env_vram = ' '
+              env_len = 0
+              env_stat = 0
+              call get_environment_variable('GPU_MEM_MIB',
+     -             env_vram,env_len,env_stat)
+              if(env_stat.eq.0 .and. env_len.gt.0)then
+                      read(env_vram(1:env_len),*,iostat=ios_env)
+     -                     gpu_vram_mib_eff
+                      if(ios_env.ne.0 .or. gpu_vram_mib_eff.le.0)then
+                              gpu_vram_mib_eff = 0
+                      else
+                              write(*,*)" VRAM size from env "//
+     -                          "GPU_MEM_MIB (MiB): ",gpu_vram_mib_eff
+                      endif
+              endif
+              if(gpu_vram_mib_eff.le.0)then
+                      if(use_gpu_actual)then
+                              gpu_vram_mib_eff = 4096
+                              write(*,*)" WARNING: VRAM size not "//
+     -                          "specified; assuming (MiB): ",
+     -                          gpu_vram_mib_eff
+                              write(*,*)" Set gpu_vram_mib in cfg or "//
+     -                          "GPU_MEM_MIB env to match your card."
+                      else
+                              gpu_vram_mib_eff = 0
+                      endif
+              endif
+      endif
+
+      ! cos/sin templates stay resident on the device across sub-blocks.
+      template_bytes = int(4,kind=int64)*int(ngood_chan,kind=int64)*
+     -                 int(nrm_out,kind=int64)*int(2,kind=int64)
+      if(gpu_vram_mib_eff.gt.0)then
+              vram_bytes_avail = int(gpu_vram_mib_eff,kind=int64)*
+     -                 1024_int64*1024_int64
+              vram_safe_bytes = int(mem_frac_vram *
+     -                 real(vram_bytes_avail,kind=dp),kind=int64)
+              vram_safe_bytes = vram_safe_bytes - template_bytes
+              if(vram_safe_bytes.lt.bytes_per_tile_pixel)then
+                      vram_safe_bytes = bytes_per_tile_pixel
+              endif
+              sub_px_max = vram_safe_bytes / bytes_per_tile_pixel
+              if(sub_px_max.lt.1_int64)sub_px_max = 1_int64
+              ny_sub = int(sub_px_max / int(tile_ra,kind=int64))
+              if(ny_sub.lt.1)ny_sub = 1
+              if(ny_sub.gt.tile_dec)ny_sub = tile_dec
+      else
+              ny_sub = tile_dec
+      endif
+      use_staging = (ny_sub.lt.tile_dec)
+
       write(*,*)" "
       write(*,*)"Tile planner (Phase-2):"
       write(*,*)" MemAvailable(kB): ",mem_avail_kb
       write(*,*)" mem_frac_ram: ",mem_frac_ram
-      write(*,*)" tile_ra x tile_dec (output px): ",tile_ra,tile_dec
-      write(*,*)" Estimated tile memory (MB): ",
+      write(*,*)" tile_ra x tile_dec (RAM read px): ",tile_ra,tile_dec
+      write(*,*)" Estimated RAM block memory (MB): ",
      -           real(tile_bytes_est,kind=dp)/(1024.0_dp*1024.0_dp)
+      write(*,*)" mem_frac_vram: ",mem_frac_vram
+      write(*,*)" gpu_vram_mib (effective): ",gpu_vram_mib_eff
+      write(*,*)" VRAM sub-block (px): ",tile_ra,ny_sub
+      write(*,*)" Staging sub-blocks: ",use_staging
 
       if(dry_run)then
               open(96,file='tile_autotune.cfg',status='unknown')
@@ -1654,6 +1746,10 @@ chelp-
               write(96,*)"tile_ra=",tile_ra
               write(96,*)"tile_dec=",tile_dec
               write(96,*)"mem_frac_ram=",mem_frac_ram
+              write(96,*)"mem_frac_vram=",mem_frac_vram
+              write(96,*)"gpu_vram_mib=",gpu_vram_mib
+              write(96,*)"# VRAM sub-block (Dec strip) px: ",
+     -             tile_ra,ny_sub
               write(96,*)"# Suggested subimage chunk for one pass"
               write(96,*)"subim_ra_blc=",xpix_beg
               write(96,*)"subim_ra_trc=",min(xpix_end,
@@ -1667,6 +1763,35 @@ chelp-
      -             nz_totpix,ngood_chan,nbad_chan,nrm_out,output_mode,
      -             tile_ra,tile_dec,nx_out,ny_out,tile_bytes_est,
      -             mem_frac_ram,status)
+              ! Append two-level (RAM block + VRAM sub-block) summary.
+              open(96,file='runtime_estimate.txt',status='old',
+     -             position='append',iostat=ios_mem)
+              if(ios_mem.eq.0)then
+                 write(96,*)" "
+                 write(96,*)"Two-level memory tiling (RAM -> VRAM)"
+                 write(96,*)"-------------------------------------"
+                 write(96,*)"RAM read block (tile_ra x tile_dec) px: ",
+     -                tile_ra,tile_dec
+                 write(96,*)"RAM block bytes: ",tile_bytes_est
+                 write(96,*)"mem_frac_vram: ",mem_frac_vram
+                 write(96,*)"gpu_vram_mib (eff): ",gpu_vram_mib_eff
+                 write(96,*)"VRAM sub-block (px): ",
+     -                tile_ra,ny_sub
+                 write(96,*)"Template device bytes: ",
+     -                template_bytes
+                 if(ny_sub.gt.0)then
+                    write(96,*)"Dec sub-blocks per RAM block: ",
+     -                   (tile_dec + ny_sub - 1)/ny_sub
+                 endif
+                 if(use_staging)then
+                    write(96,*)"Staging active: each RAM block is "//
+     -                "processed in VRAM-sized Dec strips."
+                 else
+                    write(96,*)"Staging inactive: VRAM sub-block "//
+     -                "== RAM block."
+                 endif
+                 close(96)
+              endif
               write(*,*)"Dry-run mode enabled. Wrote tile_autotune.cfg"
               write(*,*)"Dry-run mode enabled."
               write(*,*)"Wrote runtime_estimate.txt"
@@ -1686,6 +1811,24 @@ chelp-
       allocate(Q_tile(tile_ra*tile_dec*nz_out))
       allocate(U_tile(tile_ra*tile_dec*nz_out))
       allocate(wts_tile(tile_ra*tile_dec*nz_out))
+
+      ! Compact staging buffers sized to one VRAM sub-block (Dec strip).
+      ! These hold a contiguous (nx_tile x ny_sub) region so the offload
+      ! kernel maps a small, bounded array to device memory.
+      if(use_staging)then
+              allocate(stQ(tile_ra*ny_sub*nz_out))
+              allocate(stU(tile_ra*ny_sub*nz_out))
+              if(use_input_mask)allocate(stMask(tile_ra*ny_sub*nz_out))
+              if(need_icube)allocate(stI(tile_ra*ny_sub*nz_out))
+              allocate(stP(tile_ra*ny_sub*nrm_out))
+              allocate(stPhi(tile_ra*ny_sub*nrm_out))
+              allocate(stQwork(tile_ra*ny_sub*nz_out))
+              allocate(stUwork(tile_ra*ny_sub*nz_out))
+              allocate(stWts(tile_ra*ny_sub*nz_out))
+              allocate(stMaskOut(tile_ra*ny_sub*nz_out))
+              allocate(stNvalid(tile_ra*ny_sub))
+              allocate(stNgood(tile_ra*ny_sub))
+      endif
 
 
       ! Irrespective of the total number of output pixels, 
@@ -2246,12 +2389,85 @@ chelp-
      -                   incs,nullval,specI,anyflg,status)
             endif
 
-            call tile_extract_gpu(specQ,specU,specMask,specI,
+            if(.not.use_staging)then
+              ! Single-level path: one offload over the whole RAM block.
+              call tile_extract_gpu(specQ,specU,specMask,specI,
      -           flag_arr_out,cos_arr,sin_arr,Q_tile,U_tile,wts_tile,
      -           ngood_tile,p_tile_arr,phi_tile_arr,mask_tile_arr,
      -           nvalid_tile_arr,nx_tile,ny_tile,nz_out,ngood_chan,
      -           nrm_out,use_gpu_actual,use_input_mask,nan_check_on,
      -           rem_mean,output_mode,ap_angle_mode)
+            else
+              ! Two-level path: subdivide the RAM block into Dec-strip
+              ! VRAM sub-blocks. Each sub-block is gathered into compact
+              ! staging buffers, extracted (one bounded offload), then
+              ! scattered back into the full-tile output arrays.
+              ! TODO(device-async): overlap H2D/compute/D2H across
+              ! sub-blocks with !$omp target nowait/depend (needs GPU
+              ! box to validate). Currently synchronous per sub-block.
+              do iy_sub_beg = 1,ny_tile,ny_sub
+                iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
+                ny_sub_now = iy_sub_end - iy_sub_beg + 1
+
+                ! --- gather inputs (full tile -> compact sub-block) ---
+                do iyl = 1,ny_sub_now
+                   iy_loc = iy_sub_beg + iyl - 1
+                   do ix_loc = 1,nx_tile
+                      do iz = 1,nz_out
+                         src_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                           + (iz-1)*nx_tile*ny_tile
+                         dst_idx = ix_loc + (iyl-1)*nx_tile
+     -                           + (iz-1)*nx_tile*ny_sub_now
+                         stQ(dst_idx) = specQ(src_idx)
+                         stU(dst_idx) = specU(src_idx)
+                         if(use_input_mask)stMask(dst_idx) =
+     -                       specMask(src_idx)
+                         if(need_icube)stI(dst_idx) = specI(src_idx)
+                      enddo
+                   enddo
+                enddo
+
+                call tile_extract_gpu(stQ,stU,stMask,stI,
+     -             flag_arr_out,cos_arr,sin_arr,stQwork,stUwork,stWts,
+     -             stNgood,stP,stPhi,stMaskOut,
+     -             stNvalid,nx_tile,ny_sub_now,nz_out,ngood_chan,
+     -             nrm_out,use_gpu_actual,use_input_mask,nan_check_on,
+     -             rem_mean,output_mode,ap_angle_mode)
+
+                ! --- scatter outputs (compact sub-block -> full tile) ---
+                do iyl = 1,ny_sub_now
+                   iy_loc = iy_sub_beg + iyl - 1
+                   do ix_loc = 1,nx_tile
+                      ipix_full = ix_loc + (iy_loc-1)*nx_tile
+                      ipix_sub  = ix_loc + (iyl-1)*nx_tile
+                      ngood_tile(ipix_full) = stNgood(ipix_sub)
+                      nvalid_tile_arr(ipix_full) = stNvalid(ipix_sub)
+                      do irm = 1,nrm_out
+                         dst_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                           + (irm-1)*nx_tile*ny_tile
+                         src_idx = ix_loc + (iyl-1)*nx_tile
+     -                           + (irm-1)*nx_tile*ny_sub_now
+                         p_tile_arr(dst_idx) = stP(src_idx)
+                         phi_tile_arr(dst_idx) = stPhi(src_idx)
+                      enddo
+                      do iz = 1,nz_out
+                         dst_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                           + (iz-1)*nx_tile*ny_tile
+                         src_idx = ix_loc + (iyl-1)*nx_tile
+     -                           + (iz-1)*nx_tile*ny_sub_now
+                         mask_tile_arr(dst_idx) = stMaskOut(src_idx)
+                      enddo
+                      ! work buffers kept full-tile for line_cut output
+                      do iz = 1,nz_out
+                         Q_tile((ipix_full-1)*nz_out+iz) =
+     -                       stQwork((ipix_sub-1)*nz_out+iz)
+                         U_tile((ipix_full-1)*nz_out+iz) =
+     -                       stUwork((ipix_sub-1)*nz_out+iz)
+                      enddo
+                   enddo
+                enddo
+              enddo
+            endif
 
             do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)
@@ -2416,6 +2632,18 @@ chelp-
       if(allocated(Q_tile)) deallocate(Q_tile)
       if(allocated(U_tile)) deallocate(U_tile)
       if(allocated(wts_tile)) deallocate(wts_tile)
+      if(allocated(stQ)) deallocate(stQ)
+      if(allocated(stU)) deallocate(stU)
+      if(allocated(stMask)) deallocate(stMask)
+      if(allocated(stI)) deallocate(stI)
+      if(allocated(stP)) deallocate(stP)
+      if(allocated(stPhi)) deallocate(stPhi)
+      if(allocated(stQwork)) deallocate(stQwork)
+      if(allocated(stUwork)) deallocate(stUwork)
+      if(allocated(stWts)) deallocate(stWts)
+      if(allocated(stMaskOut)) deallocate(stMaskOut)
+      if(allocated(stNvalid)) deallocate(stNvalid)
+      if(allocated(stNgood)) deallocate(stNgood)
       if(allocated(p_tile_arr)) deallocate(p_tile_arr)
       if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)
       if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)

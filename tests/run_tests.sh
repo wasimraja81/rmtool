@@ -45,13 +45,16 @@ skip() { echo "[SKIP] $*"; SKIP=$((SKIP + 1)); }
 section() { echo; echo "──────────────────────────────────────────────────────"; echo "$*"; echo "──────────────────────────────────────────────────────"; }
 
 make_cfg() {
-    local tag="$1" use_gpu="$2"
+    local tag="$1" use_gpu="$2" extra="${3:-}"
     local out_prefix="$OUT_DIR/$tag"
     local cfg="$OUT_DIR/${tag}.cfg"
     sed -e "s|__DATADIR__|${DATA_DIR}|g" \
         -e "s|__OUTPREFIX__|${out_prefix}|g" \
         -e "s|__USE_GPU__|${use_gpu}|g" \
         "$TEMPLATE" > "$cfg"
+    if [[ -n "${extra}" ]]; then
+        printf '%s\n' "${extra}" >> "$cfg"
+    fi
     echo "$cfg"
 }
 
@@ -228,6 +231,45 @@ if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" && -f "${OUT_DIR}/serial.AMP.RMCUBE.FI
     fi
 else
     skip "GPU binary or serial reference not available; skipping GPU test"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Two-level VRAM sub-block staging (CPU) – bit-identical to serial
+#    Forcing a tiny gpu_vram_mib makes the RAM block subdivide into
+#    Dec-strip sub-blocks, exercising the gather/extract/scatter path.
+#    Output must be bit-identical to the single-level serial reference.
+# ---------------------------------------------------------------------------
+section "8. VRAM sub-block staging (CPU) – bit-identical comparison"
+if [[ -x "$BIN_SERIAL" && -f "${OUT_DIR}/serial.AMP.RMCUBE.FITS" ]]; then
+    # gpu_vram_mib=1 (MiB) forces ny_sub << tile_dec -> staging path on.
+    # tile_auto=n with a small fixed tile keeps a single RAM block so the
+    # ONLY structural difference vs. serial is the sub-block staging.
+    cfg_stg=$(make_cfg "stage" "n" "gpu_vram_mib=1
+mem_frac_vram=0.10")
+    log_stg="$OUT_DIR/stage.log"
+    rm -f "$OUT_DIR"/stage.*.FITS
+    if run_binary "$BIN_SERIAL" "$cfg_stg" "$log_stg"; then
+        if grep -q "Staging sub-blocks:  T" "$log_stg"; then
+            amp_stg="$OUT_DIR/stage.AMP.RMCUBE.FITS"
+            if [[ -f "$amp_stg" ]]; then
+                if python3 "$TESTS_DIR/compare_cubes.py" \
+                        "$OUT_DIR/serial.AMP.RMCUBE.FITS" "$amp_stg" \
+                        --exact; then
+                    pass "Staging AMP: bit-identical to serial"
+                else
+                    fail "Staging AMP: differs from serial (gather/scatter bug?)"
+                fi
+            else
+                fail "Staging: AMP output cube not found: $amp_stg"
+            fi
+        else
+            fail "Staging path was NOT activated (check planner logic)"
+        fi
+    else
+        fail "Staging run did not complete (see $log_stg)"
+    fi
+else
+    skip "Serial binary/reference not available; skipping staging test"
 fi
 
 # ---------------------------------------------------------------------------
