@@ -1621,34 +1621,47 @@ chelp-
       image_pixels_total = nx_out
       image_pixels_total = image_pixels_total * ny_out
 
+      ! Auto tiling policy (IO-optimal for FITS RA-fastest layout):
+      ! RA (NAXIS1) is the contiguous axis on disk, so we read FULL-RA
+      ! "Dec strips" -- each plane read is then one contiguous block of
+      ! nx_out RA samples x a contiguous range of Dec rows. We keep
+      ! tile_ra = nx_out and pack as many Dec rows as mem_frac_ram allows.
+      ! Only if a single full-RA Dec row does not fit do we fall back to
+      ! subdividing RA (rare; extremely wide images).
       if(tile_auto .or. tile_ra.le.0 .or. tile_dec.le.0)then
               if(tile_pixels_max.ge.image_pixels_total)then
                       tile_ra = nx_out
                       tile_dec = ny_out
-              else
-                      tile_ra = min(nx_out,
-     -                   max(1,int(sqrt(real(tile_pixels_max,
-     -                   kind=dp)*real(nx_out,kind=dp)/
-     -                   real(ny_out,kind=dp)))))
-                      if(tile_ra.lt.1)tile_ra = 1
-                      tile_dec = min(ny_out,
-     -                   max(1,int(tile_pixels_max/
-     -                   int(tile_ra,kind=int64))))
+              else if(tile_pixels_max.ge.int(nx_out,kind=int64))then
+                      ! At least one full-RA Dec row fits -> Dec strips.
+                      tile_ra = nx_out
+                      tile_dec = int(tile_pixels_max /
+     -                   int(nx_out,kind=int64))
                       if(tile_dec.lt.1)tile_dec = 1
+                      if(tile_dec.gt.ny_out)tile_dec = ny_out
+              else
+                      ! A single full-RA row exceeds the budget; fall back
+                      ! to RA-subtiled single Dec rows.
+                      tile_dec = 1
+                      tile_ra = int(tile_pixels_max)
+                      if(tile_ra.lt.1)tile_ra = 1
+                      if(tile_ra.gt.nx_out)tile_ra = nx_out
               endif
       else
               tile_ra = max(1,min(tile_ra,nx_out))
               tile_dec = max(1,min(tile_dec,ny_out))
       endif
 
+      ! Safety shrink: reduce Dec rows first (keep full RA contiguous);
+      ! only shrink RA once the strip is already a single Dec row.
       tile_bytes_est = int(tile_ra,kind=int64) *
      -                 int(tile_dec,kind=int64) * bytes_per_tile_pixel
       do while(tile_bytes_est.gt.mem_safe_bytes .and.
      -         (tile_ra.gt.1 .or. tile_dec.gt.1))
-              if(tile_ra.ge.tile_dec .and. tile_ra.gt.1)then
-                      tile_ra = max(1,tile_ra/2)
-              else if(tile_dec.gt.1)then
+              if(tile_dec.gt.1)then
                       tile_dec = max(1,tile_dec/2)
+              else
+                      tile_ra = max(1,tile_ra/2)
               endif
               tile_bytes_est = int(tile_ra,kind=int64) *
      -                 int(tile_dec,kind=int64) * bytes_per_tile_pixel

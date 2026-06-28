@@ -234,12 +234,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Two-level VRAM sub-block staging (CPU) – bit-identical to serial
+# 8. Auto tiling shape – full-RA Dec strips
+#    With a budget that fits >=1 full RA row but not the whole image, the
+#    auto planner must produce tile_ra == nx (full RA) and tile_dec < ny
+#    (a Dec strip), NOT a square sub-tile. This keeps each plane read
+#    contiguous on disk (RA is FITS NAXIS1, fastest-varying).
+# ---------------------------------------------------------------------------
+section "8. Auto tiling shape – full-RA Dec strips"
+if [[ -x "$BIN_SERIAL" ]]; then
+    NX=$(python3 -c "import json;print(json.load(open('$TRUTH'))['nx'])")
+    # Small mem_frac_ram -> partial tile; tile_auto=y -> Dec-strip policy.
+    cfg_auto=$(make_cfg "autotile" "n" "tile_auto=y
+mem_frac_ram=0.00003
+dry_run=y")
+    log_auto="$OUT_DIR/autotile.log"
+    rm -f "$OUT_DIR"/autotile.*.FITS
+    if "$BIN_SERIAL" "$cfg_auto" > "$log_auto" 2>&1; then
+        # Parse "tile_ra x tile_dec (RAM read px):   <ra>   <dec>"
+        read -r T_RA T_DEC < <(awk -F: '/tile_ra x tile_dec/{print $2; exit}' "$log_auto")
+        if [[ "${T_RA}" -eq "${NX}" && "${T_DEC}" -lt "${NX}" && "${T_DEC}" -ge 1 ]]; then
+            pass "Auto tiling: full-RA Dec strip (tile_ra=${T_RA}=nx, tile_dec=${T_DEC}<ny)"
+        else
+            fail "Auto tiling: expected full-RA strip (nx=${NX}), got tile_ra=${T_RA} tile_dec=${T_DEC}"
+        fi
+    else
+        fail "Auto tiling dry-run did not complete (see $log_auto)"
+    fi
+else
+    skip "Serial binary not available; skipping auto-tiling test"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Two-level VRAM sub-block staging (CPU) – bit-identical to serial
 #    Forcing a tiny gpu_vram_mib makes the RAM block subdivide into
 #    Dec-strip sub-blocks, exercising the gather/extract/scatter path.
 #    Output must be bit-identical to the single-level serial reference.
 # ---------------------------------------------------------------------------
-section "8. VRAM sub-block staging (CPU) – bit-identical comparison"
+section "9. VRAM sub-block staging (CPU) – bit-identical comparison"
 if [[ -x "$BIN_SERIAL" && -f "${OUT_DIR}/serial.AMP.RMCUBE.FITS" ]]; then
     # gpu_vram_mib=1 (MiB) forces ny_sub << tile_dec -> staging path on.
     # tile_auto=n with a small fixed tile keeps a single RAM block so the
