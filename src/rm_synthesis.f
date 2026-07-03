@@ -1523,7 +1523,7 @@ chelp-
       !    Bad channels will be masked during DFT via flag_arr and wts=0
       ! 2) Build flag_arr_out mapping for all nz_out channels
       cnt2 = 0
-      do i = zpix_end,zpix_beg,-incs(freq_axis)
+      do i = zpix_beg,zpix_end,incs(freq_axis)
          cnt2 = cnt2 + 1
          L_sq(cnt2) = (conv_fac/zval(i))**2
          flag_arr_out(cnt2) = flag_arr(i)

@@ -753,8 +753,9 @@ contains
       ! For each pixel/channel: if mask_tile_arr==0 then wts=0, else wts=1
       nvalid_pix = 0
       do cnt2 = 1, nz_out
-        iz = nz_out - cnt2 + 1
-        tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (iz - 1) * nx_tile * ny_tile
+        ! Direct indexing: cnt2=1 → FITS channel 1 (lowest freq, largest L_sq = L_sq(1))
+        ! L_sq is now in descending order (L_sq(1)=largest), matching FITS channel order
+        tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (cnt2 - 1) * nx_tile * ny_tile
 
         if (mask_tile_arr(tmp_index) == 1) then
           ! Valid channel for this pixel: load data
@@ -782,8 +783,7 @@ contains
       ! Sum of weights — already masked in wts_tile (both global and per-pixel)
       wsum = 0.0_sp
       do cnt2 = 1, nz_out
-        iz = nz_out - cnt2 + 1
-        tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (iz - 1) * nx_tile * ny_tile
+        tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (cnt2 - 1) * nx_tile * ny_tile
         wsum = wsum + wts_tile(tmp_index)
       end do
 
@@ -798,8 +798,7 @@ contains
          mean_u = 0.0_sp
          if (rem_mean > 0) then
            do cnt2 = 1, nz_out
-             iz = nz_out - cnt2 + 1
-             tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (iz - 1) * nx_tile * ny_tile
+             tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (cnt2 - 1) * nx_tile * ny_tile
              mean_q = mean_q + wts_tile(tmp_index) * Q_tile(tmp_index)
              mean_u = mean_u + wts_tile(tmp_index) * U_tile(tmp_index)
            end do
@@ -812,11 +811,11 @@ contains
            rs_cor = 0.0_sp
            ic_cor = 0.0_sp
            is_cor = 0.0_sp
-           ! DFT loop: direct indexing into full-size templates
+           ! DFT loop: direct indexing — cnt2 indexes both data and template
+           ! L_sq(cnt2) is descending, FITS channel cnt2 has that same L_sq
            ! wts_tile=0 automatically skips both globally-bad and per-pixel-bad channels
            do cnt2 = 1, nz_out
-             iz = nz_out - cnt2 + 1
-             tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (iz - 1) * nx_tile * ny_tile
+             tmp_index = ix_loc + (iy_loc - 1) * nx_tile + (cnt2 - 1) * nx_tile * ny_tile
              q_eff = Q_tile(tmp_index) - mean_q
              u_eff = U_tile(tmp_index) - mean_u
              rc_cor = rc_cor + wts_tile(tmp_index) * q_eff * cos_arr(cnt2, i)
