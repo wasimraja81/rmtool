@@ -122,6 +122,8 @@ chelp-
       integer   subim_dec_blc, subim_dec_trc, subim_dec_inc
       integer   subim_chan_blc, subim_chan_trc, subim_chan_inc
       integer   tile_ra, tile_dec
+      integer   nrm_block_size
+      parameter(nrm_block_size = 20)  ! RM bins per GPU offload block
 
       real(sp) cxval_imU, cyval_imU, czval_imU  
       integer   cxpix_imU, cypix_imU, czpix_imU 
@@ -224,7 +226,21 @@ chelp-
       integer, allocatable :: stNgood(:)
       logical   use_staging
 
-
+      ! GPU optimization: RM-block tiled extraction
+      real(sp), allocatable :: specQ_gpu(:,:), specU_gpu(:,:)
+      real(sp), allocatable :: wts_gpu(:,:)
+      real(sp), allocatable :: mean_Q(:), mean_U(:)
+      real(sp), allocatable :: cos_arr_gpu(:,:), sin_arr_gpu(:,:)
+      integer   i_rm_block, nrm_block_now
+      
+      ! GPU optimization: staging path (per sub-block)
+      real(sp), allocatable :: st_Q_gpu(:,:), st_U_gpu(:,:)
+      real(sp), allocatable :: st_wts_gpu(:,:)
+      real(sp), allocatable :: st_mean_Q(:), st_mean_U(:)
+      real(sp), allocatable :: st_cos_arr_gpu(:,:)
+      real(sp), allocatable :: st_sin_arr_gpu(:,:)
+      integer   st_i_rm_block, st_nrm_block_now
+      
       ! Variables/Parameters for RM-extraction:
       real(sp) fac, beg_rm, end_rm
       integer   ofac, rem_mean, nrm_out, nrm_out_par
@@ -2466,13 +2482,64 @@ chelp-
             endif
 
             if(.not.use_staging)then
-              ! Single-level path: one offload over the whole RAM block.
-              call tile_extract_gpu(specQ,specU,specMask,specI,
-     -           flag_arr_out,cos_arr,sin_arr,Q_tile,U_tile,wts_tile,
-     -           ngood_tile,p_tile_arr,phi_tile_arr,mask_tile_arr,
-     -           nvalid_tile_arr,nx_tile,ny_tile,nz_out,ngood_chan,
-     -           nrm_out,use_gpu_actual,use_input_mask,nan_check_on,
-     -           rem_mean,output_mode,ap_angle_mode)
+              ! Single-level path: GPU vs CPU optimization strategies
+              if(use_gpu_actual)then
+                ! ====================================================================
+                ! GPU path: RM-block tiled extraction (optimized for GPU)
+                ! ====================================================================
+                ! Reshape flat FITS arrays into dense GPU-friendly layout (CPU)
+                call prepare_gpu_data(
+     -             specQ, specU, specMask,
+     -             flag_arr_out, nx_tile, ny_tile, nz_out,
+     -             specQ_gpu, specU_gpu, wts_gpu, ngood_chan,
+     -             use_input_mask, nan_check_on,
+     -             mean_Q, mean_U, rem_mean)
+                
+                ! Transpose templates for GPU memory coalescing
+                allocate(cos_arr_gpu(nrm_out, ngood_chan))
+                allocate(sin_arr_gpu(nrm_out, ngood_chan))
+                do i = 1, nrm_out
+                  do kk = 1, ngood_chan
+                    cos_arr_gpu(i, kk) = cos_arr(kk, i)
+                    sin_arr_gpu(i, kk) = sin_arr(kk, i)
+                  end do
+                end do
+                
+                ! RM-block loop: GPU processes blocks of RM bins
+                do i_rm_block = 1, nrm_out, nrm_block_size
+                  nrm_block_now = min(nrm_block_size,
+     -                                nrm_out - i_rm_block + 1)
+                  
+                  ! GPU kernel: optimized collapse(2) parallelism
+                  call tile_extract_gpu_rm_blocked(
+     -               specQ_gpu, specU_gpu, wts_gpu,
+     -               mean_Q, mean_U, cos_arr_gpu, sin_arr_gpu,
+     -               nx_tile, ny_tile, ngood_chan,
+     -               i_rm_block, nrm_block_now, nrm_out,
+     -               use_gpu_actual, rem_mean, output_mode,
+     -               ap_angle_mode, p_tile_arr, phi_tile_arr)
+                end do
+                
+                ! Deallocate temporary GPU arrays
+                deallocate(specQ_gpu, specU_gpu, wts_gpu)
+                deallocate(cos_arr_gpu, sin_arr_gpu)
+                if (allocated(mean_Q)) deallocate(mean_Q)
+                if (allocated(mean_U)) deallocate(mean_U)
+              else
+                ! ====================================================================
+                ! CPU path: Original kernel (simpler for OpenMP)
+                ! ====================================================================
+                call tile_extract_gpu(
+     -             specQ, specU, specMask, specI, flag_arr_out,
+     -             cos_arr, sin_arr,
+     -             Q_tile, U_tile, wts_tile, ngood_tile,
+     -             p_tile_arr, phi_tile_arr,
+     -             mask_tile_arr, nvalid_tile_arr,
+     -             nx_tile, ny_tile, nz_out, nz_out, nrm_out,
+     -             use_gpu_actual,
+     -             use_input_mask, nan_check_on,
+     -             rem_mean, output_mode, ap_angle_mode)
+              endif
             else
               ! Two-level path: subdivide the RAM block into Dec-strip
               ! VRAM sub-blocks. Each sub-block is gathered into compact
@@ -2503,12 +2570,85 @@ chelp-
                    enddo
                 enddo
 
-                call tile_extract_gpu(stQ,stU,stMask,stI,
-     -             flag_arr_out,cos_arr,sin_arr,stQwork,stUwork,stWts,
-     -             stNgood,stP,stPhi,stMaskOut,
-     -             stNvalid,nx_tile,ny_sub_now,nz_out,ngood_chan,
-     -             nrm_out,use_gpu_actual,use_input_mask,nan_check_on,
-     -             rem_mean,output_mode,ap_angle_mode)
+                ! ========================================================================
+                ! GPU extraction for sub-block: RM-block tiled extraction (optimized)
+                ! ========================================================================
+                ! Reallocate output arrays with correct sub-block dimensions
+                if (allocated(stP)) deallocate(stP)
+                if (allocated(stPhi)) deallocate(stPhi)
+                allocate(stP(nx_tile*ny_sub_now*nrm_out))
+                allocate(stPhi(nx_tile*ny_sub_now*nrm_out))
+                
+                ! GPU vs CPU path for extraction
+                if(use_gpu_actual)then
+                  ! GPU path: Reshape sub-block data and use GPU-optimized kernel
+                  call prepare_gpu_data(stQ, stU, stMask,
+     -               flag_arr_out, nx_tile, ny_sub_now, nz_out,
+     -               st_Q_gpu, st_U_gpu, st_wts_gpu, ngood_chan,
+     -               use_input_mask, nan_check_on,
+     -               st_mean_Q, st_mean_U, rem_mean)
+                  
+                  ! Transpose templates for GPU memory coalescing
+                  allocate(st_cos_arr_gpu(nrm_out, ngood_chan))
+                  allocate(st_sin_arr_gpu(nrm_out, ngood_chan))
+                  do i = 1, nrm_out
+                    do kk = 1, ngood_chan
+                      st_cos_arr_gpu(i, kk) = cos_arr(kk, i)
+                      st_sin_arr_gpu(i, kk) = sin_arr(kk, i)
+                    end do
+                  end do
+                  
+                  ! RM-block loop for GPU
+                  do st_i_rm_block = 1, nrm_out, nrm_block_size
+                    st_nrm_block_now = min(nrm_block_size,
+     -                                      nrm_out - st_i_rm_block + 1)
+                    
+                    ! GPU kernel: optimized collapse(2) parallelism
+                    call tile_extract_gpu_rm_blocked(
+     -                 st_Q_gpu, st_U_gpu, st_wts_gpu,
+     -                 st_mean_Q, st_mean_U, st_cos_arr_gpu,
+     -                 st_sin_arr_gpu, nx_tile, ny_sub_now,
+     -                 ngood_chan, st_i_rm_block, st_nrm_block_now,
+     -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
+     -                 ap_angle_mode, stP, stPhi)
+                  end do
+                  
+                  ! Deallocate GPU temporary arrays
+                  deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
+                  deallocate(st_cos_arr_gpu, st_sin_arr_gpu)
+                  if (allocated(st_mean_Q)) deallocate(st_mean_Q)
+                  if (allocated(st_mean_U)) deallocate(st_mean_U)
+                else
+                  ! CPU path: Use original kernel (simpler for OpenMP)
+                  call tile_extract_gpu(
+     -               stQ, stU, stMask, stI, flag_arr_out,
+     -               cos_arr, sin_arr,
+     -               stQwork, stUwork, stWts,
+     -               stNgood, stP, stPhi,
+     -               stMaskOut, stNvalid,
+     -               nx_tile, ny_sub_now, nz_out, nz_out, nrm_out,
+     -               use_gpu_actual,
+     -               use_input_mask, nan_check_on,
+     -               rem_mean, output_mode, ap_angle_mode)
+                endif
+                
+                ! Set stNgood and stNvalid for scatter
+                do ipix_sub = 1, nx_tile*ny_sub_now
+                  stNgood(ipix_sub) = ngood_chan
+                  if(use_gpu_actual)then
+                    ! Count valid channels per pixel from GPU staging weights
+                    nvalid_pix = 0
+                    do kk = 1, ngood_chan
+                      if (st_wts_gpu(ipix_sub, kk) > 0.0_sp) then
+                        nvalid_pix = nvalid_pix + 1
+                      end if
+                    end do
+                    stNvalid(ipix_sub) = nvalid_pix
+                  else
+                    ! CPU path: set to full count (original path assumes all weights valid)
+                    stNvalid(ipix_sub) = ngood_chan
+                  endif
+                end do
 
                 ! --- scatter outputs (compact sub-block -> full tile) ---
                 do iyl = 1,ny_sub_now
