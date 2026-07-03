@@ -161,7 +161,6 @@ chelp-
       character(len=272) :: outfileMASK, outfileNVALID
       character(len=272) :: mask_cube_file, mask_input_cube_file,
      -                      mask_trust_mode
-      character(len=272) :: RMfile, QU_linecutfile
       character(len=272) :: subim_parfile, cfgfile, cfgfile_in
       character(len=172) :: path, path_I 
       character(len=1) :: yorn
@@ -187,7 +186,7 @@ chelp-
       logical   MHz
       ! various counters and indices:
       integer   i, kk, ix, iy, ixpix_now, iypix_now, irm 
-      integer   cnt1, cnt2, tmp_cnt1, tmp_cnt2, tmp_index 
+      integer   cnt1, cnt2, tmp_index 
       integer   progress_total, progress_step
       integer   progress_next_pct, progress_next_count
       integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
@@ -195,7 +194,7 @@ chelp-
       integer   nx_tile, ny_tile
       integer   ipix_tile, pix_base
       integer   ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
-      integer   cnt_good, nvalid_pix
+      integer   cnt_good, nvalid_pix, idx_wts
       integer   fpixels_nvalid(2), lpixels_nvalid(2)
       integer   naxes_mask(3), naxes_nvalid(2)
       logical   nan_check_on, chan_valid
@@ -222,6 +221,7 @@ chelp-
       real(sp), allocatable :: stP(:), stPhi(:)
       real(sp), allocatable :: stQwork(:), stUwork(:), stWts(:)
       integer*1, allocatable :: stMaskOut(:)
+      integer*1, allocatable :: stMask_tile_arr(:)
       integer*2, allocatable :: stNvalid(:)
       integer, allocatable :: stNgood(:)
       logical   use_staging
@@ -263,7 +263,7 @@ chelp-
       character(len=16) :: masksrc_key, nanchk_key
 
       ! processing related:
-      logical   line_cut
+
       logical   need_icube
       character(len=72) :: add_req
 
@@ -285,7 +285,6 @@ chelp-
       ! SANITY CHECKS:
       ! Compare the files containing the Q and U Cubes
       ! ans see if they are compatible with each other:
-      line_cut = .false.
 
       if(command_argument_count() < 1)then
               write(*,*)'  '
@@ -299,14 +298,6 @@ chelp-
               write(*,*)' You can make some additional requests: '
               write(*,*)' using this string. Valid requests as '
               write(*,*)' of now are: '
-              write(*,*)' 1) single_cut: to be used when you intend'
-              write(*,*)'                to write out the Q,U and '
-              write(*,*)'                RM-spectra for only a single'
-              write(*,*)'                "cut" in the sky. By "cut"'
-              write(*,*)'                I mean all pixels for eg.,'
-              write(*,*)'                having constant Dec value.'
-              write(*,*)'   NB: The subim_parfile must be appropriately'
-              write(*,*)'       written for this.'
               write(*,*)'  '
               write(*,*)'------------------------------------------'
               write(*,*)'  '
@@ -324,11 +315,7 @@ chelp-
       endif
 
 
-      if(index(add_req,'single_cut') > 0)then
-              line_cut = .true.
-      else
-              line_cut = .false.
-      endif
+
 
       cfgfile_in = cfgfile(1:nchar(cfgfile))
       cfgfile = cfgfile_in(1:nchar(cfgfile_in))
@@ -400,13 +387,7 @@ chelp-
               write(*,*)"No bias removal from Q and U..."
       endif
 
-
-      ! Do not write the additional files if the 
-      ! entire cube is being processed:
-      if(.not.subim)then
-              line_cut = .false.
-      endif
-
+      ! Process file paths:
       infileQ(1:) = path(1:nchar(path))//infileQ(1:nchar(infileQ))
       infileU(1:) = path(1:nchar(path))//infileU(1:nchar(infileU))
       if(nchar(mask_input_cube_file).gt.0)then
@@ -445,7 +426,7 @@ chelp-
               outfileMASK(1:) = mask_cube_file(1:nchar(mask_cube_file))
       endif
       outfileNVALID(1:) = outfile(1:nchar(outfile))//'.NVALID.MAP.FITS'
-      QU_linecutfile(1:) = outfile(1:nchar(outfile))//'.QU.linecut'
+
         global_badchan_file(1:) = global_badchan_file(
      -                       1:nchar(global_badchan_file))
 
@@ -1538,39 +1519,43 @@ chelp-
       !-------------------------------------
       ! Set up block for RM-synthesis: 
       !
-      ! 1) Arrange the good channels in 
-      !    ascending order of lambda_sq: 
-      ! Count the good channels: 
-      ngood_chan = 0
-      do i = zpix_end,zpix_beg,-incs(freq_axis)
-         if(flag_arr(i).eq.1)then
-                 ngood_chan = ngood_chan + 1
-                 L_sq(ngood_chan) = (conv_fac/zval(i))**2
-         endif
-      enddo
+      ! 1) Build L_sq for ALL channels (good and bad) in ascending lambda_sq order
+      !    Bad channels will be masked during DFT via flag_arr and wts=0
+      ! 2) Build flag_arr_out mapping for all nz_out channels
       cnt2 = 0
       do i = zpix_end,zpix_beg,-incs(freq_axis)
          cnt2 = cnt2 + 1
+         L_sq(cnt2) = (conv_fac/zval(i))**2
          flag_arr_out(cnt2) = flag_arr(i)
       enddo
+      
+      ! Count good channels for book-keeping
+      ngood_chan = 0
+      do i = 1, nz_out
+         if(flag_arr_out(i).eq.1) ngood_chan = ngood_chan + 1
+      enddo
       ! Use explicit flag to select RM extraction mode
+      ! nrm_out based on total channels (nz_out), not good channels
+      ! Bad channels are masked during DFT via flag_arr and wts=0
       if (use_auto_rm_range .eq. 1) then
-           nrm_out_par = ngood_chan
+           nrm_out_par = nz_out
            nrm_out = nrm_out_par*ofac
       else
            nrm_out = nrm_out_par*ofac
       endif
 
-      ! Allocate RM arrays sized to actual nrm_out and ngood_chan
+      ! Allocate RM arrays: templates sized (nz_out, nrm_out) for all channels
       allocate(RM(nrm_out))
       allocate(p_ex(nrm_out))
       allocate(phi_ex(nrm_out))
-      allocate(cos_arr(ngood_chan, nrm_out))
-      allocate(sin_arr(ngood_chan, nrm_out))
+      allocate(cos_arr(nz_out, nrm_out))
+      allocate(sin_arr(nz_out, nrm_out))
 
-      call extract_general_setup(L_sq,ngood_chan,fac,beg_rm,end_rm,
-     -  nrm_out,RM,cos_arr,sin_arr,nrm_out,ngood_chan,
-     -  use_auto_rm_range,ofac)
+      ! Pre-compute templates for ALL nz_out channels (good and bad)
+      ! Bad channels have valid cos/sin but won't be used (masked by wts_tile=0 in DFT)
+      call extract_general_setup(L_sq, nz_out, fac, beg_rm, end_rm,
+     -  nrm_out, RM, cos_arr, sin_arr, nrm_out, nz_out,
+     -  use_auto_rm_range, ofac)
       dRM = (RM(nrm_out) - RM(1))/real(nrm_out - 1)
       open(77,file='sampled_RM.txt',status='unknown')
       write(77,*)"# ofac: ",ofac
@@ -1583,20 +1568,13 @@ chelp-
       enddo
       close(77)
 
-      open(78,file='sampled_L_sq_good.txt',status='unknown')
-      write(78,*)"# L_sq (only good ones) "
-      do i = 1,ngood_chan
-         write(78,*)L_sq(i) 
+      open(78,file='sampled_freq.txt',status='unknown')
+      write(78,*)"# freq       L_sq       flag (1=good, 0=bad)"
+      do i = 1,nz_out
+         write(78,*)zval(zpix_end - (i-1)*incs(freq_axis)),"    ", 
+     -             L_sq(i),"   ",flag_arr_out(i)
       enddo
       close(78)
-
-      open(79,file='sampled_freq.txt',status='unknown')
-      write(79,*)"# freq       L_sq       flag"
-      do i = zpix_end,zpix_beg,-incs(freq_axis)
-         atmp = (conv_fac/zval(i))**2
-         write(79,*)zval(i),"    ",atmp,"   ",flag_arr(i) 
-      enddo
-      close(79)
 
       !----------------------------------------------------
       ! Tile planning for memory-efficient cube processing.
@@ -1760,7 +1738,8 @@ chelp-
       endif
 
       ! cos/sin templates stay resident on the device across sub-blocks.
-      template_bytes = int(4,kind=int64)*int(ngood_chan,kind=int64)*
+      ! Templates are full-size (nz_out, nrm_out), not (ngood_chan, nrm_out)
+      template_bytes = int(4,kind=int64)*int(nz_out,kind=int64)*
      -                 int(nrm_out,kind=int64)*int(2,kind=int64)
       if(gpu_vram_mib_eff.gt.0)then
               vram_bytes_avail = int(gpu_vram_mib_eff,kind=int64)*
@@ -1889,6 +1868,7 @@ chelp-
      -                 stUwork(tile_ra*ny_sub*nz_out),
      -                 stWts(tile_ra*ny_sub*nz_out),
      -                 stMaskOut(tile_ra*ny_sub*nz_out),
+     -                 stMask_tile_arr(tile_ra*ny_sub*nz_out),
      -                 stNvalid(tile_ra*ny_sub),
      -                 stNgood(tile_ra*ny_sub),
      -                 stat=ios_mem)
@@ -2374,19 +2354,8 @@ chelp-
      -            mask_trust_mode(1:nchar(mask_trust_mode)),
      -            'Mask trust mode: safe/strict',status)
       endif
-        status = 0
+      status = 0
 
-
-
-
-      RMfile = outfile(1:nchar(outfile))//'.RMSPEC'
-
-      if (line_cut)then
-              open(16,file=QU_linecutfile,status='unknown',
-     -            form='unformatted',access='direct',recl=4*ngood_chan)
-              open(17,file=RMfile,status='unknown',form='unformatted',
-     -              access='direct',recl=4*nrm_out)
-      endif
       write(*,*)" "
 
       ! dimx and dimy are the sizes along x and y of the 
@@ -2437,12 +2406,8 @@ chelp-
               in_mask_open = .true.
       endif
 
-      if(line_cut)then
-              open(121,file='rm_spec.txt')
-      endif
 
-      tmp_cnt1 = 0
-      tmp_cnt2 = 0
+
       cnt1 = 0
       progress_total = nx_out*ny_out
       progress_step = max(1, progress_total/10)
@@ -2481,30 +2446,54 @@ chelp-
      -                   incs,nullval,specI,anyflg,status)
             endif
 
+            ! ========================================================
+            ! Build unified mask from all sources: global bad channels,
+            ! NaN/Inf detection, and input mask FITS (if provided)
+            ! OPTIMIZED: Single-pass loop to eliminate false sharing
+            ! ========================================================
+            do idx_wts = 1, nx_tile*ny_tile*nz_out
+              ! Initialize as valid
+              mask_tile_arr(idx_wts) = 1
+
+              ! Extract channel index iz from linear index
+              iz = (idx_wts - 1) / (nx_tile*ny_tile) + 1
+
+              ! Check condition 1: Global bad channel
+              if (flag_arr_out(iz) == 0) then
+                mask_tile_arr(idx_wts) = 0
+              end if
+
+              ! Check condition 2: NaN/Inf in Q or U
+              if (nan_check_on) then
+                if (specQ(idx_wts) /= specQ(idx_wts) .or.
+     -              specU(idx_wts) /= specU(idx_wts)) then
+                  mask_tile_arr(idx_wts) = 0
+                end if
+              end if
+
+              ! Check condition 3: Input mask FITS (AND operation)
+              if (use_input_mask) then
+                if (specMask(idx_wts) <= 0.5_sp) then
+                  mask_tile_arr(idx_wts) = 0
+                end if
+              end if
+            end do
+
             if(.not.use_staging)then
               ! Single-level path: GPU vs CPU optimization strategies
               if(use_gpu_actual)then
                 ! ====================================================================
                 ! GPU path: RM-block tiled extraction (optimized for GPU)
                 ! ====================================================================
-                ! Reshape flat FITS arrays into dense GPU-friendly layout (CPU)
+                ! Reshape flat FITS arrays into full-size GPU-friendly layout (CPU)
                 call prepare_gpu_data(
-     -             specQ, specU, specMask,
-     -             flag_arr_out, nx_tile, ny_tile, nz_out,
-     -             specQ_gpu, specU_gpu, wts_gpu, ngood_chan,
-     -             use_input_mask, nan_check_on,
-     -             mean_Q, mean_U, rem_mean)
+     -             specQ, specU, mask_tile_arr,
+     -             nx_tile, ny_tile, nz_out,
+     -             specQ_gpu, specU_gpu, wts_gpu,
+     -             rem_mean, mean_Q, mean_U)
                 
-                ! Transpose templates for GPU memory coalescing
-                allocate(cos_arr_gpu(nrm_out, ngood_chan))
-                allocate(sin_arr_gpu(nrm_out, ngood_chan))
-                do i = 1, nrm_out
-                  do kk = 1, ngood_chan
-                    cos_arr_gpu(i, kk) = cos_arr(kk, i)
-                    sin_arr_gpu(i, kk) = sin_arr(kk, i)
-                  end do
-                end do
-                
+                ! Templates are already full-size (nz_out, nrm_out)
+                ! No transposition needed - pass directly to GPU kernel
                 ! RM-block loop: GPU processes blocks of RM bins
                 do i_rm_block = 1, nrm_out, nrm_block_size
                   nrm_block_now = min(nrm_block_size,
@@ -2513,8 +2502,8 @@ chelp-
                   ! GPU kernel: optimized collapse(2) parallelism
                   call tile_extract_gpu_rm_blocked(
      -               specQ_gpu, specU_gpu, wts_gpu,
-     -               mean_Q, mean_U, cos_arr_gpu, sin_arr_gpu,
-     -               nx_tile, ny_tile, ngood_chan,
+     -               mean_Q, mean_U, cos_arr, sin_arr,
+     -               nx_tile, ny_tile, nz_out,
      -               i_rm_block, nrm_block_now, nrm_out,
      -               use_gpu_actual, rem_mean, output_mode,
      -               ap_angle_mode, p_tile_arr, phi_tile_arr)
@@ -2522,22 +2511,18 @@ chelp-
                 
                 ! Deallocate temporary GPU arrays
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
-                deallocate(cos_arr_gpu, sin_arr_gpu)
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               else
-                ! ====================================================================
                 ! CPU path: Original kernel (simpler for OpenMP)
-                ! ====================================================================
                 call tile_extract_gpu(
-     -             specQ, specU, specMask, specI, flag_arr_out,
+     -             specQ, specU,
      -             cos_arr, sin_arr,
      -             Q_tile, U_tile, wts_tile, ngood_tile,
      -             p_tile_arr, phi_tile_arr,
      -             mask_tile_arr, nvalid_tile_arr,
      -             nx_tile, ny_tile, nz_out, nz_out, nrm_out,
      -             use_gpu_actual,
-     -             use_input_mask, nan_check_on,
      -             rem_mean, output_mode, ap_angle_mode)
               endif
             else
@@ -2563,6 +2548,8 @@ chelp-
      -                           + (iz-1)*nx_tile*ny_sub_now
                          stQ(dst_idx) = specQ(src_idx)
                          stU(dst_idx) = specU(src_idx)
+                         stMask_tile_arr(dst_idx) = mask_tile_arr(
+     -                       src_idx)
                          if(use_input_mask)stMask(dst_idx) =
      -                       specMask(src_idx)
                          if(need_icube)stI(dst_idx) = specI(src_idx)
@@ -2582,22 +2569,13 @@ chelp-
                 ! GPU vs CPU path for extraction
                 if(use_gpu_actual)then
                   ! GPU path: Reshape sub-block data and use GPU-optimized kernel
-                  call prepare_gpu_data(stQ, stU, stMask,
-     -               flag_arr_out, nx_tile, ny_sub_now, nz_out,
-     -               st_Q_gpu, st_U_gpu, st_wts_gpu, ngood_chan,
-     -               use_input_mask, nan_check_on,
-     -               st_mean_Q, st_mean_U, rem_mean)
+                  call prepare_gpu_data(stQ, stU, stMask_tile_arr,
+     -               nx_tile, ny_sub_now, nz_out,
+     -               st_Q_gpu, st_U_gpu, st_wts_gpu,
+     -               rem_mean, st_mean_Q, st_mean_U)
                   
-                  ! Transpose templates for GPU memory coalescing
-                  allocate(st_cos_arr_gpu(nrm_out, ngood_chan))
-                  allocate(st_sin_arr_gpu(nrm_out, ngood_chan))
-                  do i = 1, nrm_out
-                    do kk = 1, ngood_chan
-                      st_cos_arr_gpu(i, kk) = cos_arr(kk, i)
-                      st_sin_arr_gpu(i, kk) = sin_arr(kk, i)
-                    end do
-                  end do
-                  
+                  ! Templates are already full-size (nz_out, nrm_out)
+                  ! No transposition needed
                   ! RM-block loop for GPU
                   do st_i_rm_block = 1, nrm_out, nrm_block_size
                     st_nrm_block_now = min(nrm_block_size,
@@ -2606,48 +2584,41 @@ chelp-
                     ! GPU kernel: optimized collapse(2) parallelism
                     call tile_extract_gpu_rm_blocked(
      -                 st_Q_gpu, st_U_gpu, st_wts_gpu,
-     -                 st_mean_Q, st_mean_U, st_cos_arr_gpu,
-     -                 st_sin_arr_gpu, nx_tile, ny_sub_now,
-     -                 ngood_chan, st_i_rm_block, st_nrm_block_now,
+     -                 st_mean_Q, st_mean_U, cos_arr, sin_arr,
+     -                 nx_tile, ny_sub_now, nz_out,
+     -                 st_i_rm_block, st_nrm_block_now,
      -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
      -                 ap_angle_mode, stP, stPhi)
                   end do
                   
                   ! Deallocate GPU temporary arrays
                   deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
-                  deallocate(st_cos_arr_gpu, st_sin_arr_gpu)
                   if (allocated(st_mean_Q)) deallocate(st_mean_Q)
                   if (allocated(st_mean_U)) deallocate(st_mean_U)
                 else
                   ! CPU path: Use original kernel (simpler for OpenMP)
+                  ! Initialize staging work arrays to zero
+                  stQwork(:) = 0.0_sp
+                  stUwork(:) = 0.0_sp
+                  stWts(:) = 0.0_sp
+                  stNvalid(:) = 0
+                  stNgood(:) = 0
+                  
                   call tile_extract_gpu(
-     -               stQ, stU, stMask, stI, flag_arr_out,
+     -               stQ, stU,
      -               cos_arr, sin_arr,
      -               stQwork, stUwork, stWts,
      -               stNgood, stP, stPhi,
-     -               stMaskOut, stNvalid,
+     -               stMask_tile_arr, stNvalid,
      -               nx_tile, ny_sub_now, nz_out, nz_out, nrm_out,
      -               use_gpu_actual,
-     -               use_input_mask, nan_check_on,
      -               rem_mean, output_mode, ap_angle_mode)
                 endif
                 
-                ! Set stNgood and stNvalid for scatter
+                ! stNgood and stNvalid already set by tile_extract_gpu
+                ! Fill in stNgood for all pixels in sub-block
                 do ipix_sub = 1, nx_tile*ny_sub_now
-                  stNgood(ipix_sub) = ngood_chan
-                  if(use_gpu_actual)then
-                    ! Count valid channels per pixel from GPU staging weights
-                    nvalid_pix = 0
-                    do kk = 1, ngood_chan
-                      if (st_wts_gpu(ipix_sub, kk) > 0.0_sp) then
-                        nvalid_pix = nvalid_pix + 1
-                      end if
-                    end do
-                    stNvalid(ipix_sub) = nvalid_pix
-                  else
-                    ! CPU path: set to full count (original path assumes all weights valid)
-                    stNvalid(ipix_sub) = ngood_chan
-                  endif
+                  stNgood(ipix_sub) = nz_out
                 end do
 
                 ! --- scatter outputs (compact sub-block -> full tile) ---
@@ -2673,7 +2644,7 @@ chelp-
      -                           + (iz-1)*nx_tile*ny_sub_now
                          mask_tile_arr(dst_idx) = stMaskOut(src_idx)
                       enddo
-                      ! work buffers kept full-tile for line_cut output
+                      ! Scatter sub-block results back to full tile
                       do iz = 1,nz_out
                          Q_tile((ipix_full-1)*nz_out+iz) =
      -                       stQwork((ipix_sub-1)*nz_out+iz)
@@ -2692,33 +2663,6 @@ chelp-
                   cnt1 = cnt1 + 1
                   ipix_tile = ix_loc + (iy_loc-1)*nx_tile
                   pix_base = (ipix_tile-1)*nz_out
-                  ngood_chan = ngood_tile(ipix_tile)
-
-                  if(line_cut)then
-                          tmp_cnt1 = tmp_cnt1 + 1
-                          write(16,rec=tmp_cnt1)
-     -                    (Q_tile(pix_base+i),i=ngood_chan,1,-1)
-                          tmp_cnt1 = tmp_cnt1 + 1
-                          write(16,rec=tmp_cnt1)
-     -                    (U_tile(pix_base+i),i=ngood_chan,1,-1)
-
-                          tmp_cnt2 = tmp_cnt2 + 1
-                          write(17,rec=tmp_cnt2)
-     -                    (p_tile_arr(ix_loc + (iy_loc-1)*nx_tile +
-     -                    (i-1)*nx_tile*ny_tile),i=1,nrm_out)
-                          tmp_cnt2 = tmp_cnt2 + 1
-                          write(17,rec=tmp_cnt2)
-     -                    (phi_tile_arr(ix_loc + (iy_loc-1)*nx_tile +
-     -                    (i-1)*nx_tile*ny_tile),i=1,nrm_out)
-                          write(121,*)"## ix, iy: ",ix,iy
-                          do i = 1,nrm_out
-                                  tmp_index = ix_loc +
-     -                               (iy_loc-1)*nx_tile +
-     -                               (i-1)*nx_tile*ny_tile
-                                  write(121,*)p_tile_arr(tmp_index),
-     -                                   phi_tile_arr(tmp_index)
-                          enddo
-                  endif
 
                   if(progress_total.gt.0)then
                         do while(cnt1.ge.progress_next_count .and.
@@ -2780,9 +2724,6 @@ chelp-
             endif
         enddo
       enddo
-      if(line_cut)then
-              close(121) 
-      endif
       ! CLOSE THE FITS FILES:
       call FTCLOS(21,status)
       if (status .gt. 0)then
@@ -2858,6 +2799,7 @@ chelp-
       if(allocated(stUwork)) deallocate(stUwork)
       if(allocated(stWts)) deallocate(stWts)
       if(allocated(stMaskOut)) deallocate(stMaskOut)
+      if(allocated(stMask_tile_arr)) deallocate(stMask_tile_arr)
       if(allocated(stNvalid)) deallocate(stNvalid)
       if(allocated(stNgood)) deallocate(stNgood)
       if(allocated(p_tile_arr)) deallocate(p_tile_arr)
@@ -2867,10 +2809,6 @@ chelp-
       if(allocated(ngood_tile)) deallocate(ngood_tile)
 
 9999  continue
-      if(line_cut)then
-              close(16)
-              close(17)
-      endif
 
 !      !write(*,*)"---------------------------"
 !      !write(*,*)"Current subroutine: FTCLOS "
@@ -2886,7 +2824,7 @@ chelp-
 !              write(*,*)"Problem closing Q-file"
 !              call printerror(status)
 !      endif
-!      if(.not.line_cut)then
+
       if(out_amp_open)then
               status = 0
               call FTCLOS(41,status)

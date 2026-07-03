@@ -1,0 +1,72 @@
+RM-synthesis dry-run runtime estimate
+-------------------------------------
+Total pixels: 1024
+Total frequency channels in cube: 200
+Good frequency channels used: 200
+Explicit bad channels masked: 0
+RM samples: 201
+Output mode: AP
+RAM memory fraction target (mem_frac_ram):    0.000
+Tile size (x by y): 32 x 5
+Tile memory (bytes):     1.858560E+06
+Tiles across x/y/total: 1 x 7 => 7
+ 
+All channels in the selected span are used.
+ 
+Kernel FLOPs (dot products):     3.293184E+08
+Total estimated FLOPs:     3.317883E+08
+ 
+Estimated wall time at sustained throughput:
+   GFLOP/s        seconds          hours
+     1.0         0.332       0.000
+     2.0         0.166       0.000
+     4.0         0.083       0.000
+     8.0         0.041       0.000
+    12.0         0.028       0.000
+ 
+RAM read tiling (full-RA Dec strips)
+------------------------------------
+The cube is read in full-RA Dec strips (RA is the
+contiguous FITS axis), sized so one strip fits the
+mem_frac_ram budget. These are the ACTUAL values for
+this run:
+  mem_frac_ram:    0.000
+  RAM strip (RA x Dec) px: 32 x 5
+  RAM strip size:  1.77246E+00 MB
+  Dec strips to cover image: 7
+ 
+To use larger/smaller strips, change mem_frac_ram
+(fraction of total system RAM) or set tile_auto=n with
+explicit tile_ra/tile_dec.
+ 
+GPU memory advisory (two-level tiling)
+--------------------------------------
+Under two-level tiling the read tile and the GPU
+offload unit are DECOUPLED, so the read tile does
+NOT need to fit in VRAM:
+  - tile_ra / tile_dec size the host RAM read block
+    (bigger is better for disk I/O). Control it with
+    mem_frac_ram (or set tile_auto=n, tile_ra/tile_dec).
+  - The GPU footprint is bounded SEPARATELY by the VRAM
+    sub-block, controlled by mem_frac_vram and gpu_vram_mib.
+ 
+If you hit a GPU out-of-memory (nvptx_alloc error):
+  - do NOT shrink tile_ra/tile_dec for VRAM;
+  - lower mem_frac_vram (e.g. 0.4), and/or
+  - set gpu_vram_mib to your card size in MiB
+    (cfg > GPU_MEM_MIB env > built-in default).
+ 
+See the "Two-level memory tiling (RAM -> VRAM)" section
+appended below for the actual RAM-block and VRAM
+sub-block sizes computed for this run.
+  
+ Two-level memory tiling (RAM -> VRAM)
+ -------------------------------------
+ RAM read block (tile_ra x tile_dec) px:           32           5
+ RAM block bytes:               1858560
+ mem_frac_vram:   0.699999988    
+ gpu_vram_mib (eff):            0
+ VRAM sub-block (px):           32           5
+ Template device bytes:                321600
+ Dec sub-blocks per RAM block:            1
+ Staging inactive: VRAM sub-block == RAM block.
