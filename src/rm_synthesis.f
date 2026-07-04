@@ -90,14 +90,10 @@ chelp-
       real(sp), allocatable :: specI(:)
       real(sp), allocatable :: specQ(:)
       real(sp), allocatable :: specU(:)
-      real(sp), allocatable :: Q_tile(:)
-      real(sp), allocatable :: U_tile(:)
-      real(sp), allocatable :: wts_tile(:)
       real(sp), allocatable :: p_tile_arr(:)
       real(sp), allocatable :: phi_tile_arr(:)
       integer*1, allocatable :: mask_tile_arr(:)
       integer*2, allocatable :: nvalid_tile_arr(:)
-      integer, allocatable :: ngood_tile(:)
       real(sp)  resiQ, resiU, slopeQ, slopeU
       logical   remove_QU_bias
       integer   bitpixQ, naxisQ, naxesQ(max_axis)
@@ -219,11 +215,9 @@ chelp-
       ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
       real(sp), allocatable :: stQ(:), stU(:), stMask(:), stI(:)
       real(sp), allocatable :: stP(:), stPhi(:)
-      real(sp), allocatable :: stQwork(:), stUwork(:), stWts(:)
       integer*1, allocatable :: stMaskOut(:)
       integer*1, allocatable :: stMask_tile_arr(:)
       integer*2, allocatable :: stNvalid(:)
-      integer, allocatable :: stNgood(:)
       logical   use_staging
 
       ! GPU optimization: RM-block tiled extraction
@@ -1624,11 +1618,11 @@ chelp-
       !   work spectra : Q_tile, U_tile, wts_tile           = 3*nz
       !   outputs      : p_tile_arr, phi_tile_arr           = 2*nrm
       !   mask (int8)  : mask_tile_arr                       = nz bytes
-      ! Staging buffers (sized tile_ra*ny_sub, ny_sub<=tile_dec) are
-      ! budgeted conservatively as a full extra tile copy so the plan
-      ! never under-counts:
-      !   stQ,stU,stQwork,stUwork,stWts (5*nz) + stMaskOut (nz int8)
-      !   + stP,stPhi (2*nrm)
+      ! prepare_gpu_data temporarily allocates specQ_gpu+specU_gpu+wts_gpu
+      ! (3*nz, same size as former Q_tile+U_tile+wts_tile) per tile; these
+      ! are counted conservatively in the formula below (unchanged).
+      ! Staging buffers (sized tile_ra*ny_sub, ny_sub<=tile_dec):
+      !   stQ,stU (2*nz) + stMaskOut (nz int8) + stP,stPhi (2*nrm)
       bytes_per_tile_pixel = int(4,kind=int64)*
      -      (int(in_fields + 3 + 5,kind=int64)*int(nz_out,kind=int64) +
      -       int(2 + 2,kind=int64)*int(nrm_out,kind=int64)) +
@@ -1847,10 +1841,6 @@ chelp-
      -         phi_tile_arr(tile_ra*tile_dec*nrm_out),
      -         mask_tile_arr(tile_ra*tile_dec*nz_out),
      -         nvalid_tile_arr(tile_ra*tile_dec),
-     -         ngood_tile(tile_ra*tile_dec),
-     -         Q_tile(tile_ra*tile_dec*nz_out),
-     -         U_tile(tile_ra*tile_dec*nz_out),
-     -         wts_tile(tile_ra*tile_dec*nz_out),
      -         stat=ios_mem)
       if(ios_mem.eq.0 .and. use_input_mask)then
               allocate(specMask(tile_ra*tile_dec*nz_out),stat=ios_mem)
@@ -1867,13 +1857,9 @@ chelp-
      -                 stU(tile_ra*ny_sub*nz_out),
      -                 stP(tile_ra*ny_sub*nrm_out),
      -                 stPhi(tile_ra*ny_sub*nrm_out),
-     -                 stQwork(tile_ra*ny_sub*nz_out),
-     -                 stUwork(tile_ra*ny_sub*nz_out),
-     -                 stWts(tile_ra*ny_sub*nz_out),
      -                 stMaskOut(tile_ra*ny_sub*nz_out),
      -                 stMask_tile_arr(tile_ra*ny_sub*nz_out),
      -                 stNvalid(tile_ra*ny_sub),
-     -                 stNgood(tile_ra*ny_sub),
      -                 stat=ios_mem)
               if(ios_mem.eq.0 .and. use_input_mask)then
                       allocate(stMask(tile_ra*ny_sub*nz_out),
@@ -2526,16 +2512,31 @@ chelp-
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               else
-                ! CPU path: Original kernel (simpler for OpenMP)
-                call tile_extract_cpu(
-     -             specQ, specU,
-     -             cos_arr, sin_arr,
-     -             Q_tile, U_tile, wts_tile, ngood_tile,
-     -             p_tile_arr, phi_tile_arr,
-     -             mask_tile_arr, nvalid_tile_arr,
-     -             nx_tile, ny_tile, nz_out, nz_out, nrm_out,
-     -             use_gpu_actual,
-     -             rem_mean, output_mode, ap_angle_mode)
+                ! CPU path: same kernel as GPU, collapse(2) over pixel×RM
+                call prepare_gpu_data(
+     -             specQ, specU, mask_tile_arr,
+     -             nx_tile, ny_tile, nz_out,
+     -             specQ_gpu, specU_gpu, wts_gpu,
+     -             rem_mean, mean_Q, mean_U, wsum_gpu)
+                do ipix_tile = 1, nx_tile*ny_tile
+                  nvalid_tile_arr(ipix_tile) =
+     -               int(wsum_gpu(ipix_tile), kind=2)
+                enddo
+                do i_rm_block = 1, nrm_out, nrm_block_size
+                  nrm_block_now = min(nrm_block_size,
+     -                                nrm_out - i_rm_block + 1)
+                  call tile_extract_gpu_rm_blocked(
+     -               specQ_gpu, specU_gpu, wts_gpu,
+     -               mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,
+     -               nx_tile, ny_tile, nz_out,
+     -               i_rm_block, nrm_block_now, nrm_out,
+     -               use_gpu_actual, rem_mean, output_mode,
+     -               ap_angle_mode, p_tile_arr, phi_tile_arr)
+                end do
+                deallocate(specQ_gpu, specU_gpu, wts_gpu)
+                deallocate(wsum_gpu)
+                if (allocated(mean_Q)) deallocate(mean_Q)
+                if (allocated(mean_U)) deallocate(mean_U)
               endif
             else
               ! Two-level path: subdivide the RAM block into Dec-strip
@@ -2616,30 +2617,10 @@ chelp-
                   if (allocated(st_mean_Q)) deallocate(st_mean_Q)
                   if (allocated(st_mean_U)) deallocate(st_mean_U)
                 else
-                  ! CPU path: Use original kernel (simpler for OpenMP)
-                  ! Initialize staging work arrays to zero
-                  stQwork(:) = 0.0_sp
-                  stUwork(:) = 0.0_sp
-                  stWts(:) = 0.0_sp
-                  stNvalid(:) = 0
-                  stNgood(:) = 0
-                  
-                  call tile_extract_cpu(
-     -               stQ, stU,
-     -               cos_arr, sin_arr,
-     -               stQwork, stUwork, stWts,
-     -               stNgood, stP, stPhi,
-     -               stMask_tile_arr, stNvalid,
-     -               nx_tile, ny_sub_now, nz_out, nz_out, nrm_out,
-     -               use_gpu_actual,
-     -               rem_mean, output_mode, ap_angle_mode)
+                  ! CPU staging path unreachable: use_staging=true only
+                  ! when use_gpu_actual=true (ny_sub driven by VRAM budget)
+                  continue
                 endif
-                
-                ! stNgood and stNvalid already set by tile_extract_cpu
-                ! Fill in stNgood for all pixels in sub-block
-                do ipix_sub = 1, nx_tile*ny_sub_now
-                  stNgood(ipix_sub) = nz_out
-                end do
 
                 ! --- scatter outputs (compact sub-block -> full tile) ---
                 do iyl = 1,ny_sub_now
@@ -2647,7 +2628,6 @@ chelp-
                    do ix_loc = 1,nx_tile
                       ipix_full = ix_loc + (iy_loc-1)*nx_tile
                       ipix_sub  = ix_loc + (iyl-1)*nx_tile
-                      ngood_tile(ipix_full) = stNgood(ipix_sub)
                       nvalid_tile_arr(ipix_full) = stNvalid(ipix_sub)
                       do irm = 1,nrm_out
                          dst_idx = ix_loc + (iy_loc-1)*nx_tile
@@ -2664,13 +2644,6 @@ chelp-
      -                           + (iz-1)*nx_tile*ny_sub_now
                          mask_tile_arr(dst_idx) =
      -                       stMask_tile_arr(src_idx)
-                      enddo
-                      ! Scatter sub-block results back to full tile
-                      do iz = 1,nz_out
-                         Q_tile((ipix_full-1)*nz_out+iz) =
-     -                       stQwork((ipix_sub-1)*nz_out+iz)
-                         U_tile((ipix_full-1)*nz_out+iz) =
-     -                       stUwork((ipix_sub-1)*nz_out+iz)
                       enddo
                    enddo
                 enddo
@@ -2807,27 +2780,19 @@ chelp-
       if(allocated(specU)) deallocate(specU)
       if(allocated(specMask)) deallocate(specMask)
       if(allocated(specI)) deallocate(specI)
-      if(allocated(Q_tile)) deallocate(Q_tile)
-      if(allocated(U_tile)) deallocate(U_tile)
-      if(allocated(wts_tile)) deallocate(wts_tile)
       if(allocated(stQ)) deallocate(stQ)
       if(allocated(stU)) deallocate(stU)
       if(allocated(stMask)) deallocate(stMask)
       if(allocated(stI)) deallocate(stI)
       if(allocated(stP)) deallocate(stP)
       if(allocated(stPhi)) deallocate(stPhi)
-      if(allocated(stQwork)) deallocate(stQwork)
-      if(allocated(stUwork)) deallocate(stUwork)
-      if(allocated(stWts)) deallocate(stWts)
       if(allocated(stMaskOut)) deallocate(stMaskOut)
       if(allocated(stMask_tile_arr)) deallocate(stMask_tile_arr)
       if(allocated(stNvalid)) deallocate(stNvalid)
-      if(allocated(stNgood)) deallocate(stNgood)
       if(allocated(p_tile_arr)) deallocate(p_tile_arr)
       if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)
       if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)
       if(allocated(nvalid_tile_arr)) deallocate(nvalid_tile_arr)
-      if(allocated(ngood_tile)) deallocate(ngood_tile)
 
 9999  continue
 
