@@ -33,7 +33,7 @@ This is what caught every regression during the refactoring sessions.
 
 ## What is bad
 
-### 1 — Latent data-corruption bug: `stMaskOut` reads uninitialised memory
+### 1 — ~~Latent data-corruption bug: `stMaskOut` reads uninitialised memory~~ ✅ Fixed in `022e7e8`
 
 `stMaskOut` is allocated, **never written**, and then read in the staging
 scatter:
@@ -54,6 +54,7 @@ support large images — the very runs most likely to use staging.
 ---
 
 ### 2 — Duplicate DFT implementations: the root cause of the sign-reversal bug
+*(Sign reversal fixed in `5e0f9ea`; structural duplication remains — see priority table)*
 
 There are two complete, independent implementations of the same DFT:
 
@@ -80,7 +81,8 @@ regression and will cause another.
 
 ---
 
-### 3 — `tile_extract_gpu` is the CPU kernel
+### 3 — ~~`tile_extract_gpu` is the CPU kernel~~ ✅ Fixed in `022e7e8`, renamed in `HEAD`
+*(Module header comment corrected in `022e7e8`; function renamed `tile_extract_cpu` in follow-up commit)*
 
 The kernel named `tile_extract_gpu` is called exclusively on the **CPU path**.
 The module header compounds the confusion:
@@ -95,7 +97,7 @@ the wrong direction multiple times.
 
 ---
 
-### 4 — Comment contradicts code on L_sq ordering
+### 4 — ~~Comment contradicts code on L_sq ordering~~ ✅ Fixed in `022e7e8`
 
 ```fortran
 ! 1) Build L_sq for ALL channels (good and bad) in ascending lambda_sq order
@@ -110,7 +112,7 @@ hypothesis.
 
 ---
 
-### 5 — `sampled_freq.txt` displays mismatched columns
+### 5 — ~~`sampled_freq.txt` displays mismatched columns~~ ✅ Fixed in `022e7e8`
 
 The diagnostic file is written as:
 
@@ -199,7 +201,7 @@ scaling with core count.
 
 ---
 
-### 10 — Vestigial dead variables in `tile_extract_gpu`
+### 10 — ~~Vestigial dead variables in `tile_extract_gpu`~~ ✅ Fixed in `022e7e8`
 
 After the mask-consolidation refactoring, `tile_extract_gpu` declares and
 never uses: `pix_base`, `iz`, `kk`, `per_pix_valid`, `mask_val`. These are
@@ -256,13 +258,15 @@ variables conflates these two orthogonal concerns.
 
 | Priority | Issue | Impact |
 |---|---|---|
-| **P0** | `stMaskOut` reads uninitialised memory | Corrupt mask FITS output |
-| **P0** | Duplicate DFT kernels | Caused sign-reversal bug; will recur |
-| **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path |
-| **P1** | Serial mask build | Wastes N−1 cores before every tile |
-| **P2** | Misleading names and false comments | Caused multi-hour debugging sessions |
-| **P2** | Dead variables in `tile_extract_gpu` | Compiler warnings, incomplete refactor |
-| **P3** | Fixed-form main program | Maintenance liability |
-| **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU |
-| **P4** | No I/O / compute overlap | Performance opportunity |
-| **P4** | Serial tile loop (global unit numbers) | Scalability ceiling |
+| Priority | Issue | Impact | Status |
+|---|---|---|---|
+| **P0** | `stMaskOut` reads uninitialised memory | Corrupt mask FITS output | ✅ `022e7e8` |
+| **P0** | Duplicate DFT kernels — sign reversal | Caused sign-reversal bug; will recur | ⚠️ Sign fixed `5e0f9ea`; duplication open |
+| **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | 🔲 Open |
+| **P1** | Serial mask build | Wastes N−1 cores before every tile | 🔲 Open |
+| **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8` |
+| **P2** | Dead variables in `tile_extract_gpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
+| **P3** | Fixed-form main program | Maintenance liability | 🔲 Open |
+| **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU | 🔲 Open |
+| **P4** | No I/O / compute overlap | Performance opportunity | 🔲 Open |
+| **P4** | Serial tile loop (global unit numbers) | Scalability ceiling | 🔲 Open |

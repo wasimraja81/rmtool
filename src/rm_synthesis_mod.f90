@@ -10,7 +10,7 @@ module rm_synthesis_mod
   public :: extract_general_setup, extract_general, extract_general_ri
   public :: extract_general_w, extract_general_ri_w
   public :: prepare_gpu_data, tile_extract_gpu_rm_blocked
-  public :: tile_extract_gpu  ! CPU-only kernel: pixel-parallel OpenMP, sequential RM and channel loops
+  public :: tile_extract_cpu  ! CPU-only kernel: pixel-parallel OpenMP, sequential RM and channel loops
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
@@ -658,7 +658,7 @@ contains
 
   end subroutine tile_extract_gpu_rm_blocked
 
-  subroutine tile_extract_gpu(specQ, specU, cos_arr, sin_arr, &
+  subroutine tile_extract_cpu(specQ, specU, cos_arr, sin_arr, &
                               Q_tile, U_tile, wts_tile, ngood_tile, p_tile_arr, phi_tile_arr, &
                               mask_tile_arr, nvalid_tile_arr, &
                               nx_tile, ny_tile, nz_out, n_chan_tmpl, nrm_out, &
@@ -853,7 +853,7 @@ contains
     !$omp end parallel do
 #endif
 
-  end subroutine tile_extract_gpu
+  end subroutine tile_extract_cpu
 
   subroutine compute_mean(arr, n, mean_val)
     !! Compute mean of array

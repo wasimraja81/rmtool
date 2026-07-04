@@ -2516,7 +2516,7 @@ chelp-
                 if (allocated(mean_U)) deallocate(mean_U)
               else
                 ! CPU path: Original kernel (simpler for OpenMP)
-                call tile_extract_gpu(
+                call tile_extract_cpu(
      -             specQ, specU,
      -             cos_arr, sin_arr,
      -             Q_tile, U_tile, wts_tile, ngood_tile,
@@ -2605,7 +2605,7 @@ chelp-
                   stNvalid(:) = 0
                   stNgood(:) = 0
                   
-                  call tile_extract_gpu(
+                  call tile_extract_cpu(
      -               stQ, stU,
      -               cos_arr, sin_arr,
      -               stQwork, stUwork, stWts,
@@ -2616,7 +2616,7 @@ chelp-
      -               rem_mean, output_mode, ap_angle_mode)
                 endif
                 
-                ! stNgood and stNvalid already set by tile_extract_gpu
+                ! stNgood and stNvalid already set by tile_extract_cpu
                 ! Fill in stNgood for all pixels in sub-block
                 do ipix_sub = 1, nx_tile*ny_sub_now
                   stNgood(ipix_sub) = nz_out
