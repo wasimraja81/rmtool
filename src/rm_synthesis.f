@@ -2495,6 +2495,14 @@ chelp-
      -             specQ_gpu, specU_gpu, wts_gpu,
      -             rem_mean, mean_Q, mean_U, wsum_gpu)
                 
+                ! Populate nvalid_tile_arr from precomputed per-pixel weight sums.
+                ! wsum_gpu(ipix) is the count of valid channels for that pixel
+                ! (same quantity tile_extract_cpu stores in nvalid_tile_arr).
+                do ipix_tile = 1, nx_tile*ny_tile
+                  nvalid_tile_arr(ipix_tile) =
+     -               int(wsum_gpu(ipix_tile), kind=2)
+                enddo
+                
                 ! Templates are already full-size (nz_out, nrm_out)
                 ! No transposition needed - pass directly to GPU kernel
                 ! RM-block loop: GPU processes blocks of RM bins
@@ -2577,6 +2585,12 @@ chelp-
      -               nx_tile, ny_sub_now, nz_out,
      -               st_Q_gpu, st_U_gpu, st_wts_gpu,
      -               rem_mean, st_mean_Q, st_mean_U, st_wsum_gpu)
+                  
+                  ! Populate stNvalid from precomputed per-pixel weight sums
+                  do ipix_sub = 1, nx_tile*ny_sub_now
+                    stNvalid(ipix_sub) =
+     -               int(st_wsum_gpu(ipix_sub), kind=2)
+                  enddo
                   
                   ! Templates are already full-size (nz_out, nrm_out)
                   ! No transposition needed
