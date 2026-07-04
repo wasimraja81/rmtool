@@ -1452,7 +1452,7 @@ chelp-
 
       if (czval_im.ge.30.and.czval_im.le.1.0e4)then ! MHz units assumed
               MHz = .true.
-              conv_fac = 300.0
+              conv_fac = c_velocity        ! 299.792458 Mm/s  (freq in MHz → L_sq in m²)
               write(*,*)" "
               write(*,*)"reference-frequency: ",czval_im
               write(*,*)"Assuming frequency in MHz"
@@ -1460,7 +1460,7 @@ chelp-
               write(*,*)" "
       else if (czval_im.ge.30.0e6.and.czval_im.le.10.0e9)then ! Hz units assumed
               MHz = .false.
-              conv_fac = 3.0e8
+              conv_fac = c_velocity*1.0e6  ! 299792458.0 m/s  (freq in Hz → L_sq in m²)
               write(*,*)" "
               write(*,*)'reference-frequency: ',czval_im
               write(*,*)"Assuming frequency in Hz"
