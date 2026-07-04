@@ -2439,8 +2439,9 @@ chelp-
             ! ========================================================
             ! Build unified mask from all sources: global bad channels,
             ! NaN/Inf detection, and input mask FITS (if provided)
-            ! OPTIMIZED: Single-pass loop to eliminate false sharing
+            ! Each element independent: safe to parallelise.
             ! ========================================================
+!$omp parallel do default(shared) private(idx_wts, iz)
             do idx_wts = 1, nx_tile*ny_tile*nz_out
               ! Initialize as valid
               mask_tile_arr(idx_wts) = 1
@@ -2468,6 +2469,7 @@ chelp-
                 end if
               end if
             end do
+!$omp end parallel do
 
             if(.not.use_staging)then
               ! Single-level path: GPU vs CPU optimization strategies
