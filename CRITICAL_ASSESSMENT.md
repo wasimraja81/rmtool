@@ -354,9 +354,31 @@ At 8 cores and ~50 GFLOPs/core peak: DFT budget ≈ **2.5 s/tile** (compute).
 Mask build on 1 core: ~59 M ÷ ~500 M iter/s ≈ **0.1 s** — small but avoidable.  
 FITS I/O at 500 MB/s: read+write ≈ **~1 s/tile** — overlappable with compute.
 
+### Validated result: compile-time layout selection (`bf76380`)
+
+The `(npix, nz_out)` GPU layout gave stride = 5.9 MB per channel step in the
+inner DFT iz-loop on a 4501×4501×288 run (L3 = 20 MB). Every channel access
+was a DRAM miss: 288 misses × 101 RM bins = 29,088 DRAM misses per pixel.
+
+Fixed by `prepare_cpu_data` with `(nz_out, npix)` layout (stride-1 channel
+access) for CPU binaries; `prepare_gpu_data` keeps `(npix, nz_out)` for GPU.
+
+**CASA fullim benchmark (6 cores, data in page cache):**
+
+| | Regressed CPU path | Fixed CPU path |
+|---|---|---|
+| Wall time | ~5 min | **25 s** |
+| CPU-seconds | ~1200 s | **108 s** |
+| Minor page faults | millions/tile | 730 K (first-touch only) |
+| Peak RSS | 9+ GB | 2.93 GB |
+| CPU utilisation | 544% / 600% | 440% / 600% |
+
+12× wall-time speedup. The remaining ~27% unused capacity (440% vs 600%) is
+the serial mask build and FITS I/O phases — both addressable.
+
 ### Remaining open performance work (in priority order)
 
 1. **Parallelise mask build** — `!$omp parallel do` on the mask loop. Two lines.
 2. **Profile DFT inner loop** — use `perf stat` / `gprof` to confirm cache miss rate and FP utilisation. The `collapse(2)` schedule with default `static` may leave cores idle on the last partial block.
 3. **Overlap FITS I/O** — double-buffer: start reading tile T+1 while processing tile T.
-4. **Eliminate `prepare_gpu_data` copy** — thread the flat index formula directly into the kernel; saves 2× tile RAM and one memory pass.
+4. **Eliminate `prepare_cpu_data` copy** — thread the flat index formula directly into the kernel; saves 2× tile RAM and one memory pass.
