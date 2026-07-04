@@ -256,15 +256,13 @@ variables conflates these two orthogonal concerns.
 
 ## Priority order for fixes
 
-| Priority | Issue | Impact |
-|---|---|---|
 | Priority | Issue | Impact | Status |
 |---|---|---|---|
 | **P0** | `stMaskOut` reads uninitialised memory | Corrupt mask FITS output | ✅ `022e7e8` |
 | **P0** | Duplicate DFT kernels — sign reversal | Caused sign-reversal bug; will recur | ⚠️ Sign fixed `5e0f9ea`; duplication open |
 | **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | 🔲 Open |
 | **P1** | Serial mask build | Wastes N−1 cores before every tile | 🔲 Open |
-| **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8` |
+| **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8`, `505f829` |
 | **P2** | Dead variables in `tile_extract_cpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
 | **P3** | Fixed-form main program | Maintenance liability | 🔲 Open |
 | **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU | 🔲 Open |
