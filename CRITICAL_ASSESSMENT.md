@@ -305,7 +305,7 @@ variables conflates these two orthogonal concerns.
 | **P0** | GPU path never set `nvalid_tile_arr` | Corrupt NVALID FITS on GPU runs | ✅ `475a74c` |
 | **P0** | `use_staging` triggered on CPU runs | Crash/wrong output on CPU + small VRAM cfg | ✅ `a73d639` |
 | **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | ✅ `d1509ea` |
-| **P1** | Serial mask build | Wastes N−1 cores before every tile | 🔲 Open |
+| **P1** | Serial mask build | Wastes N−1 cores before every tile | ✅ `af85709` |
 | **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8`, `505f829` |
 | **P2** | Dead variables in `tile_extract_cpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
 | **P2** | Hardcoded speed of light | 0.069% systematic error on all L_sq | ✅ `2ead708` |
@@ -374,7 +374,8 @@ access) for CPU binaries; `prepare_gpu_data` keeps `(npix, nz_out)` for GPU.
 | CPU utilisation | 544% / 600% | 440% / 600% |
 
 12× wall-time speedup. The remaining ~27% unused capacity (440% vs 600%) is
-the serial mask build and FITS I/O phases — both addressable.
+the serial mask build (`af85709`) and FITS I/O phases. Mask build is now
+fixed; FITS I/O overlap remains open.
 
 ### Remaining open performance work (in priority order)
 
