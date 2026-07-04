@@ -60,7 +60,7 @@ There are two complete, independent implementations of the same DFT:
 
 | Kernel | Path | Where |
 |---|---|---|
-| `tile_extract_gpu` | CPU | `rm_synthesis_mod.f90` |
+| `tile_extract_cpu` (was `tile_extract_gpu`) | CPU | `rm_synthesis_mod.f90` |
 | `tile_extract_gpu_rm_blocked` | GPU (and CPU fallback) | `rm_synthesis_mod.f90` |
 
 They must track each other's invariants — channel ordering, L_sq convention,
@@ -74,7 +74,7 @@ produced wrong RM signs for every serial and OMP run.
 The fix was three lines. The structural problem remains. The CPU path should
 call `prepare_gpu_data` + `tile_extract_gpu_rm_blocked` with
 `use_gpu_actual=false` — the `collapse(2)` directive works on CPU threads —
-and `tile_extract_gpu` should be deleted.
+and `tile_extract_cpu` should be deleted.
 
 **Severity:** structural defect that has already caused one silent correctness
 regression and will cause another.
@@ -84,7 +84,7 @@ regression and will cause another.
 ### 3 — ~~`tile_extract_gpu` is the CPU kernel~~ ✅ Fixed in `022e7e8`, renamed in `HEAD`
 *(Module header comment corrected in `022e7e8`; function renamed `tile_extract_cpu` in follow-up commit)*
 
-The kernel named `tile_extract_gpu` is called exclusively on the **CPU path**.
+The kernel (then named `tile_extract_gpu`, now renamed `tile_extract_cpu` in `505f829`) was called exclusively on the **CPU path**.
 The module header compounds the confusion:
 
 ```fortran
@@ -201,10 +201,10 @@ scaling with core count.
 
 ---
 
-### 10 — ~~Vestigial dead variables in `tile_extract_gpu`~~ ✅ Fixed in `022e7e8`
+### 10 — ~~Vestigial dead variables in `tile_extract_cpu`~~ ✅ Fixed in `022e7e8`
 
-After the mask-consolidation refactoring, `tile_extract_gpu` declares and
-never uses: `pix_base`, `iz`, `kk`, `per_pix_valid`, `mask_val`. These are
+After the mask-consolidation refactoring, `tile_extract_cpu` (formerly `tile_extract_gpu`) declared and
+never used: `pix_base`, `iz`, `kk`, `per_pix_valid`, `mask_val`. These are
 leftovers from the old dense-packing approach. They generate compiler warnings,
 inflate the `private(...)` clause of the OpenMP directive with phantom names,
 and signal to any reader that the refactoring was not completed.
@@ -265,7 +265,7 @@ variables conflates these two orthogonal concerns.
 | **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | 🔲 Open |
 | **P1** | Serial mask build | Wastes N−1 cores before every tile | 🔲 Open |
 | **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8` |
-| **P2** | Dead variables in `tile_extract_gpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
+| **P2** | Dead variables in `tile_extract_cpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
 | **P3** | Fixed-form main program | Maintenance liability | 🔲 Open |
 | **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU | 🔲 Open |
 | **P4** | No I/O / compute overlap | Performance opportunity | 🔲 Open |
