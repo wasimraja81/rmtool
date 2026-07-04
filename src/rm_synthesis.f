@@ -1519,7 +1519,8 @@ chelp-
       !-------------------------------------
       ! Set up block for RM-synthesis: 
       !
-      ! 1) Build L_sq for ALL channels (good and bad) in ascending lambda_sq order
+      ! 1) Build L_sq for ALL channels (good and bad) in descending lambda_sq order
+      !    (ascending frequency → L_sq = (c/f)² decreases)
       !    Bad channels will be masked during DFT via flag_arr and wts=0
       ! 2) Build flag_arr_out mapping for all nz_out channels
       cnt2 = 0
@@ -1571,7 +1572,7 @@ chelp-
       open(78,file='sampled_freq.txt',status='unknown')
       write(78,*)"# freq       L_sq       flag (1=good, 0=bad)"
       do i = 1,nz_out
-         write(78,*)zval(zpix_end - (i-1)*incs(freq_axis)),"    ", 
+         write(78,*)zval(zpix_beg + (i-1)*incs(freq_axis)),"    ",
      -             L_sq(i),"   ",flag_arr_out(i)
       enddo
       close(78)
@@ -2642,7 +2643,8 @@ chelp-
      -                           + (iz-1)*nx_tile*ny_tile
                          src_idx = ix_loc + (iyl-1)*nx_tile
      -                           + (iz-1)*nx_tile*ny_sub_now
-                         mask_tile_arr(dst_idx) = stMaskOut(src_idx)
+                         mask_tile_arr(dst_idx) =
+     -                       stMask_tile_arr(src_idx)
                       enddo
                       ! Scatter sub-block results back to full tile
                       do iz = 1,nz_out

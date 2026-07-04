@@ -10,7 +10,7 @@ module rm_synthesis_mod
   public :: extract_general_setup, extract_general, extract_general_ri
   public :: extract_general_w, extract_general_ri_w
   public :: prepare_gpu_data, tile_extract_gpu_rm_blocked
-  public :: tile_extract_gpu  ! Legacy: kept for compatibility (now wraps tile_extract_gpu_rm_blocked)
+  public :: tile_extract_gpu  ! CPU-only kernel: pixel-parallel OpenMP, sequential RM and channel loops
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
@@ -700,11 +700,10 @@ contains
     integer(int8), intent(in) :: mask_tile_arr(nx_tile*ny_tile*nz_out)
     integer(int16), intent(inout) :: nvalid_tile_arr(nx_tile*ny_tile)
 
-    integer(int32) :: ipix, ix_loc, iy_loc, pix_base
-    integer(int32) :: i, iz, cnt2, kk, tmp_index
+    integer(int32) :: ipix, ix_loc, iy_loc
+    integer(int32) :: i, cnt2, tmp_index
     integer(int32) :: nvalid_pix
-    logical :: per_pix_valid
-    real(sp) :: mask_val, q_now, u_now
+    real(sp) :: q_now, u_now
     real(sp) :: rc_cor, rs_cor, ic_cor, is_cor
     real(sp) :: ryw_tmp, iyw_tmp, wsum, mean_q, mean_u
     real(sp) :: q_eff, u_eff
@@ -719,18 +718,18 @@ contains
     !$omp     map(tofrom: Q_tile, U_tile, wts_tile, ngood_tile,       &
     !$omp                 p_tile_arr, phi_tile_arr,                   &
     !$omp                 nvalid_tile_arr)                             &
-    !$omp     private(ipix, ix_loc, iy_loc, pix_base,                 &
-    !$omp             cnt2, iz, kk, tmp_index,                        &
-    !$omp             q_now, u_now, per_pix_valid, mask_val,          &
+    !$omp     private(ipix, ix_loc, iy_loc,                          &
+    !$omp             cnt2, tmp_index,                                &
+    !$omp             q_now, u_now,                                   &
     !$omp             nvalid_pix, wsum, mean_q, mean_u,               &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor,                 &
     !$omp             ryw_tmp, iyw_tmp, q_eff, u_eff,                 &
     !$omp             p_ex, phi_ex, i)
 #else
     !$omp parallel do default(none)                                   &
-    !$omp     private(ipix, ix_loc, iy_loc, pix_base,                 &
-    !$omp             cnt2, iz, kk, tmp_index,                        &
-    !$omp             q_now, u_now, per_pix_valid, mask_val,          &
+    !$omp     private(ipix, ix_loc, iy_loc,                          &
+    !$omp             cnt2, tmp_index,                                &
+    !$omp             q_now, u_now,                                   &
     !$omp             nvalid_pix, wsum, mean_q, mean_u,               &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor,                 &
     !$omp             ryw_tmp, iyw_tmp, q_eff, u_eff,                 &
