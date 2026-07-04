@@ -9,7 +9,7 @@ module rm_synthesis_mod
   private
   public :: extract_general_setup, extract_general, extract_general_ri
   public :: extract_general_w, extract_general_ri_w
-  public :: prepare_gpu_data, tile_extract_gpu_rm_blocked
+  public :: prepare_gpu_data, prepare_cpu_data, tile_extract_gpu_rm_blocked
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
@@ -423,13 +423,11 @@ contains
     !!     Contains all masking: global bad channels, NaN/Inf, per-pixel mask
     !!   - Index formula: ix + (iy-1)*nx_tile + (iz-1)*nx_tile*ny_tile
     !!
-    !! Output layout (GPU-friendly, FULL SIZE):
-    !!   - specQ_gpu(npix, nz_out) — full 2D array with all channels
-    !!   - specU_gpu(npix, nz_out) — full 2D array with all channels
-    !!   - wts_gpu(npix, nz_out) — weight mask: 0 if bad, 1 if good
+    !! Output layout: specQ_gpu(npix, nz_out) — GPU-optimal (pixels fastest).
+    !! Adjacent warp threads (adjacent ipix) access the same channel: stride-1
+    !! across the warp = coalesced. Use prepare_cpu_data for CPU-only runs.
     !!
-    !! No dense packing: all nz_out channels stored, bad channels have wts=0
-    !! This enables direct indexing: specQ_gpu(ipix, iz) matches cos_arr(iz, i)
+    !! No dense packing: all nz_out channels stored, bad channels have wts=0.
     !!
     !! wsum_gpu(npix) — per-pixel valid-channel count, always computed.
     !! Pixel-dependent masking (NaN/Inf, input mask) means wsum varies by pixel
@@ -456,7 +454,7 @@ contains
     
     npix = nx_tile * ny_tile
     
-    ! Allocate FULL-SIZE GPU arrays (no dense packing)
+    ! GPU layout: (npix, nz_out) — pixels fastest for warp coalescing
     allocate(specQ_gpu(npix, nz_out))
     allocate(specU_gpu(npix, nz_out))
     allocate(wts_gpu(npix, nz_out))
@@ -524,6 +522,93 @@ contains
 
   end subroutine prepare_gpu_data
 
+  subroutine prepare_cpu_data(specQ_flat, specU_flat, mask_tile, &
+                              nx_tile, ny_tile, nz_out, &
+                              specQ_cpu, specU_cpu, wts_cpu, &
+                              rem_mean, mean_Q, mean_U, wsum_cpu)
+    !! ========================================================================
+    !! CPU Data Preparation: Reshape arrays with CPU-optimal memory layout
+    !! ========================================================================
+    !!
+    !! Output layout: specQ_cpu(nz_out, npix) — channels fastest-varying.
+    !! For the inner DFT loop (do iz=1,nz_out with ipix fixed),
+    !! specQ_cpu(iz, ipix) accesses stride-1 memory. All nz_out channels
+    !! for one pixel (e.g. 288*4=1152 bytes) fit in ~19 cache lines, loaded
+    !! once and reused for all nrm_out RM bins.
+    !!
+    !! Contrast with prepare_gpu_data: (npix, nz_out) where the same loop
+    !! has stride = npix*4B >> L3 cache, causing one DRAM miss per channel.
+    
+    implicit none
+    integer(int32), intent(in) :: nx_tile, ny_tile, nz_out
+    integer(int32), intent(in) :: rem_mean
+    
+    real(sp), intent(in) :: specQ_flat(nx_tile*ny_tile*nz_out)
+    real(sp), intent(in) :: specU_flat(nx_tile*ny_tile*nz_out)
+    integer*1, intent(in) :: mask_tile(nx_tile*ny_tile*nz_out)
+    
+    real(sp), allocatable, intent(out) :: specQ_cpu(:,:)
+    real(sp), allocatable, intent(out) :: specU_cpu(:,:)
+    real(sp), allocatable, intent(out) :: wts_cpu(:,:)
+    real(sp), allocatable, intent(out) :: mean_Q(:), mean_U(:)
+    real(sp), allocatable, intent(out) :: wsum_cpu(:)
+    
+    integer(int32) :: npix, ipix, iz, src_idx
+    real(sp) :: q_sum, u_sum
+    
+    npix = nx_tile * ny_tile
+    
+    ! CPU layout: (nz_out, npix) — channels fastest for stride-1 inner loop
+    allocate(specQ_cpu(nz_out, npix))
+    allocate(specU_cpu(nz_out, npix))
+    allocate(wts_cpu(nz_out, npix))
+    
+    ! Load all channels using unified mask
+    do iz = 1, nz_out
+      do ipix = 1, npix
+        src_idx = ipix + (iz - 1) * npix
+        specQ_cpu(iz, ipix) = specQ_flat(src_idx)
+        specU_cpu(iz, ipix) = specU_flat(src_idx)
+        wts_cpu(iz, ipix) = real(mask_tile(src_idx), sp)
+      end do
+    end do
+    
+    ! Per-pixel weight sums (RM-independent, precomputed once)
+    allocate(wsum_cpu(npix))
+    !$omp parallel do default(none) &
+    !$omp     private(ipix, iz) &
+    !$omp     shared(npix, nz_out, wts_cpu, wsum_cpu)
+    do ipix = 1, npix
+      wsum_cpu(ipix) = 0.0_sp
+      do iz = 1, nz_out
+        wsum_cpu(ipix) = wsum_cpu(ipix) + wts_cpu(iz, ipix)
+      end do
+    end do
+    !$omp end parallel do
+
+    if (rem_mean > 0) then
+      allocate(mean_Q(npix))
+      allocate(mean_U(npix))
+      !$omp parallel do default(none) &
+      !$omp     private(ipix, iz, q_sum, u_sum) &
+      !$omp     shared(npix, nz_out, specQ_cpu, specU_cpu, wts_cpu, wsum_cpu, mean_Q, mean_U)
+      do ipix = 1, npix
+        q_sum = 0.0_sp
+        u_sum = 0.0_sp
+        do iz = 1, nz_out
+          q_sum = q_sum + wts_cpu(iz, ipix) * specQ_cpu(iz, ipix)
+          u_sum = u_sum + wts_cpu(iz, ipix) * specU_cpu(iz, ipix)
+        end do
+        if (wsum_cpu(ipix) > 0.0_sp) then
+          mean_Q(ipix) = q_sum / wsum_cpu(ipix)
+          mean_U(ipix) = u_sum / wsum_cpu(ipix)
+        end if
+      end do
+      !$omp end parallel do
+    end if
+
+  end subroutine prepare_cpu_data
+
   subroutine tile_extract_gpu_rm_blocked(specQ_gpu, specU_gpu, wts_gpu, &
                                          mean_Q, mean_U, wsum_gpu, &
                                          cos_arr_gpu, sin_arr_gpu, &
@@ -561,9 +646,9 @@ contains
     integer(int32), intent(in) :: rem_mean, output_mode, ap_angle_mode
     logical, intent(in) :: use_gpu_actual
     
-    real(sp), intent(in) :: specQ_gpu(nx_tile*ny_tile, nz_out)
-    real(sp), intent(in) :: specU_gpu(nx_tile*ny_tile, nz_out)
-    real(sp), intent(in) :: wts_gpu(nx_tile*ny_tile, nz_out)
+    real(sp), intent(in) :: specQ_gpu(:,:)
+    real(sp), intent(in) :: specU_gpu(:,:)
+    real(sp), intent(in) :: wts_gpu(:,:)
     real(sp), intent(in), optional :: mean_Q(nx_tile*ny_tile)
     real(sp), intent(in), optional :: mean_U(nx_tile*ny_tile)
     real(sp), intent(in) :: wsum_gpu(nx_tile*ny_tile)
@@ -627,12 +712,19 @@ contains
         
         ! Full DFT: sum over all channels for this RM bin
         ! Direct indexing: iz ∈ [1..nz_out] indexes both data and template
-        ! wts_gpu(ipix, iz)=0 automatically skips bad channels
+        ! wts=0 automatically skips bad channels
         do iz = 1, nz_out
+#ifdef USE_GPU
+          ! GPU layout: (npix, nz_out) — coalesced across warp
           q_eff = specQ_gpu(ipix, iz) - mean_q_pix
           u_eff = specU_gpu(ipix, iz) - mean_u_pix
           wt = wts_gpu(ipix, iz)
-          
+#else
+          ! CPU layout: (nz_out, npix) — stride-1 channel access
+          q_eff = specQ_gpu(iz, ipix) - mean_q_pix
+          u_eff = specU_gpu(iz, ipix) - mean_u_pix
+          wt = wts_gpu(iz, ipix)
+#endif
           rc_cor = rc_cor + wt * q_eff * cos_arr_gpu(iz, i_rm_global)
           rs_cor = rs_cor + wt * q_eff * sin_arr_gpu(iz, i_rm_global)
           ic_cor = ic_cor + wt * u_eff * cos_arr_gpu(iz, i_rm_global)

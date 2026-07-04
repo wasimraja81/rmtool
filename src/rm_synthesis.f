@@ -2513,12 +2513,22 @@ chelp-
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               else
-                ! CPU path: same kernel as GPU, collapse(2) over pixel×RM
+                ! CPU path: collapse(2) kernel with CPU-optimal data layout
+                ! GPU binary running on CPU keeps GPU layout for kernel compat.
+#ifdef USE_GPU
                 call prepare_gpu_data(
      -             specQ, specU, mask_tile_arr,
      -             nx_tile, ny_tile, nz_out,
      -             specQ_gpu, specU_gpu, wts_gpu,
      -             rem_mean, mean_Q, mean_U, wsum_gpu)
+#else
+                ! CPU binary: (nz_out,npix) layout -> stride-1 channel loop
+                call prepare_cpu_data(
+     -             specQ, specU, mask_tile_arr,
+     -             nx_tile, ny_tile, nz_out,
+     -             specQ_gpu, specU_gpu, wts_gpu,
+     -             rem_mean, mean_Q, mean_U, wsum_gpu)
+#endif
                 do ipix_tile = 1, nx_tile*ny_tile
                   nvalid_tile_arr(ipix_tile) =
      -               int(wsum_gpu(ipix_tile), kind=2)
