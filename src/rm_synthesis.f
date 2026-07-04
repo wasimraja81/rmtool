@@ -1755,7 +1755,8 @@ chelp-
       else
               ny_sub = tile_dec
       endif
-      use_staging = (ny_sub.lt.tile_dec)
+      ! We should stage only on the gpu: 
+      use_staging = (ny_sub.lt.tile_dec) .and. use_gpu_actual
 
       write(*,*)" "
       write(*,*)"Tile planner (Phase-2):"
