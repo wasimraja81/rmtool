@@ -265,30 +265,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Two-level VRAM sub-block staging (CPU) – bit-identical to serial
+# 9. Two-level VRAM sub-block staging (GPU) – bit-identical to non-staged GPU
+#    Staging is GPU-only (use_staging requires use_gpu_actual=true).
 #    Forcing a tiny gpu_vram_mib makes the RAM block subdivide into
 #    Dec-strip sub-blocks, exercising the gather/extract/scatter path.
-#    Output must be bit-identical to the single-level serial reference.
+#    Output must be bit-identical to the single-level GPU reference (test 7),
+#    since both paths use the same tile_extract_gpu_rm_blocked kernel.
 # ---------------------------------------------------------------------------
-section "9. VRAM sub-block staging (CPU) – bit-identical comparison"
-if [[ -x "$BIN_SERIAL" && -f "${OUT_DIR}/serial.AMP.RMCUBE.FITS" ]]; then
+section "9. VRAM sub-block staging (GPU) – bit-identical to non-staged GPU"
+if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" && -f "${OUT_DIR}/gpu.AMP.RMCUBE.FITS" ]]; then
+    export OMP_TARGET_OFFLOAD="${OMP_TARGET_OFFLOAD:-DISABLED}"
     # gpu_vram_mib=1 (MiB) forces ny_sub << tile_dec -> staging path on.
-    # tile_auto=n with a small fixed tile keeps a single RAM block so the
-    # ONLY structural difference vs. serial is the sub-block staging.
-    cfg_stg=$(make_cfg "stage" "n" "gpu_vram_mib=1
+    cfg_stg=$(make_cfg "stage" "y" "gpu_vram_mib=1
 mem_frac_vram=0.10")
     log_stg="$OUT_DIR/stage.log"
     rm -f "$OUT_DIR"/stage.*.FITS
-    if run_binary "$BIN_SERIAL" "$cfg_stg" "$log_stg"; then
+    if run_binary "$BIN_GPU" "$cfg_stg" "$log_stg"; then
         if grep -q "Staging sub-blocks:  T" "$log_stg"; then
             amp_stg="$OUT_DIR/stage.AMP.RMCUBE.FITS"
             if [[ -f "$amp_stg" ]]; then
                 if python3 "$TESTS_DIR/compare_cubes.py" \
-                        "$OUT_DIR/serial.AMP.RMCUBE.FITS" "$amp_stg" \
+                        "$OUT_DIR/gpu.AMP.RMCUBE.FITS" "$amp_stg" \
                         --exact; then
-                    pass "Staging AMP: bit-identical to serial"
+                    pass "Staging AMP: bit-identical to non-staged GPU"
                 else
-                    fail "Staging AMP: differs from serial (gather/scatter bug?)"
+                    fail "Staging AMP: differs from non-staged GPU (gather/scatter bug?)"
                 fi
             else
                 fail "Staging: AMP output cube not found: $amp_stg"
@@ -300,7 +301,7 @@ mem_frac_vram=0.10")
         fail "Staging run did not complete (see $log_stg)"
     fi
 else
-    skip "Serial binary/reference not available; skipping staging test"
+    skip "GPU binary or GPU reference not available; skipping staging test"
 fi
 
 # ---------------------------------------------------------------------------
