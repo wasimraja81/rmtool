@@ -129,7 +129,7 @@ conclusion.
 
 ---
 
-### 6 — `wsum` recomputed O(nrm_out) times per pixel in the GPU kernel
+### 6 — ~~`wsum` recomputed O(nrm_out) times per pixel in the GPU kernel~~ ✅ Fixed in `d1509ea`
 
 Inside `tile_extract_gpu_rm_blocked`, `wsum` is accumulated inside the
 `collapse(2)` loop — once per `(pixel, RM)` pair:
@@ -151,6 +151,29 @@ bins and 236 channels this is ~12 billion redundant FMA operations per tile
 just to compute a normalisation constant. `wsum` should be precomputed per
 pixel in `prepare_gpu_data` (which already loops over the same data) and
 passed as a `wsum_gpu(npix)` array.
+
+*Fixed in `d1509ea`: `wsum_gpu(npix)` precomputed in `prepare_gpu_data` via one
+parallel pass over `wts_gpu`; kernel uses `wsum_gpu(ipix)` directly.*
+
+---
+
+### 6b — ~~GPU path never populated `nvalid_tile_arr`~~ ✅ Fixed in `475a74c`
+
+The per-pixel valid-channel count (`nvalid_tile_arr`) is written to a FITS map
+when `write_nvalid_output = y`. `tile_extract_cpu` sets it during extraction.
+`tile_extract_gpu_rm_blocked` never touched it — so any run with `use_gpu = y`
+and `write_nvalid_output = y` wrote uninitialised data to the NVALID FITS map.
+
+With `wsum_gpu(npix)` now available after `prepare_gpu_data` returns, the fix
+required no extra data passes:
+
+```fortran
+do ipix_tile = 1, nx_tile*ny_tile
+  nvalid_tile_arr(ipix_tile) = int(wsum_gpu(ipix_tile), kind=2)
+end do
+```
+
+Applied to both the single-level and staging GPU paths.
 
 ---
 
@@ -260,10 +283,12 @@ variables conflates these two orthogonal concerns.
 |---|---|---|---|
 | **P0** | `stMaskOut` reads uninitialised memory | Corrupt mask FITS output | ✅ `022e7e8` |
 | **P0** | Duplicate DFT kernels — sign reversal | Caused sign-reversal bug; will recur | ⚠️ Sign fixed `5e0f9ea`; duplication open |
-| **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | 🔲 Open |
+| **P0** | GPU path never set `nvalid_tile_arr` | Corrupt NVALID FITS on GPU runs | ✅ `475a74c` |
+| **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | ✅ `d1509ea` |
 | **P1** | Serial mask build | Wastes N−1 cores before every tile | 🔲 Open |
 | **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8`, `505f829` |
 | **P2** | Dead variables in `tile_extract_cpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
+| **P2** | Hardcoded speed of light | 0.069% systematic error on all L_sq | ✅ `2ead708` |
 | **P3** | Fixed-form main program | Maintenance liability | 🔲 Open |
 | **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU | 🔲 Open |
 | **P4** | No I/O / compute overlap | Performance opportunity | 🔲 Open |
