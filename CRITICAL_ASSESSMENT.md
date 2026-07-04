@@ -1,6 +1,6 @@
 # Critical Assessment of rm_synthesis
 
-*Based on code review and debugging session, 2026-07-04.*
+*Based on code review and debugging session, 2026-07-04. Updated through commit `e39c257`.*
 
 ---
 
@@ -53,8 +53,8 @@ support large images — the very runs most likely to use staging.
 
 ---
 
-### 2 — Duplicate DFT implementations: the root cause of the sign-reversal bug
-*(Sign reversal fixed in `5e0f9ea`; structural duplication remains — see priority table)*
+### 2 — ~~Duplicate DFT implementations: the root cause of the sign-reversal bug~~ ✅ Fully fixed in `36eb833`
+*(Sign reversal fixed in `5e0f9ea`; `tile_extract_cpu` deleted in `36eb833`; CPU path now calls `prepare_gpu_data` + `tile_extract_gpu_rm_blocked`)*
 
 There are two complete, independent implementations of the same DFT:
 
@@ -75,6 +75,10 @@ The fix was three lines. The structural problem remains. The CPU path should
 call `prepare_gpu_data` + `tile_extract_gpu_rm_blocked` with
 `use_gpu_actual=false` — the `collapse(2)` directive works on CPU threads —
 and `tile_extract_cpu` should be deleted.
+
+*Fixed in `36eb833`: `tile_extract_cpu` deleted; CPU path now identical to GPU
+path. `use_staging` guard fixed in `a73d639` to prevent staging being entered
+for CPU runs. All 10 tests pass.*
 
 **Severity:** structural defect that has already caused one silent correctness
 regression and will cause another.
@@ -174,6 +178,21 @@ end do
 ```
 
 Applied to both the single-level and staging GPU paths.
+
+---
+
+### 6c — ~~`use_staging` triggered on CPU runs~~ ✅ Fixed in `a73d639`
+
+`use_staging = (ny_sub < tile_dec)` was independent of `use_gpu_actual`.
+Staging is a VRAM management mechanism and makes no sense on CPU; the staging
+block allocates and calls GPU-path functions that require `use_gpu_actual=true`.
+On a system where `gpu_vram_mib` was set to a small value in the config, a CPU
+run would enter staging and crash or produce wrong output.
+
+Fixed by making staging conditional on GPU being active:
+```fortran
+use_staging = (ny_sub.lt.tile_dec) .and. use_gpu_actual
+```
 
 ---
 
@@ -282,8 +301,9 @@ variables conflates these two orthogonal concerns.
 | Priority | Issue | Impact | Status |
 |---|---|---|---|
 | **P0** | `stMaskOut` reads uninitialised memory | Corrupt mask FITS output | ✅ `022e7e8` |
-| **P0** | Duplicate DFT kernels — sign reversal | Caused sign-reversal bug; will recur | ⚠️ Sign fixed `5e0f9ea`; duplication open |
+| **P0** | Duplicate DFT kernels — sign reversal | Caused sign-reversal bug; structural | ✅ Sign `5e0f9ea`; deleted `36eb833` |
 | **P0** | GPU path never set `nvalid_tile_arr` | Corrupt NVALID FITS on GPU runs | ✅ `475a74c` |
+| **P0** | `use_staging` triggered on CPU runs | Crash/wrong output on CPU + small VRAM cfg | ✅ `a73d639` |
 | **P1** | `wsum` recomputed per RM in GPU kernel | ~200× wasted work in hot path | ✅ `d1509ea` |
 | **P1** | Serial mask build | Wastes N−1 cores before every tile | 🔲 Open |
 | **P2** | Misleading names and false comments | Caused multi-hour debugging sessions | ✅ `022e7e8`, `505f829` |
@@ -293,3 +313,50 @@ variables conflates these two orthogonal concerns.
 | **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU | 🔲 Open |
 | **P4** | No I/O / compute overlap | Performance opportunity | 🔲 Open |
 | **P4** | Serial tile loop (global unit numbers) | Scalability ceiling | 🔲 Open |
+
+---
+
+## Efficiency profile (current architecture)
+
+*Assessed at `e39c257`. Figures use representative parameters:
+tile 512×512 pixels, nz\_out=236 channels, nrm\_out=201 RM bins, N=8 cores.*
+
+### Hot path per tile
+
+| Phase | Parallelism | Operations | Notes |
+|---|---|---|---|
+| FITS read | serial | O(npix × nz) float reads | I/O bound |
+| Mask build | **serial** | O(npix × nz) with int-div + 3 branches | P1 bottleneck |
+| `prepare_gpu_data` copy | OMP (wsum loop) | O(npix × nz) copy + wsum accumulate | 2× tile RAM |
+| DFT (`tile_extract_gpu_rm_blocked`) | OMP collapse(2) over (npix × nrm\_block) | O(npix × nrm × nz) FMA | peak compute |
+| FITS write | serial | O(npix × nrm) float writes | I/O bound |
+
+### DFT arithmetic intensity
+
+For the test cube (512×512 × 236ch × 201RM):
+- Work: npix × nrm × nz × 8 FP ops (4 FMA per channel × rc/rs/ic/is)  
+  = 262,144 × 201 × 236 × 8 ≈ **100 GFLOPs per tile**
+- Read traffic: specQ\_gpu + specU\_gpu = 2 × 262,144 × 236 × 4B ≈ **494 MB**
+- Template traffic: cos\_arr + sin\_arr = 2 × 236 × 201 × 4B ≈ **380 KB** (fits in L2/L3)
+- Arithmetic intensity: ~100 GFLOPs / 494 MB ≈ **~200 FLOP/byte** → compute-bound on CPU
+
+### Estimated serial bottleneck breakdown (before profiling)
+
+```
+Mask build:         O(npix × nz)   serial    ~  59 M iterations    ← remove with !$omp
+prepare_gpu_data:   O(npix × nz)   parallel  ~ 247 MB read+write
+DFT kernel:         O(npix×nrm×nz) collapse  ~  49 B FMA          ← dominant
+FITS read:          O(npix × nz)   serial    ~ 247 MB disk read
+FITS write:         O(npix × nrm)  serial    ~ 211 MB disk write
+```
+
+At 8 cores and ~50 GFLOPs/core peak: DFT budget ≈ **2.5 s/tile** (compute).  
+Mask build on 1 core: ~59 M ÷ ~500 M iter/s ≈ **0.1 s** — small but avoidable.  
+FITS I/O at 500 MB/s: read+write ≈ **~1 s/tile** — overlappable with compute.
+
+### Remaining open performance work (in priority order)
+
+1. **Parallelise mask build** — `!$omp parallel do` on the mask loop. Two lines.
+2. **Profile DFT inner loop** — use `perf stat` / `gprof` to confirm cache miss rate and FP utilisation. The `collapse(2)` schedule with default `static` may leave cores idle on the last partial block.
+3. **Overlap FITS I/O** — double-buffer: start reading tile T+1 while processing tile T.
+4. **Eliminate `prepare_gpu_data` copy** — thread the flat index formula directly into the kernel; saves 2× tile RAM and one memory pass.
