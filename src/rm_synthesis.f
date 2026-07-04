@@ -229,6 +229,7 @@ chelp-
       ! GPU optimization: RM-block tiled extraction
       real(sp), allocatable :: specQ_gpu(:,:), specU_gpu(:,:)
       real(sp), allocatable :: wts_gpu(:,:)
+      real(sp), allocatable :: wsum_gpu(:)
       real(sp), allocatable :: mean_Q(:), mean_U(:)
       real(sp), allocatable :: cos_arr_gpu(:,:), sin_arr_gpu(:,:)
       integer   i_rm_block, nrm_block_now
@@ -236,6 +237,7 @@ chelp-
       ! GPU optimization: staging path (per sub-block)
       real(sp), allocatable :: st_Q_gpu(:,:), st_U_gpu(:,:)
       real(sp), allocatable :: st_wts_gpu(:,:)
+      real(sp), allocatable :: st_wsum_gpu(:)
       real(sp), allocatable :: st_mean_Q(:), st_mean_U(:)
       real(sp), allocatable :: st_cos_arr_gpu(:,:)
       real(sp), allocatable :: st_sin_arr_gpu(:,:)
@@ -2491,7 +2493,7 @@ chelp-
      -             specQ, specU, mask_tile_arr,
      -             nx_tile, ny_tile, nz_out,
      -             specQ_gpu, specU_gpu, wts_gpu,
-     -             rem_mean, mean_Q, mean_U)
+     -             rem_mean, mean_Q, mean_U, wsum_gpu)
                 
                 ! Templates are already full-size (nz_out, nrm_out)
                 ! No transposition needed - pass directly to GPU kernel
@@ -2503,7 +2505,7 @@ chelp-
                   ! GPU kernel: optimized collapse(2) parallelism
                   call tile_extract_gpu_rm_blocked(
      -               specQ_gpu, specU_gpu, wts_gpu,
-     -               mean_Q, mean_U, cos_arr, sin_arr,
+     -               mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,
      -               nx_tile, ny_tile, nz_out,
      -               i_rm_block, nrm_block_now, nrm_out,
      -               use_gpu_actual, rem_mean, output_mode,
@@ -2512,6 +2514,7 @@ chelp-
                 
                 ! Deallocate temporary GPU arrays
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
+                deallocate(wsum_gpu)
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               else
@@ -2573,7 +2576,7 @@ chelp-
                   call prepare_gpu_data(stQ, stU, stMask_tile_arr,
      -               nx_tile, ny_sub_now, nz_out,
      -               st_Q_gpu, st_U_gpu, st_wts_gpu,
-     -               rem_mean, st_mean_Q, st_mean_U)
+     -               rem_mean, st_mean_Q, st_mean_U, st_wsum_gpu)
                   
                   ! Templates are already full-size (nz_out, nrm_out)
                   ! No transposition needed
@@ -2585,7 +2588,8 @@ chelp-
                     ! GPU kernel: optimized collapse(2) parallelism
                     call tile_extract_gpu_rm_blocked(
      -                 st_Q_gpu, st_U_gpu, st_wts_gpu,
-     -                 st_mean_Q, st_mean_U, cos_arr, sin_arr,
+     -                 st_mean_Q, st_mean_U, st_wsum_gpu,
+     -                 cos_arr, sin_arr,
      -                 nx_tile, ny_sub_now, nz_out,
      -                 st_i_rm_block, st_nrm_block_now,
      -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
@@ -2594,6 +2598,7 @@ chelp-
                   
                   ! Deallocate GPU temporary arrays
                   deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
+                  deallocate(st_wsum_gpu)
                   if (allocated(st_mean_Q)) deallocate(st_mean_Q)
                   if (allocated(st_mean_U)) deallocate(st_mean_U)
                 else

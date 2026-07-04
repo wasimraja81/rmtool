@@ -409,7 +409,7 @@ contains
   subroutine prepare_gpu_data(specQ_flat, specU_flat, mask_tile, &
                               nx_tile, ny_tile, nz_out, &
                               specQ_gpu, specU_gpu, wts_gpu, &
-                              rem_mean, mean_Q, mean_U)
+                              rem_mean, mean_Q, mean_U, wsum_gpu)
     !! ========================================================================
     !! GPU Data Preparation: Reshape and Pack Arrays
     !! ========================================================================
@@ -431,6 +431,11 @@ contains
     !!
     !! No dense packing: all nz_out channels stored, bad channels have wts=0
     !! This enables direct indexing: specQ_gpu(ipix, iz) matches cos_arr(iz, i)
+    !!
+    !! wsum_gpu(npix) — per-pixel valid-channel count, always computed.
+    !! Pixel-dependent masking (NaN/Inf, input mask) means wsum varies by pixel
+    !! but is RM-independent. Precomputing here avoids nrm_out redundant passes
+    !! inside tile_extract_gpu_rm_blocked.
     
     implicit none
     integer(int32), intent(in) :: nx_tile, ny_tile, nz_out
@@ -444,6 +449,7 @@ contains
     real(sp), allocatable, intent(out) :: specU_gpu(:,:)
     real(sp), allocatable, intent(out) :: wts_gpu(:,:)
     real(sp), allocatable, intent(out) :: mean_Q(:), mean_U(:)
+    real(sp), allocatable, intent(out) :: wsum_gpu(:)
     
     integer(int32) :: npix, ipix, iz, src_idx
     real(sp) :: q_val, u_val
@@ -479,23 +485,39 @@ contains
       end do
     end do
     
+    ! Always compute per-pixel weight sums.
+    ! wsum_gpu(ipix) is RM-independent but pixel-dependent when NaN/Inf or
+    ! input-mask channels vary spatially. Precomputing once here saves
+    ! nrm_out redundant accumulations per pixel in the GPU kernel.
+    allocate(wsum_gpu(npix))
+    !$omp parallel do default(none) &
+    !$omp     private(ipix, iz) &
+    !$omp     shared(npix, nz_out, wts_gpu, wsum_gpu)
+    do ipix = 1, npix
+      wsum_gpu(ipix) = 0.0_sp
+      do iz = 1, nz_out
+        wsum_gpu(ipix) = wsum_gpu(ipix) + wts_gpu(ipix, iz)
+      end do
+    end do
+    !$omp end parallel do
+
     ! Pre-compute per-pixel means if rem_mean > 0
     if (rem_mean > 0) then
+      allocate(mean_Q(npix))
+      allocate(mean_U(npix))
       !$omp parallel do default(none) &
-      !$omp     private(ipix, iz, wsum, q_sum, u_sum) &
-      !$omp     shared(npix, nz_out, specQ_gpu, specU_gpu, wts_gpu, mean_Q, mean_U)
+      !$omp     private(ipix, iz, q_sum, u_sum) &
+      !$omp     shared(npix, nz_out, specQ_gpu, specU_gpu, wts_gpu, wsum_gpu, mean_Q, mean_U)
       do ipix = 1, npix
-        wsum = 0.0_sp
         q_sum = 0.0_sp
         u_sum = 0.0_sp
         do iz = 1, nz_out
-          wsum = wsum + wts_gpu(ipix, iz)
           q_sum = q_sum + wts_gpu(ipix, iz) * specQ_gpu(ipix, iz)
           u_sum = u_sum + wts_gpu(ipix, iz) * specU_gpu(ipix, iz)
         end do
-        if (wsum > 0.0_sp) then
-          mean_Q(ipix) = q_sum / wsum
-          mean_U(ipix) = u_sum / wsum
+        if (wsum_gpu(ipix) > 0.0_sp) then
+          mean_Q(ipix) = q_sum / wsum_gpu(ipix)
+          mean_U(ipix) = u_sum / wsum_gpu(ipix)
         end if
       end do
       !$omp end parallel do
@@ -504,7 +526,7 @@ contains
   end subroutine prepare_gpu_data
 
   subroutine tile_extract_gpu_rm_blocked(specQ_gpu, specU_gpu, wts_gpu, &
-                                         mean_Q, mean_U, &
+                                         mean_Q, mean_U, wsum_gpu, &
                                          cos_arr_gpu, sin_arr_gpu, &
                                          nx_tile, ny_tile, nz_out, &
                                          i_rm_block, nrm_block_now, nrm_out, &
@@ -522,6 +544,7 @@ contains
     !!      - specQ_gpu(npix, nz_out) — FULL array with all channels
     !!      - wts_gpu(npix, nz_out) — weight mask (0 for bad, 1 for good channels)
     !!      - mean_Q(npix), mean_U(npix) — pre-computed if rem_mean > 0
+    !!      - wsum_gpu(npix) — per-pixel valid-channel count (precomputed)
     !!      - cos_arr_gpu(nz_out, nrm_out) — FULL-SIZE templates
     !!   2. Process: RM-block loop (CPU), GPU parallel over pixels × RM_in_block
     !!      - Use collapse(2): parallelize (pixel, RM_in_block) pairs
@@ -544,6 +567,7 @@ contains
     real(sp), intent(in) :: wts_gpu(nx_tile*ny_tile, nz_out)
     real(sp), intent(in), optional :: mean_Q(nx_tile*ny_tile)
     real(sp), intent(in), optional :: mean_U(nx_tile*ny_tile)
+    real(sp), intent(in) :: wsum_gpu(nx_tile*ny_tile)
     real(sp), intent(in) :: cos_arr_gpu(:, :)
     real(sp), intent(in) :: sin_arr_gpu(:, :)
     
@@ -552,7 +576,7 @@ contains
     
     integer(int32) :: ipix, npix, i_rm_local, i_rm_global, iz
     integer(int32) :: p_idx
-    real(sp) :: rc_cor, rs_cor, ic_cor, is_cor, wsum, ryw_tmp, iyw_tmp
+    real(sp) :: rc_cor, rs_cor, ic_cor, is_cor, ryw_tmp, iyw_tmp
     real(sp) :: q_eff, u_eff, wt, mean_q_pix, mean_u_pix
 
     npix = nx_tile * ny_tile
@@ -560,25 +584,25 @@ contains
 #ifdef USE_GPU
     !$omp target teams distribute parallel do collapse(2) if(use_gpu_actual) &
     !$omp     map(to: specQ_gpu, specU_gpu, wts_gpu, &
-    !$omp             mean_Q, mean_U, &
+    !$omp             mean_Q, mean_U, wsum_gpu, &
     !$omp             cos_arr_gpu, sin_arr_gpu, &
     !$omp             nx_tile, ny_tile, nz_out, &
     !$omp             i_rm_block, nrm_block_now, rem_mean, &
     !$omp             output_mode, ap_angle_mode, npix) &
     !$omp     map(tofrom: p_tile_arr, phi_tile_arr) &
     !$omp     private(i_rm_local, i_rm_global, iz, &
-    !$omp             rc_cor, rs_cor, ic_cor, is_cor, wsum, &
+    !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix)
 #else
     !$omp parallel do collapse(2) default(none) &
     !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, &
-    !$omp             rc_cor, rs_cor, ic_cor, is_cor, wsum, &
+    !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix) &
     !$omp     shared(npix, nz_out, nrm_block_now, &
     !$omp            specQ_gpu, specU_gpu, wts_gpu, &
-    !$omp            mean_Q, mean_U, &
+    !$omp            mean_Q, mean_U, wsum_gpu, &
     !$omp            cos_arr_gpu, sin_arr_gpu, &
     !$omp            i_rm_block, rem_mean, output_mode, ap_angle_mode, &
     !$omp            p_tile_arr, phi_tile_arr)
@@ -592,7 +616,6 @@ contains
         rs_cor = 0.0_sp
         ic_cor = 0.0_sp
         is_cor = 0.0_sp
-        wsum = 0.0_sp
         
         ! Load per-pixel mean if needed
         if (rem_mean > 0 .and. present(mean_Q)) then
@@ -611,19 +634,18 @@ contains
           u_eff = specU_gpu(ipix, iz) - mean_u_pix
           wt = wts_gpu(ipix, iz)
           
-          wsum = wsum + wt
           rc_cor = rc_cor + wt * q_eff * cos_arr_gpu(iz, i_rm_global)
           rs_cor = rs_cor + wt * q_eff * sin_arr_gpu(iz, i_rm_global)
           ic_cor = ic_cor + wt * u_eff * cos_arr_gpu(iz, i_rm_global)
           is_cor = is_cor + wt * u_eff * sin_arr_gpu(iz, i_rm_global)
         end do
         
-        ! Normalize by weight sum and compute output
-        if (wsum > 0.0_sp) then
-          rc_cor = rc_cor / wsum
-          rs_cor = rs_cor / wsum
-          ic_cor = ic_cor / wsum
-          is_cor = is_cor / wsum
+        ! Normalize by precomputed per-pixel weight sum and compute output
+        if (wsum_gpu(ipix) > 0.0_sp) then
+          rc_cor = rc_cor / wsum_gpu(ipix)
+          rs_cor = rs_cor / wsum_gpu(ipix)
+          ic_cor = ic_cor / wsum_gpu(ipix)
+          is_cor = is_cor / wsum_gpu(ipix)
           
           ryw_tmp = rc_cor - is_cor
           iyw_tmp = rs_cor + ic_cor
