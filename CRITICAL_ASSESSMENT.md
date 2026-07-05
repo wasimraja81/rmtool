@@ -1,6 +1,6 @@
 # Critical Assessment of rm_synthesis
 
-*Based on code review and debugging session, 2026-07-04. Updated through commit `e39c257`.*
+*Based on code review and debugging sessions, 2026-07-04/05. Updated through commit `a86138a`.*
 
 ---
 
@@ -196,10 +196,11 @@ use_staging = (ny_sub.lt.tile_dec) .and. use_gpu_actual
 
 ---
 
-### 7 — Mask build is serial while N−1 cores sit idle
+### 7 — ~~Mask build is serial while N−1 cores sit idle~~ ✅ Fixed in `af85709`
 
 ```fortran
-do idx_wts = 1, nx_tile*ny_tile*nz_out    ! serial
+!$omp parallel do default(shared) private(idx_wts, iz)
+do idx_wts = 1, nx_tile*ny_tile*nz_out
   mask_tile_arr(idx_wts) = 1
   iz = (idx_wts - 1) / (nx_tile*ny_tile) + 1
   if (flag_arr_out(iz) == 0) mask_tile_arr(idx_wts) = 0
@@ -212,10 +213,9 @@ do idx_wts = 1, nx_tile*ny_tile*nz_out    ! serial
 end do
 ```
 
-For a 500×500-pixel tile with 236 channels this is 59 million iterations of
-non-trivial logic including integer division and three conditional branches.
-It runs on one core while all others wait. Adding `!$omp parallel do` here
-costs two lines and gives full thread utilisation before the extraction begins.
+For a 500×500-pixel tile with 236 channels this was 59 million iterations of
+non-trivial logic including integer division and three conditional branches
+running on one core. Fixed with a single `!$omp parallel do` directive.
 
 ---
 
@@ -265,14 +265,20 @@ maintenance liability that grows over time.
 
 ---
 
-### 12 — `prepare_gpu_data` doubles the tile memory footprint
+### 12 — Data copies in `prepare_cpu_data` / `prepare_gpu_data` double tile memory
 
-It copies `specQ`/`specU` into `specQ_gpu`/`specU_gpu` — a full duplicate of
-the tile data. The GPU kernel could read from `specQ` directly using a
-computed flat index with no semantic change. The copy is justifiable only if
-the memory layout genuinely matters for VRAM cache-line coalescing on real GPU
-hardware. On CPU with `OMP_TARGET_OFFLOAD=DISABLED` it is pure overhead and
-doubles the effective tile RAM requirement.
+Both prepare functions allocate new 2D arrays and copy the flat FITS data:
+- CPU binary: `specQ_cpu(nz_out, npix)` — stride-1 layout needed for cache efficiency
+- GPU binary: `specQ_gpu(npix, nz_out)` — coalesced layout for warp access
+
+The copy is the necessary cost of the layout fix (`bf76380`). Without it,
+the inner DFT loop suffers stride-5.9 MB cache misses (the 4.3× slowdown
+we fixed). The 2× tile RAM overhead is the deliberate trade-off.
+
+The alternative — reading FITS data directly in the right layout — would
+require either reading one channel at a time (expensive I/O) or accepting
+the old cache-unfriendly layout. The copy remains open as a P3 item but
+it is a design trade-off, not a bug.
 
 ---
 
@@ -310,7 +316,7 @@ variables conflates these two orthogonal concerns.
 | **P2** | Dead variables in `tile_extract_cpu` | Compiler warnings, incomplete refactor | ✅ `022e7e8` |
 | **P2** | Hardcoded speed of light | 0.069% systematic error on all L_sq | ✅ `2ead708` |
 | **P3** | Fixed-form main program | Maintenance liability | 🔲 Open |
-| **P3** | `prepare_gpu_data` memory copy | 2× tile RAM, pure overhead on CPU | 🔲 Open |
+| **P3** | Data copies in prepare functions | 2× tile RAM; necessary layout trade-off | 🔲 Open (by design) |
 | **P4** | No I/O / compute overlap | Performance opportunity | 🔲 Open |
 | **P4** | Serial tile loop (global unit numbers) | Scalability ceiling | 🔲 Open |
 
@@ -318,16 +324,16 @@ variables conflates these two orthogonal concerns.
 
 ## Efficiency profile (current architecture)
 
-*Assessed at `e39c257`. Figures use representative parameters:
-tile 512×512 pixels, nz\_out=236 channels, nrm\_out=201 RM bins, N=8 cores.*
+*Assessed at `a86138a`. Figures use representative parameters:
+tile 512×512 pixels, nz\_out=236 channels, nrm\_out=201 RM bins, N=6 cores.*
 
 ### Hot path per tile
 
 | Phase | Parallelism | Operations | Notes |
 |---|---|---|---|
 | FITS read | serial | O(npix × nz) float reads | I/O bound |
-| Mask build | **serial** | O(npix × nz) with int-div + 3 branches | P1 bottleneck |
-| `prepare_gpu_data` copy | OMP (wsum loop) | O(npix × nz) copy + wsum accumulate | 2× tile RAM |
+| Mask build | **parallel** (`af85709`) | O(npix × nz) with int-div + 3 branches | ✅ fixed |
+| `prepare_cpu_data`/`prepare_gpu_data` copy | OMP (wsum loop only; copy serial) | O(npix × nz) reshape into target layout | necessary for cache/coalesce |
 | DFT (`tile_extract_gpu_rm_blocked`) | OMP collapse(2) over (npix × nrm\_block) | O(npix × nrm × nz) FMA | peak compute |
 | FITS write | serial | O(npix × nrm) float writes | I/O bound |
 
@@ -343,7 +349,7 @@ For the test cube (512×512 × 236ch × 201RM):
 ### Estimated serial bottleneck breakdown (before profiling)
 
 ```
-Mask build:         O(npix × nz)   serial    ~  59 M iterations    ← remove with !$omp
+Mask build:         O(npix × nz)   parallel  ~  59 M iterations    ✅ `af85709`
 prepare_gpu_data:   O(npix × nz)   parallel  ~ 247 MB read+write
 DFT kernel:         O(npix×nrm×nz) collapse  ~  49 B FMA          ← dominant
 FITS read:          O(npix × nz)   serial    ~ 247 MB disk read
@@ -373,9 +379,23 @@ access) for CPU binaries; `prepare_gpu_data` keeps `(npix, nz_out)` for GPU.
 | Peak RSS | 9+ GB | 2.93 GB |
 | CPU utilisation | 544% / 600% | 440% / 600% |
 
-12× wall-time speedup. The remaining ~27% unused capacity (440% vs 600%) is
-the serial mask build (`af85709`) and FITS I/O phases. Mask build is now
-fixed; FITS I/O overlap remains open.
+12× wall-time speedup on CASA fullim (data in page cache). The remaining
+unused CPU capacity is CFITSIO serial processing overhead (byte-swapping
+46 GB through a serial API), confirmed on Jennifer fullim — see below.
+
+**Jennifer fullim benchmark (6 cores, 4501×4501×288, data from disk):**
+
+| | Regressed CPU path | Fixed CPU path |
+|---|---|---|
+| Wall time | 1:13:52 | **13:59** |
+| CPU% | 544% | 204% |
+| Bottleneck | DRAM cache misses | Disk I/O (142 MB/s) |
+
+**Jennifer fullim (back-to-back, data in page cache):**
+- CPU%: 211% — Amdahl serial fraction = **37%**
+- 37% × 839s = **309s serial** = CFITSIO byte-swap overhead processing 47 GB
+- Even from page cache, CFITSIO processes each float serially (FITS big-endian → x86 little-endian)
+- True compute ceiling with current CFITSIO API: **~270% CPU** on 6 cores
 
 ### Remaining open performance work (in priority order)
 
