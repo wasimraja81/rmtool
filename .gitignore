@@ -3,6 +3,8 @@
 /bin/
 *.o
 *.mod
+# Docker artifacts
+rmtool-multibuild.tar
 
 # CMake artifacts
 CMakeCache.txt
