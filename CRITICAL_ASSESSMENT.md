@@ -83,19 +83,13 @@ immediately by the test suite which verifies RM peak positions.
 
 ---
 
-### 3 — ~~`tile_extract_gpu` is the CPU kernel~~ ✅ Fixed in `022e7e8`, renamed in `HEAD`
-*(Module header comment corrected in `022e7e8`; function renamed `tile_extract_cpu` in follow-up commit)*
+### 3 — ~~`tile_extract_gpu` was the CPU kernel~~ ✅ Renamed in `505f829`, deleted in `36eb833`
+*(Renamed `tile_extract_cpu` in `505f829`; then deleted entirely when the CPU path was unified with the GPU kernel)*
 
-The kernel (then named `tile_extract_gpu`, now renamed `tile_extract_cpu` in `505f829`) was called exclusively on the **CPU path**.
-The module header compounds the confusion:
-
-```fortran
-public :: tile_extract_gpu  ! Legacy: kept for compatibility (now wraps tile_extract_gpu_rm_blocked)
-```
-
-It does not wrap anything. It reimplements the DFT independently. The comment
-is false. During this debugging session the misleading name sent analysis in
-the wrong direction multiple times.
+The kernel (named `tile_extract_gpu` despite being CPU-only) was renamed to
+`tile_extract_cpu` in `505f829` for clarity. It was subsequently deleted in
+`36eb833` when the CPU path was unified under `tile_extract_gpu_rm_blocked`.
+Neither the name nor the function exists in the codebase any longer.
 
 ---
 
