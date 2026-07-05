@@ -53,35 +53,33 @@ support large images — the very runs most likely to use staging.
 
 ---
 
-### 2 — ~~Duplicate DFT implementations: the root cause of the sign-reversal bug~~ ✅ Fully fixed in `36eb833`
-*(Sign reversal fixed in `5e0f9ea`; `tile_extract_cpu` deleted in `36eb833`; CPU path now calls `prepare_gpu_data` + `tile_extract_gpu_rm_blocked`)*
+### 2 — ~~Duplicate DFT implementations: the root cause of the sign-reversal bug~~ ✅ Fully resolved across `36eb833`, `bf76380`
+*(Sign reversal fixed in `5e0f9ea`; `tile_extract_cpu` deleted in `36eb833`; layout split added in `bf76380`)*
 
-There are two complete, independent implementations of the same DFT:
+The original bug: two independent DFT implementations (`tile_extract_cpu` and
+`tile_extract_gpu_rm_blocked`) each maintained their own copy of the channel
+ordering and normalisation logic. An unrelated change to the L_sq loop direction
+caused them to diverge silently — one path produced correct RM signs, the
+other reversed them on every CPU run.
 
-| Kernel | Path | Where |
-|---|---|---|
-| `tile_extract_cpu` (was `tile_extract_gpu`) | CPU | `rm_synthesis_mod.f90` |
-| `tile_extract_gpu_rm_blocked` | GPU (and CPU fallback) | `rm_synthesis_mod.f90` |
+**Fix (`36eb833`):** `tile_extract_cpu` deleted. A single kernel
+(`tile_extract_gpu_rm_blocked`) now serves both CPU and GPU, with one `#ifdef
+USE_GPU` block controlling the access pattern only.
 
-They must track each other's invariants — channel ordering, L_sq convention,
-normalisation, masking logic — but nothing enforces that. The sign-reversal
-bug fixed in this session was caused by exactly this duplication: the L_sq
-loop direction changed in `rm_synthesis.f` as part of the mask-consolidation
-refactoring, only the GPU kernel's direct-index convention happened to survive
-correctly, and the CPU kernel's old reversal `iz = nz_out - cnt2 + 1` silently
-produced wrong RM signs for every serial and OMP run.
+**Subsequent intentional split (`bf76380`):** `prepare_gpu_data` and
+`prepare_cpu_data` are separate functions with different memory layouts:
+- `prepare_cpu_data`: `(nz_out, npix)` — channels fastest, stride-1 for CPU DFT inner loop
+- `prepare_gpu_data`: `(npix, nz_out)` — pixels fastest, coalesced across GPU warp
 
-The fix was three lines. The structural problem remains. The CPU path should
-call `prepare_gpu_data` + `tile_extract_gpu_rm_blocked` with
-`use_gpu_actual=false` — the `collapse(2)` directive works on CPU threads —
-and `tile_extract_cpu` should be deleted.
+This is *principled* divergence: different optimal memory layouts for
+different hardware, controlled at compile time via `#ifdef USE_GPU`. It is not
+the same class of problem as the original duplicate DFT — the algorithm
+(DFT, normalisation, masking) is identical; only the data staging differs.
+The `#ifdef` in the kernel is 6 lines and covers only index order, not logic.
 
-*Fixed in `36eb833`: `tile_extract_cpu` deleted; CPU path now identical to GPU
-path. `use_staging` guard fixed in `a73d639` to prevent staging being entered
-for CPU runs. All 10 tests pass.*
-
-**Severity:** structural defect that has already caused one silent correctness
-regression and will cause another.
+**Why this is safe:** if the index order ever diverges from the layout,
+the mismatch produces wrong numerical output (not a silent sign flip) — caught
+immediately by the test suite which verifies RM peak positions.
 
 ---
 
