@@ -20,7 +20,7 @@ the single biggest algorithmic win in the hot path.
 
 ### Unified mask in a single pass
 Three separate masking sources — global bad channels, NaN/Inf in Q or U, and
-an optional input mask FITS — are reduced to one `int8` array in one serial
+an optional input mask FITS — are reduced to one `int8` array in one parallel
 loop per tile. Clean and cache-friendly compared to the previous three nested
 loops.
 
@@ -379,7 +379,7 @@ fixed; FITS I/O overlap remains open.
 
 ### Remaining open performance work (in priority order)
 
-1. **Parallelise mask build** — `!$omp parallel do` on the mask loop. Two lines.
+1. ~~**Parallelise mask build**~~ ✅ Done (`af85709`)
 2. **Profile DFT inner loop** — use `perf stat` / `gprof` to confirm cache miss rate and FP utilisation. The `collapse(2)` schedule with default `static` may leave cores idle on the last partial block.
 3. **Overlap FITS I/O** — double-buffer: start reading tile T+1 while processing tile T.
 4. **Eliminate `prepare_cpu_data` copy** — thread the flat index formula directly into the kernel; saves 2× tile RAM and one memory pass.
