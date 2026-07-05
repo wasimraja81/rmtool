@@ -2462,6 +2462,14 @@ chelp-
                 end if
               end if
 
+              ! Check condition 2b: FITS NULL value (-999 from CFITSIO nullval)
+              ! When CFITSIO encounters NULL pixels in FITS, it substitutes nullval.
+              ! These must be masked or they will contaminate RM synthesis.
+              if (abs(specQ(idx_wts) - nullval) < 1.0e-6_sp .or.
+     -            abs(specU(idx_wts) - nullval) < 1.0e-6_sp) then
+                mask_tile_arr(idx_wts) = 0
+              end if
+
               ! Check condition 3: Input mask FITS (AND operation)
               if (use_input_mask) then
                 if (specMask(idx_wts) <= 0.5_sp) then

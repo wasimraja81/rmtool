@@ -662,6 +662,7 @@ contains
     integer(int32) :: p_idx
     real(sp) :: rc_cor, rs_cor, ic_cor, is_cor, ryw_tmp, iyw_tmp
     real(sp) :: q_eff, u_eff, wt, mean_q_pix, mean_u_pix
+    real(sp) :: zero_val = 0.0_sp  ! Used for runtime NaN generation (0.0/0.0)
 
     npix = nx_tile * ny_tile
     
@@ -672,7 +673,7 @@ contains
     !$omp             cos_arr_gpu, sin_arr_gpu, &
     !$omp             nx_tile, ny_tile, nz_out, &
     !$omp             i_rm_block, nrm_block_now, rem_mean, &
-    !$omp             output_mode, ap_angle_mode, npix) &
+    !$omp             output_mode, ap_angle_mode, npix, zero_val) &
     !$omp     map(tofrom: p_tile_arr, phi_tile_arr) &
     !$omp     private(i_rm_local, i_rm_global, iz, &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
@@ -689,7 +690,7 @@ contains
     !$omp            mean_Q, mean_U, wsum_gpu, &
     !$omp            cos_arr_gpu, sin_arr_gpu, &
     !$omp            i_rm_block, rem_mean, output_mode, ap_angle_mode, &
-    !$omp            p_tile_arr, phi_tile_arr)
+    !$omp            p_tile_arr, phi_tile_arr, zero_val)
 #endif
     do ipix = 1, npix
       do i_rm_local = 1, nrm_block_now
@@ -756,10 +757,11 @@ contains
             end if
           end if
         else
-          ! No valid data for this pixel
+          ! No valid data for this pixel: output NaN
+          ! Using runtime 0.0/0.0 to generate IEEE NaN (portable across platforms)
           p_idx = ipix + (i_rm_global - 1) * npix
-          p_tile_arr(p_idx) = 0.0_sp
-          phi_tile_arr(p_idx) = 0.0_sp
+          p_tile_arr(p_idx) = zero_val / zero_val
+          phi_tile_arr(p_idx) = zero_val / zero_val
         end if
       end do
     end do
