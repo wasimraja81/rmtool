@@ -2441,6 +2441,10 @@ chelp-
             ! NaN/Inf detection, and input mask FITS (if provided)
             ! Each element independent: safe to parallelise.
             ! ========================================================
+            ! Build unified mask from all sources: global bad channels,
+            ! NaN/Inf detection, and input mask FITS (if provided)
+            ! Each element independent: safe to parallelise.
+            ! ========================================================
 !$omp parallel do default(shared) private(idx_wts, iz)
             do idx_wts = 1, nx_tile*ny_tile*nz_out
               ! Initialize as valid

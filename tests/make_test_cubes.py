@@ -22,6 +22,14 @@ SOURCES = [
     {"name": "src_B", "x": 22, "y": 20, "rm": 22.0, "p0": 0.8, "chi0_deg": 30.0},
 ]
 
+# Bad channel test configuration
+# BAD_CHANNEL_IDX: channel index (0-based) that will be NaN at certain pixels
+# BAD_PIXELS: list of (x, y) coordinates where that channel is NaN
+# FULLY_MASKED_PIXELS: list of (x, y) coordinates where ALL channels are NaN
+BAD_CHANNEL_IDX = 50
+BAD_PIXELS = [(12, 10), (12, 11), (13, 10)]  # src_A region with one channel bad
+FULLY_MASKED_PIXELS = [(25, 25)]  # Completely masked pixel for NaN output test
+
 NX, NY = 32, 32
 N_CHAN  = 200
 F_START = 550.0e6   # Hz
@@ -64,6 +72,44 @@ def make_header(nx: int, ny: int, n_chan: int,
     return h
 
 
+def make_cubes_with_bad_channels(q_cube: np.ndarray, u_cube: np.ndarray,
+                                 bad_chan_idx: int,
+                                 bad_pixels: list[tuple[int, int]],
+                                 fully_masked: list[tuple[int, int]]) -> tuple:
+    """
+    Create variants of Q/U cubes with injected bad channels (as marker values).
+    
+    Note: rm_synthesis.f checks for nullval=-999.0 to mask bad channels.
+    We inject this marker value to simulate FITS NULL handling by CFITSIO.
+    
+    Args:
+        q_cube, u_cube: original data arrays
+        bad_chan_idx: channel index (0-based) to inject marker value
+        bad_pixels: list of (x, y) where bad_chan_idx is marked bad
+        fully_masked: list of (x, y) where ALL channels are marked bad
+    
+    Returns:
+        (q_bad, u_bad): copies with marker value (-999.0) injected
+    """
+    q_bad = q_cube.copy()
+    u_bad = u_cube.copy()
+    
+    # Use marker value that matches rm_synthesis.f nullval = -999.0
+    BAD_MARKER = -999.0
+    
+    # Inject bad marker at one channel for specific pixels
+    for x, y in bad_pixels:
+        q_bad[0, bad_chan_idx, y, x] = BAD_MARKER
+        u_bad[0, bad_chan_idx, y, x] = BAD_MARKER
+    
+    # Inject bad marker at all channels for fully-masked pixels
+    for x, y in fully_masked:
+        q_bad[0, :, y, x] = BAD_MARKER
+        u_bad[0, :, y, x] = BAD_MARKER
+    
+    return q_bad, u_bad
+
+
 def main() -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,10 +135,22 @@ def main() -> None:
     u_cube += rng.normal(0.0, noise, u_cube.shape).astype(np.float32)
 
     hdr = make_header(NX, NY, N_CHAN, F_START, F_STEP)
+    
+    # Write normal cubes (without bad channels)
     q_path = OUTDIR / "TEST.Q.FITSCUBE"
     u_path = OUTDIR / "TEST.U.FITSCUBE"
     fits.PrimaryHDU(data=q_cube, header=hdr).writeto(q_path, overwrite=True)
     fits.PrimaryHDU(data=u_cube, header=hdr).writeto(u_path, overwrite=True)
+
+    # Write cubes with bad channels (NaN at specific pixels)
+    q_bad, u_bad = make_cubes_with_bad_channels(q_cube, u_cube,
+                                                BAD_CHANNEL_IDX,
+                                                BAD_PIXELS,
+                                                FULLY_MASKED_PIXELS)
+    q_path_bad = OUTDIR / "TEST_BADCHAN.Q.FITSCUBE"
+    u_path_bad = OUTDIR / "TEST_BADCHAN.U.FITSCUBE"
+    fits.PrimaryHDU(data=q_bad, header=hdr).writeto(q_path_bad, overwrite=True)
+    fits.PrimaryHDU(data=u_bad, header=hdr).writeto(u_path_bad, overwrite=True)
 
     manifest = {
         "nx": NX, "ny": NY, "n_chan": N_CHAN,
@@ -100,10 +158,18 @@ def main() -> None:
         "sources": SOURCES,
         "noise_sigma": noise,
         "files": {"Q": str(q_path), "U": str(u_path)},
+        "bad_channel_test": {
+            "files_badchan": {"Q": str(q_path_bad), "U": str(u_path_bad)},
+            "bad_channel_idx": BAD_CHANNEL_IDX,
+            "bad_pixels": BAD_PIXELS,
+            "fully_masked_pixels": FULLY_MASKED_PIXELS,
+        },
     }
     (OUTDIR / "truth.json").write_text(json.dumps(manifest, indent=2))
     print(f"Wrote {q_path}")
     print(f"Wrote {u_path}")
+    print(f"Wrote {q_path_bad}")
+    print(f"Wrote {u_path_bad}")
     print(f"Wrote {OUTDIR / 'truth.json'}")
 
 

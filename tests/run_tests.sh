@@ -305,6 +305,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 10. Bad channel masking – per-channel NaN and fully-masked pixel handling
+#     Tests that:
+#     - Pixels with one bad channel still produce valid RM values
+#     - Fully-masked pixels output NaN in RM cube
+#     - Mask cube correctly shows per-channel masking
+# ---------------------------------------------------------------------------
+section "10. Bad channel masking – per-channel masking and NaN output"
+if [[ -x "$BIN_SERIAL" ]]; then
+    cfg_badchan=$(make_cfg "badchan" "n")
+    # Update config to use the bad channel test data
+    sed -i 's|TEST\.Q\.FITSCUBE|TEST_BADCHAN.Q.FITSCUBE|g' "$cfg_badchan"
+    sed -i 's|TEST\.U\.FITSCUBE|TEST_BADCHAN.U.FITSCUBE|g' "$cfg_badchan"
+    log_badchan="$OUT_DIR/badchan.log"
+    rm -f "$OUT_DIR"/badchan.*.FITS
+    if run_binary "$BIN_SERIAL" "$cfg_badchan" "$log_badchan"; then
+        # Validate using Python script
+        if python3 "$TESTS_DIR/check_bad_channel_masking.py"; then
+            pass "Bad channel masking: per-channel NaN handling correct"
+        else
+            fail "Bad channel masking: validation failed (see above)"
+        fi
+    else
+        fail "Bad channel test did not complete successfully (see $log_badchan)"
+    fi
+else
+    skip "Serial binary not available; skipping bad channel test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"
