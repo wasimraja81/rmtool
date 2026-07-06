@@ -89,20 +89,21 @@ def make_cubes_with_bad_channels(q_cube: np.ndarray, u_cube: np.ndarray,
         fully_masked: list of (x, y) where ALL channels are marked bad
     
     Returns:
-        (q_bad, u_bad): copies with marker value (-999.0) injected
+        (q_bad, u_bad): copies with IEEE NaN injected
     """
     q_bad = q_cube.copy()
     u_bad = u_cube.copy()
     
-    # Use marker value that matches rm_synthesis.f nullval = -999.0
-    BAD_MARKER = -999.0
+    # Use IEEE NaN - it is layout-independent and will be detected correctly
+    # by the mask building code via NaN self-inequality check (x /= x)
+    BAD_MARKER = np.nan
     
-    # Inject bad marker at one channel for specific pixels
+    # Inject NaN at one channel for specific pixels
     for x, y in bad_pixels:
         q_bad[0, bad_chan_idx, y, x] = BAD_MARKER
         u_bad[0, bad_chan_idx, y, x] = BAD_MARKER
     
-    # Inject bad marker at all channels for fully-masked pixels
+    # Inject NaN at all channels for fully-masked pixels
     for x, y in fully_masked:
         q_bad[0, :, y, x] = BAD_MARKER
         u_bad[0, :, y, x] = BAD_MARKER

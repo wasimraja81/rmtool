@@ -14,7 +14,7 @@ CPU_OPTFLAGS := -O3 -march=native
 CPU_DEBUGFLAGS := -g -fbacktrace -fbounds-check
 CPU_OMPFLAGS := -fopenmp
 GPU_NVFLAGS := -cpp -O3 -mp=gpu -gpu=cc80,managed -DUSE_GPU
-GPU_GNUFLAGS := $(BASEFLAGS) -O3 -fopenmp -foffload=nvptx-none -foffload="-lm" -ffast-math -DUSE_GPU
+GPU_GNUFLAGS := $(BASEFLAGS) -O3 -fopenmp -foffload=nvptx-none -foffload="-lm" -ffast-math -fno-finite-math-only -DUSE_GPU
 
 FFLAGS := $(BASEFLAGS)
 

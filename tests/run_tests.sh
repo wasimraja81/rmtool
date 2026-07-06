@@ -12,6 +12,9 @@
 #   5. Run serial binary  → check RM peaks at source positions
 #   6. Run OMP   binary   → bit-identical to serial reference
 #   7. Run GPU   binary   → within rtol=1e-4 of serial reference
+#   8-9. Staging tests (GPU only, if available)
+#  10. Bad channel masking – per-channel NaN and fully-masked pixel handling
+#      (run for serial, OMP, and GPU binaries)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -310,27 +313,75 @@ fi
 #     - Pixels with one bad channel still produce valid RM values
 #     - Fully-masked pixels output NaN in RM cube
 #     - Mask cube correctly shows per-channel masking
+#
+#     Runs for all three binaries: serial, OMP, GPU
 # ---------------------------------------------------------------------------
-section "10. Bad channel masking – per-channel masking and NaN output"
+section "10. Bad channel masking – Serial binary"
 if [[ -x "$BIN_SERIAL" ]]; then
-    cfg_badchan=$(make_cfg "badchan" "n")
+    cfg_badchan=$(make_cfg "badchan_serial" "n")
     # Update config to use the bad channel test data
     sed -i 's|TEST\.Q\.FITSCUBE|TEST_BADCHAN.Q.FITSCUBE|g' "$cfg_badchan"
     sed -i 's|TEST\.U\.FITSCUBE|TEST_BADCHAN.U.FITSCUBE|g' "$cfg_badchan"
-    log_badchan="$OUT_DIR/badchan.log"
-    rm -f "$OUT_DIR"/badchan.*.FITS
+    log_badchan="$OUT_DIR/badchan_serial.log"
+    rm -f "$OUT_DIR"/badchan_serial.*.FITS
     if run_binary "$BIN_SERIAL" "$cfg_badchan" "$log_badchan"; then
         # Validate using Python script
-        if python3 "$TESTS_DIR/check_bad_channel_masking.py"; then
-            pass "Bad channel masking: per-channel NaN handling correct"
+        if python3 "$TESTS_DIR/check_bad_channel_masking.py" "badchan_serial"; then
+            pass "Bad channel masking (serial): per-channel NaN handling correct"
         else
-            fail "Bad channel masking: validation failed (see above)"
+            fail "Bad channel masking (serial): validation failed (see above)"
         fi
     else
-        fail "Bad channel test did not complete successfully (see $log_badchan)"
+        fail "Bad channel test (serial) did not complete successfully (see $log_badchan)"
     fi
 else
     skip "Serial binary not available; skipping bad channel test"
+fi
+
+section "10. Bad channel masking – OMP binary"
+if [[ -x "$BIN_OMP" ]]; then
+    cfg_badchan=$(make_cfg "badchan_omp" "n")
+    # Update config to use the bad channel test data
+    sed -i 's|TEST\.Q\.FITSCUBE|TEST_BADCHAN.Q.FITSCUBE|g' "$cfg_badchan"
+    sed -i 's|TEST\.U\.FITSCUBE|TEST_BADCHAN.U.FITSCUBE|g' "$cfg_badchan"
+    log_badchan="$OUT_DIR/badchan_omp.log"
+    rm -f "$OUT_DIR"/badchan_omp.*.FITS
+    if run_binary "$BIN_OMP" "$cfg_badchan" "$log_badchan"; then
+        # Validate using Python script
+        if python3 "$TESTS_DIR/check_bad_channel_masking.py" "badchan_omp"; then
+            pass "Bad channel masking (OMP): per-channel NaN handling correct"
+        else
+            fail "Bad channel masking (OMP): validation failed (see above)"
+        fi
+    else
+        fail "Bad channel test (OMP) did not complete successfully (see $log_badchan)"
+    fi
+else
+    skip "OMP binary not available; skipping bad channel test"
+fi
+
+section "10. Bad channel masking – GPU binary"
+if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" ]]; then
+    cfg_badchan=$(make_cfg "badchan_gpu" "y")
+    # Update config to use the bad channel test data
+    sed -i 's|TEST\.Q\.FITSCUBE|TEST_BADCHAN.Q.FITSCUBE|g' "$cfg_badchan"
+    sed -i 's|TEST\.U\.FITSCUBE|TEST_BADCHAN.U.FITSCUBE|g' "$cfg_badchan"
+    log_badchan="$OUT_DIR/badchan_gpu.log"
+    rm -f "$OUT_DIR"/badchan_gpu.*.FITS
+    # Disable mandatory offload so test runs on host if no physical GPU
+    export OMP_TARGET_OFFLOAD="${OMP_TARGET_OFFLOAD:-DISABLED}"
+    if run_binary "$BIN_GPU" "$cfg_badchan" "$log_badchan"; then
+        # Validate using Python script
+        if python3 "$TESTS_DIR/check_bad_channel_masking.py" "badchan_gpu"; then
+            pass "Bad channel masking (GPU): per-channel NaN handling correct"
+        else
+            fail "Bad channel masking (GPU): validation failed (see above)"
+        fi
+    else
+        fail "Bad channel test (GPU) did not complete successfully (see $log_badchan)"
+    fi
+else
+    skip "GPU binary not available or not built; skipping bad channel GPU test"
 fi
 
 # ---------------------------------------------------------------------------

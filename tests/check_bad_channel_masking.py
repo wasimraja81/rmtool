@@ -116,6 +116,9 @@ def check_mask_cube_correctness(mask_cube, bad_channel_idx, bad_pixels, fully_ma
         return True
 
 def main():
+    # Get output prefix from command-line argument (default: "badchan")
+    output_prefix = sys.argv[1] if len(sys.argv) > 1 else "badchan"
+    
     # Load test metadata
     truth = load_truth()
     bad_chan_info = truth.get("bad_channel_test", {})
@@ -130,9 +133,8 @@ def main():
     q_file = bad_chan_info["files_badchan"]["Q"]
     
     # Expected RM cube output file (from test suite)
-    prefix = OUTPUT_DIR / "badchan"
-    rm_cube_path = prefix.parent / f"{prefix.name}.AMP.RMCUBE.FITS"
-    mask_cube_path = prefix.parent / f"{prefix.name}.MASK.CUBE.FITS"
+    rm_cube_path = OUTPUT_DIR / f"{output_prefix}.AMP.RMCUBE.FITS"
+    mask_cube_path = OUTPUT_DIR / f"{output_prefix}.MASK.CUBE.FITS"
     
     print(f"\nBad channel masking test")
     print(f"  Bad channel index: {bad_chan_idx}")
