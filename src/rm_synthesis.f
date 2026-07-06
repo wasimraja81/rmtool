@@ -429,53 +429,6 @@ chelp-
       ! Bad channels will be read after cube dimensions are known
                         nbad_chan = 0
 
-      write(*,*)' ========================================'
-      write(*,*)' RM Extraction Parameters from Config:'
-      if(write_mask_output)then
-              write(*,*)' write_mask_output: y'
-      else
-              write(*,*)' write_mask_output: n'
-      endif
-      if(write_nvalid_output)then
-              write(*,*)' write_nvalid_output: y'
-      else
-              write(*,*)' write_nvalid_output: n'
-      endif
-      if(use_gpu)then
-              write(*,*)' use_gpu: y'
-      else
-              write(*,*)' use_gpu: n'
-      endif
-      if(use_gpu_actual)then
-              write(*,*)' use_gpu_actual: y'
-      else
-              write(*,*)' use_gpu_actual: n'
-      endif
-      if(output_mode.eq.1)then
-              write(*,*)' output_mode: ri'
-      else
-              write(*,*)' output_mode: ap'
-      endif
-      write(*,*)' ofac: ',ofac
-      write(*,*)' fac:  ',fac
-      write(*,*)' use_auto_rm_range: ',use_auto_rm_range
-      if(output_mode.eq.0)then
-              if(ap_angle_mode.eq.1)then
-                      write(*,*)' ap_angle_mode: pol'
-              else
-                      write(*,*)' ap_angle_mode: phase'
-              endif
-      endif
-      if(use_auto_rm_range.eq.0)then
-              write(*,*)' beg_rm: ',beg_rm
-              write(*,*)' end_rm: ',end_rm
-              write(*,*)' nrm: ',nrm_out_par
-              write(*,*)' nrm_out (nrm*ofac): ',nrm_out_par*ofac
-      else
-              write(*,*)' beg/end/nrm are auto-derived from data'
-      endif
-      write(*,*)' ========================================'
-
       ! Extract Some basic INFO from the FITS files:
       call myfits_info(infileQ,
      -           bitpixQ,naxisQ,naxesQ,
@@ -484,30 +437,7 @@ chelp-
      -           czval_imQ,czpix_imQ,zinc_imQ,
      -           freq_axisQ,cubeQ,message,status)
 
-      if (status.eq.0)then
-              write(*,*)"Q-cube opened:",infileQ(1:nchar(infileQ))
-              write(*,*)"      bitpixQ:",bitpixQ
-              write(*,*)"       naxisQ:",naxisQ
-              write(*,*)" "
-              write(*,*)"   ref. x-val:",cxval_imQ
-              write(*,*)"   ref. x-pix:",cxpix_imQ
-              write(*,*)"         xinc:",xinc_imQ
-              write(*,*)" "
-              write(*,*)"   ref. y-val:",cyval_imQ
-              write(*,*)"   ref. y-pix:",cypix_imQ
-              write(*,*)"         yinc:",yinc_imQ
-              write(*,*)" "
-              write(*,*)"   ref. z-val:",czval_imQ
-              write(*,*)"   ref. z-pix:",czpix_imQ
-              write(*,*)"         zinc:",zinc_imQ
-              write(*,*)" "
-              write(*,*)"        cubeQ:",cubeQ
-              write(*,*)"   freq-axisQ:",freq_axisQ
-              write(*,*)"      message:",message(1:nchar(message))
-              do i = 1,naxisQ
-                 write(*,*)"naxesQ(",i,") = ",naxesQ(i)
-              enddo
-      else
+      if (status.ne.0)then
               write(*,*)"status = ",status
               write(*,*)"something went wrong with the "
               write(*,*)"'myfits_info' subroutine call"
@@ -525,30 +455,7 @@ chelp-
      -           czval_imU,czpix_imU,zinc_imU,
      -           freq_axisU,cubeU,message,status)
 
-      if (status.eq.0)then
-              write(*,*)"U-cube opened:",infileU(1:nchar(infileU))
-              write(*,*)"      bitpixU:",bitpixU
-              write(*,*)"       naxisU:",naxisU
-              write(*,*)" "
-              write(*,*)"   ref. x-val:",cxval_imU
-              write(*,*)"   ref. x-pix:",cxpix_imU
-              write(*,*)"         xinc:",xinc_imU
-              write(*,*)" "
-              write(*,*)"   ref. y-val:",cyval_imU
-              write(*,*)"   ref. y-pix:",cypix_imU
-              write(*,*)"         yinc:",yinc_imU
-              write(*,*)" "
-              write(*,*)"   ref. z-val:",czval_imU
-              write(*,*)"   ref. z-pix:",czpix_imU
-              write(*,*)"         zinc:",zinc_imU
-              write(*,*)" "
-              write(*,*)"        cubeU:",cubeU
-              write(*,*)"   freq-axisU:",freq_axisU
-              write(*,*)"      message:",message(1:nchar(message))
-              do i = 1,naxisU
-                 write(*,*)"naxesU(",i,") = ",naxesU(i)
-              enddo
-      else
+      if (status.ne.0)then
               write(*,*)"status = ",status
               write(*,*)"something went wrong with the "
               write(*,*)"'myfits_info' subroutine call"
@@ -559,8 +466,6 @@ chelp-
               !goto 9999
       endif
 
-      write(*,*)"Beginning sanity checks..."
-      write(*,*)" "
       if (.not.cubeQ)then
               write(*,*)'ERROR: Missing spectral axis in Q-file!'
               write(*,*)'    No CTYPE*=FREQ axis detected.'
@@ -618,7 +523,6 @@ chelp-
                          !goto 9999
                  endif
               enddo
-              write(*,*)' '
       endif
       freq_axis = freq_axisQ
 
@@ -769,9 +673,6 @@ chelp-
               xinc_im = xinc_imQ
               yinc_im = yinc_imQ
               zinc_im = zinc_imQ
-              write(*,*)'Q and U-Cubes seem compatible.'
-              write(*,*)'We will proceed with the tomography now...'
-              write(*,*)' '
       endif
 
 
@@ -815,12 +716,6 @@ chelp-
       !       to be 1 in cases where we find the reference values tagged 
       !       to pixel number 0 in the FITS file. 
       !
-
-
-        write(*,*)"! -----------------------------------------------"
-        write(*,*)"! Final sanity checks..."
-        write(*,*)"! Reference-pixel conventions are validated below."
-        write(*,*)"! -----------------------------------------------"
 
         ! Check if the reference pixel is indeed at the centre of the 
         ! image array and also find out the number of points leading 
@@ -891,21 +786,6 @@ chelp-
                         nx_1st = nxc
                         nx_2nd = nxc - 1
                 else
-                        write(*,*)"------------------------------"
-                        write(*,*)"           WARNING            "
-                        write(*,*)"centre x-pixel is offset from "
-                        write(*,*)"actual centre of the image... "
-                        write(*,*)" "
-                        write(*,*)"Total x-pixels in image: ",nx_totpix
-                        write(*,*)"Expected x-centre : ",nxc,"or",nxc+1
-                        write(*,*)"Found x-centre at : ",cxpix_im
-                        write(*,*)" "
-                        write(*,*)"Proceed with the fact that the"
-                        write(*,*)"x-reference pix is offset from"
-                        write(*,*)"the centre of image... "
-                        !write(*,*)"Quitting now... "
-                        !goto 9999
-                        !stop
                         if(cxpix_im.eq.0)then
                                 nx_1st = 0
                                 nx_2nd = nx_totpix - 1
@@ -921,21 +801,6 @@ chelp-
                         nx_1st = nxc - 1
                         nx_2nd = nxc - 1
                 else
-                        write(*,*)"------------------------------"
-                        write(*,*)"           WARNING            "
-                        write(*,*)"centre x-pixel is offset from "
-                        write(*,*)"actual centre of the image... "
-                        write(*,*)" "
-                        write(*,*)"Total x-pixels in image: ",nx_totpix
-                        write(*,*)"Expected x-centre : ",nxc
-                        write(*,*)"Found x-centre at : ",cxpix_im
-                        write(*,*)" "
-                        write(*,*)"Proceed with the fact that the"
-                        write(*,*)"x-reference pix is offset from"
-                        write(*,*)"the centre of image... "
-                        !write(*,*)"Quitting now... "
-                        !goto 9999
-                        !stop
                         if(cxpix_im.eq.0)then
                                 nx_1st = 0
                                 nx_2nd = nx_totpix - 1
@@ -959,21 +824,6 @@ chelp-
                         ny_1st = nyc
                         ny_2nd = nyc - 1
                 else
-                        write(*,*)"------------------------------"
-                        write(*,*)"           WARNING            "
-                        write(*,*)"centre y-pixel is offset from "
-                        write(*,*)"actual centre of the image... "
-                        write(*,*)" "
-                        write(*,*)"Total y-pixels in image: ",ny_totpix
-                        write(*,*)"Expected y-centre : ",nyc,"or",nyc+1
-                        write(*,*)"Found y-centre at : ",cypix_im
-                        write(*,*)" "
-                        write(*,*)"Proceed with the fact that the"
-                        write(*,*)"y-reference pix is offset from"
-                        write(*,*)"the centre of image... "
-                        !write(*,*)"Quitting now... "
-                        !goto 9999
-                        !stop
                         if(cypix_im.eq.0)then
                                 ny_1st = 0
                                 ny_2nd = ny_totpix - 1
@@ -989,21 +839,6 @@ chelp-
                         ny_1st = nyc - 1
                         ny_2nd = nyc - 1
                 else
-                        write(*,*)"------------------------------"
-                        write(*,*)"           WARNING            "
-                        write(*,*)"centre y-pixel is offset from "
-                        write(*,*)"actual centre of the image... "
-                        write(*,*)" "
-                        write(*,*)"Total y-pixels in image: ",ny_totpix
-                        write(*,*)"Expected y-centre : ",nyc
-                        write(*,*)"Found y-centre at : ",cypix_im
-                        write(*,*)" "
-                        write(*,*)"Proceed with the fact that the"
-                        write(*,*)"y-reference pix is offset from"
-                        write(*,*)"the centre of image... "
-                        !write(*,*)"Quitting now... "
-                        !goto 9999
-                        !stop
                         if(cypix_im.eq.0)then
                                 ny_1st = 0
                                 ny_2nd = ny_totpix - 1
@@ -1034,21 +869,6 @@ chelp-
                         nz_1st = nzc
                         nz_2nd = nzc - 1
                 else
-                        write(*,*)"------------------------------"
-                        write(*,*)"           WARNING            "
-                        write(*,*)"centre z-pixel is offset from "
-                        write(*,*)"actual centre of the image... "
-                        write(*,*)" "
-                        write(*,*)"Total z-pixels in image: ",nz_totpix
-                        write(*,*)"Expected z-centre : ",nzc,"or",nzc+1
-                        write(*,*)"Found z-centre at : ",czpix_im
-                        write(*,*)" "
-                        write(*,*)"Proceed with the fact that the"
-                        write(*,*)"z-reference pix is offset from"
-                        write(*,*)"the centre of image... "
-                        !write(*,*)"Quitting now... "
-                        !goto 9999
-                        !stop
                         if(czpix_im.eq.0)then
                                 nz_1st = 0
                                 nz_2nd = nz_totpix - 1
@@ -1064,21 +884,6 @@ chelp-
                         nz_1st = nzc - 1
                         nz_2nd = nzc - 1
                 else
-                        write(*,*)"------------------------------"
-                        write(*,*)"           WARNING            "
-                        write(*,*)"centre z-pixel is offset from "
-                        write(*,*)"actual centre of the image... "
-                        write(*,*)" "
-                        write(*,*)"Total z-pixels in image: ",nz_totpix
-                        write(*,*)"Expected z-centre : ",nzc
-                        write(*,*)"Found z-centre at : ",czpix_im
-                        write(*,*)" "
-                        write(*,*)"Proceed with the fact that the"
-                        write(*,*)"z-reference pix is offset from"
-                        write(*,*)"the centre of image... "
-                        !write(*,*)"Quitting now... "
-                        !goto 9999
-                        !stop
                         if(czpix_im.eq.0)then ! taking care of C vs. Fortran programmers
                                 nz_1st = 0
                                 nz_2nd = nz_totpix - 1
