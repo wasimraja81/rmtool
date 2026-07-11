@@ -27,32 +27,24 @@ WORKDIR /app/rmtool
 # Copy everything from the build context root directory into /app/rmtool
 COPY . .
 
-# Run sequenced builds using your exact Makefile variables
-RUN set -e; \
-    # 0. Create missing directories that were ignored by .dockerignore \
+# Run sequenced builds for all OMP/GPU combinations.
+# The Makefile emits names like rm_synthesis_release_cpu_serial, etc.
+RUN set -eux; \
     mkdir -p bin build; \
-    \
-    # 1. Build configuration: OMP=0 GPU=0
     make clean OMP=0 GPU=0; \
     make -j2 OMP=0 GPU=0; \
-    mv bin/rm_synthesis_release_omp0_gpu0 bin/rm_synthesis_OMP0_GPU0; \
-    \
-    # 2. Build configuration: OMP=1 GPU=0
+    cp -f bin/rm_synthesis_release_cpu_serial bin/rm_synthesis_OMP0_GPU0; \
     make clean OMP=1 GPU=0; \
     make -j2 OMP=1 GPU=0; \
-    mv bin/rm_synthesis_release_omp1_gpu0 bin/rm_synthesis_OMP1_GPU0; \
-    \
-    # 3. Build configuration: OMP=0 GPU=1
+    cp -f bin/rm_synthesis_release_cpu_omp bin/rm_synthesis_OMP1_GPU0; \
     make clean OMP=0 GPU=1; \
     make -j2 OMP=0 GPU=1; \
-    mv bin/rm_synthesis_release_omp0_gpu1 bin/rm_synthesis_OMP0_GPU1; \
-    \
-    # 4. Build configuration: OMP=1 GPU=1
+    cp -f bin/rm_synthesis_release_gpu_offload bin/rm_synthesis_OMP0_GPU1; \
     make clean OMP=1 GPU=1; \
     make -j2 OMP=1 GPU=1; \
-    mv bin/rm_synthesis_release_omp1_gpu1 bin/rm_synthesis_OMP1_GPU1
+    cp -f bin/rm_synthesis_release_gpu_offload_hostomp bin/rm_synthesis_OMP1_GPU1
 
-# Expose all three compiled targets to the container's system PATH
+# Expose all four compiled targets to the container's system PATH
 ENV PATH="/app/rmtool/bin:${PATH}"
 
 CMD ["/bin/bash"]
