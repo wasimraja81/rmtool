@@ -1,0 +1,209 @@
+GPU Backend TODO
+================
+Target: OpenMP 5 target offload (gfortran -foffload=nvptx / nvfortran -mp=gpu)
+Branch: refactor-hpc (continue here; tag rmsynth-hpc-gpu-v1 when validated)
+
+FALLBACK GUARANTEE
+------------------
+If use_gpu=y but no GPU device is found at runtime, the code MUST silently
+fall back to CPU without any user intervention. Implementation:
+  - Call omp_get_num_devices() after cfg parse
+  - Set use_gpu_actual = use_gpu .and. (omp_get_num_devices() > 0)
+  - Print a WARNING message if falling back (not an error, not a stop)
+  - All !$omp target directives carry if(use_gpu_actual)
+  - When if() is false, OpenMP executes the block on the host transparently
+
+
+STEP 1 — Tile scratch arrays: make per-pixel  [rm_synthesis.f]
+---------------------------------------------------------------
+Problem: Q_now(nz_out), U_now(nz_out), wts_now are single shared work arrays
+         reused serially per pixel. GPU needs one copy per thread.
+
+Replace:
+  allocate(wts_now(ngood_chan))
+  Q_now / U_now declared as fixed work arrays
+
+With:
+  allocate(Q_tile   (nx_tile * ny_tile * nz_out))
+  allocate(U_tile   (nx_tile * ny_tile * nz_out))
+  allocate(wts_tile (nx_tile * ny_tile * nz_out))
+  allocate(ngood_tile(nx_tile * ny_tile))   ! integer, count of valid chans per pix
+
+Pixel offset inside tile:
+  ipix = (iy_loc-1)*nx_tile + ix_loc            ! 1-based
+  base = (ipix-1)*nz_out + 1                    ! start of this pixel's spectrum
+
+Commit message: "step1/gpu: tile scratch arrays made per-pixel"
+
+
+STEP 2 — New tile_extract_gpu subroutine (CPU only)  [rm_synthesis_mod.f90]
+-----------------------------------------------------------------------------
+Extract the channel-selection + DFT work into a single subroutine with a
+flat pixel loop (ipix = 1, nx_tile*ny_tile) so it can later be annotated.
+
+Signature (free-form Fortran):
+  subroutine tile_extract_gpu(                         &
+      specQ, specU, specMask, specI, flag_arr,          &
+      cos_arr, sin_arr,                                 &
+      Q_tile, U_tile, wts_tile, ngood_tile,             &
+      p_tile_arr, phi_tile_arr,                         &
+      mask_tile_arr, nvalid_tile_arr,                   &
+      nx_tile, ny_tile, nz_out, nrm_out,                &
+      remove_qu_bias, use_input_mask,                   &
+      nan_check_on, resiQ, slopeQ, resiU, slopeU,      &
+      rem_mean, output_mode, ap_angle_mode)
+
+Inner loop:   do ipix = 1, nx_tile*ny_tile
+                 -- channel selection into Q_tile/U_tile slices
+                 -- call weighted DFT inline (not via extract_general_w
+                    because that call itself can't be on a device yet)
+              end do
+
+At this step: NO !$omp target yet; verify benchmark matches current output.
+
+Commit message: "step2/gpu: extract tile pixel loop into tile_extract_gpu (cpu)"
+
+
+STEP 3 — CPU benchmark validation
+-----------------------------------
+Run benchmark.cfg with GPU=0 (or without GPU build flag).
+Output files must be bit-identical to pre-step-1 outputs.
+Record wall-clock baseline for later comparison.
+
+
+STEP 4 — Add !$omp target annotations  [rm_synthesis_mod.f90]
+--------------------------------------------------------------
+Inside tile_extract_gpu, change the pixel loop header to:
+
+  !$omp target teams distribute parallel do if(use_gpu_actual)     &
+  !$omp& default(none)                                             &
+  !$omp& map(to: specQ, specU, cos_arr, sin_arr, flag_arr)         &
+  !$omp& map(from: p_tile_arr, phi_tile_arr,                       &
+  !$omp&          mask_tile_arr, nvalid_tile_arr)                   &
+  !$omp& private(ipix, ix_loc, iy_loc, ...)
+  do ipix = 1, nx_tile*ny_tile
+    ...
+  end do
+  !$omp end target teams distribute parallel do
+
+Notes:
+  - cos_arr/sin_arr are read-only across all pixels; map(to) once per tile
+  - specQ/specU already tile-sized; transfer cost is proportional to tile, not image
+  - p_tile_arr / phi_tile_arr are write-only device->host
+  - No CFITSIO calls inside the device region (host-only I/O stays outside)
+
+Commit message: "step4/gpu: add omp target offload to tile_extract_gpu"
+
+
+COMPILATION STRATEGY — DUAL BACKEND OPTIMALITY
+-----------------------------------------------
+The GPU refactor flips the parallelism level:
+  current CPU:  !$omp parallel do over RM bins (nout) inside each pixel call
+  after refactor: parallelise over pixels (nx_tile*ny_tile) for both backends
+Pixels >> RM bins in a typical tile, so the refactor also improves CPU.
+
+Three build modes:
+
+  GPU=0 OMP=1 (pure CPU, maximum CPU performance)
+  ---------------------------------------------------
+  FC = gfortran
+  FFLAGS = -O3 -march=native -fopenmp
+  DEFINES = (none; USE_GPU not defined)
+  Result: preprocessor strips all !$omp target; plain !$omp parallel do over
+          pixels; full AVX2/AVX-512 SIMD; zero offload overhead.
+  use_gpu is ignored even if set y in cfg (omp_get_num_devices returns 0).
+
+  GPU=1 (GPU offload build)
+  ---------------------------------------------------
+  FC = nvfortran           (preferred; excellent CPU codegen for fallback too)
+  FFLAGS = -O3 -mp=gpu -gpu=cc80,managed
+  DEFINES = -DUSE_GPU
+  Fallback FC = gfortran -O3 -fopenmp -foffload=nvptx-none -DUSE_GPU
+  Result: !$omp target teams distribute compiled for GPU; host path also
+          compiled at -O3 by nvfortran.
+
+  GPU=1 binary, no GPU found at runtime (the fallback case)
+  -----------------------------------------------------------
+  use_gpu_actual = .false. (set by omp_get_num_devices() == 0 check)
+  !$omp target if(.false.) teams distribute parallel do
+    -> OpenMP spec mandates host execution; threads spread over pixels
+  Performance: near-native with nvfortran; within ~5% of GPU=0 build.
+  For a CPU-only HPC node, best practice is to submit with GPU=0 binary.
+  The GPU=1 fallback is a convenience safety net, not the performance target.
+
+Source-level guard (in tile_extract_gpu and rm_synthesis_mod.f90):
+  #ifdef USE_GPU
+    !$omp target teams distribute parallel do if(use_gpu_actual) &
+    !$omp& map(to: specQ,specU,cos_arr,sin_arr,flag_arr) &
+    !$omp& map(from: p_tile_arr,phi_tile_arr,mask_tile_arr,nvalid_tile_arr)
+  #else
+    !$omp parallel do default(none) shared(...) private(ipix,...)
+  #endif
+    do ipix = 1, nx_tile*ny_tile
+      ...
+    end do
+  #ifdef USE_GPU
+    !$omp end target teams distribute parallel do
+  #else
+    !$omp end parallel do
+  #endif
+
+This ensures:
+  - GPU=0 binary: maximum CPU performance, no offload overhead at all
+  - GPU=1 binary + GPU present: full device offload
+  - GPU=1 binary + no GPU: safe host fallback with warning, close to CPU perf
+  - User experience: compile once for target, run anywhere without crashes
+
+
+STEP 5 — cfg key + Makefile GPU target  [rm_synthesis_mod.f90, rm_synthesis.f, Makefile]
+------------------------------------------------------------------------------------------
+Config key (default n, backward compatible):
+  use_gpu = y|n
+
+Parser: add case 'use_gpu' alongside dry_run / tile_auto (flag_from_value).
+
+Runtime check (add after cfg parse in rm_synthesis.f):
+  use_gpu_actual = .false.
+  if (use_gpu) then
+    use_gpu_actual = (omp_get_num_devices() > 0)
+    if (.not. use_gpu_actual) then
+      write(*,*) 'WARNING: use_gpu=y requested but no GPU device found.'
+      write(*,*) 'WARNING: Falling back to CPU execution transparently.'
+    else
+      write(*,*) 'GPU device found. Offloading tile kernel to GPU.'
+    endif
+  endif
+
+Makefile GPU=1 mode (nvfortran preferred; gfortran fallback):
+  ifeq ($(GPU),1)
+    FC = nvfortran
+    FFLAGS_EXTRA = -mp=gpu -gpu=cc80,managed
+    # fallback: FC = gfortran; FFLAGS_EXTRA = -foffload=nvptx-none -fopenmp
+  endif
+
+Commit message: "step5/gpu: add use_gpu cfg key, runtime fallback, GPU=1 makefile target"
+
+
+STEP 6 — GPU benchmark + tag
+------------------------------
+Run benchmark.cfg with GPU=1 vs GPU=0 on same data.
+Verify output files match (within float32 precision).
+Record speedup (expected 5-20x depending on tile size and GPU model).
+Tag: rmsynth-hpc-gpu-v1
+
+Commit message: "step6/gpu: benchmark validated; tag rmsynth-hpc-gpu-v1"
+
+
+NOTES / RISKS
+-------------
+- wts_now allocation currently sized to ngood_chan (post-bad-channel removal).
+  After step 1, wts_tile is sized to nz_out (max possible); zero-fill unused slots.
+- mean_rem (Q/U mean removal) uses a reduction over nz_out; fine on GPU as
+  !$omp simd reduction already present in extract_general_w; replicate inline
+  in tile_extract_gpu.
+- ap_angle_mode half-angle scaling (phi_ex *= 0.5) is per-RM-bin, trivially
+  device-safe.
+- CFITSIO writes stay host-side; device->host transfer of p_tile_arr happens
+  at the end of each tile, same cadence as current CPU writes.
+- If nvfortran is unavailable, gfortran -foffload=nvptx-none works for NVIDIA;
+  for AMD use -foffload=amdgcn-amdhsa. Both honour the same !$omp target syntax.
