@@ -119,7 +119,7 @@ chelp-
       integer   subim_chan_blc, subim_chan_trc, subim_chan_inc
       integer   tile_ra, tile_dec
       integer   nrm_block_size
-      parameter(nrm_block_size = 20)  ! RM bins per GPU offload block
+      parameter(nrm_block_size = 256)  ! RM bins per GPU offload block
 
       real(sp) cxval_imU, cyval_imU, czval_imU  
       integer   cxpix_imU, cypix_imU, czpix_imU 

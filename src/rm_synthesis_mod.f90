@@ -680,7 +680,7 @@ contains
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix)
 #else
-    !$omp parallel do collapse(2) default(none) &
+    !$omp parallel do collapse(2) schedule(dynamic,64) default(none) &
     !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
