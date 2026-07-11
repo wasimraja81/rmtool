@@ -12,13 +12,14 @@ CPPFLAGS := -cpp
 BASEFLAGS := $(CPPFLAGS) -std=gnu -fallow-argument-mismatch -ffree-line-length-none
 CPU_OPTFLAGS := -O3 -march=native
 CPU_DEBUGFLAGS := -g -fbacktrace -fbounds-check
+CPU_PROFILEFLAGS := -O3 -march=native -g -fno-omit-frame-pointer
 CPU_OMPFLAGS := -fopenmp
 GPU_NVFLAGS := -cpp -O3 -mp=gpu -gpu=cc80,managed -DUSE_GPU
 GPU_GNUFLAGS := $(BASEFLAGS) -O3 -fopenmp -foffload=nvptx-none -foffload="-lm" -ffast-math -fno-finite-math-only -DUSE_GPU
 
 FFLAGS := $(BASEFLAGS)
 
-# Build mode: release or debug
+# Build mode: release, profile, or debug
 MODE ?= release
 # Optional OpenMP support (set OMP=1 to enable)
 OMP ?= 0
@@ -58,6 +59,8 @@ ifeq ($(GPU),1)
 else
   ifeq ($(MODE),debug)
     FFLAGS += $(CPU_DEBUGFLAGS)
+	else ifeq ($(MODE),profile)
+		FFLAGS += $(CPU_PROFILEFLAGS)
   else
     FFLAGS += $(CPU_OPTFLAGS)
   endif
@@ -72,8 +75,20 @@ MODE_TAG := $(MODE)_omp$(OMP_EFFECTIVE)_gpu$(GPU)
 # Directories
 SRCDIR := src
 BUILDDIR := build/$(MODE_TAG)
-BINDIR := bin
+BINDIR ?= bin
 MODDIR := $(BUILDDIR)/modules
+PROFILE_BINDIR := scratch/profiles/bin
+
+# Profile builds default to a dedicated scratch binary directory.
+# Users can still override BINDIR explicitly on the command line.
+ifeq ($(MODE),profile)
+ifneq ($(origin BINDIR),command line)
+BINDIR := $(PROFILE_BINDIR)
+endif
+endif
+
+# Default bin directory (used to decide whether to update the convenience symlink)
+DEFAULT_BINDIR := bin
 
 # CFITSIO library
 CFITSIO_LIB ?= -lcfitsio
@@ -110,7 +125,10 @@ check_gpu_compiler:
 	    exit 127; }
 
 $(BUILDDIR):
-	@mkdir -p $(BUILDDIR) $(MODDIR) $(BINDIR)
+	@mkdir -p $(BUILDDIR) $(MODDIR)
+
+$(BINDIR):
+	@mkdir -p $(BINDIR)
 
 # Module compilation
 $(BUILDDIR)/rm_synthesis_mod.o: $(MODSRC) | $(BUILDDIR) $(CHECK_GPU_COMPILER)
@@ -123,9 +141,13 @@ $(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(BUILDDIR)/rm_synthesis_mod.o | $(BUILDD
 # Linking
 $(EXECUTABLE_MODE): $(OBJFILES) | $(BINDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -o $@ $^ $(LIBS)
-	@cp -f $@ $(EXECUTABLE)
 	@echo "✓ Executable created: $@"
+ifeq ($(BINDIR),$(DEFAULT_BINDIR))
+	@cp -f $@ $(EXECUTABLE)
 	@echo "✓ Updated default executable: $(EXECUTABLE)"
+else
+	@echo "  (default bin/rm_synthesis not updated; BINDIR=$(BINDIR))"
+endif
 
 $(EXECUTABLE): $(EXECUTABLE_MODE)
 	@:
@@ -155,10 +177,11 @@ uninstall:
 help:
 	@echo "RM-Synthesis Build System"
 	@echo "========================="
-	@echo "Usage: make [target] [MODE=debug|release] [OMP=0|1] [GPU=0|1]"
+	@echo "Usage: make [target] [MODE=release|profile|debug] [OMP=0|1] [GPU=0|1]"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make                         - Build executable (default, release mode)"
+	@echo "  make MODE=profile            - Build profiling binary (optimized + symbols + frame pointers)"
 	@echo "  make MODE=debug              - Build with debug symbols and checks"
 	@echo "  make OMP=1                   - Build with OpenMP enabled CPU backend"
 	@echo "  make GPU=1                   - Build GPU/offload backend (auto: nvfortran -> gfortran)"
@@ -170,13 +193,16 @@ help:
 	@echo "  make help         - Show this message"
 	@echo ""
 	@echo "Note: Artifacts are mode-specific under build/<mode>_omp<0|1>_gpu<0|1>."
+	@echo "      MODE=profile defaults binaries to scratch/profiles/bin (unless BINDIR=... is provided)."
 	@echo "      When GPU=1, OMP is forced to 0 (OMP flag is ignored)."
 	@echo "      Switching MODE/OMP/GPU does not require make clean."
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                            # Build release version"
+	@echo "  make MODE=profile               # Build CPU profiling-friendly version"
 	@echo "  make MODE=debug                 # Build debug version"
 	@echo "  make MODE=release OMP=1         # Build OpenMP-enabled CPU release version"
+	@echo "  make MODE=profile OMP=1         # Build OpenMP-enabled CPU profiling version"
 	@echo "  make MODE=debug OMP=1           # Build OpenMP-enabled CPU debug version"
 	@echo "  make GPU=1                      # Build GPU/offload binary (auto compiler)"
 	@echo "  make GPU=1 GPU_FC=nvfortran     # Select GPU compiler explicitly"
