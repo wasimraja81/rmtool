@@ -28,6 +28,37 @@ make help
 - Fast incremental builds
 - Direct control over compilation
 
+### Build Variants and Binary Names
+
+Build commands are unchanged (`make OMP=... GPU=...`), but binary names use
+clear capability labels:
+
+| Build command | Binary produced | Semantics |
+|---|---|---|
+| `make OMP=0 GPU=0` | `bin/rm_synthesis_release_cpu_serial` | Pure serial CPU, no parallelism |
+| `make OMP=1 GPU=0` | `bin/rm_synthesis_release_cpu_omp` | CPU with OpenMP parallelization |
+| `make OMP=0 GPU=1` | `bin/rm_synthesis_release_gpu_offload` | GPU offload, serial host prep |
+| `make OMP=1 GPU=1` | `bin/rm_synthesis_release_gpu_offload_hostomp` | GPU offload + host OpenMP |
+
+#### HOST_OMP Policy
+
+Each variant is compiled with a compile-time `HOST_OMP` macro that controls
+whether host-side preprocessing loops use OpenMP parallelization:
+
+- **HOST_OMP=0** (`cpu_serial`, `gpu_offload`): Host loops remain serial
+- **HOST_OMP=1** (`cpu_omp`, `gpu_offload_hostomp`): Host loops parallelized via `!$omp parallel do`
+
+The `HOST_OMP` macro gates preprocessor directives in fixed-form Fortran 
+(`src/rm_synthesis.f`) and runtime variable checks in free-form Fortran 
+(`src/rm_synthesis_mod.f90`), ensuring correct semantic behavior for each variant.
+
+#### Use Cases
+
+- **cpu_serial**: Baseline reference for benchmarking
+- **cpu_omp**: Measure CPU parallelism efficiency vs. serial
+- **gpu_offload**: GPU kernel speedup with minimal host overhead
+- **gpu_offload_hostomp**: Maximum parallelization (GPU kernel + host prep)
+
 ### Option 2: CMake (Recommended for Distribution)
 
 ```bash

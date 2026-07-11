@@ -29,8 +29,8 @@ Environment:
 
 Binary:
   auto mode selects executable from cfg key use_gpu/use_gpus:
-    use_gpu=y  -> bin/rm_synthesis_release_omp0_gpu1
-    use_gpu=n  -> bin/rm_synthesis_release_omp1_gpu0
+    use_gpu=y  -> bin/rm_synthesis_release_gpu_offload_hostomp
+    use_gpu=n  -> bin/rm_synthesis_release_cpu_omp
 
 EOF
 }
@@ -85,17 +85,17 @@ USE_GPU_CFG="$(awk -F= '
 ' "${CFG_PATH}")"
 
 if [[ "${BACKEND}" == "cpu" ]]; then
-  EXE="${ROOT_DIR}/bin/rm_synthesis_release_omp1_gpu0"
+  EXE="${ROOT_DIR}/bin/rm_synthesis_release_cpu_omp"
   USE_GPU_MODE="n"
 elif [[ "${BACKEND}" == "gpu" ]]; then
-  EXE="${ROOT_DIR}/bin/rm_synthesis_release_omp0_gpu1"
+  EXE="${ROOT_DIR}/bin/rm_synthesis_release_gpu_offload_hostomp"
   USE_GPU_MODE="y"
 else
   if [[ "${USE_GPU_CFG}" == "y" || "${USE_GPU_CFG}" == "yes" || "${USE_GPU_CFG}" == "1" ]]; then
-    EXE="${ROOT_DIR}/bin/rm_synthesis_release_omp0_gpu1"
+    EXE="${ROOT_DIR}/bin/rm_synthesis_release_gpu_offload_hostomp"
     USE_GPU_MODE="y"
   else
-    EXE="${ROOT_DIR}/bin/rm_synthesis_release_omp1_gpu0"
+    EXE="${ROOT_DIR}/bin/rm_synthesis_release_cpu_omp"
     USE_GPU_MODE="n"
   fi
 fi
@@ -107,7 +107,7 @@ echo "[runFile] Executable: ${EXE}"
 if [[ ! -x "${EXE}" ]]; then
   echo "[runFile] ERROR: executable not found or not executable: ${EXE}" >&2
   if [[ "${USE_GPU_MODE}" == "y" ]]; then
-    echo "[runFile] Build first with: make GPU=1" >&2
+    echo "[runFile] Build first with: make GPU=1 OMP=1" >&2
   else
     echo "[runFile] Build first with: make GPU=0 OMP=1" >&2
   fi

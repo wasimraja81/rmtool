@@ -29,6 +29,17 @@ make
 ./bin/rm_synthesis cfg/your_config.cfg
 ```
 
+Common explicit build variants:
+
+| Build command | Binary produced |
+|---|---|
+| `make OMP=0 GPU=0` | `bin/rm_synthesis_release_cpu_serial` |
+| `make OMP=1 GPU=0` | `bin/rm_synthesis_release_cpu_omp` |
+| `make OMP=0 GPU=1` | `bin/rm_synthesis_release_gpu_offload` |
+| `make OMP=1 GPU=1` | `bin/rm_synthesis_release_gpu_offload_hostomp` |
+
+The build commands are unchanged; only the binary naming is now clearer.
+
 See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 
 ## Documentation

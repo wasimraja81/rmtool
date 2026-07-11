@@ -16,14 +16,15 @@ symlinked to `bin/rm_synthesis` (last build wins the symlink).
 
 | Make flags | Binary produced | What it can do |
 |---|---|---|
-| `GPU=0 OMP=0` | `bin/rm_synthesis_release_omp0_gpu0` | **Serial CPU** – one thread, most portable, reference baseline |
-| `OMP=1 GPU=0` | `bin/rm_synthesis_release_omp1_gpu0` | **OpenMP CPU** – multi-threaded parallel DFT loop; use this for large images on any Linux box |
-| `GPU=1` | `bin/rm_synthesis_release_omp0_gpu1` | **GPU offload** – OpenMP target offload; falls back to host when `use_gpu=n` in cfg, so the same binary is valid for CPU-only dry-runs too |
+| `GPU=0 OMP=0` | `bin/rm_synthesis_release_cpu_serial` | **Serial CPU** – one thread, most portable, reference baseline |
+| `OMP=1 GPU=0` | `bin/rm_synthesis_release_cpu_omp` | **OpenMP CPU** – multi-threaded parallel DFT loop; use this for large images on any Linux box |
+| `GPU=1 OMP=0` | `bin/rm_synthesis_release_gpu_offload` | **GPU offload** – OpenMP target offload build without host-OMP flavor tag |
+| `GPU=1 OMP=1` | `bin/rm_synthesis_release_gpu_offload_hostomp` | **GPU offload + host-OMP flavor** |
 
 Key points:
 - `MODE=release` (the default) enables `-O3 -march=native`; never compile production runs with `MODE=debug`.
 - The GPU binary is built with `-ffast-math -DUSE_GPU`. Setting `use_gpu=n` in the config at runtime makes it behave like the serial CPU binary.
-- OMP and GPU are mutually exclusive at compile time (`GPU=1` forces OMP off).
+- GPU and OMP can be enabled together at compile time (`GPU=1 OMP=1`).
 - `OMP_NUM_THREADS` controls thread count at runtime for the OMP binary.
 
 ---

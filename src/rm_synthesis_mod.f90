@@ -10,6 +10,7 @@ module rm_synthesis_mod
   public :: extract_general_setup, extract_general, extract_general_ri
   public :: extract_general_w, extract_general_ri_w
   public :: prepare_gpu_data, prepare_cpu_data, tile_extract_gpu_rm_blocked
+  public :: cubestat_tail_quantile_maps
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
@@ -27,6 +28,12 @@ module rm_synthesis_mod
   ! Physical constants
   ! Speed of light in units of 10^6 m/s (for freq[MHz] <-> lambda[m] conversion)
   real(sp), parameter :: c_velocity = 299.792458_sp
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  logical, parameter :: host_omp_enabled = .true.
+#else
+  logical, parameter :: host_omp_enabled = .false.
+#endif
   
   public :: max_axis, max_ra, max_dec, maxchan, max_pix, maxofac, maxnt
   public :: c_velocity
@@ -155,7 +162,7 @@ contains
     ! Extract using pre-computed templates.
     ! One fused loop reduces memory traffic versus copying template vectors
     ! and calling 4 separate dot products per RM bin.
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,cos_arr,sin_arr,p_ex,phi_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -213,7 +220,7 @@ contains
       end do
     end if
 
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,cos_arr,sin_arr,re_ex,im_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -288,7 +295,7 @@ contains
       end do
     end if
 
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,p_ex,phi_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -369,7 +376,7 @@ contains
       end do
     end if
 
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,re_ex,im_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -487,7 +494,7 @@ contains
     ! input-mask channels vary spatially. Precomputing once here saves
     ! nrm_out redundant accumulations per pixel in the GPU kernel.
     allocate(wsum_gpu(npix))
-    !$omp parallel do default(none) &
+    !$omp parallel do if(host_omp_enabled) default(none) &
     !$omp     private(ipix, iz) &
     !$omp     shared(npix, nz_out, wts_gpu, wsum_gpu)
     do ipix = 1, npix
@@ -502,7 +509,7 @@ contains
     if (rem_mean > 0) then
       allocate(mean_Q(npix))
       allocate(mean_U(npix))
-      !$omp parallel do default(none) &
+      !$omp parallel do if(host_omp_enabled) default(none) &
       !$omp     private(ipix, iz, q_sum, u_sum) &
       !$omp     shared(npix, nz_out, specQ_gpu, specU_gpu, wts_gpu, wsum_gpu, mean_Q, mean_U)
       do ipix = 1, npix
@@ -575,7 +582,7 @@ contains
     
     ! Per-pixel weight sums (RM-independent, precomputed once)
     allocate(wsum_cpu(npix))
-    !$omp parallel do default(none) &
+    !$omp parallel do if(host_omp_enabled) default(none) &
     !$omp     private(ipix, iz) &
     !$omp     shared(npix, nz_out, wts_cpu, wsum_cpu)
     do ipix = 1, npix
@@ -589,7 +596,7 @@ contains
     if (rem_mean > 0) then
       allocate(mean_Q(npix))
       allocate(mean_U(npix))
-      !$omp parallel do default(none) &
+      !$omp parallel do if(host_omp_enabled) default(none) &
       !$omp     private(ipix, iz, q_sum, u_sum) &
       !$omp     shared(npix, nz_out, specQ_cpu, specU_cpu, wts_cpu, wsum_cpu, mean_Q, mean_U)
       do ipix = 1, npix
@@ -680,7 +687,7 @@ contains
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix)
 #else
-    !$omp parallel do collapse(2) schedule(dynamic,64) default(none) &
+    !$omp parallel do if(host_omp_enabled) collapse(2) schedule(dynamic,64) default(none) &
     !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
@@ -772,6 +779,120 @@ contains
 #endif
 
   end subroutine tile_extract_gpu_rm_blocked
+
+  subroutine cubestat_tail_quantile_maps(p_tile_arr, phi_tile_arr, rm_axis, &
+                                         nx_tile, ny_tile, nrm_out, &
+                                         peak_map, rm_peak_map, &
+                                         ang_peak_map, snr_map)
+    !! Compute cubestat maps from tile RM profiles using tail-quantile sigma.
+    !! Sigma definition per pixel: sigma = (q50 - q16) / 0.67449
+    !! Fallback when q50<=q16: MAD-based robust sigma.
+    implicit none
+    integer(int32), intent(in) :: nx_tile, ny_tile, nrm_out
+    real(sp), intent(in) :: p_tile_arr(nx_tile*ny_tile*nrm_out)
+    real(sp), intent(in) :: phi_tile_arr(nx_tile*ny_tile*nrm_out)
+    real(sp), intent(in) :: rm_axis(nrm_out)
+    real(sp), intent(out) :: peak_map(nx_tile*ny_tile)
+    real(sp), intent(out) :: rm_peak_map(nx_tile*ny_tile)
+    real(sp), intent(out) :: ang_peak_map(nx_tile*ny_tile)
+    real(sp), intent(out) :: snr_map(nx_tile*ny_tile)
+
+    integer(int32) :: npix, ipix, irm, idx, nvalid
+    integer(int32) :: idx_peak, i16, i50, i_mad
+    real(sp) :: pval, pmax, sigma_noise, q16, q50, median_val, eps_sigma
+    real(sp) :: vals(nrm_out), dev(nrm_out)
+    real(sp) :: zero_val
+
+    npix = nx_tile * ny_tile
+    eps_sigma = 1.0e-12_sp
+    zero_val = 0.0_sp
+
+    !$omp parallel do if(host_omp_enabled) schedule(static) default(none) &
+    !$omp   private(ipix, irm, idx, pval, nvalid, pmax, idx_peak, i16, i50, &
+    !$omp           i_mad, q16, q50, sigma_noise, median_val, vals, dev) &
+    !$omp   shared(npix, nrm_out, p_tile_arr, phi_tile_arr, rm_axis, eps_sigma, zero_val, &
+    !$omp          peak_map, rm_peak_map, ang_peak_map, snr_map)
+    do ipix = 1, npix
+      pmax = -huge(1.0_sp)
+      idx_peak = 0
+      nvalid = 0
+
+      do irm = 1, nrm_out
+        idx = ipix + (irm - 1) * npix
+        pval = p_tile_arr(idx)
+        if (pval == pval) then
+          nvalid = nvalid + 1
+          vals(nvalid) = pval
+          if (pval > pmax) then
+            pmax = pval
+            idx_peak = irm
+          end if
+        end if
+      end do
+
+      if (nvalid <= 0 .or. idx_peak <= 0) then
+        peak_map(ipix) = zero_val / zero_val
+        rm_peak_map(ipix) = zero_val / zero_val
+        ang_peak_map(ipix) = zero_val / zero_val
+        snr_map(ipix) = zero_val / zero_val
+        cycle
+      end if
+
+      call sort_real_inplace(vals, nvalid)
+
+      i16 = int(0.16_sp * real(nvalid - 1, sp)) + 1
+      if (i16 < 1) i16 = 1
+      if (i16 > nvalid) i16 = nvalid
+      i50 = (nvalid + 1) / 2
+      if (i50 < 1) i50 = 1
+      if (i50 > nvalid) i50 = nvalid
+
+      q16 = vals(i16)
+      q50 = vals(i50)
+      sigma_noise = (q50 - q16) / 0.67449_sp
+
+      if (sigma_noise <= 0.0_sp) then
+        median_val = vals(i50)
+        do irm = 1, nvalid
+          dev(irm) = abs(vals(irm) - median_val)
+        end do
+        call sort_real_inplace(dev, nvalid)
+        i_mad = (nvalid + 1) / 2
+        if (i_mad < 1) i_mad = 1
+        if (i_mad > nvalid) i_mad = nvalid
+        sigma_noise = 1.4826_sp * dev(i_mad)
+      end if
+
+      if (sigma_noise < eps_sigma) sigma_noise = eps_sigma
+
+      idx = ipix + (idx_peak - 1) * npix
+      peak_map(ipix) = pmax
+      rm_peak_map(ipix) = rm_axis(idx_peak)
+      ang_peak_map(ipix) = phi_tile_arr(idx)
+      snr_map(ipix) = pmax / sigma_noise
+    end do
+    !$omp end parallel do
+
+  contains
+
+    subroutine sort_real_inplace(arr, n)
+      real(sp), intent(inout) :: arr(n)
+      integer(int32), intent(in) :: n
+      integer(int32) :: i, j
+      real(sp) :: key
+
+      do i = 2, n
+        key = arr(i)
+        j = i - 1
+        do while (j >= 1 .and. arr(j) > key)
+          arr(j + 1) = arr(j)
+          j = j - 1
+        end do
+        arr(j + 1) = key
+      end do
+    end subroutine sort_real_inplace
+
+  end subroutine cubestat_tail_quantile_maps
 
   subroutine compute_mean(arr, n, mean_val)
     !! Compute mean of array
@@ -867,7 +988,7 @@ contains
                              ap_angle_mode, mask_cube_file, &
                              mask_input_cube_file, &
                              mask_trust_mode, write_mask_output, &
-                             write_nvalid_output, use_gpu, io_overlap, status)
+                             write_nvalid_output, cubestat, use_gpu, io_overlap, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
@@ -878,6 +999,7 @@ contains
     character(len=*), intent(inout) :: mask_trust_mode
     logical, intent(inout) :: write_mask_output
     logical, intent(inout) :: write_nvalid_output
+    logical, intent(inout) :: cubestat
     logical, intent(inout) :: use_gpu
     logical, intent(inout) :: io_overlap
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
@@ -916,6 +1038,7 @@ contains
     logical :: seen_mask_cube_file, seen_mask_input_cube_file
     logical :: seen_mask_trust_mode
     logical :: seen_write_mask_output, seen_write_nvalid_output
+    logical :: seen_cubestat
     logical :: seen_use_gpu
     logical :: seen_io_overlap
 
@@ -967,6 +1090,7 @@ contains
     seen_mask_trust_mode = .false.
     seen_write_mask_output = .false.
     seen_write_nvalid_output = .false.
+    seen_cubestat = .false.
     seen_use_gpu = .false.
     seen_io_overlap = .false.
 
@@ -1016,6 +1140,7 @@ contains
     mask_trust_mode = 'safe'
     write_mask_output = .true.
     write_nvalid_output = .true.
+    cubestat = .false.
     use_gpu = .false.
     io_overlap = .false.
 
@@ -1679,6 +1804,15 @@ contains
         end if
         seen_write_nvalid_output = .true.
         write_nvalid_output = flag_from_value(val)
+      case ('cubestat')
+        if (seen_cubestat) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': cubestat'
+          status = -190
+          close(unit_cfg)
+          return
+        end if
+        seen_cubestat = .true.
+        cubestat = flag_from_value(val)
       case ('use_gpu', 'use_gpus')
         if (seen_use_gpu) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': use_gpu/use_gpus'
