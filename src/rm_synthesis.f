@@ -2250,7 +2250,9 @@ chelp-
             ! NaN/Inf detection, and input mask FITS (if provided)
             ! Each element independent: safe to parallelise.
             ! ========================================================
+#if HOST_OMP == 1
 !$omp parallel do default(shared) private(idx_wts, iz)
+#endif
             do idx_wts = 1, nx_tile*ny_tile*nz_out
               ! Initialize as valid
               mask_tile_arr(idx_wts) = 1
@@ -2286,7 +2288,9 @@ chelp-
                 end if
               end if
             end do
+#if HOST_OMP == 1
 !$omp end parallel do
+#endif
 
             if(.not.use_staging)then
               ! Single-level path: GPU vs CPU optimization strategies

@@ -31,9 +31,10 @@ OUT_DIR="$TESTS_DIR/output"
 TRUTH="$DATA_DIR/truth.json"
 TEMPLATE="$TESTS_DIR/rmsynth-test.cfg.template"
 
-BIN_SERIAL="$REPO_ROOT/bin/rm_synthesis_release_omp0_gpu0"
-BIN_OMP="$REPO_ROOT/bin/rm_synthesis_release_omp1_gpu0"
-BIN_GPU="$REPO_ROOT/bin/rm_synthesis_release_omp0_gpu1"
+BIN_SERIAL="$REPO_ROOT/bin/rm_synthesis_release_cpu_serial"
+BIN_OMP="$REPO_ROOT/bin/rm_synthesis_release_cpu_omp"
+BIN_GPU="$REPO_ROOT/bin/rm_synthesis_release_gpu_offload"
+BIN_GPU_HOSTOMP="$REPO_ROOT/bin/rm_synthesis_release_gpu_offload_hostomp"
 
 PASS=0
 FAIL=0
@@ -126,9 +127,9 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Build GPU binary  (best-effort)
 # ---------------------------------------------------------------------------
-section "4. Building GPU binary  (make GPU=1)"
+section "4. Building GPU binary  (make GPU=1 OMP=0)"
 BUILD_GPU=0
-if make GPU=1 2>&1 | tail -5; then
+if make GPU=1 OMP=0 2>&1 | tail -5; then
     if [[ -x "$BIN_GPU" ]]; then
         pass "GPU binary built: $BIN_GPU"
         BUILD_GPU=1
@@ -136,7 +137,23 @@ if make GPU=1 2>&1 | tail -5; then
         fail "GPU binary not found after make: $BIN_GPU"
     fi
 else
-    skip "make GPU=1 failed (no GPU compiler?); GPU test will be skipped"
+    skip "make GPU=1 OMP=0 failed (no GPU compiler?); GPU test will be skipped"
+fi
+
+# ---------------------------------------------------------------------------
+# 4b. Build GPU+HostOMP binary  (best-effort)
+# ---------------------------------------------------------------------------
+section "4b. Building GPU+HostOMP binary  (make GPU=1 OMP=1)"
+BUILD_GPU_HOSTOMP=0
+if make GPU=1 OMP=1 2>&1 | tail -5; then
+    if [[ -x "$BIN_GPU_HOSTOMP" ]]; then
+        pass "GPU+HostOMP binary built: $BIN_GPU_HOSTOMP"
+        BUILD_GPU_HOSTOMP=1
+    else
+        fail "GPU+HostOMP binary not found after make: $BIN_GPU_HOSTOMP"
+    fi
+else
+    skip "make GPU=1 OMP=1 failed; GPU+HostOMP test will be skipped"
 fi
 
 # ---------------------------------------------------------------------------
@@ -234,6 +251,42 @@ if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" && -f "${OUT_DIR}/serial.AMP.RMCUBE.FI
     fi
 else
     skip "GPU binary or serial reference not available; skipping GPU test"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. GPU+HostOMP binary  → within rtol=1e-4 of serial reference
+# ---------------------------------------------------------------------------
+section "7b. GPU+HostOMP binary – tolerance comparison with serial"
+if [[ "$BUILD_GPU_HOSTOMP" -eq 1 && -x "$BIN_GPU_HOSTOMP" && -f "${OUT_DIR}/serial.AMP.RMCUBE.FITS" ]]; then
+    # Disable mandatory offload so test runs on host if no physical GPU
+    export OMP_TARGET_OFFLOAD="${OMP_TARGET_OFFLOAD:-DISABLED}"
+    cfg_gpu_hostomp=$(make_cfg "gpu_hostomp" "y")
+    log_gpu_hostomp="$OUT_DIR/gpu_hostomp.log"
+    rm -f "$OUT_DIR"/gpu_hostomp.*.FITS
+    if run_binary "$BIN_GPU_HOSTOMP" "$cfg_gpu_hostomp" "$log_gpu_hostomp"; then
+        amp_gpu_hostomp="$OUT_DIR/gpu_hostomp.AMP.RMCUBE.FITS"
+        if [[ -f "$amp_gpu_hostomp" ]]; then
+            # Also check RM peaks in GPU+HostOMP output
+            if python3 "$TESTS_DIR/check_rm_peak.py" "$amp_gpu_hostomp" "$TRUTH"; then
+                pass "GPU+HostOMP: RM peaks at correct positions"
+            else
+                fail "GPU+HostOMP: RM peak check failed"
+            fi
+            if python3 "$TESTS_DIR/compare_cubes.py" \
+                    "$OUT_DIR/serial.AMP.RMCUBE.FITS" "$amp_gpu_hostomp" \
+                    --rtol 2e-3; then
+                pass "GPU+HostOMP AMP: matches serial within rtol=2e-3 (ffast-math vs IEEE)"
+            else
+                fail "GPU+HostOMP AMP: differs from serial beyond rtol=2e-3"
+            fi
+        else
+            fail "GPU+HostOMP: AMP output cube not found: $amp_gpu_hostomp"
+        fi
+    else
+        fail "GPU+HostOMP binary did not complete successfully (see $log_gpu_hostomp)"
+    fi
+else
+    skip "GPU+HostOMP binary or serial reference not available; skipping GPU+HostOMP test"
 fi
 
 # ---------------------------------------------------------------------------

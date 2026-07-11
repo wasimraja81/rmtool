@@ -24,16 +24,10 @@ MODE ?= release
 # Optional OpenMP support (set OMP=1 to enable)
 OMP ?= 0
 OMP_EFFECTIVE := $(OMP)
+HOST_OMP_CPP := -DHOST_OMP=$(OMP_EFFECTIVE)
 
 # Optional GPU/offload build (set GPU=1 to enable)
 GPU ?= 0
-
-ifeq ($(GPU),1)
-  ifneq ($(OMP),0)
-    $(warning GPU=1 forces OMP=0; ignoring requested OMP=$(OMP))
-  endif
-  OMP_EFFECTIVE := 0
-endif
 
 # Auto-select GPU compiler only when user did not explicitly set GPU_FC.
 # Preference order: nvfortran, then gfortran.
@@ -68,13 +62,29 @@ else
     FFLAGS += $(CPU_OMPFLAGS)
   endif
 endif
+FFLAGS += $(HOST_OMP_CPP)
 
-# Mode/OMP/GPU specific artifact tag so build outputs do not conflict
-MODE_TAG := $(MODE)_omp$(OMP_EFFECTIVE)_gpu$(GPU)
+# Human-readable build flavor naming
+ifeq ($(GPU),0)
+	ifeq ($(OMP_EFFECTIVE),1)
+		FLAVOR := cpu_omp
+	else
+		FLAVOR := cpu_serial
+	endif
+else
+	ifeq ($(OMP_EFFECTIVE),1)
+		FLAVOR := gpu_offload_hostomp
+	else
+		FLAVOR := gpu_offload
+	endif
+endif
+
+# Mode/flavor specific artifact tag so build outputs do not conflict
+BUILD_TAG := $(MODE)_$(FLAVOR)
 
 # Directories
 SRCDIR := src
-BUILDDIR := build/$(MODE_TAG)
+BUILDDIR := build/$(BUILD_TAG)
 BINDIR ?= bin
 MODDIR := $(BUILDDIR)/modules
 PROFILE_BINDIR := scratch/profiles/bin
@@ -103,7 +113,7 @@ SOURCES := $(MODSRC) $(MAINSRC) $(INCSRC)
 OBJFILES := $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/rm_synthesis.o
 
 # Target executable (mode-specific plus default convenience path)
-EXECUTABLE_MODE := $(BINDIR)/rm_synthesis_$(MODE_TAG)
+EXECUTABLE_MODE := $(BINDIR)/rm_synthesis_$(BUILD_TAG)
 EXECUTABLE := $(BINDIR)/rm_synthesis
 
 # Default target
@@ -155,7 +165,7 @@ $(EXECUTABLE): $(EXECUTABLE_MODE)
 clean:
 	@rm -rf $(BUILDDIR)
 	@rm -f $(EXECUTABLE_MODE) $(EXECUTABLE)
-	@echo "✓ Cleaned artifacts for mode tag: $(MODE_TAG)"
+	@echo "✓ Cleaned artifacts for build tag: $(BUILD_TAG)"
 
 clean-all:
 	@rm -rf build
@@ -192,9 +202,11 @@ help:
 	@echo "  make uninstall    - Remove installation"
 	@echo "  make help         - Show this message"
 	@echo ""
-	@echo "Note: Artifacts are mode-specific under build/<mode>_omp<0|1>_gpu<0|1>."
+	@echo "Note: Artifacts are mode-specific under build/<mode>_<flavor>."
+	@echo "      Flavors: cpu_serial, cpu_omp, gpu_offload, gpu_offload_hostomp."
 	@echo "      MODE=profile defaults binaries to scratch/profiles/bin (unless BINDIR=... is provided)."
-	@echo "      When GPU=1, OMP is forced to 0 (OMP flag is ignored)."
+	@echo "      GPU=1 OMP=0/1 sets HOST_OMP=0/1; host OpenMP regions are gated accordingly."
+	@echo "      GPU and OMP can be enabled together (e.g., GPU=1 OMP=1)."
 	@echo "      Switching MODE/OMP/GPU does not require make clean."
 	@echo ""
 	@echo "Examples:"

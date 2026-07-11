@@ -1090,15 +1090,15 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   fi
 fi
 
-OMP_BIN="$PROFILE_BIN_DIR/rm_synthesis_profile_omp1_gpu0"
-GPU_BIN="$PROFILE_BIN_DIR/rm_synthesis_release_omp0_gpu1"
+OMP_BIN="$PROFILE_BIN_DIR/rm_synthesis_profile_cpu_omp"
+GPU_BIN="$PROFILE_BIN_DIR/rm_synthesis_release_gpu_offload"
 
 if [[ ! -x "$OMP_BIN" ]]; then
-  OMP_BIN="$REPO_ROOT/bin/rm_synthesis_release_omp1_gpu0"
+  OMP_BIN="$REPO_ROOT/bin/rm_synthesis_release_cpu_omp"
 fi
 
 if [[ ! -x "$GPU_BIN" ]]; then
-  GPU_BIN="$REPO_ROOT/bin/rm_synthesis_release_omp0_gpu1"
+  GPU_BIN="$REPO_ROOT/bin/rm_synthesis_release_gpu_offload"
 fi
 
 if [[ "$RUN_OMP" -eq 1 ]]; then

@@ -27,6 +27,12 @@ module rm_synthesis_mod
   ! Physical constants
   ! Speed of light in units of 10^6 m/s (for freq[MHz] <-> lambda[m] conversion)
   real(sp), parameter :: c_velocity = 299.792458_sp
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  logical, parameter :: host_omp_enabled = .true.
+#else
+  logical, parameter :: host_omp_enabled = .false.
+#endif
   
   public :: max_axis, max_ra, max_dec, maxchan, max_pix, maxofac, maxnt
   public :: c_velocity
@@ -155,7 +161,7 @@ contains
     ! Extract using pre-computed templates.
     ! One fused loop reduces memory traffic versus copying template vectors
     ! and calling 4 separate dot products per RM bin.
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,cos_arr,sin_arr,p_ex,phi_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -213,7 +219,7 @@ contains
       end do
     end if
 
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,cos_arr,sin_arr,re_ex,im_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -288,7 +294,7 @@ contains
       end do
     end if
 
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,p_ex,phi_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -369,7 +375,7 @@ contains
       end do
     end if
 
-    !$omp parallel do default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
     !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,re_ex,im_ex)
     do i = 1, nout
       rc_cor = 0.0_sp
@@ -487,7 +493,7 @@ contains
     ! input-mask channels vary spatially. Precomputing once here saves
     ! nrm_out redundant accumulations per pixel in the GPU kernel.
     allocate(wsum_gpu(npix))
-    !$omp parallel do default(none) &
+    !$omp parallel do if(host_omp_enabled) default(none) &
     !$omp     private(ipix, iz) &
     !$omp     shared(npix, nz_out, wts_gpu, wsum_gpu)
     do ipix = 1, npix
@@ -502,7 +508,7 @@ contains
     if (rem_mean > 0) then
       allocate(mean_Q(npix))
       allocate(mean_U(npix))
-      !$omp parallel do default(none) &
+      !$omp parallel do if(host_omp_enabled) default(none) &
       !$omp     private(ipix, iz, q_sum, u_sum) &
       !$omp     shared(npix, nz_out, specQ_gpu, specU_gpu, wts_gpu, wsum_gpu, mean_Q, mean_U)
       do ipix = 1, npix
@@ -575,7 +581,7 @@ contains
     
     ! Per-pixel weight sums (RM-independent, precomputed once)
     allocate(wsum_cpu(npix))
-    !$omp parallel do default(none) &
+    !$omp parallel do if(host_omp_enabled) default(none) &
     !$omp     private(ipix, iz) &
     !$omp     shared(npix, nz_out, wts_cpu, wsum_cpu)
     do ipix = 1, npix
@@ -589,7 +595,7 @@ contains
     if (rem_mean > 0) then
       allocate(mean_Q(npix))
       allocate(mean_U(npix))
-      !$omp parallel do default(none) &
+      !$omp parallel do if(host_omp_enabled) default(none) &
       !$omp     private(ipix, iz, q_sum, u_sum) &
       !$omp     shared(npix, nz_out, specQ_cpu, specU_cpu, wts_cpu, wsum_cpu, mean_Q, mean_U)
       do ipix = 1, npix
@@ -680,7 +686,7 @@ contains
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix)
 #else
-    !$omp parallel do collapse(2) schedule(dynamic,64) default(none) &
+    !$omp parallel do if(host_omp_enabled) collapse(2) schedule(dynamic,64) default(none) &
     !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
