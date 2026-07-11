@@ -15,6 +15,8 @@
 #   8-9. Staging tests (GPU only, if available)
 #  10. Bad channel masking – per-channel NaN and fully-masked pixel handling
 #      (run for serial, OMP, and GPU binaries)
+#  11. Cubestat outputs – peak/RM-peak/angle-peak/SNR map validation
+#      (serial path, cubestat=y)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -435,6 +437,69 @@ if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" ]]; then
     fi
 else
     skip "GPU binary not available or not built; skipping bad channel GPU test"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. Cubestat outputs – peak/RM-peak/angle-peak/SNR maps
+# ---------------------------------------------------------------------------
+section "11. Cubestat outputs – serial validation"
+if [[ -x "$BIN_SERIAL" ]]; then
+    cfg_cubestat=$(make_cfg "cubestat_serial" "n" "cubestat=y")
+    log_cubestat="$OUT_DIR/cubestat_serial.log"
+    rm -f "$OUT_DIR"/cubestat_serial.*.FITS
+    if run_binary "$BIN_SERIAL" "$cfg_cubestat" "$log_cubestat"; then
+        peak_map="$OUT_DIR/cubestat_serial.PEAK.MAP.FITS"
+        rm_peak_map="$OUT_DIR/cubestat_serial.RM_PEAK.MAP.FITS"
+        ang_peak_map="$OUT_DIR/cubestat_serial.ANG_PEAK.MAP.FITS"
+        snr_map="$OUT_DIR/cubestat_serial.SNR.MAP.FITS"
+        if [[ -f "$peak_map" && -f "$rm_peak_map" && -f "$ang_peak_map" && -f "$snr_map" ]]; then
+            if python3 - "$TRUTH" "$peak_map" "$rm_peak_map" "$ang_peak_map" "$snr_map" <<'PY'
+import json, sys, numpy as np
+from astropy.io import fits
+truth = json.load(open(sys.argv[1]))
+peak = fits.getdata(sys.argv[2]).squeeze()
+rm_peak = fits.getdata(sys.argv[3]).squeeze()
+ang_peak = fits.getdata(sys.argv[4]).squeeze()
+snr = fits.getdata(sys.argv[5]).squeeze()
+ok = True
+for src in truth["sources"]:
+    x, y, rm_exp = src["x"], src["y"], float(src["rm"])
+    p = float(peak[y, x])
+    r = float(rm_peak[y, x])
+    a = float(ang_peak[y, x])
+    s = float(snr[y, x])
+    if not np.isfinite(p) or p <= 0.0:
+        print(f"[FAIL] {src['name']}: peak invalid ({p})")
+        ok = False
+    if not np.isfinite(r):
+        print(f"[FAIL] {src['name']}: RM_peak invalid ({r})")
+        ok = False
+    if abs(r - rm_exp) > 2.0:
+        print(f"[FAIL] {src['name']}: RM_peak mismatch expected {rm_exp:+.1f}, got {r:+.2f}")
+        ok = False
+    if not np.isfinite(a):
+        print(f"[FAIL] {src['name']}: ANG_peak invalid ({a})")
+        ok = False
+    if not np.isfinite(s) or s <= 0.0:
+        print(f"[FAIL] {src['name']}: SNR invalid ({s})")
+        ok = False
+    if ok:
+        print(f"[OK] {src['name']}: peak={p:.4g}, rm_peak={r:+.2f}, snr={s:.3f}")
+sys.exit(0 if ok else 1)
+PY
+            then
+                pass "Cubestat maps (serial): files present and source values valid"
+            else
+                fail "Cubestat maps (serial): value validation failed"
+            fi
+        else
+            fail "Cubestat maps (serial): one or more output files missing"
+        fi
+    else
+        fail "Cubestat run (serial) did not complete successfully (see $log_cubestat)"
+    fi
+else
+    skip "Serial binary not available; skipping cubestat map test"
 fi
 
 # ---------------------------------------------------------------------------

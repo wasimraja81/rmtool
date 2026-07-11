@@ -92,6 +92,10 @@ chelp-
       real(sp), allocatable :: specU(:)
       real(sp), allocatable :: p_tile_arr(:)
       real(sp), allocatable :: phi_tile_arr(:)
+        real(sp), allocatable :: peak_tile_arr(:)
+        real(sp), allocatable :: rm_peak_tile_arr(:)
+        real(sp), allocatable :: ang_peak_tile_arr(:)
+        real(sp), allocatable :: snr_tile_arr(:)
       integer*1, allocatable :: mask_tile_arr(:)
       integer*2, allocatable :: nvalid_tile_arr(:)
       real(sp)  resiQ, resiU, slopeQ, slopeU
@@ -143,6 +147,8 @@ chelp-
       logical   cubeM
       logical   out_amp_open, out_ang_open, out_exists
       logical   out_mask_open, out_nvalid_open
+        logical   out_peak_open, out_rmpeak_open
+        logical   out_angpeak_open, out_snr_open
       integer   freq_axis, freq_axisQ, freq_axisU
       integer   freq_axisM
 
@@ -155,6 +161,8 @@ chelp-
       character(len=272) :: infileI, infileQ, infileU, message
       character(len=272) :: outfile, outfileAMP, outfileANG
       character(len=272) :: outfileMASK, outfileNVALID
+        character(len=272) :: outfilePEAK, outfileRMPEAK
+        character(len=272) :: outfileANGPEAK, outfileSNR
       character(len=272) :: mask_cube_file, mask_input_cube_file,
      -                      mask_trust_mode
       character(len=272) :: subim_parfile, cfgfile, cfgfile_in
@@ -173,7 +181,8 @@ chelp-
       real(sp) nullval
       logical   subim
       logical   tile_auto, dry_run
-      logical   write_mask_output, write_nvalid_output
+                        logical   write_mask_output, write_nvalid_output
+                        logical   cubestat
       logical   use_gpu
       real(sp) conv_fac ! freq-to-lambda conversion factor
       real(sp) mem_frac_ram, mem_frac_vram
@@ -192,7 +201,7 @@ chelp-
       integer   ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
       integer   cnt_good, nvalid_pix, idx_wts
       integer   fpixels_nvalid(2), lpixels_nvalid(2)
-      integer   naxes_mask(3), naxes_nvalid(2)
+        integer   naxes_mask(3), naxes_nvalid(2), naxes_stat(2)
       logical   nan_check_on, chan_valid
       logical   use_input_mask, in_mask_open
       logical   use_gpu_actual
@@ -327,7 +336,7 @@ chelp-
               stop
       endif
 
-      call read_cfg_keyval(cfgfile,
+        call read_cfg_keyval(cfgfile,
      -          path,infileQ,infileU,outfile,
      -          remove_badchan,global_badchan_file,
      -          subim,subim_parfile,
@@ -346,7 +355,8 @@ chelp-
      -          mask_input_cube_file,
      -          mask_trust_mode,
      -          write_mask_output,
-     -          write_nvalid_output,use_gpu,io_overlap,status)
+     -          write_nvalid_output,cubestat,use_gpu,
+     -          io_overlap,status)
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
@@ -422,6 +432,12 @@ chelp-
               outfileMASK(1:) = mask_cube_file(1:nchar(mask_cube_file))
       endif
       outfileNVALID(1:) = outfile(1:nchar(outfile))//'.NVALID.MAP.FITS'
+        outfilePEAK(1:) = outfile(1:nchar(outfile))//'.PEAK.MAP.FITS'
+        outfileRMPEAK(1:) = outfile(1:nchar(outfile))//
+     -                   '.RM_PEAK.MAP.FITS'
+        outfileANGPEAK(1:) = outfile(1:nchar(outfile))//
+     -                    '.ANG_PEAK.MAP.FITS'
+        outfileSNR(1:) = outfile(1:nchar(outfile))//'.SNR.MAP.FITS'
 
         global_badchan_file(1:) = global_badchan_file(
      -                       1:nchar(global_badchan_file))
@@ -922,6 +938,10 @@ chelp-
       out_ang_open = .false.
       out_mask_open = .false.
       out_nvalid_open = .false.
+        out_peak_open = .false.
+        out_rmpeak_open = .false.
+        out_angpeak_open = .false.
+        out_snr_open = .false.
       in_mask_open = .false.
       use_input_mask = .false.
       masksrc_key = 'generated'
@@ -1021,6 +1041,63 @@ chelp-
                               stop
                       endif
               endif
+              if(cubestat)then
+                      inquire(file=outfilePEAK(1:nchar(outfilePEAK)),
+     -                      exist=out_exists)
+                      if(out_exists)then
+                              write(*,*)" "
+                              write(*,*)"ERROR: Output file already"
+     -                          //" exists:"
+                              write(*,*)outfilePEAK(
+     -                          1:nchar(outfilePEAK))
+                              write(*,*)"Refusing to overwrite"
+     -                          //" existing file."
+                              write(*,*)"Please remove/rename it and"
+     -                          //" run again."
+                              stop
+                      endif
+                      inquire(file=outfileRMPEAK(
+     -                      1:nchar(outfileRMPEAK)),exist=out_exists)
+                      if(out_exists)then
+                              write(*,*)" "
+                              write(*,*)"ERROR: Output file already"
+     -                          //" exists:"
+                              write(*,*)outfileRMPEAK(
+     -                          1:nchar(outfileRMPEAK))
+                              write(*,*)"Refusing to overwrite"
+     -                          //" existing file."
+                              write(*,*)"Please remove/rename it and"
+     -                          //" run again."
+                              stop
+                      endif
+                      inquire(file=outfileANGPEAK(
+     -                      1:nchar(outfileANGPEAK)),exist=out_exists)
+                      if(out_exists)then
+                              write(*,*)" "
+                              write(*,*)"ERROR: Output file already"
+     -                          //" exists:"
+                              write(*,*)outfileANGPEAK(
+     -                          1:nchar(outfileANGPEAK))
+                              write(*,*)"Refusing to overwrite"
+     -                          //" existing file."
+                              write(*,*)"Please remove/rename it and"
+     -                          //" run again."
+                              stop
+                      endif
+                      inquire(file=outfileSNR(1:nchar(outfileSNR)),
+     -                      exist=out_exists)
+                      if(out_exists)then
+                              write(*,*)" "
+                              write(*,*)"ERROR: Output file already"
+     -                          //" exists:"
+                              write(*,*)outfileSNR(1:nchar(outfileSNR))
+                              write(*,*)"Refusing to overwrite"
+     -                          //" existing file."
+                              write(*,*)"Please remove/rename it and"
+     -                          //" run again."
+                              stop
+                      endif
+              endif
 
               status = 0
               call ftinit(41,outfileAMP,blocksize,status)
@@ -1068,6 +1145,56 @@ chelp-
                               stop
                       endif
                       out_nvalid_open = .true.
+              endif
+
+              if(cubestat)then
+                      status = 0
+                      call ftinit(46,outfilePEAK,blocksize,status)
+                      if(status.ne.0)then
+                              write(*,*)"Error creating PEAK output"
+     -                          //" file:"
+                              write(*,*)outfilePEAK(
+     -                          1:nchar(outfilePEAK))
+                              call printerror(status)
+                              stop
+                      endif
+                      out_peak_open = .true.
+
+                      status = 0
+                      call ftinit(47,outfileRMPEAK,blocksize,status)
+                      if(status.ne.0)then
+                              write(*,*)"Error creating RM_PEAK"
+     -                          //" output file:"
+                              write(*,*)outfileRMPEAK(
+     -                          1:nchar(outfileRMPEAK))
+                              call printerror(status)
+                              stop
+                      endif
+                      out_rmpeak_open = .true.
+
+                      status = 0
+                      call ftinit(48,outfileANGPEAK,blocksize,status)
+                      if(status.ne.0)then
+                              write(*,*)"Error creating ANG_PEAK"
+     -                          //" output file:"
+                              write(*,*)outfileANGPEAK(
+     -                          1:nchar(outfileANGPEAK))
+                              call printerror(status)
+                              stop
+                      endif
+                      out_angpeak_open = .true.
+
+                      status = 0
+                      call ftinit(49,outfileSNR,blocksize,status)
+                      if(status.ne.0)then
+                              write(*,*)"Error creating SNR output"
+     -                          //" file:"
+                              write(*,*)outfileSNR(
+     -                          1:nchar(outfileSNR))
+                              call printerror(status)
+                              stop
+                      endif
+                      out_snr_open = .true.
               endif
       endif
 
@@ -1648,6 +1775,13 @@ chelp-
      -         mask_tile_arr(tile_ra*tile_dec*nz_out),
      -         nvalid_tile_arr(tile_ra*tile_dec),
      -         stat=ios_mem)
+      if(ios_mem.eq.0 .and. cubestat)then
+              allocate(peak_tile_arr(tile_ra*tile_dec),
+     -               rm_peak_tile_arr(tile_ra*tile_dec),
+     -               ang_peak_tile_arr(tile_ra*tile_dec),
+     -               snr_tile_arr(tile_ra*tile_dec),
+     -               stat=ios_mem)
+      endif
       if(ios_mem.eq.0 .and. use_input_mask)then
               allocate(specMask(tile_ra*tile_dec*nz_out),stat=ios_mem)
       endif
@@ -1692,6 +1826,10 @@ chelp-
               if(out_ang_open)call ftdelt(42,status)
               if(out_mask_open)call ftdelt(43,status)
               if(out_nvalid_open)call ftdelt(44,status)
+              if(out_peak_open)call ftdelt(46,status)
+              if(out_rmpeak_open)call ftdelt(47,status)
+              if(out_angpeak_open)call ftdelt(48,status)
+              if(out_snr_open)call ftdelt(49,status)
               call FTCLOS(21,status)
               call FTCLOS(22,status)
               stop
@@ -1742,6 +1880,8 @@ chelp-
       naxes_mask(3) = nz_out
       naxes_nvalid(1) = nx_out
       naxes_nvalid(2) = ny_out
+      naxes_stat(1) = nx_out
+      naxes_stat(2) = ny_out
       call ftphpr(41,simple,bitpix,3,naxes_out,0,1,extend,status)
       call ftphpr(42,simple,bitpix,3,naxes_out,0,1,extend,status)
       if(out_mask_open)then
@@ -1749,6 +1889,22 @@ chelp-
       endif
       if(out_nvalid_open)then
               call ftphpr(44,simple,16,2,naxes_nvalid,0,1,extend,status)
+      endif
+      if(out_peak_open)then
+              call ftphpr(46,simple,bitpix,2,naxes_stat,0,1,
+     -                    extend,status)
+      endif
+      if(out_rmpeak_open)then
+              call ftphpr(47,simple,bitpix,2,naxes_stat,0,1,
+     -                    extend,status)
+      endif
+      if(out_angpeak_open)then
+              call ftphpr(48,simple,bitpix,2,naxes_stat,0,1,
+     -                    extend,status)
+      endif
+      if(out_snr_open)then
+              call ftphpr(49,simple,bitpix,2,naxes_stat,0,1,
+     -                    extend,status)
       endif
 
 !  Put (append) a new keyword of the appropriate datatype into the CHU
@@ -1790,6 +1946,14 @@ chelp-
       if(out_nvalid_open)then
               call ftpkys(44,'ctype1',ctype(1:nchar(ctype)),' ',status)
       endif
+      if(out_peak_open)call ftpkys(46,'ctype1',ctype(1:nchar(ctype)),
+     -     ' ',status)
+      if(out_rmpeak_open)call ftpkys(47,'ctype1',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_angpeak_open)call ftpkys(48,'ctype1',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_snr_open)call ftpkys(49,'ctype1',ctype(1:nchar(ctype)),
+     -     ' ',status)
       status = 0
 
       ! --- Axis 1: CRVAL passthrough, CRPIX offset, CDELT scaled ---
@@ -1800,6 +1964,14 @@ chelp-
      -     ' ',status)
         if(out_nvalid_open)call ftpkyd(44,'crval1',cval,decimals,
      -     ' ',status)
+        if(out_peak_open)call ftpkyd(46,'crval1',cval,decimals,
+     -     ' ',status)
+        if(out_rmpeak_open)call ftpkyd(47,'crval1',cval,decimals,
+     -     ' ',status)
+        if(out_angpeak_open)call ftpkyd(48,'crval1',cval,decimals,
+     -     ' ',status)
+        if(out_snr_open)call ftpkyd(49,'crval1',cval,decimals,
+     -     ' ',status)
       call ftgkyd(21,'crpix1',atmp8,comment,status)
       atmp8 = (atmp8 - dble(xpix_beg)) / dble(incs(1)) + 1.0d0
       call ftpkyd(41,'crpix1',atmp8,decimals,' ',status)
@@ -1808,6 +1980,14 @@ chelp-
      -     ' ',status)
         if(out_nvalid_open)call ftpkyd(44,'crpix1',atmp8,decimals,
      -     ' ',status)
+        if(out_peak_open)call ftpkyd(46,'crpix1',atmp8,decimals,
+     -     ' ',status)
+        if(out_rmpeak_open)call ftpkyd(47,'crpix1',atmp8,decimals,
+     -     ' ',status)
+        if(out_angpeak_open)call ftpkyd(48,'crpix1',atmp8,decimals,
+     -     ' ',status)
+        if(out_snr_open)call ftpkyd(49,'crpix1',atmp8,decimals,
+     -     ' ',status)
       call ftgkyd(21,'cdelt1',cdelt,comment,status)
       cdelt = dble(incs(1)) * cdelt
       call ftpkyd(41,'cdelt1',cdelt,decimals,' ',status)
@@ -1815,6 +1995,14 @@ chelp-
         if(out_mask_open)call ftpkyd(43,'cdelt1',cdelt,decimals,
      -     ' ',status)
         if(out_nvalid_open)call ftpkyd(44,'cdelt1',cdelt,decimals,
+     -     ' ',status)
+        if(out_peak_open)call ftpkyd(46,'cdelt1',cdelt,decimals,
+     -     ' ',status)
+        if(out_rmpeak_open)call ftpkyd(47,'cdelt1',cdelt,decimals,
+     -     ' ',status)
+        if(out_angpeak_open)call ftpkyd(48,'cdelt1',cdelt,decimals,
+     -     ' ',status)
+        if(out_snr_open)call ftpkyd(49,'cdelt1',cdelt,decimals,
      -     ' ',status)
       status = 0
 
@@ -1831,6 +2019,14 @@ chelp-
                       call ftpkys(44,'cunit1',ctype(1:nchar(ctype)),
      -                    ' ',status)
               endif
+              if(out_peak_open)call ftpkys(46,'cunit1',
+     -            ctype(1:nchar(ctype)),' ',status)
+              if(out_rmpeak_open)call ftpkys(47,'cunit1',
+     -            ctype(1:nchar(ctype)),' ',status)
+              if(out_angpeak_open)call ftpkys(48,'cunit1',
+     -            ctype(1:nchar(ctype)),' ',status)
+              if(out_snr_open)call ftpkys(49,'cunit1',
+     -            ctype(1:nchar(ctype)),' ',status)
       endif
       status = 0
 
@@ -1846,6 +2042,14 @@ chelp-
                 call ftpkys(44,'ctype2', ctype(1:nchar(ctype)),
      -             ' ',status)
       endif
+      if(out_peak_open)call ftpkys(46,'ctype2',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_rmpeak_open)call ftpkys(47,'ctype2',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_angpeak_open)call ftpkys(48,'ctype2',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_snr_open)call ftpkys(49,'ctype2',
+     -     ctype(1:nchar(ctype)),' ',status)
       status = 0
 
       ! --- Axis 2: CRVAL passthrough, CRPIX offset, CDELT scaled ---
@@ -1856,6 +2060,14 @@ chelp-
      -     ' ',status)
         if(out_nvalid_open)call ftpkyd(44,'crval2',cval,decimals,
      -     ' ',status)
+        if(out_peak_open)call ftpkyd(46,'crval2',cval,decimals,
+     -     ' ',status)
+        if(out_rmpeak_open)call ftpkyd(47,'crval2',cval,decimals,
+     -     ' ',status)
+        if(out_angpeak_open)call ftpkyd(48,'crval2',cval,decimals,
+     -     ' ',status)
+        if(out_snr_open)call ftpkyd(49,'crval2',cval,decimals,
+     -     ' ',status)
       call ftgkyd(21,'crpix2',atmp8,comment,status)
       atmp8 = (atmp8 - dble(ypix_beg)) / dble(incs(2)) + 1.0d0
       call ftpkyd(41,'crpix2',atmp8,decimals,' ',status)
@@ -1864,6 +2076,14 @@ chelp-
      -     ' ',status)
         if(out_nvalid_open)call ftpkyd(44,'crpix2',atmp8,decimals,
      -     ' ',status)
+        if(out_peak_open)call ftpkyd(46,'crpix2',atmp8,decimals,
+     -     ' ',status)
+        if(out_rmpeak_open)call ftpkyd(47,'crpix2',atmp8,decimals,
+     -     ' ',status)
+        if(out_angpeak_open)call ftpkyd(48,'crpix2',atmp8,decimals,
+     -     ' ',status)
+        if(out_snr_open)call ftpkyd(49,'crpix2',atmp8,decimals,
+     -     ' ',status)
       call ftgkyd(21,'cdelt2',cdelt,comment,status)
       cdelt = dble(incs(2)) * cdelt
       call ftpkyd(41,'cdelt2',cdelt,decimals,' ',status)
@@ -1871,6 +2091,14 @@ chelp-
         if(out_mask_open)call ftpkyd(43,'cdelt2',cdelt,decimals,
      -     ' ',status)
         if(out_nvalid_open)call ftpkyd(44,'cdelt2',cdelt,decimals,
+     -     ' ',status)
+        if(out_peak_open)call ftpkyd(46,'cdelt2',cdelt,decimals,
+     -     ' ',status)
+        if(out_rmpeak_open)call ftpkyd(47,'cdelt2',cdelt,decimals,
+     -     ' ',status)
+        if(out_angpeak_open)call ftpkyd(48,'cdelt2',cdelt,decimals,
+     -     ' ',status)
+        if(out_snr_open)call ftpkyd(49,'cdelt2',cdelt,decimals,
      -     ' ',status)
       status = 0
 
@@ -1887,6 +2115,14 @@ chelp-
                       call ftpkys(44,'cunit2',ctype(1:nchar(ctype)),
      -                    ' ',status)
               endif
+              if(out_peak_open)call ftpkys(46,'cunit2',
+     -            ctype(1:nchar(ctype)),' ',status)
+              if(out_rmpeak_open)call ftpkys(47,'cunit2',
+     -            ctype(1:nchar(ctype)),' ',status)
+              if(out_angpeak_open)call ftpkys(48,'cunit2',
+     -            ctype(1:nchar(ctype)),' ',status)
+              if(out_snr_open)call ftpkys(49,'cunit2',
+     -            ctype(1:nchar(ctype)),' ',status)
       endif
       status = 0
 
@@ -2053,6 +2289,22 @@ chelp-
               call ftpkys(44,'bunit','COUNT',
      -            'Number of valid channels',status)
       endif
+      if(out_peak_open)then
+              call ftpkys(46,'bunit',ctype(1:nchar(ctype)),
+     -            'Peak RM power units',status)
+      endif
+      if(out_rmpeak_open)then
+              call ftpkys(47,'bunit','rad/m**2',
+     -            'RM at peak power',status)
+      endif
+      if(out_angpeak_open)then
+              call ftpkys(48,'bunit','rad',
+     -            'Angle at RM peak',status)
+      endif
+      if(out_snr_open)then
+              call ftpkys(49,'bunit','SNR',
+     -            'Signal-to-noise ratio',status)
+      endif
 
       ! --- Metadata: OBJECT, OBSERVER, TELESCOP ---
       status = 0
@@ -2090,6 +2342,14 @@ chelp-
       if(out_mask_open)call ftpkys(43,'telescop',
      -     ctype(1:nchar(ctype)),' ',status)
       if(out_nvalid_open)call ftpkys(44,'telescop',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_peak_open)call ftpkys(46,'telescop',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_rmpeak_open)call ftpkys(47,'telescop',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_angpeak_open)call ftpkys(48,'telescop',
+     -     ctype(1:nchar(ctype)),' ',status)
+      if(out_snr_open)call ftpkys(49,'telescop',
      -     ctype(1:nchar(ctype)),' ',status)
       status = 0
 
@@ -2148,6 +2408,38 @@ chelp-
               call ftpkys(44,'MASKTRUS',
      -            mask_trust_mode(1:nchar(mask_trust_mode)),
      -            'Mask trust mode: safe/strict',status)
+      endif
+      if(out_peak_open)then
+              call ftpkys(46,'CUBESTAT','T',
+     -            'Cubestat map generated',status)
+              call ftpkys(46,'CSMETHOD','TAIL_Q16_Q50',
+     -            'Sigma=(q50-q16)/0.67449',status)
+              call ftpkys(46,'CSTYPE','PEAK',
+     -            'Peak RM power map',status)
+      endif
+      if(out_rmpeak_open)then
+              call ftpkys(47,'CUBESTAT','T',
+     -            'Cubestat map generated',status)
+              call ftpkys(47,'CSMETHOD','TAIL_Q16_Q50',
+     -            'Sigma=(q50-q16)/0.67449',status)
+              call ftpkys(47,'CSTYPE','RM_PEAK',
+     -            'RM at peak power map',status)
+      endif
+      if(out_angpeak_open)then
+              call ftpkys(48,'CUBESTAT','T',
+     -            'Cubestat map generated',status)
+              call ftpkys(48,'CSMETHOD','TAIL_Q16_Q50',
+     -            'Sigma=(q50-q16)/0.67449',status)
+              call ftpkys(48,'CSTYPE','ANG_PEAK',
+     -            'Angle at RM peak map',status)
+      endif
+      if(out_snr_open)then
+              call ftpkys(49,'CUBESTAT','T',
+     -            'Cubestat map generated',status)
+              call ftpkys(49,'CSMETHOD','TAIL_Q16_Q50',
+     -            'Sigma=(q50-q16)/0.67449',status)
+              call ftpkys(49,'CSTYPE','SNR',
+     -            'SNR map at RM peak',status)
       endif
       status = 0
 
@@ -2510,6 +2802,14 @@ chelp-
             iy_out_beg = int((iy_tile_beg - ypix_beg)/incs(2)) + 1
             iy_out_end = iy_out_beg + ny_tile - 1
 
+            if(cubestat)then
+                    call cubestat_tail_quantile_maps(
+     -                  p_tile_arr,phi_tile_arr,RM,
+     -                  nx_tile,ny_tile,nrm_out,
+     -                  peak_tile_arr,rm_peak_tile_arr,
+     -                  ang_peak_tile_arr,snr_tile_arr)
+            endif
+
             fpixels_out(1) = ix_out_beg
             lpixels_out(1) = ix_out_end
             fpixels_out(2) = iy_out_beg
@@ -2546,6 +2846,58 @@ chelp-
                     call ftpssi(44,group,2,naxes_nvalid,
      -                  fpixels_nvalid,lpixels_nvalid,
      -                  nvalid_tile_arr,status)
+                    if(status.gt.0)then
+                            call printerror(status)
+                    endif
+            endif
+
+            if(out_peak_open)then
+                    fpixels_nvalid(1) = ix_out_beg
+                    lpixels_nvalid(1) = ix_out_end
+                    fpixels_nvalid(2) = iy_out_beg
+                    lpixels_nvalid(2) = iy_out_end
+                    call ftpsse(46,group,2,naxes_stat,
+     -                  fpixels_nvalid,lpixels_nvalid,
+     -                  peak_tile_arr,status)
+                    if(status.gt.0)then
+                            call printerror(status)
+                    endif
+            endif
+
+            if(out_rmpeak_open)then
+                    fpixels_nvalid(1) = ix_out_beg
+                    lpixels_nvalid(1) = ix_out_end
+                    fpixels_nvalid(2) = iy_out_beg
+                    lpixels_nvalid(2) = iy_out_end
+                    call ftpsse(47,group,2,naxes_stat,
+     -                  fpixels_nvalid,lpixels_nvalid,
+     -                  rm_peak_tile_arr,status)
+                    if(status.gt.0)then
+                            call printerror(status)
+                    endif
+            endif
+
+            if(out_angpeak_open)then
+                    fpixels_nvalid(1) = ix_out_beg
+                    lpixels_nvalid(1) = ix_out_end
+                    fpixels_nvalid(2) = iy_out_beg
+                    lpixels_nvalid(2) = iy_out_end
+                    call ftpsse(48,group,2,naxes_stat,
+     -                  fpixels_nvalid,lpixels_nvalid,
+     -                  ang_peak_tile_arr,status)
+                    if(status.gt.0)then
+                            call printerror(status)
+                    endif
+            endif
+
+            if(out_snr_open)then
+                    fpixels_nvalid(1) = ix_out_beg
+                    lpixels_nvalid(1) = ix_out_end
+                    fpixels_nvalid(2) = iy_out_beg
+                    lpixels_nvalid(2) = iy_out_end
+                    call ftpsse(49,group,2,naxes_stat,
+     -                  fpixels_nvalid,lpixels_nvalid,
+     -                  snr_tile_arr,status)
                     if(status.gt.0)then
                             call printerror(status)
                     endif
@@ -2625,6 +2977,10 @@ chelp-
       if(allocated(stNvalid)) deallocate(stNvalid)
       if(allocated(p_tile_arr)) deallocate(p_tile_arr)
       if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)
+        if(allocated(peak_tile_arr)) deallocate(peak_tile_arr)
+        if(allocated(rm_peak_tile_arr)) deallocate(rm_peak_tile_arr)
+        if(allocated(ang_peak_tile_arr)) deallocate(ang_peak_tile_arr)
+        if(allocated(snr_tile_arr)) deallocate(snr_tile_arr)
       if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)
       if(allocated(nvalid_tile_arr)) deallocate(nvalid_tile_arr)
 
@@ -2674,6 +3030,38 @@ chelp-
               call FTCLOS(44,status)
               if (status .gt. 0)then
                       write(*,*)"Problem closing NVALID-file"
+                      call printerror(status)
+              endif
+      endif
+      if(out_peak_open)then
+              status = 0
+              call FTCLOS(46,status)
+              if (status .gt. 0)then
+                      write(*,*)"Problem closing PEAK-file"
+                      call printerror(status)
+              endif
+      endif
+      if(out_rmpeak_open)then
+              status = 0
+              call FTCLOS(47,status)
+              if (status .gt. 0)then
+                      write(*,*)"Problem closing RM_PEAK-file"
+                      call printerror(status)
+              endif
+      endif
+      if(out_angpeak_open)then
+              status = 0
+              call FTCLOS(48,status)
+              if (status .gt. 0)then
+                      write(*,*)"Problem closing ANG_PEAK-file"
+                      call printerror(status)
+              endif
+      endif
+      if(out_snr_open)then
+              status = 0
+              call FTCLOS(49,status)
+              if (status .gt. 0)then
+                      write(*,*)"Problem closing SNR-file"
                       call printerror(status)
               endif
       endif
