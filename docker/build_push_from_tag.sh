@@ -18,14 +18,43 @@ REPO="wasimraja81/rmtool"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
 DEFAULT_REMOTE_URL="https://github.com/wasimraja81/rmtool.git"
 
+usage() {
+  cat <<'EOF'
+Usage:
+  docker/build_push_from_tag.sh <git_tag> [docker_image_tag]
+
+Builds and pushes wasimraja81/rmtool:<docker_image_tag> from a checked-out git tag.
+
+Arguments:
+  <git_tag>           Required source git tag to checkout in temporary clone
+  [docker_image_tag]  Optional Docker image tag (defaults to <git_tag>)
+
+Environment:
+  GIT_REMOTE       Git remote name when discovering URL from local repo (default: origin)
+  GIT_REMOTE_URL   Explicit git clone URL override
+  TMP_BASE_DIR     Base directory for temporary clone work
+EOF
+}
+
+if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+  usage
+  exit 0
+fi
+
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: $0 <git_tag> [docker_image_tag]" >&2
+  usage >&2
   exit 1
 fi
 
 GIT_TAG="$1"
 IMAGE_TAG="${2:-$GIT_TAG}"
 IMAGE_REF="${REPO}:${IMAGE_TAG}"
+
+if [[ "$GIT_TAG" == -* ]]; then
+  echo "Error: invalid git tag '${GIT_TAG}'." >&2
+  echo "Hint: use -h or --help for usage." >&2
+  exit 1
+fi
 
 for cmd in git docker mktemp; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
