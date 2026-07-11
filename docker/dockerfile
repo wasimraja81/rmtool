@@ -3,6 +3,11 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG RMTOOL_GIT_TAG=unknown
+LABEL org.opencontainers.image.title="rmtool" \
+    org.opencontainers.image.version="${RMTOOL_GIT_TAG}" \
+    org.opencontainers.image.description="RM synthesis toolchain image built from a tagged source snapshot"
+
 # Install dependencies needed for compiling the Fortran/C code
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -40,7 +45,12 @@ RUN set -e; \
     # 3. Build configuration: OMP=0 GPU=1
     make clean OMP=0 GPU=1; \
     make -j2 OMP=0 GPU=1; \
-    mv bin/rm_synthesis_release_omp0_gpu1 bin/rm_synthesis_OMP0_GPU1
+    mv bin/rm_synthesis_release_omp0_gpu1 bin/rm_synthesis_OMP0_GPU1; \
+    \
+    # 4. Build configuration: OMP=1 GPU=1
+    make clean OMP=1 GPU=1; \
+    make -j2 OMP=1 GPU=1; \
+    mv bin/rm_synthesis_release_omp1_gpu1 bin/rm_synthesis_OMP1_GPU1
 
 # Expose all three compiled targets to the container's system PATH
 ENV PATH="/app/rmtool/bin:${PATH}"
