@@ -32,6 +32,7 @@ DATA_DIR="$TESTS_DIR/data"
 OUT_DIR="$TESTS_DIR/output"
 TRUTH="$DATA_DIR/truth.json"
 TEMPLATE="$TESTS_DIR/rmsynth-test.cfg.template"
+TIMING_TEMPLATE="$TESTS_DIR/rmsynth-timing.cfg.template"
 
 BIN_SERIAL="$REPO_ROOT/bin/rm_synthesis_release_cpu_serial"
 BIN_OMP="$REPO_ROOT/bin/rm_synthesis_release_cpu_omp"
@@ -64,6 +65,19 @@ make_cfg() {
     echo "$cfg"
 }
 
+make_timing_cfg() {
+    local tag="$1" use_gpu="$2"
+    local out_prefix="$OUT_DIR/$tag"
+    local cfg="$OUT_DIR/${tag}.cfg"
+    local csv_file="$OUT_DIR/${tag}.timing.csv"
+    sed -e "s|__DATADIR__|${DATA_DIR}|g" \
+        -e "s|__OUTPREFIX__|${out_prefix}|g" \
+        -e "s|__USE_GPU__|${use_gpu}|g" \
+        -e "s|__TIMINGCSV__|${csv_file}|g" \
+        "$TIMING_TEMPLATE" > "$cfg"
+    echo "$cfg"
+}
+
 run_binary() {
     local binary="$1" cfg="$2" logfile="$3"
     if "$binary" "$cfg" > "$logfile" 2>&1; then
@@ -75,6 +89,25 @@ run_binary() {
     fi
 }
 
+require_timing_markers() {
+    local logfile="$1"
+    grep -q "Run summary:" "$logfile" && \
+    grep -q "Timing summary (seconds):" "$logfile" && \
+    grep -q "Macro timing breakdown:" "$logfile"
+}
+
+require_timing_csv_row() {
+    local csv_file="$1"
+    [[ -f "$csv_file" ]] || return 1
+    local nlines
+    nlines=$(wc -l < "$csv_file")
+    [[ "$nlines" -ge 2 ]] || return 1
+    local header_cols data_cols
+    header_cols=$(head -1 "$csv_file" | awk -F',' '{print NF}')
+    data_cols=$(tail -1 "$csv_file" | awk -F',' '{print NF}')
+    [[ "$header_cols" -eq "$data_cols" ]] || return 1
+}
+
 # ---------------------------------------------------------------------------
 # 0. Prepare output directory
 # ---------------------------------------------------------------------------
@@ -83,6 +116,7 @@ mkdir -p "$OUT_DIR"
 
 # Clean previous test outputs (binary refuses to overwrite)
 rm -f "$OUT_DIR"/serial.*.FITS "$OUT_DIR"/omp.*.FITS "$OUT_DIR"/gpu.*.FITS
+rm -f "$OUT_DIR"/*.timing.csv
 rm -f "$OUT_DIR"/*.cfg "$OUT_DIR"/*.log
 
 # ---------------------------------------------------------------------------
@@ -500,6 +534,69 @@ PY
     fi
 else
     skip "Serial binary not available; skipping cubestat map test"
+fi
+
+# ---------------------------------------------------------------------------
+# 12. Timing report and CSV validation (Phase 7)
+# ---------------------------------------------------------------------------
+section "12. Timing report + CSV validation"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    cfg_timing_serial=$(make_timing_cfg "timing_serial" "n")
+    log_timing_serial="$OUT_DIR/timing_serial.log"
+    csv_timing_serial="$OUT_DIR/timing_serial.timing.csv"
+    rm -f "$OUT_DIR"/timing_serial.*.FITS "$csv_timing_serial"
+    if run_binary "$BIN_SERIAL" "$cfg_timing_serial" "$log_timing_serial"; then
+        if require_timing_markers "$log_timing_serial"; then
+            pass "Timing markers present (serial)"
+        else
+            fail "Timing markers missing (serial)"
+        fi
+        if require_timing_csv_row "$csv_timing_serial"; then
+            pass "Timing CSV emitted (serial)"
+        else
+            fail "Timing CSV missing/invalid (serial)"
+        fi
+    else
+        fail "Timing run failed (serial)"
+    fi
+else
+    skip "Serial binary not available; skipping timing validation"
+fi
+
+if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" ]]; then
+    export OMP_TARGET_OFFLOAD="${OMP_TARGET_OFFLOAD:-DISABLED}"
+    cfg_timing_gpu=$(make_timing_cfg "timing_gpu" "y")
+    log_timing_gpu="$OUT_DIR/timing_gpu.log"
+    csv_timing_gpu="$OUT_DIR/timing_gpu.timing.csv"
+    rm -f "$OUT_DIR"/timing_gpu.*.FITS "$csv_timing_gpu"
+    if run_binary "$BIN_GPU" "$cfg_timing_gpu" "$log_timing_gpu"; then
+        if require_timing_markers "$log_timing_gpu"; then
+            pass "Timing markers present (GPU)"
+        else
+            fail "Timing markers missing (GPU)"
+        fi
+        if require_timing_csv_row "$csv_timing_gpu"; then
+            pass "Timing CSV emitted (GPU)"
+        else
+            fail "Timing CSV missing/invalid (GPU)"
+        fi
+        if [[ -f "$csv_timing_serial" && -f "$csv_timing_gpu" ]]; then
+            mode_serial=$(tail -1 "$csv_timing_serial" | awk -F',' '{print $2}')
+            mode_gpu=$(tail -1 "$csv_timing_gpu" | awk -F',' '{print $2}')
+            if [[ "$mode_serial" == "cpu_serial" && "$mode_gpu" == "gpu_offload" ]]; then
+                pass "CPU vs GPU timing CSV mode labels valid"
+            else
+                fail "CPU vs GPU timing CSV mode labels unexpected: serial=$mode_serial gpu=$mode_gpu"
+            fi
+        else
+            skip "CPU/GPU CSV pair not available; skipping mode label comparison"
+        fi
+    else
+        fail "Timing run failed (GPU)"
+    fi
+else
+    skip "GPU binary not available; skipping timing GPU validation"
 fi
 
 # ---------------------------------------------------------------------------

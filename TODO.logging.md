@@ -116,12 +116,12 @@ Acceptance criteria:
 
 ## Phase 7: Tests and validation
 
-- [ ] Add a small test config with timing enabled and tiny subimage.
-- [ ] Extend tests/run_tests.sh to verify:
+- [x] Add a small test config with timing enabled and tiny subimage.
+- [x] Extend tests/run_tests.sh to verify:
   - run completes with timing enabled
   - summary markers appear in output
   - no regressions in existing outputs
-- [ ] Compare CPU vs GPU timing reports on same synthetic dataset.
+- [x] Compare CPU vs GPU timing reports on same synthetic dataset.
 
 ## Nice-to-have items (likely missed otherwise)
 
