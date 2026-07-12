@@ -17,7 +17,7 @@ module rm_synthesis_mod
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
-  public :: init_logging, log_message
+  public :: init_logging, log_message, log_tile_bounds, log_tile_note, log_subblock_progress
   public :: timer_reset, timer_start, timer_stop, timer_add
   public :: timer_report_summary, timer_get_stage_seconds
   public :: write_timing_csv_line
@@ -212,6 +212,34 @@ contains
 !$omp end critical (logger_write_lock)
 #endif
   end subroutine log_message
+
+  subroutine log_tile_bounds(stage_name, event, x_beg, x_end, y_beg, y_end)
+    implicit none
+    character(len=*), intent(in) :: stage_name, event
+    integer(int32), intent(in) :: x_beg, x_end, y_beg, y_end
+    character(len=160) :: message
+
+    write(message, '(A,1X,"x:[",I0,",",I0,"] y:[",I0,",",I0,"]")') &
+      trim(event), x_beg, x_end, y_beg, y_end
+    call log_message('debug', stage_name, trim(message))
+  end subroutine log_tile_bounds
+
+  subroutine log_tile_note(stage_name, note)
+    implicit none
+    character(len=*), intent(in) :: stage_name, note
+    call log_message('debug', stage_name, trim(note))
+  end subroutine log_tile_note
+
+  subroutine log_subblock_progress(stage_name, label, sub_idx, sub_total, y_beg, y_end)
+    implicit none
+    character(len=*), intent(in) :: stage_name, label
+    integer(int32), intent(in) :: sub_idx, sub_total, y_beg, y_end
+    character(len=128) :: message
+
+    write(message, '(A,1X,I0,"/",I0,1X,"y:[",I0,",",I0,"]")') &
+      trim(label), sub_idx, sub_total, y_beg, y_end
+    call log_message('debug', stage_name, trim(message))
+  end subroutine log_subblock_progress
 
   subroutine timer_reset()
     implicit none

@@ -213,6 +213,7 @@ chelp-
       integer   progress_total, progress_step
       integer   progress_next_pct, progress_next_count
       integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
+      integer   n_subblocks_tile, i_subblock
       integer   ix_loc, iy_loc, iz
       integer   nx_tile, ny_tile
       integer   ipix_tile, pix_base
@@ -2612,11 +2613,8 @@ chelp-
             fpixels(freq_axis) = zpix_beg
             lpixels(freq_axis) = zpix_end
 
-             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
-     -       'tile read start x:[',ix_tile_beg,',',ix_tile_end,
-     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
-             call log_message('debug','tile_read',
-     -         message(1:nchar(message)))
+             call log_tile_bounds('tile_read','start',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
             call timer_start(t_stage)
             call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
@@ -2632,18 +2630,12 @@ chelp-
      -                   incs,nullval,specI,anyflg,status)
             endif
 
-             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
-     -       'tile read done x:[',ix_tile_beg,',',ix_tile_end,
-     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
-             call log_message('debug','tile_read',
-     -         message(1:nchar(message)))
+             call log_tile_bounds('tile_read','done',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
              call timer_stop(STAGE_TILE_READ,t_stage)
 
-             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
-     -       'tile mask start x:[',ix_tile_beg,',',ix_tile_end,
-     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
-             call log_message('debug','tile_mask',
-     -         message(1:nchar(message)))
+             call log_tile_bounds('tile_mask','start',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
              call timer_start(t_stage)
 
             ! ========================================================
@@ -2697,23 +2689,15 @@ chelp-
 !$omp end parallel do
 #endif
             call timer_stop(STAGE_TILE_MASK,t_stage)
-             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
-     -       'tile mask done x:[',ix_tile_beg,',',ix_tile_end,
-     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
-             call log_message('debug','tile_mask',
-     -         message(1:nchar(message)))
+             call log_tile_bounds('tile_mask','done',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
-             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
-     -       'tile compute start x:[',ix_tile_beg,',',ix_tile_end,
-     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
-             call log_message('debug','tile_compute',
-     -         message(1:nchar(message)))
-            call timer_start(t_stage)
             if(.not.use_staging)then
+              call log_tile_bounds('tile_prep','start',
+     -           ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+              call timer_start(t_stage)
               ! Single-level path: GPU vs CPU optimization strategies
               if(use_gpu_actual)then
-                  call log_message('debug','tile_compute',
-     -             'sending tile buffers to GPU')
                 ! ====================================================================
                 ! GPU path: RM-block tiled extraction (optimized for GPU)
                 ! ====================================================================
@@ -2731,7 +2715,14 @@ chelp-
                   nvalid_tile_arr(ipix_tile) =
      -               int(wsum_gpu(ipix_tile), kind=2)
                 enddo
-                
+                call timer_stop(STAGE_TILE_PREP,t_stage)
+                call log_tile_bounds('tile_prep','done',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call log_tile_bounds('tile_compute','start',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call timer_start(t_stage)
+                call log_tile_note('tile_compute', 'gpu send')
+
                 ! Templates are already full-size (nz_out, nrm_out)
                 ! No transposition needed - pass directly to GPU kernel
                 ! RM-block loop: GPU processes blocks of RM bins
@@ -2749,8 +2740,8 @@ chelp-
      -               use_gpu_actual, rem_mean, output_mode,
      -               ap_angle_mode, p_tile_arr, phi_tile_arr)
                 end do
-                call log_message('debug','tile_compute',
-     -             'received tile results from GPU')
+                call log_tile_note('tile_compute', 'gpu recv')
+                call timer_stop(STAGE_TILE_COMPUTE,t_stage)
                 
                 ! Deallocate temporary GPU arrays
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
@@ -2758,8 +2749,6 @@ chelp-
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               else
-                call log_message('debug','tile_compute',
-     -             'running tile compute on CPU')
                 ! CPU path: collapse(2) kernel with CPU-optimal data layout
                 ! GPU binary running on CPU keeps GPU layout for kernel compat.
 #ifdef USE_GPU
@@ -2780,6 +2769,13 @@ chelp-
                   nvalid_tile_arr(ipix_tile) =
      -               int(wsum_gpu(ipix_tile), kind=2)
                 enddo
+                call timer_stop(STAGE_TILE_PREP,t_stage)
+                call log_tile_bounds('tile_prep','done',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call log_tile_bounds('tile_compute','start',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call timer_start(t_stage)
+                call log_tile_note('tile_compute', 'cpu compute')
                 do i_rm_block = 1, nrm_out, nrm_block_size
                   nrm_block_now = min(nrm_block_size,
      -                                nrm_out - i_rm_block + 1)
@@ -2792,6 +2788,7 @@ chelp-
      -               use_gpu_actual, rem_mean, output_mode,
      -               ap_angle_mode, p_tile_arr, phi_tile_arr)
                 end do
+                call timer_stop(STAGE_TILE_COMPUTE,t_stage)
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
                 deallocate(wsum_gpu)
                 if (allocated(mean_Q)) deallocate(mean_Q)
@@ -2805,16 +2802,20 @@ chelp-
               ! TODO(device-async): overlap H2D/compute/D2H across
               ! sub-blocks with !$omp target nowait/depend (needs GPU
               ! box to validate). Currently synchronous per sub-block.
+              call log_tile_bounds('tile_compute','start',
+     -           ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+              n_subblocks_tile = (ny_tile + ny_sub - 1) / ny_sub
+              i_subblock = 0
               do iy_sub_beg = 1,ny_tile,ny_sub
                 iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
                 ny_sub_now = iy_sub_end - iy_sub_beg + 1
                 n_subblocks_total = n_subblocks_total + 1_int64
-                write(message,'(A,I0,A,I0,A)')
-     -           'staging subblock send to GPU y:[',
-     -           iy_tile_beg + iy_sub_beg - 1,',',
-     -           iy_tile_beg + iy_sub_end - 1,']'
-                call log_message('debug','tile_compute',
-     -             message(1:nchar(message)))
+                i_subblock = i_subblock + 1
+                call log_subblock_progress('tile_prep', 'prep',
+     -               i_subblock, n_subblocks_tile,
+     -               iy_tile_beg + iy_sub_beg - 1,
+     -               iy_tile_beg + iy_sub_end - 1)
+                call timer_start(t_stage)
 
                 ! --- gather inputs (full tile -> compact sub-block) ---
                 do iyl = 1,ny_sub_now
@@ -2858,6 +2859,16 @@ chelp-
                     stNvalid(ipix_sub) =
      -               int(st_wsum_gpu(ipix_sub), kind=2)
                   enddo
+                  call timer_stop(STAGE_TILE_PREP,t_stage)
+                  call log_subblock_progress('tile_prep', 'prep',
+     -                 i_subblock, n_subblocks_tile,
+     -                 iy_tile_beg + iy_sub_beg - 1,
+     -                 iy_tile_beg + iy_sub_end - 1)
+                  call log_subblock_progress('tile_compute', 'send',
+     -                 i_subblock, n_subblocks_tile,
+     -                 iy_tile_beg + iy_sub_beg - 1,
+     -                 iy_tile_beg + iy_sub_end - 1)
+                  call timer_start(t_stage)
                   
                   ! Templates are already full-size (nz_out, nrm_out)
                   ! No transposition needed
@@ -2877,18 +2888,17 @@ chelp-
      -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
      -                 ap_angle_mode, stP, stPhi)
                   end do
-                  
+                  call timer_stop(STAGE_TILE_COMPUTE,t_stage)
+
                   ! Deallocate GPU temporary arrays
                   deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
                   deallocate(st_wsum_gpu)
                   if (allocated(st_mean_Q)) deallocate(st_mean_Q)
                   if (allocated(st_mean_U)) deallocate(st_mean_U)
-                  write(message,'(A,I0,A,I0,A)')
-     -             'staging subblock results from GPU y:[',
-     -             iy_tile_beg + iy_sub_beg - 1,',',
-     -             iy_tile_beg + iy_sub_end - 1,']'
-                  call log_message('debug','tile_compute',
-     -               message(1:nchar(message)))
+                  call log_subblock_progress('tile_compute', 'done',
+     -                 i_subblock, n_subblocks_tile,
+     -                 iy_tile_beg + iy_sub_beg - 1,
+     -                 iy_tile_beg + iy_sub_end - 1)
                 else
                   ! CPU staging path unreachable: use_staging=true only
                   ! when use_gpu_actual=true (ny_sub driven by VRAM budget)
@@ -2896,6 +2906,11 @@ chelp-
                 endif
 
                 ! --- scatter outputs (compact sub-block -> full tile) ---
+                call log_subblock_progress('tile_scatter', 'start',
+     -               i_subblock, n_subblocks_tile,
+     -               iy_tile_beg + iy_sub_beg - 1,
+     -               iy_tile_beg + iy_sub_end - 1)
+                call timer_start(t_stage)
                 do iyl = 1,ny_sub_now
                    iy_loc = iy_sub_beg + iyl - 1
                    do ix_loc = 1,nx_tile
@@ -2920,14 +2935,15 @@ chelp-
                       enddo
                    enddo
                 enddo
+                call timer_stop(STAGE_TILE_SCATTER,t_stage)
+                call log_subblock_progress('tile_scatter', 'done',
+     -               i_subblock, n_subblocks_tile,
+     -               iy_tile_beg + iy_sub_beg - 1,
+     -               iy_tile_beg + iy_sub_end - 1)
               enddo
             endif
-             call timer_stop(STAGE_TILE_COMPUTE,t_stage)
-             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
-     -       'tile compute done x:[',ix_tile_beg,',',ix_tile_end,
-     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
-             call log_message('debug','tile_compute',
-     -         message(1:nchar(message)))
+             call log_tile_bounds('tile_compute','done',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
             do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)
