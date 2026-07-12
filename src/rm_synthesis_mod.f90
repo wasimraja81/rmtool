@@ -23,7 +23,7 @@ module rm_synthesis_mod
   public :: STAGE_TOTAL, STAGE_CFG_PARSE, STAGE_IO_INIT, STAGE_HEADER
   public :: STAGE_TILE_TOTAL, STAGE_TILE_READ, STAGE_TILE_MASK
   public :: STAGE_TILE_PREP, STAGE_TILE_COMPUTE, STAGE_TILE_CUBESTAT
-  public :: STAGE_TILE_WRITE, STAGE_FINALIZE
+  public :: STAGE_TILE_SCATTER, STAGE_TILE_WRITE, STAGE_FINALIZE
   public :: sp, dp, int32, int64
   
   ! Include file parameters for RM-synthesis
@@ -53,9 +53,10 @@ module rm_synthesis_mod
   integer, parameter :: STAGE_TILE_MASK     = 7
   integer, parameter :: STAGE_TILE_PREP     = 8
   integer, parameter :: STAGE_TILE_COMPUTE  = 9
-  integer, parameter :: STAGE_TILE_CUBESTAT = 10
-  integer, parameter :: STAGE_TILE_WRITE    = 11
-  integer, parameter :: STAGE_FINALIZE      = 12
+  integer, parameter :: STAGE_TILE_SCATTER  = 10
+  integer, parameter :: STAGE_TILE_CUBESTAT = 11
+  integer, parameter :: STAGE_TILE_WRITE    = 12
+  integer, parameter :: STAGE_FINALIZE      = 13
   integer, parameter :: MAX_STAGES          = 32
 
   logical, save :: logger_initialized = .false.
@@ -91,6 +92,7 @@ contains
     stage_names(STAGE_TILE_MASK) = 'tile_mask'
     stage_names(STAGE_TILE_PREP) = 'tile_prep'
     stage_names(STAGE_TILE_COMPUTE) = 'tile_compute'
+    stage_names(STAGE_TILE_SCATTER) = 'tile_scatter'
     stage_names(STAGE_TILE_CUBESTAT) = 'tile_cubestat'
     stage_names(STAGE_TILE_WRITE) = 'tile_write'
     stage_names(STAGE_FINALIZE) = 'finalize'
@@ -225,7 +227,8 @@ contains
     if (.not. timing_enabled_glob) return
     if (stage_id == STAGE_TILE_TOTAL .or. stage_id == STAGE_TILE_READ .or. &
         stage_id == STAGE_TILE_MASK .or. stage_id == STAGE_TILE_PREP .or. &
-        stage_id == STAGE_TILE_COMPUTE .or. stage_id == STAGE_TILE_CUBESTAT .or. &
+      stage_id == STAGE_TILE_COMPUTE .or. stage_id == STAGE_TILE_SCATTER .or. &
+      stage_id == STAGE_TILE_CUBESTAT .or. &
         stage_id == STAGE_TILE_WRITE) then
       if (.not. timing_tile_enabled_glob) return
     end if

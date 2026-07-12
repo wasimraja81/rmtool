@@ -198,6 +198,7 @@ chelp-
         ! /proc/self/io counters sampled at run start and end
         integer(kind=int64) :: io_rb0, io_wb0, io_rb1, io_wb1
         integer(kind=int64) :: io_rsys0, io_wsys0, io_rsys1, io_wsys1
+        integer(kind=int64) :: n_rm_blocks_total, n_subblocks_total
         integer   io_unit, ios_io
         character(len=256) :: io_line
         logical   io_avail
@@ -2553,6 +2554,8 @@ chelp-
 
 
       cnt1 = 0
+        n_rm_blocks_total = 0_int64
+        n_subblocks_total = 0_int64
       progress_total = nx_out*ny_out
       progress_step = max(1, progress_total/10)
       progress_next_pct = 10
@@ -2644,152 +2647,104 @@ chelp-
 #endif
             call timer_stop(STAGE_TILE_MASK,t_stage)
 
-            call timer_start(t_stage)
-            if(.not.use_staging)then
-              ! Single-level path: GPU vs CPU optimization strategies
-              if(use_gpu_actual)then
-                ! ====================================================================
-                ! GPU path: RM-block tiled extraction (optimized for GPU)
-                ! ====================================================================
-                ! Reshape flat FITS arrays into full-size GPU-friendly layout (CPU)
-                call prepare_gpu_data(
-     -             specQ, specU, mask_tile_arr,
-     -             nx_tile, ny_tile, nz_out,
-     -             specQ_gpu, specU_gpu, wts_gpu,
-     -             rem_mean, mean_Q, mean_U, wsum_gpu)
-                
-                ! Populate nvalid_tile_arr from precomputed per-pixel weight sums.
-                ! wsum_gpu(ipix) is the count of valid channels for that pixel
-                ! (same quantity tile_extract_cpu stores in nvalid_tile_arr).
-                do ipix_tile = 1, nx_tile*ny_tile
-                  nvalid_tile_arr(ipix_tile) =
-     -               int(wsum_gpu(ipix_tile), kind=2)
-                enddo
-                
-                ! Templates are already full-size (nz_out, nrm_out)
-                ! No transposition needed - pass directly to GPU kernel
-                ! RM-block loop: GPU processes blocks of RM bins
-                do i_rm_block = 1, nrm_out, nrm_block_size
-                  nrm_block_now = min(nrm_block_size,
-     -                                nrm_out - i_rm_block + 1)
-                  
-                  ! GPU kernel: optimized collapse(2) parallelism
-                  call tile_extract_gpu_rm_blocked(
-     -               specQ_gpu, specU_gpu, wts_gpu,
-     -               mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,
-     -               nx_tile, ny_tile, nz_out,
-     -               i_rm_block, nrm_block_now, nrm_out,
-     -               use_gpu_actual, rem_mean, output_mode,
-     -               ap_angle_mode, p_tile_arr, phi_tile_arr)
-                end do
-                
-                ! Deallocate temporary GPU arrays
-                deallocate(specQ_gpu, specU_gpu, wts_gpu)
-                deallocate(wsum_gpu)
-                if (allocated(mean_Q)) deallocate(mean_Q)
-                if (allocated(mean_U)) deallocate(mean_U)
-              else
-                ! CPU path: collapse(2) kernel with CPU-optimal data layout
-                ! GPU binary running on CPU keeps GPU layout for kernel compat.
+      call timer_start(t_stage)
+      if(.not.use_staging)then
+      if(use_gpu_actual)then
+      call prepare_gpu_data(
+     -                 specQ, specU, mask_tile_arr,
+     -                 nx_tile, ny_tile, nz_out,
+     -                 specQ_gpu, specU_gpu, wts_gpu,
+     -                 rem_mean, mean_Q, mean_U, wsum_gpu)
+      else
 #ifdef USE_GPU
-                call prepare_gpu_data(
-     -             specQ, specU, mask_tile_arr,
-     -             nx_tile, ny_tile, nz_out,
-     -             specQ_gpu, specU_gpu, wts_gpu,
-     -             rem_mean, mean_Q, mean_U, wsum_gpu)
+      call prepare_gpu_data(
+     -                 specQ, specU, mask_tile_arr,
+     -                 nx_tile, ny_tile, nz_out,
+     -                 specQ_gpu, specU_gpu, wts_gpu,
+     -                 rem_mean, mean_Q, mean_U, wsum_gpu)
 #else
-                ! CPU binary: (nz_out,npix) layout -> stride-1 channel loop
-                call prepare_cpu_data(
-     -             specQ, specU, mask_tile_arr,
-     -             nx_tile, ny_tile, nz_out,
-     -             specQ_gpu, specU_gpu, wts_gpu,
-     -             rem_mean, mean_Q, mean_U, wsum_gpu)
+      call prepare_cpu_data(
+     -                 specQ, specU, mask_tile_arr,
+     -                 nx_tile, ny_tile, nz_out,
+     -                 specQ_gpu, specU_gpu, wts_gpu,
+     -                 rem_mean, mean_Q, mean_U, wsum_gpu)
 #endif
-                do ipix_tile = 1, nx_tile*ny_tile
-                  nvalid_tile_arr(ipix_tile) =
-     -               int(wsum_gpu(ipix_tile), kind=2)
-                enddo
-                do i_rm_block = 1, nrm_out, nrm_block_size
-                  nrm_block_now = min(nrm_block_size,
-     -                                nrm_out - i_rm_block + 1)
-                  call tile_extract_gpu_rm_blocked(
-     -               specQ_gpu, specU_gpu, wts_gpu,
-     -               mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,
-     -               nx_tile, ny_tile, nz_out,
-     -               i_rm_block, nrm_block_now, nrm_out,
-     -               use_gpu_actual, rem_mean, output_mode,
-     -               ap_angle_mode, p_tile_arr, phi_tile_arr)
-                end do
-                deallocate(specQ_gpu, specU_gpu, wts_gpu)
-                deallocate(wsum_gpu)
-                if (allocated(mean_Q)) deallocate(mean_Q)
-                if (allocated(mean_U)) deallocate(mean_U)
-              endif
-            call timer_stop(STAGE_TILE_COMPUTE,t_stage)
-            else
-              ! Two-level path: subdivide the RAM block into Dec-strip
-              ! VRAM sub-blocks. Each sub-block is gathered into compact
-              ! staging buffers, extracted (one bounded offload), then
-              ! scattered back into the full-tile output arrays.
-              ! TODO(device-async): overlap H2D/compute/D2H across
-              ! sub-blocks with !$omp target nowait/depend (needs GPU
-              ! box to validate). Currently synchronous per sub-block.
-              do iy_sub_beg = 1,ny_tile,ny_sub
-                iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
-                ny_sub_now = iy_sub_end - iy_sub_beg + 1
+      endif
+      call timer_stop(STAGE_TILE_PREP,t_stage)
 
-                ! --- gather inputs (full tile -> compact sub-block) ---
-                do iyl = 1,ny_sub_now
-                   iy_loc = iy_sub_beg + iyl - 1
-                   do ix_loc = 1,nx_tile
-                      do iz = 1,nz_out
-                         src_idx = ix_loc + (iy_loc-1)*nx_tile
-     -                           + (iz-1)*nx_tile*ny_tile
-                         dst_idx = ix_loc + (iyl-1)*nx_tile
-     -                           + (iz-1)*nx_tile*ny_sub_now
-                         stQ(dst_idx) = specQ(src_idx)
-                         stU(dst_idx) = specU(src_idx)
-                         stMask_tile_arr(dst_idx) = mask_tile_arr(
-     -                       src_idx)
-                         if(use_input_mask)stMask(dst_idx) =
-     -                       specMask(src_idx)
-                         if(need_icube)stI(dst_idx) = specI(src_idx)
-                      enddo
-                   enddo
-                enddo
+      call timer_start(t_stage)
+      do ipix_tile = 1,nx_tile*ny_tile
+      nvalid_tile_arr(ipix_tile) =
+     -              int(wsum_gpu(ipix_tile),kind=2)
+      enddo
+      call timer_stop(STAGE_TILE_SCATTER,t_stage)
 
-                ! ========================================================================
-                ! GPU extraction for sub-block: RM-block tiled extraction (optimized)
-                ! ========================================================================
-                ! Reallocate output arrays with correct sub-block dimensions
-                if (allocated(stP)) deallocate(stP)
-                if (allocated(stPhi)) deallocate(stPhi)
-                allocate(stP(nx_tile*ny_sub_now*nrm_out))
-                allocate(stPhi(nx_tile*ny_sub_now*nrm_out))
-                
-                ! GPU vs CPU path for extraction
-                if(use_gpu_actual)then
-                  ! GPU path: Reshape sub-block data and use GPU-optimized kernel
-                  call prepare_gpu_data(stQ, stU, stMask_tile_arr,
-     -               nx_tile, ny_sub_now, nz_out,
-     -               st_Q_gpu, st_U_gpu, st_wts_gpu,
-     -               rem_mean, st_mean_Q, st_mean_U, st_wsum_gpu)
-                  
-                  ! Populate stNvalid from precomputed per-pixel weight sums
-                  do ipix_sub = 1, nx_tile*ny_sub_now
-                    stNvalid(ipix_sub) =
-     -               int(st_wsum_gpu(ipix_sub), kind=2)
-                  enddo
-                  
-                  ! Templates are already full-size (nz_out, nrm_out)
-                  ! No transposition needed
-                  ! RM-block loop for GPU
-                  do st_i_rm_block = 1, nrm_out, nrm_block_size
-                    st_nrm_block_now = min(nrm_block_size,
-     -                                      nrm_out - st_i_rm_block + 1)
-                    
-                    ! GPU kernel: optimized collapse(2) parallelism
-                    call tile_extract_gpu_rm_blocked(
+      call timer_start(t_stage)
+      do i_rm_block = 1,nrm_out,nrm_block_size
+      nrm_block_now = min(nrm_block_size,
+     -                               nrm_out - i_rm_block + 1)
+      n_rm_blocks_total = n_rm_blocks_total + 1_int64
+      call tile_extract_gpu_rm_blocked(
+     -              specQ_gpu, specU_gpu, wts_gpu,
+     -              mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,
+     -              nx_tile, ny_tile, nz_out,
+     -              i_rm_block, nrm_block_now, nrm_out,
+     -              use_gpu_actual, rem_mean, output_mode,
+     -              ap_angle_mode, p_tile_arr, phi_tile_arr)
+      enddo
+      call timer_stop(STAGE_TILE_COMPUTE,t_stage)
+
+      deallocate(specQ_gpu, specU_gpu, wts_gpu)
+      deallocate(wsum_gpu)
+      if(allocated(mean_Q))deallocate(mean_Q)
+      if(allocated(mean_U))deallocate(mean_U)
+      else
+      do iy_sub_beg = 1,ny_tile,ny_sub
+      iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
+      ny_sub_now = iy_sub_end - iy_sub_beg + 1
+      n_subblocks_total = n_subblocks_total + 1_int64
+
+      call timer_start(t_stage)
+      do iyl = 1,ny_sub_now
+      iy_loc = iy_sub_beg + iyl - 1
+      do ix_loc = 1,nx_tile
+      do iz = 1,nz_out
+      src_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                            + (iz-1)*nx_tile*ny_tile
+      dst_idx = ix_loc + (iyl-1)*nx_tile
+     -                            + (iz-1)*nx_tile*ny_sub_now
+      stQ(dst_idx) = specQ(src_idx)
+      stU(dst_idx) = specU(src_idx)
+      stMask_tile_arr(dst_idx) = mask_tile_arr(
+     -                        src_idx)
+      if(use_input_mask)stMask(dst_idx) =
+     -                        specMask(src_idx)
+      if(need_icube)stI(dst_idx) = specI(src_idx)
+      enddo
+      enddo
+      enddo
+
+      if(allocated(stP))deallocate(stP)
+      if(allocated(stPhi))deallocate(stPhi)
+      allocate(stP(nx_tile*ny_sub_now*nrm_out))
+      allocate(stPhi(nx_tile*ny_sub_now*nrm_out))
+
+      if(use_gpu_actual)then
+      call prepare_gpu_data(stQ,stU,stMask_tile_arr,
+     -                   nx_tile,ny_sub_now,nz_out,
+     -                   st_Q_gpu,st_U_gpu,st_wts_gpu,
+     -                   rem_mean,st_mean_Q,st_mean_U,st_wsum_gpu)
+      else
+      continue
+      endif
+      call timer_stop(STAGE_TILE_PREP,t_stage)
+
+      call timer_start(t_stage)
+      do st_i_rm_block = 1,nrm_out,nrm_block_size
+      st_nrm_block_now = min(nrm_block_size,
+     -                 nrm_out - st_i_rm_block + 1)
+      n_rm_blocks_total = n_rm_blocks_total + 1_int64
+      call tile_extract_gpu_rm_blocked(
      -                 st_Q_gpu, st_U_gpu, st_wts_gpu,
      -                 st_mean_Q, st_mean_U, st_wsum_gpu,
      -                 cos_arr, sin_arr,
@@ -2797,48 +2752,47 @@ chelp-
      -                 st_i_rm_block, st_nrm_block_now,
      -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
      -                 ap_angle_mode, stP, stPhi)
-                  end do
-                  
-                  ! Deallocate GPU temporary arrays
-                  deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
-                  deallocate(st_wsum_gpu)
-                  if (allocated(st_mean_Q)) deallocate(st_mean_Q)
-                  if (allocated(st_mean_U)) deallocate(st_mean_U)
-                else
-                  ! CPU staging path unreachable: use_staging=true only
-                  ! when use_gpu_actual=true (ny_sub driven by VRAM budget)
-                  continue
-                endif
+      enddo
+      call timer_stop(STAGE_TILE_COMPUTE,t_stage)
 
-                ! --- scatter outputs (compact sub-block -> full tile) ---
-                do iyl = 1,ny_sub_now
-                   iy_loc = iy_sub_beg + iyl - 1
-                   do ix_loc = 1,nx_tile
-                      ipix_full = ix_loc + (iy_loc-1)*nx_tile
-                      ipix_sub  = ix_loc + (iyl-1)*nx_tile
-                      nvalid_tile_arr(ipix_full) = stNvalid(ipix_sub)
-                      do irm = 1,nrm_out
-                         dst_idx = ix_loc + (iy_loc-1)*nx_tile
-     -                           + (irm-1)*nx_tile*ny_tile
-                         src_idx = ix_loc + (iyl-1)*nx_tile
-     -                           + (irm-1)*nx_tile*ny_sub_now
-                         p_tile_arr(dst_idx) = stP(src_idx)
-                         phi_tile_arr(dst_idx) = stPhi(src_idx)
-                      enddo
-                      do iz = 1,nz_out
-                         dst_idx = ix_loc + (iy_loc-1)*nx_tile
-     -                           + (iz-1)*nx_tile*ny_tile
-                         src_idx = ix_loc + (iyl-1)*nx_tile
-     -                           + (iz-1)*nx_tile*ny_sub_now
-                         mask_tile_arr(dst_idx) =
-     -                       stMask_tile_arr(src_idx)
-                      enddo
-                   enddo
-                enddo
-              enddo
-            endif
+      call timer_start(t_stage)
+      do ipix_sub = 1,nx_tile*ny_sub_now
+      stNvalid(ipix_sub) = int(st_wsum_gpu(ipix_sub),kind=2)
+      enddo
+      deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
+      deallocate(st_wsum_gpu)
+      if(allocated(st_mean_Q))deallocate(st_mean_Q)
+      if(allocated(st_mean_U))deallocate(st_mean_U)
 
-            do iy_loc = 1,ny_tile
+      do iyl = 1,ny_sub_now
+      iy_loc = iy_sub_beg + iyl - 1
+      do ix_loc = 1,nx_tile
+      ipix_full = ix_loc + (iy_loc-1)*nx_tile
+      ipix_sub  = ix_loc + (iyl-1)*nx_tile
+      nvalid_tile_arr(ipix_full) = stNvalid(ipix_sub)
+      do irm = 1,nrm_out
+      dst_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                            + (irm-1)*nx_tile*ny_tile
+      src_idx = ix_loc + (iyl-1)*nx_tile
+     -                            + (irm-1)*nx_tile*ny_sub_now
+      p_tile_arr(dst_idx) = stP(src_idx)
+      phi_tile_arr(dst_idx) = stPhi(src_idx)
+      enddo
+      do iz = 1,nz_out
+      dst_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                            + (iz-1)*nx_tile*ny_tile
+      src_idx = ix_loc + (iyl-1)*nx_tile
+     -                            + (iz-1)*nx_tile*ny_sub_now
+      mask_tile_arr(dst_idx) =
+     -                        stMask_tile_arr(src_idx)
+      enddo
+      enddo
+      enddo
+      call timer_stop(STAGE_TILE_SCATTER,t_stage)
+      enddo
+      endif
+
+      do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)
                do ix_loc = 1,nx_tile
                   ix = ix_tile_beg + (ix_loc-1)*incs(1)
@@ -3084,7 +3038,6 @@ chelp-
       write(*,'(A)') 'Disk I/O summary:'
       if(io_avail)then
               write(*,'(A,F12.3,A)')'  read  (GiB): ',
-     -          real(io_rb1-io_rb0,dp)/(1024.0_dp**3),
      -          real(max(0_int64,io_rb1-io_rb0),dp)/(1024.0_dp**3),
      -          ' (/proc/self/io)'
               write(*,'(A,F12.3,A)')'  write (GiB): ',
@@ -3098,6 +3051,9 @@ chelp-
               write(*,'(A)')
      -          '  /proc/self/io not available on this system'
       endif
+        write(*,'(A)') 'GPU offload counters:'
+        write(*,'(A,I0)')'  RM blocks processed: ',n_rm_blocks_total
+        write(*,'(A,I0)')'  VRAM sub-blocks   : ',n_subblocks_total
       call timer_report_summary()
 
 9999  continue
