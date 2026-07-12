@@ -117,7 +117,7 @@ log_level = info                  # error|warn|info|debug
 timing_enabled = y                # master timing switch
 timing_tile_enabled = y           # include tile-level stage timers
 timing_io_enabled = y             # include I/O stage timers
-timing_output_file =              # empty => stdout, else append to file
+log_output_file =                 # empty => stdout, else append to file
 timing_csv_file = ./timing.csv    # optional: append one CSV row per run
 ```
 
@@ -127,7 +127,7 @@ Logging behavior:
 	- `warn`: warnings + errors
 	- `info`: run lifecycle messages (recommended default)
 	- `debug`: reserved for future verbose diagnostics
-- `timing_output_file` controls destination for both structured log lines and
+- `log_output_file` controls destination for both structured log lines and
 	timing summary blocks.
 	- empty: output goes to stdout
 	- non-empty: output is appended to one consolidated run log file

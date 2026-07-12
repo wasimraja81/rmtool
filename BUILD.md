@@ -209,11 +209,11 @@ Add to your cfg:
 timing_enabled = y
 timing_tile_enabled = y
 timing_io_enabled = y
-timing_output_file =
+log_output_file =
 timing_csv_file = ./timing.csv
 ```
 
-`timing_output_file`:
+`log_output_file`:
 - empty value writes timing to stdout
 - non-empty value appends timing logs to that file
 

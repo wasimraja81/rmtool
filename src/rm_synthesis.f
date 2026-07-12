@@ -191,7 +191,7 @@ chelp-
       integer   gpu_vram_mib
       logical   io_overlap
         character(len=16) :: log_level
-        character(len=272) :: timing_output_file
+                                character(len=272) :: log_output_file
                                 character(len=272) :: timing_csv_file
         integer   log_init_status
         real(dp)  t_cfg_start, t_cfg_end
@@ -378,7 +378,7 @@ chelp-
      -          write_nvalid_output,cubestat,use_gpu,
      -          io_overlap,log_level,
      -          timing_enabled,timing_tile_enabled,
-     -          timing_io_enabled,timing_output_file,
+     -          timing_io_enabled,log_output_file,
      -          timing_csv_file,
      -          status)
       t_cfg_end = wall_time_seconds()
@@ -391,12 +391,16 @@ chelp-
 
       call init_logging(log_level,timing_enabled,
      -     timing_tile_enabled,timing_io_enabled,
-     -     timing_output_file,log_init_status)
+     -     log_output_file,log_init_status)
       if(log_init_status.ne.0)then
               write(*,*)"Error initializing logger/timing output"
-              write(*,*)"timing_output_file: ",
-     -         timing_output_file(1:nchar(timing_output_file))
+              write(*,*)"log_output_file: ",
+     -         log_output_file(1:nchar(log_output_file))
               stop
+      endif
+      if(nchar(log_output_file).gt.0)then
+              write(*,'(A,A)')'Logging/timing output file: ',
+     -         log_output_file(1:nchar(log_output_file))
       endif
       call timer_reset()
       call timer_add(STAGE_CFG_PARSE,t_cfg_end - t_cfg_start)

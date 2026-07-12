@@ -13,7 +13,7 @@ Goal: add low-overhead, configurable timing and run diagnostics for CPU and GPU 
   - timing_enabled = y|n
   - timing_tile_enabled = y|n
   - timing_io_enabled = y|n
-  - timing_output_file = optional path (stdout if empty)
+  - log_output_file = optional path (stdout if empty)
 - [x] Keep instrumentation overhead small when disabled (single boolean guard at callsites).
 
 ## Phase 1: Minimal logger and timer primitives

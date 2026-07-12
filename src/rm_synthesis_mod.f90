@@ -155,12 +155,12 @@ contains
   end function iso_timestamp_local
 
   subroutine init_logging(log_level_name, timing_enabled, timing_tile_enabled, &
-                          timing_io_enabled, timing_output_file, status)
+                          timing_io_enabled, log_output_file, status)
     implicit none
     character(len=*), intent(in) :: log_level_name
     logical, intent(in) :: timing_enabled, timing_tile_enabled
     logical, intent(in) :: timing_io_enabled
-    character(len=*), intent(in) :: timing_output_file
+    character(len=*), intent(in) :: log_output_file
     integer(int32), intent(out) :: status
     integer :: ios_local
 
@@ -178,9 +178,9 @@ contains
       logger_unit = 6
     end if
 
-    if (nchar(timing_output_file) > 0) then
+    if (nchar(log_output_file) > 0) then
       logger_unit = 99
-      open(logger_unit, file=trim(timing_output_file), status='unknown', &
+      open(logger_unit, file=trim(log_output_file), status='unknown', &
            position='append', action='write', iostat=ios_local)
       if (ios_local /= 0) then
         status = ios_local
@@ -207,6 +207,7 @@ contains
     ts = iso_timestamp_local()
     write(logger_unit, '(A," [",A,"] [",A,"] ",A)') &
       trim(ts), trim(level_name), trim(stage_name), trim(message)
+    flush(logger_unit)
   end subroutine log_message
 
   subroutine timer_reset()
@@ -314,6 +315,7 @@ contains
 
     ts = iso_timestamp_local()
     write(logger_unit, '(A," [info] [timing] ",A)') trim(ts), trim(message)
+    flush(logger_unit)
   end subroutine log_timing_line
 
   real(dp) function timer_get_stage_seconds(stage_id)
@@ -1336,7 +1338,7 @@ contains
                              mask_trust_mode, write_mask_output, &
                              write_nvalid_output, cubestat, use_gpu, io_overlap, &
                              log_level, timing_enabled, timing_tile_enabled, &
-                             timing_io_enabled, timing_output_file, &
+                             timing_io_enabled, log_output_file, &
                              timing_csv_file, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
@@ -1355,7 +1357,7 @@ contains
     logical, intent(inout) :: timing_enabled
     logical, intent(inout) :: timing_tile_enabled
     logical, intent(inout) :: timing_io_enabled
-    character(len=*), intent(inout) :: timing_output_file
+    character(len=*), intent(inout) :: log_output_file
     character(len=*), intent(inout) :: timing_csv_file
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
@@ -1400,7 +1402,7 @@ contains
     logical :: seen_timing_enabled
     logical :: seen_timing_tile_enabled
     logical :: seen_timing_io_enabled
-    logical :: seen_timing_output_file
+    logical :: seen_log_output_file
     logical :: seen_timing_csv_file
 
     status = 0
@@ -1458,7 +1460,7 @@ contains
     seen_timing_enabled = .false.
     seen_timing_tile_enabled = .false.
     seen_timing_io_enabled = .false.
-    seen_timing_output_file = .false.
+    seen_log_output_file = .false.
     seen_timing_csv_file = .false.
 
     ! Defaults can be overridden by the config.
@@ -1514,7 +1516,7 @@ contains
     timing_enabled = .false.
     timing_tile_enabled = .false.
     timing_io_enabled = .false.
-    timing_output_file = ''
+    log_output_file = ''
     timing_csv_file = ''
 
     unit_cfg = 11
@@ -2240,15 +2242,15 @@ contains
         end if
         seen_timing_io_enabled = .true.
         timing_io_enabled = flag_from_value(val)
-      case ('timing_output_file')
-        if (seen_timing_output_file) then
-          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_output_file'
+      case ('log_output_file')
+        if (seen_log_output_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': log_output_file'
           status = -197
           close(unit_cfg)
           return
         end if
-        seen_timing_output_file = .true.
-        timing_output_file = trim(val)
+        seen_log_output_file = .true.
+        log_output_file = trim(val)
       case ('timing_csv_file')
         if (seen_timing_csv_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_csv_file'
