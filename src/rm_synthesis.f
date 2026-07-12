@@ -239,13 +239,18 @@ chelp-
       integer   gpu_vram_mib_eff, ny_sub
       integer   iy_sub_beg, iy_sub_end, ny_sub_now
       integer   iyl, src_idx, dst_idx, ipix_full, ipix_sub
+      integer   slot_idx, next_slot, sub_idx_next
+      integer   slot_iy_beg(2), slot_iy_end(2), slot_ny(2)
+      integer   slot_subid(2)
+      integer   dep_h2d(2), dep_kern(2), dep_d2h(2)
+      logical   use_async_pipeline
       integer   env_len, env_stat, ios_env
       character(len=128) :: env_vram
       ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
-      real(sp), allocatable :: stQ(:), stU(:), stMask(:), stI(:)
+      real(sp), allocatable :: stQ(:,:), stU(:,:), stMask(:,:), stI(:,:)
       real(sp), allocatable :: stP(:), stPhi(:)
       integer*1, allocatable :: stMaskOut(:)
-      integer*1, allocatable :: stMask_tile_arr(:)
+      integer*1, allocatable :: stMask_tile_arr(:,:)
       integer*2, allocatable :: stNvalid(:)
       logical   use_staging
 
@@ -1880,20 +1885,21 @@ chelp-
       ! These hold a contiguous (nx_tile x ny_sub) region so the offload
       ! kernel maps a small, bounded array to device memory.
       if(ios_mem.eq.0 .and. use_staging)then
-              allocate(stQ(tile_ra*ny_sub*nz_out),
-     -                 stU(tile_ra*ny_sub*nz_out),
+              allocate(stQ(tile_ra*ny_sub*nz_out,2),
+     -                 stU(tile_ra*ny_sub*nz_out,2),
      -                 stP(tile_ra*ny_sub*nrm_out),
      -                 stPhi(tile_ra*ny_sub*nrm_out),
      -                 stMaskOut(tile_ra*ny_sub*nz_out),
-     -                 stMask_tile_arr(tile_ra*ny_sub*nz_out),
+     -                 stMask_tile_arr(tile_ra*ny_sub*nz_out,2),
      -                 stNvalid(tile_ra*ny_sub),
      -                 stat=ios_mem)
               if(ios_mem.eq.0 .and. use_input_mask)then
-                      allocate(stMask(tile_ra*ny_sub*nz_out),
+                      allocate(stMask(tile_ra*ny_sub*nz_out,2),
      -                         stat=ios_mem)
               endif
               if(ios_mem.eq.0 .and. need_icube)then
-                      allocate(stI(tile_ra*ny_sub*nz_out),stat=ios_mem)
+                      allocate(stI(tile_ra*ny_sub*nz_out,2),
+     -                         stat=ios_mem)
               endif
       endif
 
@@ -2805,55 +2811,86 @@ chelp-
               call log_tile_bounds('tile_compute','start',
      -           ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
               n_subblocks_tile = (ny_tile + ny_sub - 1) / ny_sub
-              i_subblock = 0
-              do iy_sub_beg = 1,ny_tile,ny_sub
-                iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
-                ny_sub_now = iy_sub_end - iy_sub_beg + 1
+              ! Placeholder dependency tokens for future nowait/depend
+              ! overlap across ping-pong slots (H2D -> compute -> D2H).
+              dep_h2d(1) = 0
+              dep_h2d(2) = 0
+              dep_kern(1) = 0
+              dep_kern(2) = 0
+              dep_d2h(1) = 0
+              dep_d2h(2) = 0
+              use_async_pipeline = use_gpu_actual.and.
+     -                            n_subblocks_tile.gt.1
+              if(n_subblocks_tile.gt.0)then
+                slot_idx = 1
+                slot_subid(slot_idx) = 1
+                slot_iy_beg(slot_idx) = 1
+                slot_iy_end(slot_idx) = min(ny_tile,ny_sub)
+                slot_ny(slot_idx) =
+     -            slot_iy_end(slot_idx)-slot_iy_beg(slot_idx)+1
                 n_subblocks_total = n_subblocks_total + 1_int64
-                i_subblock = i_subblock + 1
                 call log_subblock_progress('tile_prep', 'prep',
-     -               i_subblock, n_subblocks_tile,
-     -               iy_tile_beg + iy_sub_beg - 1,
-     -               iy_tile_beg + iy_sub_end - 1)
+     -               slot_subid(slot_idx), n_subblocks_tile,
+     -               iy_tile_beg + slot_iy_beg(slot_idx) - 1,
+     -               iy_tile_beg + slot_iy_end(slot_idx) - 1)
                 call timer_start(t_stage)
-
-                ! --- gather inputs (full tile -> compact sub-block) ---
-                do iyl = 1,ny_sub_now
-                   iy_loc = iy_sub_beg + iyl - 1
+                do iyl = 1,slot_ny(slot_idx)
+                   iy_loc = slot_iy_beg(slot_idx) + iyl - 1
                    do ix_loc = 1,nx_tile
                       do iz = 1,nz_out
                          src_idx = ix_loc + (iy_loc-1)*nx_tile
      -                           + (iz-1)*nx_tile*ny_tile
                          dst_idx = ix_loc + (iyl-1)*nx_tile
-     -                           + (iz-1)*nx_tile*ny_sub_now
-                         stQ(dst_idx) = specQ(src_idx)
-                         stU(dst_idx) = specU(src_idx)
-                         stMask_tile_arr(dst_idx) = mask_tile_arr(
-     -                       src_idx)
-                         if(use_input_mask)stMask(dst_idx) =
+     -                           + (iz-1)*nx_tile*slot_ny(slot_idx)
+                         stQ(dst_idx,slot_idx) = specQ(src_idx)
+                         stU(dst_idx,slot_idx) = specU(src_idx)
+                         stMask_tile_arr(dst_idx,slot_idx) =
+     -                       mask_tile_arr(src_idx)
+                         if(use_input_mask)then
+                           stMask(dst_idx,slot_idx) =
      -                       specMask(src_idx)
-                         if(need_icube)stI(dst_idx) = specI(src_idx)
+                         endif
+                         if(need_icube)then
+                           stI(dst_idx,slot_idx) =
+     -                       specI(src_idx)
+                         endif
                       enddo
                    enddo
                 enddo
+                call timer_stop(STAGE_TILE_PREP,t_stage)
+                if(use_async_pipeline)then
+                  dep_h2d(slot_idx) = slot_subid(slot_idx)
+                else
+                  dep_h2d(slot_idx) = 0
+                endif
+                call log_subblock_progress('tile_prep', 'prep',
+     -               slot_subid(slot_idx), n_subblocks_tile,
+     -               iy_tile_beg + slot_iy_beg(slot_idx) - 1,
+     -               iy_tile_beg + slot_iy_end(slot_idx) - 1)
+              endif
 
-                ! ========================================================================
+              do i_subblock = 1,n_subblocks_tile
+                slot_idx = mod(i_subblock-1,2) + 1
+                iy_sub_beg = slot_iy_beg(slot_idx)
+                iy_sub_end = slot_iy_end(slot_idx)
+                ny_sub_now = slot_ny(slot_idx)
+
+                ! ==============================================================
                 ! GPU extraction for sub-block: RM-block tiled extraction (optimized)
-                ! ========================================================================
-                ! Reallocate output arrays with correct sub-block dimensions
-                if (allocated(stP)) deallocate(stP)
-                if (allocated(stPhi)) deallocate(stPhi)
-                allocate(stP(nx_tile*ny_sub_now*nrm_out))
-                allocate(stPhi(nx_tile*ny_sub_now*nrm_out))
-                
+                ! ==============================================================
+                ! Reuse preallocated staging output buffers; only the
+                ! first nx_tile*ny_sub_now*nrm_out elements are used.
+
                 ! GPU vs CPU path for extraction
                 if(use_gpu_actual)then
                   ! GPU path: Reshape sub-block data and use GPU-optimized kernel
-                  call prepare_gpu_data(stQ, stU, stMask_tile_arr,
+                  call prepare_gpu_data(stQ(1,slot_idx),
+     -               stU(1,slot_idx),
+     -               stMask_tile_arr(1,slot_idx),
      -               nx_tile, ny_sub_now, nz_out,
      -               st_Q_gpu, st_U_gpu, st_wts_gpu,
      -               rem_mean, st_mean_Q, st_mean_U, st_wsum_gpu)
-                  
+
                   ! Populate stNvalid from precomputed per-pixel weight sums
                   do ipix_sub = 1, nx_tile*ny_sub_now
                     stNvalid(ipix_sub) =
@@ -2869,26 +2906,51 @@ chelp-
      -                 iy_tile_beg + iy_sub_beg - 1,
      -                 iy_tile_beg + iy_sub_end - 1)
                   call timer_start(t_stage)
-                  
+
                   ! Templates are already full-size (nz_out, nrm_out)
                   ! No transposition needed
                   ! RM-block loop for GPU
-                  do st_i_rm_block = 1, nrm_out, nrm_block_size
-                    st_nrm_block_now = min(nrm_block_size,
-     -                                      nrm_out - st_i_rm_block + 1)
-                  n_rm_blocks_total = n_rm_blocks_total + 1_int64
-                    
-                    ! GPU kernel: optimized collapse(2) parallelism
-                    call tile_extract_gpu_rm_blocked(
-     -                 st_Q_gpu, st_U_gpu, st_wts_gpu,
-     -                 st_mean_Q, st_mean_U, st_wsum_gpu,
-     -                 cos_arr, sin_arr,
-     -                 nx_tile, ny_sub_now, nz_out,
-     -                 st_i_rm_block, st_nrm_block_now,
-     -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
-     -                 ap_angle_mode, stP, stPhi)
-                  end do
+                  if(use_async_pipeline)then
+                     do st_i_rm_block = 1,nrm_out,nrm_block_size
+                       st_nrm_block_now=min(nrm_block_size,
+     -                   nrm_out-st_i_rm_block+1)
+                       n_rm_blocks_total = n_rm_blocks_total + 1_int64
+
+                       !$omp task depend(in:dep_h2d(slot_idx)) &
+                       !$omp& depend(out:dep_kern(slot_idx))
+                       call tile_extract_gpu_rm_blocked(
+     -                   st_Q_gpu, st_U_gpu, st_wts_gpu,
+     -                   st_mean_Q, st_mean_U, st_wsum_gpu,
+     -                   cos_arr, sin_arr,
+     -                   nx_tile, ny_sub_now, nz_out,
+     -                   st_i_rm_block, st_nrm_block_now,
+     -                   nrm_out, use_gpu_actual, rem_mean,
+     -                   output_mode, ap_angle_mode, stP, stPhi)
+                     enddo
+                     !$omp taskwait
+                  else
+                     do st_i_rm_block = 1,nrm_out,nrm_block_size
+                       st_nrm_block_now=min(nrm_block_size,
+     -                    nrm_out-st_i_rm_block+1)
+                       n_rm_blocks_total = n_rm_blocks_total + 1_int64
+
+                       ! GPU kernel: optimized collapse(2) parallelism
+                       call tile_extract_gpu_rm_blocked(
+     -                    st_Q_gpu, st_U_gpu, st_wts_gpu,
+     -                    st_mean_Q, st_mean_U, st_wsum_gpu,
+     -                    cos_arr, sin_arr,
+     -                    nx_tile, ny_sub_now, nz_out,
+     -                    st_i_rm_block, st_nrm_block_now,
+     -                    nrm_out, use_gpu_actual, rem_mean,
+     -                    output_mode, ap_angle_mode, stP, stPhi)
+                     enddo
+                  endif
                   call timer_stop(STAGE_TILE_COMPUTE,t_stage)
+                  if(use_async_pipeline)then
+                      dep_d2h(slot_idx) = dep_kern(slot_idx)
+                  else
+                      dep_d2h(slot_idx) = slot_subid(slot_idx)
+                  endif
 
                   ! Deallocate GPU temporary arrays
                   deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
@@ -2931,15 +2993,71 @@ chelp-
                          src_idx = ix_loc + (iyl-1)*nx_tile
      -                           + (iz-1)*nx_tile*ny_sub_now
                          mask_tile_arr(dst_idx) =
-     -                       stMask_tile_arr(src_idx)
+     -                       stMask_tile_arr(src_idx,slot_idx)
                       enddo
                    enddo
                 enddo
                 call timer_stop(STAGE_TILE_SCATTER,t_stage)
+                if(use_async_pipeline)then
+                    dep_h2d(slot_idx) = dep_d2h(slot_idx)
+                else
+                    dep_h2d(slot_idx) = 0
+                endif
                 call log_subblock_progress('tile_scatter', 'done',
      -               i_subblock, n_subblocks_tile,
      -               iy_tile_beg + iy_sub_beg - 1,
      -               iy_tile_beg + iy_sub_end - 1)
+
+                if(i_subblock.lt.n_subblocks_tile)then
+                  next_slot = mod(i_subblock,2) + 1
+                  sub_idx_next = i_subblock + 1
+                  slot_subid(next_slot) = sub_idx_next
+                  slot_iy_beg(next_slot) =
+     -               1 + (sub_idx_next-1)*ny_sub
+                  slot_iy_end(next_slot) =
+     -               min(ny_tile,slot_iy_beg(next_slot)+ny_sub-1)
+                  slot_ny(next_slot) =
+     -               slot_iy_end(next_slot)-slot_iy_beg(next_slot)+1
+                  n_subblocks_total = n_subblocks_total + 1_int64
+                  call log_subblock_progress('tile_prep', 'prep',
+     -                 slot_subid(next_slot), n_subblocks_tile,
+     -                 iy_tile_beg + slot_iy_beg(next_slot) - 1,
+     -                 iy_tile_beg + slot_iy_end(next_slot) - 1)
+                  call timer_start(t_stage)
+                  do iyl = 1,slot_ny(next_slot)
+                     iy_loc = slot_iy_beg(next_slot) + iyl - 1
+                     do ix_loc = 1,nx_tile
+                        do iz = 1,nz_out
+                           src_idx = ix_loc + (iy_loc-1)*nx_tile
+     -                             + (iz-1)*nx_tile*ny_tile
+                           dst_idx = ix_loc + (iyl-1)*nx_tile
+     -                             + (iz-1)*nx_tile*slot_ny(next_slot)
+                           stQ(dst_idx,next_slot) = specQ(src_idx)
+                           stU(dst_idx,next_slot) = specU(src_idx)
+                           stMask_tile_arr(dst_idx,next_slot) =
+     -                         mask_tile_arr(src_idx)
+                           if(use_input_mask)then
+                              stMask(dst_idx,next_slot) =
+     -                         specMask(src_idx)
+                           endif
+                           if(need_icube)then
+                              stI(dst_idx,next_slot) =
+     -                         specI(src_idx)
+                           endif
+                        enddo
+                     enddo
+                  enddo
+                  call timer_stop(STAGE_TILE_PREP,t_stage)
+                  if(use_async_pipeline)then
+                        dep_h2d(next_slot) = slot_subid(next_slot)
+                  else
+                        dep_h2d(next_slot) = 0
+                  endif
+                  call log_subblock_progress('tile_prep', 'prep',
+     -                 slot_subid(next_slot), n_subblocks_tile,
+     -                 iy_tile_beg + slot_iy_beg(next_slot) - 1,
+     -                 iy_tile_beg + slot_iy_end(next_slot) - 1)
+                endif
               enddo
             endif
              call log_tile_bounds('tile_compute','done',
