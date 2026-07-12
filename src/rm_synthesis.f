@@ -197,6 +197,7 @@ chelp-
         real(dp)  t_total_start, t_stage, t_tile_start
         ! /proc/self/io counters sampled at run start and end
         integer(kind=int64) :: io_rb0, io_wb0, io_rb1, io_wb1
+        integer(kind=int64) :: io_rsys0, io_wsys0, io_rsys1, io_wsys1
         integer   io_unit, ios_io
         character(len=256) :: io_line
         logical   io_avail
@@ -394,7 +395,8 @@ chelp-
       call timer_add(STAGE_CFG_PARSE,t_cfg_end - t_cfg_start)
       call timer_start(t_total_start)
       ! Sample /proc/self/io at run start for disk I/O accounting
-      io_rb0 = 0_int64; io_wb0 = 0_int64; io_avail = .false.
+        io_rb0 = 0_int64; io_wb0 = 0_int64; io_avail = .false.
+        io_rsys0 = 0_int64; io_wsys0 = 0_int64
       io_unit = 92
       open(io_unit,file='/proc/self/io',status='old',iostat=ios_io)
       if(ios_io.eq.0)then
@@ -406,6 +408,10 @@ chelp-
      -                      read(io_line(12:),*,iostat=ios_io) io_rb0
                       if(io_line(1:11).eq.'write_bytes')
      -                      read(io_line(13:),*,iostat=ios_io) io_wb0
+                      if(io_line(1:5).eq.'syscr')
+     -                      read(io_line(7:),*,iostat=ios_io) io_rsys0
+                      if(io_line(1:5).eq.'syscw')
+     -                      read(io_line(7:),*,iostat=ios_io) io_wsys0
               enddo
               close(io_unit)
       endif
@@ -3048,7 +3054,8 @@ chelp-
       call timer_stop(STAGE_FINALIZE,t_stage)
       call timer_stop(STAGE_TOTAL,t_total_start)
       ! Sample /proc/self/io at run end for I/O accounting
-      io_rb1 = 0_int64; io_wb1 = 0_int64
+        io_rb1 = 0_int64; io_wb1 = 0_int64
+        io_rsys1 = 0_int64; io_wsys1 = 0_int64
       if(io_avail)then
               open(io_unit,file='/proc/self/io',status='old',
      -             iostat=ios_io)
@@ -3063,6 +3070,12 @@ chelp-
                               if(io_line(1:11).eq.'write_bytes')
      -                          read(io_line(13:),*,iostat=ios_io)
      -                               io_wb1
+                              if(io_line(1:5).eq.'syscr')
+     -                          read(io_line(7:),*,iostat=ios_io)
+     -                               io_rsys1
+                              if(io_line(1:5).eq.'syscw')
+     -                          read(io_line(7:),*,iostat=ios_io)
+     -                               io_wsys1
                       enddo
                       close(io_unit)
               endif
@@ -3072,10 +3085,15 @@ chelp-
       if(io_avail)then
               write(*,'(A,F12.3,A)')'  read  (GiB): ',
      -          real(io_rb1-io_rb0,dp)/(1024.0_dp**3),
+     -          real(max(0_int64,io_rb1-io_rb0),dp)/(1024.0_dp**3),
      -          ' (/proc/self/io)'
               write(*,'(A,F12.3,A)')'  write (GiB): ',
-     -          real(io_wb1-io_wb0,dp)/(1024.0_dp**3),
+     -          real(max(0_int64,io_wb1-io_wb0),dp)/(1024.0_dp**3),
      -          ' (/proc/self/io)'
+              write(*,'(A,I0)')'  read syscalls : ',
+     -          max(0_int64,io_rsys1-io_rsys0)
+              write(*,'(A,I0)')'  write syscalls: ',
+     -          max(0_int64,io_wsys1-io_wsys0)
       else
               write(*,'(A)')
      -          '  /proc/self/io not available on this system'

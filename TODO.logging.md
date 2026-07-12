@@ -5,20 +5,20 @@ Goal: add low-overhead, configurable timing and run diagnostics for CPU and GPU 
 
 ## Logging and timing conventions
 
-- [ ] Use local wall-clock timestamps in ISO-8601 format with timezone offset.
+- [x] Use local wall-clock timestamps in ISO-8601 format with timezone offset.
   - Example format: 2026-07-12T14:03:09+10:00
   - Decision: yes, ISO-8601 is a good default (human-readable and machine-parseable).
-- [ ] Add config keys:
+- [x] Add config keys:
   - log_level = error|warn|info|debug
   - timing_enabled = y|n
   - timing_tile_enabled = y|n
   - timing_io_enabled = y|n
   - timing_output_file = optional path (stdout if empty)
-- [ ] Keep instrumentation overhead small when disabled (single boolean guard at callsites).
+- [x] Keep instrumentation overhead small when disabled (single boolean guard at callsites).
 
 ## Phase 1: Minimal logger and timer primitives
 
-- [ ] Add logging/timing helper routines to src/rm_synthesis_mod.f90.
+- [x] Add logging/timing helper routines to src/rm_synthesis_mod.f90.
   - Suggested new utilities:
     - log_message(level, stage, message)
     - timer_start(stage_id)
@@ -26,26 +26,26 @@ Goal: add low-overhead, configurable timing and run diagnostics for CPU and GPU 
     - timer_add(stage_id, dt)
     - timer_report_summary()
   - Use wall time for durations (prefer omp_get_wtime when available, fallback to system_clock).
-- [ ] Add stage identifiers for major sections (fixed set, stable names).
-- [ ] Ensure logger supports both stdout and optional file output.
+- [x] Add stage identifiers for major sections (fixed set, stable names).
+- [x] Ensure logger supports both stdout and optional file output.
 
 Acceptance criteria:
-- [ ] Build succeeds for OMP=0/1 and GPU=0/1.
-- [ ] timing_enabled=n adds no meaningful runtime overhead.
+- [x] Build succeeds for OMP=0/1 and GPU=0/1.
+- [x] timing_enabled=n adds no meaningful runtime overhead.
 
 ## Phase 2: Macroscopic timing in main pipeline
 
 ### Insertion points identified in src/rm_synthesis.f
 
-- [ ] Config and startup section (around lines 330-430)
+- [x] Config and startup section (around lines 330-430)
   - Time config file locate + parse (call read_cfg_keyval)
   - Log selected mode summary (use_gpu requested/actual, tile settings, dry_run)
-- [ ] Input/output FITS open/init section (around lines 939-1200)
+- [x] Input/output FITS open/init section (around lines 939-1200)
   - Time FTOPEN for Q/U/I/mask
   - Time output file existence checks and ftinit creation
-- [ ] Header propagation section (around lines 1900-2460)
+- [x] Header propagation section (around lines 1900-2460)
   - Time ftphpr and header keyword propagation block
-- [ ] Main tile loop section (around lines 2503-2900)
+- [x] Main tile loop section (around lines 2503-2900)
   - Per-tile wall time total
   - Separate timers per tile for:
     - tile read (FTGSVE calls)
@@ -54,28 +54,28 @@ Acceptance criteria:
     - compute kernel(s) (tile_extract_gpu_rm_blocked loops)
     - cubestat_tail_quantile_maps
     - tile writes (ftpsse/ftpssb/ftpssi)
-- [ ] Final close/deallocation section (around lines 2900-3082)
+- [x] Final close/deallocation section (around lines 2900-3082)
   - Time FTCLOS blocks and final cleanup
   - Print one summary table at end
 
 Acceptance criteria:
-- [ ] End-of-run summary includes total time and stage breakdown percentages.
-- [ ] Tile timing can be turned off separately (timing_tile_enabled).
+- [x] End-of-run summary includes total time and stage breakdown percentages.
+- [x] Tile timing can be turned off separately (timing_tile_enabled).
 
 ## Phase 3: Disk I/O macro counters
 
-- [ ] Capture process-level I/O counters at run start and run end.
+- [x] Capture process-level I/O counters at run start and run end.
   - Linux source: /proc/self/io
   - Track at least:
     - read_bytes
     - write_bytes
     - syscr (read syscalls)
     - syscw (write syscalls)
-- [ ] Report deltas in final summary.
-- [ ] Add fallback message if /proc/self/io unavailable.
+- [x] Report deltas in final summary.
+- [x] Add fallback message if /proc/self/io unavailable.
 
 Acceptance criteria:
-- [ ] CPU and GPU runs report comparable macro I/O deltas for same config/cube.
+- [x] CPU and GPU runs report comparable macro I/O deltas for same config/cube.
 
 ## Phase 4: GPU offload transfer timing
 
