@@ -135,4 +135,4 @@ Acceptance criteria:
 - [ ] Logging/timing is config-driven, default-safe (off or info-level low-noise).
 - [ ] CPU and GPU runs both produce reliable stage breakdowns.
 - [ ] Data transfer vs compute bottleneck is directly visible in final report.
-- [ ] Documentation updated in README or BUILD with usage examples.
+- [x] Documentation updated in README or BUILD with usage examples.

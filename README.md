@@ -103,6 +103,46 @@ infileI = I_cube.fits
 
 For complete documentation, see [cfg/CONFIG_README.md](cfg/CONFIG_README.md).
 
+## Timing And Benchmark CSV Output
+
+The runtime logger can emit a human-readable timing summary and an optional CSV
+row for automation/benchmark tracking.
+
+Add these keys to your config:
+
+```cfg
+# Optional timing controls
+log_level = info                  # error|warn|info|debug
+timing_enabled = y                # master timing switch
+timing_tile_enabled = y           # include tile-level stage timers
+timing_io_enabled = y             # include I/O stage timers
+timing_output_file =              # empty => stdout, else append to file
+timing_csv_file = ./timing.csv    # optional: append one CSV row per run
+```
+
+When enabled, the run prints:
+- `Run summary:` (binary flavor and GPU requested/active state)
+- `Timing summary (seconds):` (stage totals and percentages)
+- `Macro timing breakdown:` (read I/O, compute RM, compute cubestat, write I/O, overhead)
+
+The optional CSV output writes a header (once) and one row per run with:
+- run id and mode
+- cube and tile dimensions
+- stage timings
+- process-level I/O counters
+
+Example run:
+
+```bash
+bin/rm_synthesis_release_cpu_serial cfg/rmsynth-casa.fullim.cfg
+```
+
+Example GPU run:
+
+```bash
+bin/rm_synthesis_release_gpu_offload cfg/rmsynth-casa.fullim.cfg
+```
+
 ## GPU Runtime Behavior
 
 - `use_gpu=n` runs host execution.

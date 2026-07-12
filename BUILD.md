@@ -199,6 +199,42 @@ make MODE=release
 FFLAGS="-O3 -march=native -ffast-math" make
 ```
 
+## Timing And Benchmark Logging
+
+All build variants support runtime timing diagnostics through config keys.
+
+Add to your cfg:
+
+```cfg
+timing_enabled = y
+timing_tile_enabled = y
+timing_io_enabled = y
+timing_output_file =
+timing_csv_file = ./timing.csv
+```
+
+`timing_output_file`:
+- empty value writes timing to stdout
+- non-empty value appends timing logs to that file
+
+`timing_csv_file`:
+- appends one CSV row per run
+- useful for scripted benchmark sweeps across `cpu_serial`, `cpu_omp`,
+  `gpu_offload`, and `gpu_offload_hostomp`
+
+Example benchmark commands:
+
+```bash
+make OMP=0 GPU=0
+bin/rm_synthesis_release_cpu_serial cfg/rmsynth-casa.fullim.cfg
+
+make OMP=1 GPU=0
+bin/rm_synthesis_release_cpu_omp cfg/rmsynth-casa.fullim.cfg
+
+make OMP=0 GPU=1
+bin/rm_synthesis_release_gpu_offload cfg/rmsynth-casa.fullim.cfg
+```
+
 ## Distribution
 
 For distributing the package:
