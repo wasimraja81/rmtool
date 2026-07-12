@@ -401,6 +401,8 @@ chelp-
       call timer_reset()
       call timer_add(STAGE_CFG_PARSE,t_cfg_end - t_cfg_start)
       call timer_start(t_total_start)
+        call log_message('info','startup',
+     -     'rm_synthesis run started')
       ! Sample /proc/self/io at run start for disk I/O accounting
         io_rb0 = 0_int64; io_wb0 = 0_int64; io_avail = .false.
         io_rsys0 = 0_int64; io_wsys0 = 0_int64
@@ -433,14 +435,22 @@ chelp-
 #else
         binary_flavor = 'cpu_serial'
 #endif
+        write(message,'(A,A)')'binary_flavor=',
+     -     binary_flavor(1:nchar(binary_flavor))
+        call log_message('info','startup',
+     -     message(1:nchar(message)))
       if(use_gpu)then
 #ifdef USE_GPU
               use_gpu_actual = .true.
               write(*,*)"GPU requested: attempting OpenMP offload."
+                  call log_message('info','startup',
+     -             'GPU requested and enabled')
 #else
               write(*,*)"WARNING: use_gpu requested but this binary "
               write(*,*)"was built without USE_GPU; "
               write(*,*)"falling back to CPU."
+                  call log_message('warn','startup',
+     -             'use_gpu requested but binary has no USE_GPU')
 #endif
       endif
 
@@ -3153,6 +3163,8 @@ chelp-
      -                 timing_csv_file(1:nchar(timing_csv_file))
               endif
       endif
+        call log_message('info','finalize',
+     -     'rm_synthesis run completed')
 
 9999  continue
 

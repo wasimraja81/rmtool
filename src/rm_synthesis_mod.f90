@@ -257,6 +257,7 @@ contains
     real(dp) :: total_t, pct
     real(dp) :: io_read_t, io_write_t, compute_rm_t
     real(dp) :: compute_stat_t, other_t, macro_sum
+    character(len=160) :: line
 
     if (.not. timing_enabled_glob) return
 
@@ -268,15 +269,15 @@ contains
       end do
     end if
 
-    write(logger_unit, '(A)') ' '
-    write(logger_unit, '(A)') 'Timing summary (seconds):'
-    write(logger_unit, '(A)') 'stage                     sec         pct'
+    call log_timing_line('Timing summary (seconds):')
+    call log_timing_line('stage                     sec         pct')
     do i = 1, MAX_STAGES
       if (len_trim(stage_names(i)) > 0 .and. stage_totals(i) > 0.0_dp) then
         pct = 0.0_dp
         if (total_t > 0.0_dp) pct = 100.0_dp * stage_totals(i) / total_t
-        write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') trim(stage_names(i)), &
+        write(line, '(A24,1X,F12.3,1X,F8.2)') trim(stage_names(i)), &
           stage_totals(i), pct
+        call log_timing_line(trim(line))
       end if
     end do
 
@@ -288,20 +289,32 @@ contains
     macro_sum = io_read_t + io_write_t + compute_rm_t + compute_stat_t
     other_t = max(0.0_dp, total_t - macro_sum)
 
-    write(logger_unit, '(A)') 'Macro timing breakdown:'
-    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'read I/O', io_read_t, &
+    call log_timing_line('Macro timing breakdown:')
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'read I/O', io_read_t, &
       merge(100.0_dp*io_read_t/total_t, 0.0_dp, total_t > 0.0_dp)
-    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'compute RM', compute_rm_t, &
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'compute RM', compute_rm_t, &
       merge(100.0_dp*compute_rm_t/total_t, 0.0_dp, total_t > 0.0_dp)
-    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'compute cubestat', &
-      compute_stat_t, merge(100.0_dp*compute_stat_t/total_t, 0.0_dp, total_t > 0.0_dp)
-    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'output write I/O', io_write_t, &
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'compute cubestat', compute_stat_t, &
+      merge(100.0_dp*compute_stat_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'output write I/O', io_write_t, &
       merge(100.0_dp*io_write_t/total_t, 0.0_dp, total_t > 0.0_dp)
-    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'other overhead', other_t, &
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'other overhead', other_t, &
       merge(100.0_dp*other_t/total_t, 0.0_dp, total_t > 0.0_dp)
-
-    write(logger_unit, '(A)') ' '
+    call log_timing_line(trim(line))
   end subroutine timer_report_summary
+
+  subroutine log_timing_line(message)
+    implicit none
+    character(len=*), intent(in) :: message
+    character(len=32) :: ts
+
+    ts = iso_timestamp_local()
+    write(logger_unit, '(A," [info] [timing] ",A)') trim(ts), trim(message)
+  end subroutine log_timing_line
 
   real(dp) function timer_get_stage_seconds(stage_id)
     implicit none
