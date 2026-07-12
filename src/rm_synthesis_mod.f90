@@ -253,6 +253,8 @@ contains
     implicit none
     integer :: i
     real(dp) :: total_t, pct
+    real(dp) :: io_read_t, io_write_t, compute_rm_t
+    real(dp) :: compute_stat_t, other_t, macro_sum
 
     if (.not. timing_enabled_glob) return
 
@@ -275,6 +277,27 @@ contains
           stage_totals(i), pct
       end if
     end do
+
+    ! Phase-5 macro breakdown requested for performance attribution.
+    io_read_t = stage_totals(STAGE_TILE_READ)
+    io_write_t = stage_totals(STAGE_TILE_WRITE)
+    compute_rm_t = stage_totals(STAGE_TILE_COMPUTE)
+    compute_stat_t = stage_totals(STAGE_TILE_CUBESTAT)
+    macro_sum = io_read_t + io_write_t + compute_rm_t + compute_stat_t
+    other_t = max(0.0_dp, total_t - macro_sum)
+
+    write(logger_unit, '(A)') 'Macro timing breakdown:'
+    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'read I/O', io_read_t, &
+      merge(100.0_dp*io_read_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'compute RM', compute_rm_t, &
+      merge(100.0_dp*compute_rm_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'compute cubestat', &
+      compute_stat_t, merge(100.0_dp*compute_stat_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'output write I/O', io_write_t, &
+      merge(100.0_dp*io_write_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') 'other overhead', other_t, &
+      merge(100.0_dp*other_t/total_t, 0.0_dp, total_t > 0.0_dp)
+
     write(logger_unit, '(A)') ' '
   end subroutine timer_report_summary
 
