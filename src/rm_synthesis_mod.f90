@@ -5,7 +5,7 @@ module rm_synthesis_mod
   
   use iso_fortran_env, only: sp => real32, dp => real64, int8, int16, int32, int64
 #if defined(HOST_OMP) && (HOST_OMP == 1)
-  use omp_lib, only: omp_get_wtime
+  use omp_lib, only: omp_get_wtime, omp_get_thread_num
 #endif
   implicit none
   
@@ -135,24 +135,20 @@ contains
   character(len=32) function iso_timestamp_local()
     implicit none
     integer :: vals(8)
-    character(len=5) :: zone
-    character(len=1) :: zsgn
-    integer :: zhh, zmm
-
-    call date_and_time(values=vals, zone=zone)
-    zsgn = '+'
-    if (zone(1:1) == '-') zsgn = '-'
-    read(zone(2:3), '(I2)', err=10) zhh
-    read(zone(4:5), '(I2)', err=10) zmm
+    call date_and_time(values=vals)
     write(iso_timestamp_local, &
-      '(I4.4,"-",I2.2,"-",I2.2,"T",I2.2,":",I2.2,":",I2.2,A1,I2.2,":",I2.2)') &
-      vals(1), vals(2), vals(3), vals(5), vals(6), vals(7), zsgn, zhh, zmm
-    return
-10  continue
-    write(iso_timestamp_local, &
-      '(I4.4,"-",I2.2,"-",I2.2,"T",I2.2,":",I2.2,":",I2.2)') &
-      vals(1), vals(2), vals(3), vals(5), vals(6), vals(7)
+      '(I4.4,"-",I2.2,"-",I2.2,"T",I2.2,":",I2.2,":",I2.2,".",I3.3)') &
+      vals(1), vals(2), vals(3), vals(5), vals(6), vals(7), vals(8)
   end function iso_timestamp_local
+
+  integer function current_thread_id()
+    implicit none
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    current_thread_id = omp_get_thread_num()
+#else
+    current_thread_id = 0
+#endif
+  end function current_thread_id
 
   subroutine init_logging(log_level_name, timing_enabled, timing_tile_enabled, &
                           timing_io_enabled, log_output_file, status)
@@ -196,7 +192,7 @@ contains
   subroutine log_message(level_name, stage_name, message)
     implicit none
     character(len=*), intent(in) :: level_name, stage_name, message
-    integer :: msg_level
+    integer :: msg_level, tid
     character(len=32) :: ts
 
     if (.not. logger_initialized) return
@@ -205,9 +201,16 @@ contains
     if (msg_level > logger_level) return
 
     ts = iso_timestamp_local()
-    write(logger_unit, '(A," [",A,"] [",A,"] ",A)') &
-      trim(ts), trim(level_name), trim(stage_name), trim(message)
+    tid = current_thread_id()
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp critical (logger_write_lock)
+#endif
+    write(logger_unit, '(A," [",A,"] [",A,"] [tid=",I0,"] ",A)') &
+      trim(ts), trim(level_name), trim(stage_name), tid, trim(message)
     flush(logger_unit)
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp end critical (logger_write_lock)
+#endif
   end subroutine log_message
 
   subroutine timer_reset()
@@ -312,10 +315,19 @@ contains
     implicit none
     character(len=*), intent(in) :: message
     character(len=32) :: ts
+    integer :: tid
 
     ts = iso_timestamp_local()
-    write(logger_unit, '(A," [info] [timing] ",A)') trim(ts), trim(message)
+    tid = current_thread_id()
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp critical (logger_write_lock)
+#endif
+    write(logger_unit, '(A," [info] [timing] [tid=",I0,"] ",A)') &
+      trim(ts), tid, trim(message)
     flush(logger_unit)
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp end critical (logger_write_lock)
+#endif
   end subroutine log_timing_line
 
   real(dp) function timer_get_stage_seconds(stage_id)

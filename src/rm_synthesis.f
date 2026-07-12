@@ -2589,6 +2589,8 @@ chelp-
       progress_step = max(1, progress_total/10)
       progress_next_pct = 10
       progress_next_count = progress_step
+        call log_message('info','tile_read',
+     -     'starting tiled FITS reads')
       do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
         ix_tile_end = min(xpix_end,
      -                     ix_tile_beg + (tile_ra-1)*incs(1))
@@ -2610,6 +2612,12 @@ chelp-
             fpixels(freq_axis) = zpix_beg
             lpixels(freq_axis) = zpix_end
 
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile read start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_read',
+     -         message(1:nchar(message)))
+
             call timer_start(t_stage)
             call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
      -                   nullval,specQ,anyflg,status)
@@ -2623,6 +2631,20 @@ chelp-
                     call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,
      -                   incs,nullval,specI,anyflg,status)
             endif
+
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile read done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_read',
+     -         message(1:nchar(message)))
+             call timer_stop(STAGE_TILE_READ,t_stage)
+
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile mask start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_mask',
+     -         message(1:nchar(message)))
+             call timer_start(t_stage)
 
             ! ========================================================
             ! Build unified mask from all sources: global bad channels,
@@ -2675,11 +2697,23 @@ chelp-
 !$omp end parallel do
 #endif
             call timer_stop(STAGE_TILE_MASK,t_stage)
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile mask done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_mask',
+     -         message(1:nchar(message)))
 
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile compute start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_compute',
+     -         message(1:nchar(message)))
             call timer_start(t_stage)
             if(.not.use_staging)then
               ! Single-level path: GPU vs CPU optimization strategies
               if(use_gpu_actual)then
+                  call log_message('debug','tile_compute',
+     -             'sending tile buffers to GPU')
                 ! ====================================================================
                 ! GPU path: RM-block tiled extraction (optimized for GPU)
                 ! ====================================================================
@@ -2715,6 +2749,8 @@ chelp-
      -               use_gpu_actual, rem_mean, output_mode,
      -               ap_angle_mode, p_tile_arr, phi_tile_arr)
                 end do
+                call log_message('debug','tile_compute',
+     -             'received tile results from GPU')
                 
                 ! Deallocate temporary GPU arrays
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
@@ -2722,6 +2758,8 @@ chelp-
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               else
+                call log_message('debug','tile_compute',
+     -             'running tile compute on CPU')
                 ! CPU path: collapse(2) kernel with CPU-optimal data layout
                 ! GPU binary running on CPU keeps GPU layout for kernel compat.
 #ifdef USE_GPU
@@ -2759,7 +2797,6 @@ chelp-
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               endif
-            call timer_stop(STAGE_TILE_COMPUTE,t_stage)
             else
               ! Two-level path: subdivide the RAM block into Dec-strip
               ! VRAM sub-blocks. Each sub-block is gathered into compact
@@ -2772,6 +2809,12 @@ chelp-
                 iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
                 ny_sub_now = iy_sub_end - iy_sub_beg + 1
                 n_subblocks_total = n_subblocks_total + 1_int64
+                write(message,'(A,I0,A,I0,A)')
+     -           'staging subblock send to GPU y:[',
+     -           iy_tile_beg + iy_sub_beg - 1,',',
+     -           iy_tile_beg + iy_sub_end - 1,']'
+                call log_message('debug','tile_compute',
+     -             message(1:nchar(message)))
 
                 ! --- gather inputs (full tile -> compact sub-block) ---
                 do iyl = 1,ny_sub_now
@@ -2840,6 +2883,12 @@ chelp-
                   deallocate(st_wsum_gpu)
                   if (allocated(st_mean_Q)) deallocate(st_mean_Q)
                   if (allocated(st_mean_U)) deallocate(st_mean_U)
+                  write(message,'(A,I0,A,I0,A)')
+     -             'staging subblock results from GPU y:[',
+     -             iy_tile_beg + iy_sub_beg - 1,',',
+     -             iy_tile_beg + iy_sub_end - 1,']'
+                  call log_message('debug','tile_compute',
+     -               message(1:nchar(message)))
                 else
                   ! CPU staging path unreachable: use_staging=true only
                   ! when use_gpu_actual=true (ny_sub driven by VRAM budget)
@@ -2873,6 +2922,12 @@ chelp-
                 enddo
               enddo
             endif
+             call timer_stop(STAGE_TILE_COMPUTE,t_stage)
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile compute done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_compute',
+     -         message(1:nchar(message)))
 
             do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)
@@ -2900,6 +2955,11 @@ chelp-
             iy_out_beg = int((iy_tile_beg - ypix_beg)/incs(2)) + 1
             iy_out_end = iy_out_beg + ny_tile - 1
 
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile cubestat start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_cubestat',
+     -         message(1:nchar(message)))
             call timer_start(t_stage)
             if(cubestat)then
                     call cubestat_tail_quantile_maps(
@@ -2909,7 +2969,17 @@ chelp-
      -                  ang_peak_tile_arr,snr_tile_arr)
             endif
             call timer_stop(STAGE_TILE_CUBESTAT,t_stage)
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile cubestat done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_cubestat',
+     -         message(1:nchar(message)))
 
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile write start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_write',
+     -         message(1:nchar(message)))
             call timer_start(t_stage)
             fpixels_out(1) = ix_out_beg
             lpixels_out(1) = ix_out_end
@@ -3004,6 +3074,11 @@ chelp-
                     endif
             endif
             call timer_stop(STAGE_TILE_WRITE,t_stage)
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile write done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_write',
+     -         message(1:nchar(message)))
             call timer_add(STAGE_TILE_TOTAL,
      -           wall_time_seconds()-t_tile_start)
         enddo
