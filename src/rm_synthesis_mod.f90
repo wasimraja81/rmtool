@@ -4,6 +4,9 @@ module rm_synthesis_mod
   !! Author: Wasim Raja (modernized 2026)
   
   use iso_fortran_env, only: sp => real32, dp => real64, int8, int16, int32, int64
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  use omp_lib, only: omp_get_wtime
+#endif
   implicit none
   
   private
@@ -14,6 +17,13 @@ module rm_synthesis_mod
   public :: linspace, nchar
   public :: read_cfg_keyval
   public :: write_runtime_estimate
+  public :: init_logging, log_message
+  public :: timer_reset, timer_start, timer_stop, timer_add
+  public :: timer_report_summary, wall_time_seconds
+  public :: STAGE_TOTAL, STAGE_CFG_PARSE, STAGE_IO_INIT, STAGE_HEADER
+  public :: STAGE_TILE_TOTAL, STAGE_TILE_READ, STAGE_TILE_MASK
+  public :: STAGE_TILE_PREP, STAGE_TILE_COMPUTE, STAGE_TILE_CUBESTAT
+  public :: STAGE_TILE_WRITE, STAGE_FINALIZE
   public :: sp, dp, int32, int64
   
   ! Include file parameters for RM-synthesis
@@ -29,6 +39,35 @@ module rm_synthesis_mod
   ! Speed of light in units of 10^6 m/s (for freq[MHz] <-> lambda[m] conversion)
   real(sp), parameter :: c_velocity = 299.792458_sp
 
+  integer, parameter :: LOG_ERROR = 0
+  integer, parameter :: LOG_WARN  = 1
+  integer, parameter :: LOG_INFO  = 2
+  integer, parameter :: LOG_DEBUG = 3
+
+  integer, parameter :: STAGE_TOTAL         = 1
+  integer, parameter :: STAGE_CFG_PARSE     = 2
+  integer, parameter :: STAGE_IO_INIT       = 3
+  integer, parameter :: STAGE_HEADER        = 4
+  integer, parameter :: STAGE_TILE_TOTAL    = 5
+  integer, parameter :: STAGE_TILE_READ     = 6
+  integer, parameter :: STAGE_TILE_MASK     = 7
+  integer, parameter :: STAGE_TILE_PREP     = 8
+  integer, parameter :: STAGE_TILE_COMPUTE  = 9
+  integer, parameter :: STAGE_TILE_CUBESTAT = 10
+  integer, parameter :: STAGE_TILE_WRITE    = 11
+  integer, parameter :: STAGE_FINALIZE      = 12
+  integer, parameter :: MAX_STAGES          = 32
+
+  logical, save :: logger_initialized = .false.
+  logical, save :: logger_owns_unit = .false.
+  logical, save :: timing_enabled_glob = .false.
+  logical, save :: timing_tile_enabled_glob = .false.
+  logical, save :: timing_io_enabled_glob = .false.
+  integer, save :: logger_unit = 6
+  integer, save :: logger_level = LOG_INFO
+  real(dp), save :: stage_totals(MAX_STAGES) = 0.0_dp
+  character(len=24), save :: stage_names(MAX_STAGES)
+
 #if defined(HOST_OMP) && (HOST_OMP == 1)
   logical, parameter :: host_omp_enabled = .true.
 #else
@@ -39,6 +78,202 @@ module rm_synthesis_mod
   public :: c_velocity
 
 contains
+
+  subroutine init_stage_names()
+    implicit none
+    stage_names = ' '
+    stage_names(STAGE_TOTAL) = 'total'
+    stage_names(STAGE_CFG_PARSE) = 'cfg_parse'
+    stage_names(STAGE_IO_INIT) = 'io_init'
+    stage_names(STAGE_HEADER) = 'header_write'
+    stage_names(STAGE_TILE_TOTAL) = 'tile_total'
+    stage_names(STAGE_TILE_READ) = 'tile_read'
+    stage_names(STAGE_TILE_MASK) = 'tile_mask'
+    stage_names(STAGE_TILE_PREP) = 'tile_prep'
+    stage_names(STAGE_TILE_COMPUTE) = 'tile_compute'
+    stage_names(STAGE_TILE_CUBESTAT) = 'tile_cubestat'
+    stage_names(STAGE_TILE_WRITE) = 'tile_write'
+    stage_names(STAGE_FINALIZE) = 'finalize'
+  end subroutine init_stage_names
+
+  real(dp) function wall_time_seconds()
+    implicit none
+    integer(int64) :: clk_count, clk_rate
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    wall_time_seconds = omp_get_wtime()
+#else
+    call system_clock(clk_count, clk_rate)
+    if (clk_rate > 0_int64) then
+      wall_time_seconds = real(clk_count, dp) / real(clk_rate, dp)
+    else
+      wall_time_seconds = 0.0_dp
+    end if
+#endif
+  end function wall_time_seconds
+
+  integer function level_from_name(level_name)
+    implicit none
+    character(len=*), intent(in) :: level_name
+    character(len=16) :: tmp
+    tmp = trim(lower_ascii(level_name))
+    select case (tmp)
+    case ('error')
+      level_from_name = LOG_ERROR
+    case ('warn', 'warning')
+      level_from_name = LOG_WARN
+    case ('debug')
+      level_from_name = LOG_DEBUG
+    case default
+      level_from_name = LOG_INFO
+    end select
+  end function level_from_name
+
+  character(len=32) function iso_timestamp_local()
+    implicit none
+    integer :: vals(8)
+    character(len=5) :: zone
+    character(len=1) :: zsgn
+    integer :: zhh, zmm
+
+    call date_and_time(values=vals, zone=zone)
+    zsgn = '+'
+    if (zone(1:1) == '-') zsgn = '-'
+    read(zone(2:3), '(I2)', err=10) zhh
+    read(zone(4:5), '(I2)', err=10) zmm
+    write(iso_timestamp_local, &
+      '(I4.4,"-",I2.2,"-",I2.2,"T",I2.2,":",I2.2,":",I2.2,A1,I2.2,":",I2.2)') &
+      vals(1), vals(2), vals(3), vals(5), vals(6), vals(7), zsgn, zhh, zmm
+    return
+10  continue
+    write(iso_timestamp_local, &
+      '(I4.4,"-",I2.2,"-",I2.2,"T",I2.2,":",I2.2,":",I2.2)') &
+      vals(1), vals(2), vals(3), vals(5), vals(6), vals(7)
+  end function iso_timestamp_local
+
+  subroutine init_logging(log_level_name, timing_enabled, timing_tile_enabled, &
+                          timing_io_enabled, timing_output_file, status)
+    implicit none
+    character(len=*), intent(in) :: log_level_name
+    logical, intent(in) :: timing_enabled, timing_tile_enabled
+    logical, intent(in) :: timing_io_enabled
+    character(len=*), intent(in) :: timing_output_file
+    integer(int32), intent(out) :: status
+    integer :: ios_local
+
+    status = 0
+    call init_stage_names()
+
+    logger_level = level_from_name(log_level_name)
+    timing_enabled_glob = timing_enabled
+    timing_tile_enabled_glob = timing_tile_enabled
+    timing_io_enabled_glob = timing_io_enabled
+
+    if (logger_owns_unit) then
+      close(logger_unit)
+      logger_owns_unit = .false.
+      logger_unit = 6
+    end if
+
+    if (nchar(timing_output_file) > 0) then
+      logger_unit = 99
+      open(logger_unit, file=trim(timing_output_file), status='unknown', &
+           position='append', action='write', iostat=ios_local)
+      if (ios_local /= 0) then
+        status = ios_local
+        logger_unit = 6
+        return
+      end if
+      logger_owns_unit = .true.
+    end if
+
+    logger_initialized = .true.
+  end subroutine init_logging
+
+  subroutine log_message(level_name, stage_name, message)
+    implicit none
+    character(len=*), intent(in) :: level_name, stage_name, message
+    integer :: msg_level
+    character(len=32) :: ts
+
+    if (.not. logger_initialized) return
+
+    msg_level = level_from_name(level_name)
+    if (msg_level > logger_level) return
+
+    ts = iso_timestamp_local()
+    write(logger_unit, '(A," [",A,"] [",A,"] ",A)') &
+      trim(ts), trim(level_name), trim(stage_name), trim(message)
+  end subroutine log_message
+
+  subroutine timer_reset()
+    implicit none
+    call init_stage_names()
+    stage_totals = 0.0_dp
+  end subroutine timer_reset
+
+  subroutine timer_start(t0)
+    implicit none
+    real(dp), intent(out) :: t0
+    t0 = wall_time_seconds()
+  end subroutine timer_start
+
+  subroutine timer_add(stage_id, dt)
+    implicit none
+    integer(int32), intent(in) :: stage_id
+    real(dp), intent(in) :: dt
+
+    if (.not. timing_enabled_glob) return
+    if (stage_id == STAGE_TILE_TOTAL .or. stage_id == STAGE_TILE_READ .or. &
+        stage_id == STAGE_TILE_MASK .or. stage_id == STAGE_TILE_PREP .or. &
+        stage_id == STAGE_TILE_COMPUTE .or. stage_id == STAGE_TILE_CUBESTAT .or. &
+        stage_id == STAGE_TILE_WRITE) then
+      if (.not. timing_tile_enabled_glob) return
+    end if
+    if ((stage_id == STAGE_IO_INIT .or. stage_id == STAGE_TILE_READ .or. &
+         stage_id == STAGE_TILE_WRITE) .and. (.not. timing_io_enabled_glob)) return
+
+    if (stage_id >= 1 .and. stage_id <= MAX_STAGES) then
+      stage_totals(stage_id) = stage_totals(stage_id) + max(0.0_dp, dt)
+    end if
+  end subroutine timer_add
+
+  subroutine timer_stop(stage_id, t0)
+    implicit none
+    integer(int32), intent(in) :: stage_id
+    real(dp), intent(in) :: t0
+    real(dp) :: dt
+    dt = wall_time_seconds() - t0
+    call timer_add(stage_id, dt)
+  end subroutine timer_stop
+
+  subroutine timer_report_summary()
+    implicit none
+    integer :: i
+    real(dp) :: total_t, pct
+
+    if (.not. timing_enabled_glob) return
+
+    total_t = stage_totals(STAGE_TOTAL)
+    if (total_t <= 0.0_dp) then
+      total_t = 0.0_dp
+      do i = 1, MAX_STAGES
+        if (i /= STAGE_TOTAL) total_t = total_t + stage_totals(i)
+      end do
+    end if
+
+    write(logger_unit, '(A)') ' '
+    write(logger_unit, '(A)') 'Timing summary (seconds):'
+    write(logger_unit, '(A)') 'stage                     sec         pct'
+    do i = 1, MAX_STAGES
+      if (len_trim(stage_names(i)) > 0 .and. stage_totals(i) > 0.0_dp) then
+        pct = 0.0_dp
+        if (total_t > 0.0_dp) pct = 100.0_dp * stage_totals(i) / total_t
+        write(logger_unit, '(A24,1X,F12.3,1X,F8.2)') trim(stage_names(i)), &
+          stage_totals(i), pct
+      end if
+    end do
+    write(logger_unit, '(A)') ' '
+  end subroutine timer_report_summary
 
   subroutine extract_general_setup(t, npts, fac, beg_rm, end_rm, nout, nu, cos_arr, sin_arr, maxout, maxpts, use_auto_rm_range, ofac)
     !! Pre-compute sine and cosine templates for RM-extraction
@@ -988,7 +1223,9 @@ contains
                              ap_angle_mode, mask_cube_file, &
                              mask_input_cube_file, &
                              mask_trust_mode, write_mask_output, &
-                             write_nvalid_output, cubestat, use_gpu, io_overlap, status)
+                             write_nvalid_output, cubestat, use_gpu, io_overlap, &
+                             log_level, timing_enabled, timing_tile_enabled, &
+                             timing_io_enabled, timing_output_file, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
@@ -1002,6 +1239,11 @@ contains
     logical, intent(inout) :: cubestat
     logical, intent(inout) :: use_gpu
     logical, intent(inout) :: io_overlap
+    character(len=*), intent(inout) :: log_level
+    logical, intent(inout) :: timing_enabled
+    logical, intent(inout) :: timing_tile_enabled
+    logical, intent(inout) :: timing_io_enabled
+    character(len=*), intent(inout) :: timing_output_file
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -1041,6 +1283,11 @@ contains
     logical :: seen_cubestat
     logical :: seen_use_gpu
     logical :: seen_io_overlap
+    logical :: seen_log_level
+    logical :: seen_timing_enabled
+    logical :: seen_timing_tile_enabled
+    logical :: seen_timing_io_enabled
+    logical :: seen_timing_output_file
 
     status = 0
     line_no = 0
@@ -1093,6 +1340,11 @@ contains
     seen_cubestat = .false.
     seen_use_gpu = .false.
     seen_io_overlap = .false.
+    seen_log_level = .false.
+    seen_timing_enabled = .false.
+    seen_timing_tile_enabled = .false.
+    seen_timing_io_enabled = .false.
+    seen_timing_output_file = .false.
 
     ! Defaults can be overridden by the config.
     path = '../DATA/'
@@ -1143,6 +1395,11 @@ contains
     cubestat = .false.
     use_gpu = .false.
     io_overlap = .false.
+    log_level = 'info'
+    timing_enabled = .false.
+    timing_tile_enabled = .false.
+    timing_io_enabled = .false.
+    timing_output_file = ''
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -1831,6 +2088,51 @@ contains
         end if
         seen_io_overlap = .true.
         io_overlap = flag_from_value(val)
+      case ('log_level')
+        if (seen_log_level) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': log_level'
+          status = -193
+          close(unit_cfg)
+          return
+        end if
+        seen_log_level = .true.
+        log_level = trim(lower_ascii(val))
+      case ('timing_enabled')
+        if (seen_timing_enabled) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_enabled'
+          status = -194
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_enabled = .true.
+        timing_enabled = flag_from_value(val)
+      case ('timing_tile_enabled')
+        if (seen_timing_tile_enabled) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_tile_enabled'
+          status = -195
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_tile_enabled = .true.
+        timing_tile_enabled = flag_from_value(val)
+      case ('timing_io_enabled')
+        if (seen_timing_io_enabled) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_io_enabled'
+          status = -196
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_io_enabled = .true.
+        timing_io_enabled = flag_from_value(val)
+      case ('timing_output_file')
+        if (seen_timing_output_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_output_file'
+          status = -197
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_output_file = .true.
+        timing_output_file = trim(val)
       case default
         write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
         status = -131
@@ -1927,6 +2229,13 @@ contains
     if (status == 0 .and. gpu_vram_mib < 0) then
       write(*,*) 'Invalid gpu_vram_mib: expected >= 0 (0 means auto-detect)'
       status = -191
+    end if
+    if (status == 0) then
+      if (trim(log_level) /= 'error' .and. trim(log_level) /= 'warn' .and. &
+          trim(log_level) /= 'info' .and. trim(log_level) /= 'debug') then
+        write(*,*) 'Invalid log_level: expected error|warn|info|debug'
+        status = -198
+      end if
     end if
     if (status == 0 .and. nrm_out_par < 1) then
       write(*,*) 'Invalid nrm: expected >= 1'

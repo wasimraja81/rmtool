@@ -184,10 +184,22 @@ chelp-
                         logical   write_mask_output, write_nvalid_output
                         logical   cubestat
       logical   use_gpu
+        logical   timing_enabled, timing_tile_enabled
+        logical   timing_io_enabled
       real(sp) conv_fac ! freq-to-lambda conversion factor
       real(sp) mem_frac_ram, mem_frac_vram
       integer   gpu_vram_mib
       logical   io_overlap
+        character(len=16) :: log_level
+        character(len=272) :: timing_output_file
+        integer   log_init_status
+        real(dp)  t_cfg_start, t_cfg_end
+        real(dp)  t_total_start, t_stage, t_tile_start
+        ! /proc/self/io counters sampled at run start and end
+        integer(kind=int64) :: io_rb0, io_wb0, io_rb1, io_wb1
+        integer   io_unit, ios_io
+        character(len=256) :: io_line
+        logical   io_avail
       logical   MHz
       ! various counters and indices:
       integer   i, kk, ix, iy, ixpix_now, iypix_now, irm 
@@ -336,7 +348,8 @@ chelp-
               stop
       endif
 
-        call read_cfg_keyval(cfgfile,
+                        t_cfg_start = wall_time_seconds()
+                                call read_cfg_keyval(cfgfile,
      -          path,infileQ,infileU,outfile,
      -          remove_badchan,global_badchan_file,
      -          subim,subim_parfile,
@@ -356,12 +369,45 @@ chelp-
      -          mask_trust_mode,
      -          write_mask_output,
      -          write_nvalid_output,cubestat,use_gpu,
-     -          io_overlap,status)
+     -          io_overlap,log_level,
+     -          timing_enabled,timing_tile_enabled,
+     -          timing_io_enabled,timing_output_file,
+     -          status)
+      t_cfg_end = wall_time_seconds()
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
               write(*,*)"Quitting now..."
               stop
+      endif
+
+      call init_logging(log_level,timing_enabled,
+     -     timing_tile_enabled,timing_io_enabled,
+     -     timing_output_file,log_init_status)
+      if(log_init_status.ne.0)then
+              write(*,*)"Error initializing logger/timing output"
+              write(*,*)"timing_output_file: ",
+     -         timing_output_file(1:nchar(timing_output_file))
+              stop
+      endif
+      call timer_reset()
+      call timer_add(STAGE_CFG_PARSE,t_cfg_end - t_cfg_start)
+      call timer_start(t_total_start)
+      ! Sample /proc/self/io at run start for disk I/O accounting
+      io_rb0 = 0_int64; io_wb0 = 0_int64; io_avail = .false.
+      io_unit = 92
+      open(io_unit,file='/proc/self/io',status='old',iostat=ios_io)
+      if(ios_io.eq.0)then
+              io_avail = .true.
+              do
+                      read(io_unit,'(A)',iostat=ios_io) io_line
+                      if(ios_io.ne.0)exit
+                      if(io_line(1:10).eq.'read_bytes')
+     -                      read(io_line(12:),*,iostat=ios_io) io_rb0
+                      if(io_line(1:11).eq.'write_bytes')
+     -                      read(io_line(13:),*,iostat=ios_io) io_wb0
+              enddo
+              close(io_unit)
       endif
 
       use_gpu_actual = .false.
@@ -928,6 +974,7 @@ chelp-
 
 
       !=======================================================
+        call timer_start(t_stage)
       group = 1
       firstpix = 1
       nullval = -999.0
@@ -1197,6 +1244,9 @@ chelp-
                       out_snr_open = .true.
               endif
       endif
+
+      call timer_stop(STAGE_IO_INIT,t_stage)
+      call timer_start(t_stage)
 
 
       !=======================================================
@@ -2442,6 +2492,7 @@ chelp-
      -            'SNR map at RM peak',status)
       endif
       status = 0
+      call timer_stop(STAGE_HEADER,t_stage)
 
       write(*,*)" "
 
@@ -2509,6 +2560,7 @@ chelp-
             iy_tile_end = min(ypix_end,
      -                        iy_tile_beg + (tile_dec-1)*incs(2))
             ny_tile = int((iy_tile_end - iy_tile_beg)/incs(2)) + 1
+            call timer_start(t_tile_start)
 
             write(*,*)"Doing tile x:[",ix_tile_beg,",",ix_tile_end,
      -                "] y:[",iy_tile_beg,",",iy_tile_end,"]"
@@ -2520,6 +2572,7 @@ chelp-
             fpixels(freq_axis) = zpix_beg
             lpixels(freq_axis) = zpix_end
 
+            call timer_start(t_stage)
             call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
      -                   nullval,specQ,anyflg,status)
             call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,
@@ -2583,7 +2636,9 @@ chelp-
 #if HOST_OMP == 1
 !$omp end parallel do
 #endif
+            call timer_stop(STAGE_TILE_MASK,t_stage)
 
+            call timer_start(t_stage)
             if(.not.use_staging)then
               ! Single-level path: GPU vs CPU optimization strategies
               if(use_gpu_actual)then
@@ -2664,6 +2719,7 @@ chelp-
                 if (allocated(mean_Q)) deallocate(mean_Q)
                 if (allocated(mean_U)) deallocate(mean_U)
               endif
+            call timer_stop(STAGE_TILE_COMPUTE,t_stage)
             else
               ! Two-level path: subdivide the RAM block into Dec-strip
               ! VRAM sub-blocks. Each sub-block is gathered into compact
@@ -2802,6 +2858,7 @@ chelp-
             iy_out_beg = int((iy_tile_beg - ypix_beg)/incs(2)) + 1
             iy_out_end = iy_out_beg + ny_tile - 1
 
+            call timer_start(t_stage)
             if(cubestat)then
                     call cubestat_tail_quantile_maps(
      -                  p_tile_arr,phi_tile_arr,RM,
@@ -2809,7 +2866,9 @@ chelp-
      -                  peak_tile_arr,rm_peak_tile_arr,
      -                  ang_peak_tile_arr,snr_tile_arr)
             endif
+            call timer_stop(STAGE_TILE_CUBESTAT,t_stage)
 
+            call timer_start(t_stage)
             fpixels_out(1) = ix_out_beg
             lpixels_out(1) = ix_out_end
             fpixels_out(2) = iy_out_beg
@@ -2902,6 +2961,9 @@ chelp-
                             call printerror(status)
                     endif
             endif
+            call timer_stop(STAGE_TILE_WRITE,t_stage)
+            call timer_add(STAGE_TILE_TOTAL,
+     -           wall_time_seconds()-t_tile_start)
         enddo
       enddo
       ! CLOSE THE FITS FILES:
@@ -2983,6 +3045,42 @@ chelp-
         if(allocated(snr_tile_arr)) deallocate(snr_tile_arr)
       if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)
       if(allocated(nvalid_tile_arr)) deallocate(nvalid_tile_arr)
+      call timer_stop(STAGE_FINALIZE,t_stage)
+      call timer_stop(STAGE_TOTAL,t_total_start)
+      ! Sample /proc/self/io at run end for I/O accounting
+      io_rb1 = 0_int64; io_wb1 = 0_int64
+      if(io_avail)then
+              open(io_unit,file='/proc/self/io',status='old',
+     -             iostat=ios_io)
+              if(ios_io.eq.0)then
+                      do
+                              read(io_unit,'(A)',iostat=ios_io)
+     -                             io_line
+                              if(ios_io.ne.0)exit
+                              if(io_line(1:10).eq.'read_bytes')
+     -                          read(io_line(12:),*,iostat=ios_io)
+     -                               io_rb1
+                              if(io_line(1:11).eq.'write_bytes')
+     -                          read(io_line(13:),*,iostat=ios_io)
+     -                               io_wb1
+                      enddo
+                      close(io_unit)
+              endif
+      endif
+      write(*,'(A)') ' '
+      write(*,'(A)') 'Disk I/O summary:'
+      if(io_avail)then
+              write(*,'(A,F12.3,A)')'  read  (GiB): ',
+     -          real(io_rb1-io_rb0,dp)/(1024.0_dp**3),
+     -          ' (/proc/self/io)'
+              write(*,'(A,F12.3,A)')'  write (GiB): ',
+     -          real(io_wb1-io_wb0,dp)/(1024.0_dp**3),
+     -          ' (/proc/self/io)'
+      else
+              write(*,'(A)')
+     -          '  /proc/self/io not available on this system'
+      endif
+      call timer_report_summary()
 
 9999  continue
 
