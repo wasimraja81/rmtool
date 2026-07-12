@@ -79,25 +79,25 @@ Acceptance criteria:
 
 ## Phase 4: GPU offload transfer timing
 
-- [ ] Add timing around host-side prep and offload compute calls in tile loop.
-- [ ] Split GPU-path timings into:
+- [x] Add timing around host-side prep and offload compute calls in tile loop.
+- [x] Split GPU-path timings into:
   - H2D/data prep bucket (prepare_gpu_data + mapping overhead)
   - device compute bucket (tile_extract_gpu_rm_blocked loop)
   - D2H/scatter bucket (scatter back to p_tile_arr/phi_tile_arr and nvalid)
-- [ ] Add counters for number of RM blocks and sub-blocks processed.
+- [x] Add counters for number of RM blocks and sub-blocks processed.
 
 Notes on current code hotspots:
 - Single-level path: around lines 2588-2675
 - Two-level staged path: around lines 2676-2798
 
 Acceptance criteria:
-- [ ] Summary clearly shows whether GPU path is transfer-bound or compute-bound.
+- [x] Summary clearly shows whether GPU path is transfer-bound or compute-bound.
 
 ## Phase 5: Compute-time accounting (DFT + stats)
 
-- [ ] Report aggregate compute time for RM extraction kernels.
-- [ ] Report cubestat compute time separately.
-- [ ] Report percentage split:
+- [x] Report aggregate compute time for RM extraction kernels.
+- [x] Report cubestat compute time separately.
+- [x] Report percentage split:
   - read I/O
   - compute RM
   - compute cubestat
@@ -105,14 +105,14 @@ Acceptance criteria:
   - other overhead
 
 Acceptance criteria:
-- [ ] Percentages sum to ~100% (small residual allowed for instrumentation overhead).
+- [x] Percentages sum to ~100% (small residual allowed for instrumentation overhead).
 
 ## Phase 6: Output format and usability
 
-- [ ] Emit a concise summary block for humans.
-- [ ] Emit an optional CSV line/file for benchmarking automation.
+- [x] Emit a concise summary block for humans.
+- [x] Emit an optional CSV line/file for benchmarking automation.
   - Columns: run_id, mode, cube dims, tile dims, stage times, io counters
-- [ ] Add one line identifying binary flavor (cpu_serial, cpu_omp, gpu_offload, gpu_offload_hostomp).
+- [x] Add one line identifying binary flavor (cpu_serial, cpu_omp, gpu_offload, gpu_offload_hostomp).
 
 ## Phase 7: Tests and validation
 

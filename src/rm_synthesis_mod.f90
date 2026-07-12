@@ -19,7 +19,9 @@ module rm_synthesis_mod
   public :: write_runtime_estimate
   public :: init_logging, log_message
   public :: timer_reset, timer_start, timer_stop, timer_add
-  public :: timer_report_summary, wall_time_seconds
+  public :: timer_report_summary, timer_get_stage_seconds
+  public :: write_timing_csv_line
+  public :: wall_time_seconds
   public :: STAGE_TOTAL, STAGE_CFG_PARSE, STAGE_IO_INIT, STAGE_HEADER
   public :: STAGE_TILE_TOTAL, STAGE_TILE_READ, STAGE_TILE_MASK
   public :: STAGE_TILE_PREP, STAGE_TILE_COMPUTE, STAGE_TILE_CUBESTAT
@@ -300,6 +302,76 @@ contains
 
     write(logger_unit, '(A)') ' '
   end subroutine timer_report_summary
+
+  real(dp) function timer_get_stage_seconds(stage_id)
+    implicit none
+    integer(int32), intent(in) :: stage_id
+
+    timer_get_stage_seconds = 0.0_dp
+    if (stage_id >= 1 .and. stage_id <= MAX_STAGES) then
+      timer_get_stage_seconds = stage_totals(stage_id)
+    end if
+  end function timer_get_stage_seconds
+
+  subroutine write_timing_csv_line(csv_file, run_id, mode, cube_nx, cube_ny, &
+                                   cube_nchan, cube_nrm, tile_ra, tile_dec, &
+                                   io_read_bytes, io_write_bytes, &
+                                   io_read_syscalls, io_write_syscalls, status)
+    implicit none
+    character(len=*), intent(in) :: csv_file, run_id, mode
+    integer(int32), intent(in) :: cube_nx, cube_ny, cube_nchan, cube_nrm
+    integer(int32), intent(in) :: tile_ra, tile_dec
+    integer(int64), intent(in) :: io_read_bytes, io_write_bytes
+    integer(int64), intent(in) :: io_read_syscalls, io_write_syscalls
+    integer(int32), intent(out) :: status
+
+    integer(int32) :: csv_unit
+    integer(int64) :: csv_size
+    real(dp) :: total_t
+
+    status = 0
+    if (nchar(csv_file) <= 0) return
+
+    total_t = timer_get_stage_seconds(STAGE_TOTAL)
+    if (total_t <= 0.0_dp) then
+      total_t = timer_get_stage_seconds(STAGE_CFG_PARSE) + &
+                timer_get_stage_seconds(STAGE_IO_INIT) + &
+                timer_get_stage_seconds(STAGE_HEADER) + &
+                timer_get_stage_seconds(STAGE_TILE_TOTAL) + &
+                timer_get_stage_seconds(STAGE_FINALIZE)
+    end if
+
+    csv_unit = 97
+    open(csv_unit, file=trim(csv_file), status='unknown', position='append', &
+         action='write', iostat=status)
+    if (status /= 0) return
+
+    csv_size = 0_int64
+    inquire(unit=csv_unit, size=csv_size)
+    if (csv_size == 0_int64) then
+      write(csv_unit, '(A)') &
+        'run_id,mode,cube_nx,cube_ny,cube_nchan,cube_nrm,tile_ra,tile_dec,' // &
+        'stage_total_sec,cfg_parse_sec,io_init_sec,header_sec,tile_total_sec,' // &
+        'tile_read_sec,tile_mask_sec,tile_prep_sec,tile_compute_sec,' // &
+        'tile_scatter_sec,tile_cubestat_sec,tile_write_sec,finalize_sec,' // &
+        'io_read_bytes,io_write_bytes,io_read_syscalls,io_write_syscalls'
+    end if
+
+    write(csv_unit, '(A,",",A,",",I0,",",I0,",",I0,",",I0,",",I0,",",I0,",",' // &
+                    'F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",' // &
+                    'F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",' // &
+                    'F0.6,",",I0,",",I0,",",I0,",",I0)') &
+      trim(run_id), trim(mode), cube_nx, cube_ny, cube_nchan, cube_nrm, tile_ra, tile_dec, &
+      total_t, timer_get_stage_seconds(STAGE_CFG_PARSE), timer_get_stage_seconds(STAGE_IO_INIT), &
+      timer_get_stage_seconds(STAGE_HEADER), timer_get_stage_seconds(STAGE_TILE_TOTAL), &
+      timer_get_stage_seconds(STAGE_TILE_READ), timer_get_stage_seconds(STAGE_TILE_MASK), &
+      timer_get_stage_seconds(STAGE_TILE_PREP), timer_get_stage_seconds(STAGE_TILE_COMPUTE), &
+      timer_get_stage_seconds(STAGE_TILE_SCATTER), timer_get_stage_seconds(STAGE_TILE_CUBESTAT), &
+      timer_get_stage_seconds(STAGE_TILE_WRITE), timer_get_stage_seconds(STAGE_FINALIZE), &
+      io_read_bytes, io_write_bytes, io_read_syscalls, io_write_syscalls
+
+    close(csv_unit)
+  end subroutine write_timing_csv_line
 
   subroutine extract_general_setup(t, npts, fac, beg_rm, end_rm, nout, nu, cos_arr, sin_arr, maxout, maxpts, use_auto_rm_range, ofac)
     !! Pre-compute sine and cosine templates for RM-extraction
@@ -1251,7 +1323,8 @@ contains
                              mask_trust_mode, write_mask_output, &
                              write_nvalid_output, cubestat, use_gpu, io_overlap, &
                              log_level, timing_enabled, timing_tile_enabled, &
-                             timing_io_enabled, timing_output_file, status)
+                             timing_io_enabled, timing_output_file, &
+                             timing_csv_file, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
     implicit none
     character(len=*), intent(in) :: cfgfile
@@ -1270,6 +1343,7 @@ contains
     logical, intent(inout) :: timing_tile_enabled
     logical, intent(inout) :: timing_io_enabled
     character(len=*), intent(inout) :: timing_output_file
+    character(len=*), intent(inout) :: timing_csv_file
     logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
     integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
     integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
@@ -1314,6 +1388,7 @@ contains
     logical :: seen_timing_tile_enabled
     logical :: seen_timing_io_enabled
     logical :: seen_timing_output_file
+    logical :: seen_timing_csv_file
 
     status = 0
     line_no = 0
@@ -1371,6 +1446,7 @@ contains
     seen_timing_tile_enabled = .false.
     seen_timing_io_enabled = .false.
     seen_timing_output_file = .false.
+    seen_timing_csv_file = .false.
 
     ! Defaults can be overridden by the config.
     path = '../DATA/'
@@ -1426,6 +1502,7 @@ contains
     timing_tile_enabled = .false.
     timing_io_enabled = .false.
     timing_output_file = ''
+    timing_csv_file = ''
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -2159,6 +2236,15 @@ contains
         end if
         seen_timing_output_file = .true.
         timing_output_file = trim(val)
+      case ('timing_csv_file')
+        if (seen_timing_csv_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_csv_file'
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_csv_file = .true.
+        timing_csv_file = trim(val)
       case default
         write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
         status = -131
