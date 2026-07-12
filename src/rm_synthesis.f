@@ -184,10 +184,28 @@ chelp-
                         logical   write_mask_output, write_nvalid_output
                         logical   cubestat
       logical   use_gpu
+        logical   timing_enabled, timing_tile_enabled
+        logical   timing_io_enabled
       real(sp) conv_fac ! freq-to-lambda conversion factor
       real(sp) mem_frac_ram, mem_frac_vram
       integer   gpu_vram_mib
       logical   io_overlap
+        character(len=16) :: log_level
+                                character(len=272) :: log_output_file
+                                character(len=272) :: timing_csv_file
+        integer   log_init_status
+        real(dp)  t_cfg_start, t_cfg_end
+        real(dp)  t_total_start, t_stage, t_tile_start
+                                integer   csv_status
+                                integer   run_vals(8)
+                                character(len=32) :: run_id
+        ! /proc/self/io counters sampled at run start and end
+        integer(kind=int64) :: io_rb0, io_wb0, io_rb1, io_wb1
+        integer(kind=int64) :: io_rsys0, io_wsys0, io_rsys1, io_wsys1
+        integer(kind=int64) :: n_rm_blocks_total, n_subblocks_total
+        integer   io_unit, ios_io
+        character(len=256) :: io_line
+        logical   io_avail
       logical   MHz
       ! various counters and indices:
       integer   i, kk, ix, iy, ixpix_now, iypix_now, irm 
@@ -195,6 +213,7 @@ chelp-
       integer   progress_total, progress_step
       integer   progress_next_pct, progress_next_count
       integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
+      integer   n_subblocks_tile, i_subblock
       integer   ix_loc, iy_loc, iz
       integer   nx_tile, ny_tile
       integer   ipix_tile, pix_base
@@ -205,6 +224,7 @@ chelp-
       logical   nan_check_on, chan_valid
       logical   use_input_mask, in_mask_open
       logical   use_gpu_actual
+        character(len=32) :: binary_flavor
       real(sp)  mask_val
       integer   in_fields
       integer   mem_unit, ios_mem
@@ -336,7 +356,8 @@ chelp-
               stop
       endif
 
-        call read_cfg_keyval(cfgfile,
+                        t_cfg_start = wall_time_seconds()
+                                call read_cfg_keyval(cfgfile,
      -          path,infileQ,infileU,outfile,
      -          remove_badchan,global_badchan_file,
      -          subim,subim_parfile,
@@ -356,7 +377,12 @@ chelp-
      -          mask_trust_mode,
      -          write_mask_output,
      -          write_nvalid_output,cubestat,use_gpu,
-     -          io_overlap,status)
+     -          io_overlap,log_level,
+     -          timing_enabled,timing_tile_enabled,
+     -          timing_io_enabled,log_output_file,
+     -          timing_csv_file,
+     -          status)
+      t_cfg_end = wall_time_seconds()
       if(status.ne.0)then
               write(*,*)"Error opening/parsing config file: "
               write(*,*)cfgfile(1:nchar(cfgfile))
@@ -364,15 +390,72 @@ chelp-
               stop
       endif
 
+      call init_logging(log_level,timing_enabled,
+     -     timing_tile_enabled,timing_io_enabled,
+     -     log_output_file,log_init_status)
+      if(log_init_status.ne.0)then
+              write(*,*)"Error initializing logger/timing output"
+              write(*,*)"log_output_file: ",
+     -         log_output_file(1:nchar(log_output_file))
+              stop
+      endif
+      if(nchar(log_output_file).gt.0)then
+              write(*,'(A,A)')'Logging/timing output file: ',
+     -         log_output_file(1:nchar(log_output_file))
+      endif
+      call timer_reset()
+      call timer_add(STAGE_CFG_PARSE,t_cfg_end - t_cfg_start)
+      call timer_start(t_total_start)
+        call log_message('info','startup',
+     -     'rm_synthesis run started')
+      ! Sample /proc/self/io at run start for disk I/O accounting
+        io_rb0 = 0_int64; io_wb0 = 0_int64; io_avail = .false.
+        io_rsys0 = 0_int64; io_wsys0 = 0_int64
+      io_unit = 92
+      open(io_unit,file='/proc/self/io',status='old',iostat=ios_io)
+      if(ios_io.eq.0)then
+              io_avail = .true.
+              do
+                      read(io_unit,'(A)',iostat=ios_io) io_line
+                      if(ios_io.ne.0)exit
+                      if(io_line(1:10).eq.'read_bytes')
+     -                      read(io_line(12:),*,iostat=ios_io) io_rb0
+                      if(io_line(1:11).eq.'write_bytes')
+     -                      read(io_line(13:),*,iostat=ios_io) io_wb0
+                      if(io_line(1:5).eq.'syscr')
+     -                      read(io_line(7:),*,iostat=ios_io) io_rsys0
+                      if(io_line(1:5).eq.'syscw')
+     -                      read(io_line(7:),*,iostat=ios_io) io_wsys0
+              enddo
+              close(io_unit)
+      endif
+
       use_gpu_actual = .false.
+#if defined(USE_GPU) && (HOST_OMP == 1)
+        binary_flavor = 'gpu_offload_hostomp'
+#elif defined(USE_GPU)
+        binary_flavor = 'gpu_offload'
+#elif HOST_OMP == 1
+        binary_flavor = 'cpu_omp'
+#else
+        binary_flavor = 'cpu_serial'
+#endif
+        write(message,'(A,A)')'binary_flavor=',
+     -     binary_flavor(1:nchar(binary_flavor))
+        call log_message('info','startup',
+     -     message(1:nchar(message)))
       if(use_gpu)then
 #ifdef USE_GPU
               use_gpu_actual = .true.
               write(*,*)"GPU requested: attempting OpenMP offload."
+                  call log_message('info','startup',
+     -             'GPU requested and enabled')
 #else
               write(*,*)"WARNING: use_gpu requested but this binary "
               write(*,*)"was built without USE_GPU; "
               write(*,*)"falling back to CPU."
+                  call log_message('warn','startup',
+     -             'use_gpu requested but binary has no USE_GPU')
 #endif
       endif
 
@@ -928,6 +1011,7 @@ chelp-
 
 
       !=======================================================
+        call timer_start(t_stage)
       group = 1
       firstpix = 1
       nullval = -999.0
@@ -1197,6 +1281,9 @@ chelp-
                       out_snr_open = .true.
               endif
       endif
+
+      call timer_stop(STAGE_IO_INIT,t_stage)
+      call timer_start(t_stage)
 
 
       !=======================================================
@@ -2442,6 +2529,7 @@ chelp-
      -            'SNR map at RM peak',status)
       endif
       status = 0
+      call timer_stop(STAGE_HEADER,t_stage)
 
       write(*,*)" "
 
@@ -2496,10 +2584,14 @@ chelp-
 
 
       cnt1 = 0
+        n_rm_blocks_total = 0_int64
+        n_subblocks_total = 0_int64
       progress_total = nx_out*ny_out
       progress_step = max(1, progress_total/10)
       progress_next_pct = 10
       progress_next_count = progress_step
+        call log_message('info','tile_read',
+     -     'starting tiled FITS reads')
       do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
         ix_tile_end = min(xpix_end,
      -                     ix_tile_beg + (tile_ra-1)*incs(1))
@@ -2509,6 +2601,7 @@ chelp-
             iy_tile_end = min(ypix_end,
      -                        iy_tile_beg + (tile_dec-1)*incs(2))
             ny_tile = int((iy_tile_end - iy_tile_beg)/incs(2)) + 1
+            call timer_start(t_tile_start)
 
             write(*,*)"Doing tile x:[",ix_tile_beg,",",ix_tile_end,
      -                "] y:[",iy_tile_beg,",",iy_tile_end,"]"
@@ -2520,6 +2613,10 @@ chelp-
             fpixels(freq_axis) = zpix_beg
             lpixels(freq_axis) = zpix_end
 
+             call log_tile_bounds('tile_read','start',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+
+            call timer_start(t_stage)
             call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,
      -                   nullval,specQ,anyflg,status)
             call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,
@@ -2532,6 +2629,14 @@ chelp-
                     call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,
      -                   incs,nullval,specI,anyflg,status)
             endif
+
+             call log_tile_bounds('tile_read','done',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+             call timer_stop(STAGE_TILE_READ,t_stage)
+
+             call log_tile_bounds('tile_mask','start',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+             call timer_start(t_stage)
 
             ! ========================================================
             ! Build unified mask from all sources: global bad channels,
@@ -2583,8 +2688,14 @@ chelp-
 #if HOST_OMP == 1
 !$omp end parallel do
 #endif
+            call timer_stop(STAGE_TILE_MASK,t_stage)
+             call log_tile_bounds('tile_mask','done',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
             if(.not.use_staging)then
+              call log_tile_bounds('tile_prep','start',
+     -           ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+              call timer_start(t_stage)
               ! Single-level path: GPU vs CPU optimization strategies
               if(use_gpu_actual)then
                 ! ====================================================================
@@ -2604,13 +2715,21 @@ chelp-
                   nvalid_tile_arr(ipix_tile) =
      -               int(wsum_gpu(ipix_tile), kind=2)
                 enddo
-                
+                call timer_stop(STAGE_TILE_PREP,t_stage)
+                call log_tile_bounds('tile_prep','done',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call log_tile_bounds('tile_compute','start',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call timer_start(t_stage)
+                call log_tile_note('tile_compute', 'gpu send')
+
                 ! Templates are already full-size (nz_out, nrm_out)
                 ! No transposition needed - pass directly to GPU kernel
                 ! RM-block loop: GPU processes blocks of RM bins
                 do i_rm_block = 1, nrm_out, nrm_block_size
                   nrm_block_now = min(nrm_block_size,
      -                                nrm_out - i_rm_block + 1)
+                  n_rm_blocks_total = n_rm_blocks_total + 1_int64
                   
                   ! GPU kernel: optimized collapse(2) parallelism
                   call tile_extract_gpu_rm_blocked(
@@ -2621,6 +2740,8 @@ chelp-
      -               use_gpu_actual, rem_mean, output_mode,
      -               ap_angle_mode, p_tile_arr, phi_tile_arr)
                 end do
+                call log_tile_note('tile_compute', 'gpu recv')
+                call timer_stop(STAGE_TILE_COMPUTE,t_stage)
                 
                 ! Deallocate temporary GPU arrays
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
@@ -2648,9 +2769,17 @@ chelp-
                   nvalid_tile_arr(ipix_tile) =
      -               int(wsum_gpu(ipix_tile), kind=2)
                 enddo
+                call timer_stop(STAGE_TILE_PREP,t_stage)
+                call log_tile_bounds('tile_prep','done',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call log_tile_bounds('tile_compute','start',
+     -             ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+                call timer_start(t_stage)
+                call log_tile_note('tile_compute', 'cpu compute')
                 do i_rm_block = 1, nrm_out, nrm_block_size
                   nrm_block_now = min(nrm_block_size,
      -                                nrm_out - i_rm_block + 1)
+                  n_rm_blocks_total = n_rm_blocks_total + 1_int64
                   call tile_extract_gpu_rm_blocked(
      -               specQ_gpu, specU_gpu, wts_gpu,
      -               mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,
@@ -2659,6 +2788,7 @@ chelp-
      -               use_gpu_actual, rem_mean, output_mode,
      -               ap_angle_mode, p_tile_arr, phi_tile_arr)
                 end do
+                call timer_stop(STAGE_TILE_COMPUTE,t_stage)
                 deallocate(specQ_gpu, specU_gpu, wts_gpu)
                 deallocate(wsum_gpu)
                 if (allocated(mean_Q)) deallocate(mean_Q)
@@ -2672,9 +2802,20 @@ chelp-
               ! TODO(device-async): overlap H2D/compute/D2H across
               ! sub-blocks with !$omp target nowait/depend (needs GPU
               ! box to validate). Currently synchronous per sub-block.
+              call log_tile_bounds('tile_compute','start',
+     -           ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+              n_subblocks_tile = (ny_tile + ny_sub - 1) / ny_sub
+              i_subblock = 0
               do iy_sub_beg = 1,ny_tile,ny_sub
                 iy_sub_end = min(ny_tile,iy_sub_beg + ny_sub - 1)
                 ny_sub_now = iy_sub_end - iy_sub_beg + 1
+                n_subblocks_total = n_subblocks_total + 1_int64
+                i_subblock = i_subblock + 1
+                call log_subblock_progress('tile_prep', 'prep',
+     -               i_subblock, n_subblocks_tile,
+     -               iy_tile_beg + iy_sub_beg - 1,
+     -               iy_tile_beg + iy_sub_end - 1)
+                call timer_start(t_stage)
 
                 ! --- gather inputs (full tile -> compact sub-block) ---
                 do iyl = 1,ny_sub_now
@@ -2718,6 +2859,16 @@ chelp-
                     stNvalid(ipix_sub) =
      -               int(st_wsum_gpu(ipix_sub), kind=2)
                   enddo
+                  call timer_stop(STAGE_TILE_PREP,t_stage)
+                  call log_subblock_progress('tile_prep', 'prep',
+     -                 i_subblock, n_subblocks_tile,
+     -                 iy_tile_beg + iy_sub_beg - 1,
+     -                 iy_tile_beg + iy_sub_end - 1)
+                  call log_subblock_progress('tile_compute', 'send',
+     -                 i_subblock, n_subblocks_tile,
+     -                 iy_tile_beg + iy_sub_beg - 1,
+     -                 iy_tile_beg + iy_sub_end - 1)
+                  call timer_start(t_stage)
                   
                   ! Templates are already full-size (nz_out, nrm_out)
                   ! No transposition needed
@@ -2725,6 +2876,7 @@ chelp-
                   do st_i_rm_block = 1, nrm_out, nrm_block_size
                     st_nrm_block_now = min(nrm_block_size,
      -                                      nrm_out - st_i_rm_block + 1)
+                  n_rm_blocks_total = n_rm_blocks_total + 1_int64
                     
                     ! GPU kernel: optimized collapse(2) parallelism
                     call tile_extract_gpu_rm_blocked(
@@ -2736,12 +2888,17 @@ chelp-
      -                 nrm_out, use_gpu_actual, rem_mean, output_mode,
      -                 ap_angle_mode, stP, stPhi)
                   end do
-                  
+                  call timer_stop(STAGE_TILE_COMPUTE,t_stage)
+
                   ! Deallocate GPU temporary arrays
                   deallocate(st_Q_gpu, st_U_gpu, st_wts_gpu)
                   deallocate(st_wsum_gpu)
                   if (allocated(st_mean_Q)) deallocate(st_mean_Q)
                   if (allocated(st_mean_U)) deallocate(st_mean_U)
+                  call log_subblock_progress('tile_compute', 'done',
+     -                 i_subblock, n_subblocks_tile,
+     -                 iy_tile_beg + iy_sub_beg - 1,
+     -                 iy_tile_beg + iy_sub_end - 1)
                 else
                   ! CPU staging path unreachable: use_staging=true only
                   ! when use_gpu_actual=true (ny_sub driven by VRAM budget)
@@ -2749,6 +2906,11 @@ chelp-
                 endif
 
                 ! --- scatter outputs (compact sub-block -> full tile) ---
+                call log_subblock_progress('tile_scatter', 'start',
+     -               i_subblock, n_subblocks_tile,
+     -               iy_tile_beg + iy_sub_beg - 1,
+     -               iy_tile_beg + iy_sub_end - 1)
+                call timer_start(t_stage)
                 do iyl = 1,ny_sub_now
                    iy_loc = iy_sub_beg + iyl - 1
                    do ix_loc = 1,nx_tile
@@ -2773,8 +2935,15 @@ chelp-
                       enddo
                    enddo
                 enddo
+                call timer_stop(STAGE_TILE_SCATTER,t_stage)
+                call log_subblock_progress('tile_scatter', 'done',
+     -               i_subblock, n_subblocks_tile,
+     -               iy_tile_beg + iy_sub_beg - 1,
+     -               iy_tile_beg + iy_sub_end - 1)
               enddo
             endif
+             call log_tile_bounds('tile_compute','done',
+     -         ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
             do iy_loc = 1,ny_tile
                iy = iy_tile_beg + (iy_loc-1)*incs(2)
@@ -2802,6 +2971,12 @@ chelp-
             iy_out_beg = int((iy_tile_beg - ypix_beg)/incs(2)) + 1
             iy_out_end = iy_out_beg + ny_tile - 1
 
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile cubestat start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_cubestat',
+     -         message(1:nchar(message)))
+            call timer_start(t_stage)
             if(cubestat)then
                     call cubestat_tail_quantile_maps(
      -                  p_tile_arr,phi_tile_arr,RM,
@@ -2809,7 +2984,19 @@ chelp-
      -                  peak_tile_arr,rm_peak_tile_arr,
      -                  ang_peak_tile_arr,snr_tile_arr)
             endif
+            call timer_stop(STAGE_TILE_CUBESTAT,t_stage)
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile cubestat done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_cubestat',
+     -         message(1:nchar(message)))
 
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile write start x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_write',
+     -         message(1:nchar(message)))
+            call timer_start(t_stage)
             fpixels_out(1) = ix_out_beg
             lpixels_out(1) = ix_out_end
             fpixels_out(2) = iy_out_beg
@@ -2902,6 +3089,14 @@ chelp-
                             call printerror(status)
                     endif
             endif
+            call timer_stop(STAGE_TILE_WRITE,t_stage)
+             write(message,'(A,I0,A,I0,A,I0,A,I0,A)')
+     -       'tile write done x:[',ix_tile_beg,',',ix_tile_end,
+     -       '] y:[',iy_tile_beg,',',iy_tile_end,']'
+             call log_message('debug','tile_write',
+     -         message(1:nchar(message)))
+            call timer_add(STAGE_TILE_TOTAL,
+     -           wall_time_seconds()-t_tile_start)
         enddo
       enddo
       ! CLOSE THE FITS FILES:
@@ -2983,6 +3178,88 @@ chelp-
         if(allocated(snr_tile_arr)) deallocate(snr_tile_arr)
       if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)
       if(allocated(nvalid_tile_arr)) deallocate(nvalid_tile_arr)
+      call timer_stop(STAGE_FINALIZE,t_stage)
+      call timer_stop(STAGE_TOTAL,t_total_start)
+      ! Sample /proc/self/io at run end for I/O accounting
+        io_rb1 = 0_int64; io_wb1 = 0_int64
+        io_rsys1 = 0_int64; io_wsys1 = 0_int64
+      if(io_avail)then
+              open(io_unit,file='/proc/self/io',status='old',
+     -             iostat=ios_io)
+              if(ios_io.eq.0)then
+                      do
+                              read(io_unit,'(A)',iostat=ios_io)
+     -                             io_line
+                              if(ios_io.ne.0)exit
+                              if(io_line(1:10).eq.'read_bytes')
+     -                          read(io_line(12:),*,iostat=ios_io)
+     -                               io_rb1
+                              if(io_line(1:11).eq.'write_bytes')
+     -                          read(io_line(13:),*,iostat=ios_io)
+     -                               io_wb1
+                              if(io_line(1:5).eq.'syscr')
+     -                          read(io_line(7:),*,iostat=ios_io)
+     -                               io_rsys1
+                              if(io_line(1:5).eq.'syscw')
+     -                          read(io_line(7:),*,iostat=ios_io)
+     -                               io_wsys1
+                      enddo
+                      close(io_unit)
+              endif
+      endif
+      write(*,'(A)') ' '
+        write(*,'(A)') 'Run summary:'
+        write(*,'(A,A)') '  binary flavor : ',
+     -        binary_flavor(1:nchar(binary_flavor))
+        write(*,'(A,L1)') '  gpu requested : ',use_gpu
+        write(*,'(A,L1)') '  gpu active    : ',use_gpu_actual
+        write(*,'(A)') ' '
+      write(*,'(A)') 'Disk I/O summary:'
+      if(io_avail)then
+              write(*,'(A,F12.3,A)')'  read  (GiB): ',
+     -          real(max(0_int64,io_rb1-io_rb0),dp)/(1024.0_dp**3),
+     -          ' (/proc/self/io)'
+              write(*,'(A,F12.3,A)')'  write (GiB): ',
+     -          real(max(0_int64,io_wb1-io_wb0),dp)/(1024.0_dp**3),
+     -          ' (/proc/self/io)'
+              write(*,'(A,I0)')'  read syscalls : ',
+     -          max(0_int64,io_rsys1-io_rsys0)
+              write(*,'(A,I0)')'  write syscalls: ',
+     -          max(0_int64,io_wsys1-io_wsys0)
+      else
+              write(*,'(A)')
+     -          '  /proc/self/io not available on this system'
+      endif
+      write(*,'(A)') 'GPU offload counters:'
+      write(*,'(A,I0)')'  RM blocks processed: ',n_rm_blocks_total
+      write(*,'(A,I0)')'  VRAM sub-blocks   : ',n_subblocks_total
+      call timer_report_summary()
+
+      if(nchar(timing_csv_file).gt.0)then
+              call date_and_time(values=run_vals)
+              write(run_id,'(I4.4,I2.2,I2.2,"T",I2.2,I2.2,I2.2)')
+     -             run_vals(1),run_vals(2),run_vals(3),
+     -             run_vals(5),run_vals(6),run_vals(7)
+
+              call write_timing_csv_line(
+     -             timing_csv_file(1:nchar(timing_csv_file)),
+     -             run_id(1:nchar(run_id)),
+     -             binary_flavor(1:nchar(binary_flavor)),
+     -             nx_out,ny_out,nz_out,nrm_out,tile_ra,tile_dec,
+     -             max(0_int64,io_rb1-io_rb0),
+     -             max(0_int64,io_wb1-io_wb0),
+     -             max(0_int64,io_rsys1-io_rsys0),
+     -             max(0_int64,io_wsys1-io_wsys0),
+     -             csv_status)
+              if(csv_status.ne.0)then
+                      write(*,'(A)')
+     -                 'WARNING: unable to append timing_csv_file:'
+                      write(*,'(A)')
+     -                 timing_csv_file(1:nchar(timing_csv_file))
+              endif
+      endif
+        call log_message('info','finalize',
+     -     'rm_synthesis run completed')
 
 9999  continue
 

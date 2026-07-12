@@ -1,6 +1,7 @@
 # rmtool
 
-RM (Rotation Measure) synthesis tools for analyzing polarized radio observations. This package implements Rotation Measure synthesis algorithms to decompose linear polarization into RM spectra for radio spectro-polarimetry data.
+
+An HPC package for conducting Faraday Tomography (RM-Synthesis) on radio spectro-polarimetric data. The package is built for all machines - scaling from Low-RAM Desktop PCs to HPC Clusters, with GPU acceleration integration underway.
 
 ## Features
 
@@ -103,6 +104,68 @@ infileI = I_cube.fits
 
 For complete documentation, see [cfg/CONFIG_README.md](cfg/CONFIG_README.md).
 
+## Timing And Benchmark CSV Output
+
+The runtime logger can emit a human-readable timing summary and an optional CSV
+row for automation/benchmark tracking.
+
+Add these keys to your config:
+
+```cfg
+# Optional timing controls
+log_level = info                  # error|warn|info|debug
+timing_enabled = y                # master timing switch
+timing_tile_enabled = y           # include tile-level stage timers
+timing_io_enabled = y             # include I/O stage timers
+log_output_file =                 # empty => stdout, else append to file
+timing_csv_file = ./timing.csv    # optional: append one CSV row per run
+```
+
+Logging behavior:
+- `log_level` controls structured log lines emitted via `log_message`.
+	- `error`: errors only
+	- `warn`: warnings + errors
+	- `info`: run lifecycle messages (recommended default)
+	- `debug`: reserved for future verbose diagnostics
+- `log_output_file` controls destination for both structured log lines and
+	timing summary blocks.
+	- empty: output goes to stdout
+	- non-empty: output is appended to one consolidated run log file
+	- every emitted line in this consolidated log is ISO-8601 timestamped
+
+The consolidated log file includes ISO-8601 local timestamps on structured log
+entries, for example:
+
+```text
+2026-07-12T14:03:09+10:00 [info] [startup] rm_synthesis run started
+2026-07-12T14:03:09+10:00 [info] [startup] binary_flavor=gpu_offload
+...
+2026-07-12T14:03:11+10:00 [info] [finalize] rm_synthesis run completed
+```
+
+When enabled, the run prints:
+- `Run summary:` (binary flavor and GPU requested/active state)
+- `Timing summary (seconds):` (stage totals and percentages)
+- `Macro timing breakdown:` (read I/O, compute RM, compute cubestat, write I/O, overhead)
+
+The optional CSV output writes a header (once) and one row per run with:
+- run id and mode
+- cube and tile dimensions
+- stage timings
+- process-level I/O counters
+
+Example run:
+
+```bash
+bin/rm_synthesis_release_cpu_serial cfg/rmsynth-casa.fullim.cfg
+```
+
+Example GPU run:
+
+```bash
+bin/rm_synthesis_release_gpu_offload cfg/rmsynth-casa.fullim.cfg
+```
+
 ## GPU Runtime Behavior
 
 - `use_gpu=n` runs host execution.
@@ -130,6 +193,12 @@ make GPU=1
 - `AP + phase mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.PHA.RMCUBE.FITS`
 - `AP + pol mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.POLA.RMCUBE.FITS`
 - `RI mode`: `OUTBASE.REAL.RMCUBE.FITS` and `OUTBASE.IMAG.RMCUBE.FITS`
+- `Common diagnostics`: `OUTBASE.NVALID.MAP.FITS` (valid-channel count map)
+- `When cubestat=y`:
+	- `OUTBASE.PEAK.MAP.FITS`
+	- `OUTBASE.RM_PEAK.MAP.FITS`
+	- `OUTBASE.ANG_PEAK.MAP.FITS`
+	- `OUTBASE.SNR.MAP.FITS`
 
 ## Project Structure
 
