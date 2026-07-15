@@ -25,6 +25,10 @@ compile_commands.json
 *.swp
 .DS_Store
 
+# Python cache artifacts
+__pycache__/
+*.pyc
+
 # local run artifacts
 /scratch/profiles/
 scratch/
