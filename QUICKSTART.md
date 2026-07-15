@@ -7,6 +7,7 @@
 4. [Running on real data](#4-running-on-real-data)
 5. [Requirements](#5-requirements)
 6. [Swim-lane plots](#6-swim-lane-plots)
+7. [Architecture notes](#7-architecture-notes)
 
 ---
 
@@ -270,6 +271,17 @@ pip install astropy numpy
 ---
 
 ## 6. Swim-lane plots
+
+Design and interpretation notes for memory strategy, RM blocking, and
+CPU/GPU timeline diagnostics are documented in:
+
+- [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
+
+---
+
+## 7. Architecture notes
+
+- [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
 
 Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
 and GPU lanes from the run log.

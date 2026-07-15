@@ -48,6 +48,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[QUICKSTART.md](QUICKSTART.md)** — Quick reference and build overview
 - **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
 - **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference
+- **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM blocking, CPU/GPU parallelization, offload strategy
 
 ## Configuration
 
@@ -211,9 +212,22 @@ Key options:
 The script also prints summary metrics (interval count, window seconds,
 GPU-GPU overlap, CPU-GPU overlap) to stdout.
 
-Example swim-lane plot:
+Design rationale and diagnostic interpretation notes are documented in
+[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md).
 
-![GPU swim-lane timeline](https://raw.githubusercontent.com/wasimraja81/rmtool/main/docs/images/swimlane_gpu_example.png)
+Example swim-lane plots:
+
+Pipeline/stage-overlap view (long-run async example):
+
+![Swim-lane GPU async example](docs/images/swimlane_gpu_example.png)
+
+Pipeline/stage-overlap view (sync-fallback/smaller-run example):
+
+![Swim-lane pipeline example](docs/images/swimlane_pipeline_example.png)
+
+CPU thread-detail view:
+
+![Swim-lane CPU thread example](docs/images/swimlane_cpu_thread_example.png)
 
 ### GPU Validation Scope For Swim-Lane Diagnostics
 
