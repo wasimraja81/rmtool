@@ -106,7 +106,7 @@ LIBS := $(CFITSIO_LIB)
 
 # Source files
 MODSRC := $(SRCDIR)/rm_synthesis_mod.f90
-MAINSRC := $(SRCDIR)/rm_synthesis.f
+MAINSRC := $(SRCDIR)/rm_synthesis.f90
 INCSRC := $(SRCDIR)/myfits_info.f $(SRCDIR)/printerror.f
 
 SOURCES := $(MODSRC) $(MAINSRC) $(INCSRC)
