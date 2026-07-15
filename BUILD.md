@@ -4,6 +4,11 @@ This package supports two modern build approaches for maximum flexibility.
 
 ## Quick Start
 
+### Release Tagging Policy
+
+- Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`).
+- Current formal release: `1.0` (on `main`).
+
 ### Option 1: Simple Makefile (Recommended for Development)
 
 ```bash

@@ -166,6 +166,39 @@ Example GPU run:
 bin/rm_synthesis_release_gpu_offload cfg/rmsynth-casa.fullim.cfg
 ```
 
+## Swim-Lane Plot Generation
+
+Use the swim-lane script to visualize overlap between I/O, CPU staging, and GPU
+compute from a consolidated run log.
+
+Generate a plot from a run log:
+
+```bash
+python scripts/plot_tile_async_swimlane.py \
+	--log scratch/JENNIFER_TOO_FULLIM_TEST.run.log \
+	--out scratch/tile_async_swimlane.png \
+	--run latest \
+	--time-axis absolute
+```
+
+Key options:
+
+- `--run latest|first|N` selects which detected run block from the log to plot.
+- `--time-axis absolute|relative` chooses wall-clock vs seconds-from-run-start.
+- `--out` controls output PNG path.
+
+The script also prints summary metrics (interval count, window seconds,
+GPU-GPU overlap, CPU-GPU overlap) to stdout.
+
+### GPU Validation Scope For Swim-Lane Diagnostics
+
+- Tested on: `NVIDIA GeForce RTX 3050 (6 GiB VRAM)` with GNU OpenMP offload
+	(`nvptx`) in this repository's current workflow.
+- Not yet validated: AMD ROCm offload targets, Intel GPU offload targets, and
+	very old NVIDIA GPUs/toolchains where OpenMP target offload support differs.
+- If your platform is unvalidated, treat swim-lane diagnostics as experimental
+	and confirm with a short controlled run before production execution.
+
 ## GPU Runtime Behavior
 
 - `use_gpu=n` runs host execution.
@@ -222,6 +255,12 @@ rmtool/
 
 - **main** — Stable, production-ready releases
 - **develop** — Active development branch
+
+### Release Tags
+
+- Formal release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`).
+- The first formal release tag is `1.0` on `main`.
+- Milestone-style tags can still exist for internal checkpoints, but official releases use the numeric format above.
 
 ### Building
 

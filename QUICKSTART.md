@@ -6,6 +6,7 @@
 3. [Validation test suite](#3-validation-test-suite)
 4. [Running on real data](#4-running-on-real-data)
 5. [Requirements](#5-requirements)
+6. [Swim-lane plots](#6-swim-lane-plots)
 
 ---
 
@@ -276,3 +277,29 @@ cat scratch/runtime_estimate.txt       # wall-time estimate
 sudo apt-get install gfortran libcfitsio-dev make
 pip install astropy numpy
 ```
+
+---
+
+## 6. Swim-lane plots
+
+Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
+and GPU lanes from the run log.
+
+```bash
+python scripts/plot_tile_async_swimlane.py \
+  --log scratch/JENNIFER_TOO_FULLIM_TEST.run.log \
+  --out scratch/tile_async_swimlane.png \
+  --run latest \
+  --time-axis absolute
+```
+
+Useful flags:
+
+- `--run latest|first|N`: choose which run block from the log.
+- `--time-axis absolute|relative`: absolute clock vs relative seconds.
+
+Validation scope:
+
+- Tested in this repo workflow on `NVIDIA GeForce RTX 3050 (6 GiB)`.
+- Not yet validated on AMD/ROCm, Intel GPU offload paths, or older NVIDIA
+  offload stacks with differing OpenMP target support.
