@@ -165,6 +165,9 @@ fi
 echo "[runFile] Running with OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 if [[ "${USE_GPU_MODE}" == "y" ]]; then
   echo "[runFile] OMP_TARGET_OFFLOAD=${OMP_TARGET_OFFLOAD} OMP_DEFAULT_DEVICE=${OMP_DEFAULT_DEVICE}"
+  if [[ "${OMP_NUM_THREADS}" -lt 2 ]]; then
+    echo "[runFile] WARN: OMP_NUM_THREADS=${OMP_NUM_THREADS} disables host-task overlap; async pipeline may serialize or queue work." >&2
+  fi
 fi
 /usr/bin/time -v "${EXE}" "${CFG_ARG}"
 

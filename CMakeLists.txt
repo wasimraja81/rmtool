@@ -45,7 +45,7 @@ message(STATUS "CFITSIO found: ${CFITSIO_LIBRARIES}")
 # Source files
 set(SOURCES
   src/rm_synthesis_mod.f90
-  src/rm_synthesis.f
+  src/rm_synthesis.f90
   src/myfits_info.f
   src/printerror.f
 )
