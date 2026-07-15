@@ -213,7 +213,7 @@ GPU-GPU overlap, CPU-GPU overlap) to stdout.
 
 Example swim-lane plot:
 
-![GPU swim-lane timeline](docs/images/swimlane_gpu_example.png)
+![GPU swim-lane timeline](https://raw.githubusercontent.com/wasimraja81/rmtool/main/docs/images/swimlane_gpu_example.png)
 
 ### GPU Validation Scope For Swim-Lane Diagnostics
 
