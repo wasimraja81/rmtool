@@ -157,13 +157,34 @@ The optional CSV output writes a header (once) and one row per run with:
 Example run:
 
 ```bash
-bin/rm_synthesis_release_cpu_serial cfg/rmsynth-casa.fullim.cfg
+bin/rm_synthesis_release_cpu_serial cfg/rmsynth.cfg
 ```
 
 Example GPU run:
 
 ```bash
-bin/rm_synthesis_release_gpu_offload cfg/rmsynth-casa.fullim.cfg
+bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
+```
+
+## GPU Acceleration
+
+rmtool supports OpenMP target offload builds for GPU execution.
+
+Build and run:
+
+```bash
+# Build GPU/offload-capable binary
+make GPU=1
+
+# Run with a GPU-enabled config (use_gpu=y in cfg/rmsynth.cfg)
+bin/rm_synthesis_release_gpu_offload_hostomp cfg/rmsynth.cfg
+```
+
+Useful runtime environment variables:
+
+```bash
+OMP_TARGET_OFFLOAD=MANDATORY   # fail if offload cannot run
+OMP_DEFAULT_DEVICE=0           # choose target device index
 ```
 
 ## Swim-Lane Plot Generation
@@ -175,7 +196,7 @@ Generate a plot from a run log:
 
 ```bash
 python scripts/plot_tile_async_swimlane.py \
-	--log scratch/JENNIFER_TOO_FULLIM_TEST.run.log \
+	--log scratch/RMSYNTH_OUTPUT.run.log \
 	--out scratch/tile_async_swimlane.png \
 	--run latest \
 	--time-axis absolute
@@ -189,6 +210,10 @@ Key options:
 
 The script also prints summary metrics (interval count, window seconds,
 GPU-GPU overlap, CPU-GPU overlap) to stdout.
+
+Example swim-lane plot:
+
+![GPU swim-lane timeline](docs/images/swimlane_gpu_example.png)
 
 ### GPU Validation Scope For Swim-Lane Diagnostics
 

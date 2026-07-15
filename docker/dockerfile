@@ -9,12 +9,19 @@ LABEL org.opencontainers.image.title="rmtool" \
     org.opencontainers.image.description="RM synthesis toolchain image built from a tagged source snapshot"
 
 # Install dependencies needed for compiling the Fortran/C code
+# and running Python plotting scripts in-container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gfortran \
     gcc-offload-nvptx \
     nvptx-tools \
     make \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-matplotlib \
+    python3-numpy \
+    python3-astropy \
     libcfitsio-dev \
     libcurl4-openssl-dev \
     libnghttp2-dev \

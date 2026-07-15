@@ -37,6 +37,9 @@ scratch/
 sampled_RM.txt
 sampled_freq.txt
 
+# local machine/user-specific configs (do not track)
+cfg/*jennifer*.cfg
+
 # local package downloads (do not track)
 *.deb
 

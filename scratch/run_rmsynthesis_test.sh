@@ -14,10 +14,10 @@ Positional Arguments:
   [backend]        auto|cpu|gpu (default: auto)
 
 Examples:
-  $(basename "$0") rmsynth-casa.fullim.cfg
-  $(basename "$0") rmsynth-casa.fullim.cfg 8
-  $(basename "$0") cfg/benchmark.cfg 4 auto
-  $(basename "$0") rmsynth-subim.cfg 1 gpu
+  $(basename "$0") rmsynth.cfg
+  $(basename "$0") rmsynth.cfg 8
+  $(basename "$0") cfg/rmsynth.cfg 4 auto
+  $(basename "$0") rmsynth.cfg 1 gpu
 
 Environment:
   CPU mode sets:

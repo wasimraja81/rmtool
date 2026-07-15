@@ -92,8 +92,17 @@ make uninstall
 ## 3. Validation test suite
 
 The test suite lives in `tests/`. It generates synthetic Q/U FITS cubes containing
-two known point sources (RM = −5 and +22 rad/m²), runs all three binaries, checks
-that the RM peaks land at the correct positions, and cross-compares numerical outputs.
+two known point sources (RM = -5 and +22 rad/m^2), then runs a multi-stage
+validation workflow that currently includes:
+
+- CPU serial and CPU OpenMP builds/runs
+- GPU and GPU+HostOMP builds/runs when available
+- RM peak checks and cube comparisons vs serial reference
+- GPU staging-path activation and staged-vs-nonstaged comparison
+- auto-tiling shape check (full-RA Dec strips)
+- bad-channel masking checks (serial/OMP/GPU)
+- cubestat output map checks
+- timing summary/CSV emission checks
 
 ### 3a. One-shot run (builds + tests everything)
 
@@ -101,7 +110,7 @@ that the RM peaks land at the correct positions, and cross-compares numerical ou
 bash tests/run_tests.sh
 ```
 
-Expected output (abridged):
+Representative output (abridged):
 
 ```
 5. Serial binary – RM peak validation
@@ -114,13 +123,23 @@ Expected output (abridged):
 
 7. GPU binary – tolerance comparison with serial
 [PASS] GPU: RM peaks at correct positions
-[PASS] GPU AMP: matches serial within rtol=2e-4
+[PASS] GPU AMP: matches serial within rtol=2e-3
 
-Test Summary: 8 Pass, 0 Fail, 0 Skip
+12. Timing report + CSV validation
+[PASS] Timing markers present (serial)
+
+Test Summary
+Total : ...
+Pass  : ...
+Fail  : ...
+Skip  : ...
 RESULT: ALL PASSED
 ```
 
-The small OMP/GPU differences (~1e-4 rel.) are normal floating-point
+`Pass/Fail/Skip` counts vary by platform. In particular, GPU sections are
+explicitly skipped when a GPU-capable binary cannot be built.
+
+The small OMP/GPU differences (~1e-4 to ~1e-3 rel.) are normal floating-point
 reassociation from parallel reductions and `-ffast-math`; the RM peaks themselves
 are exact.
 
@@ -138,7 +157,7 @@ python3 tests/check_rm_peak.py  <path/to/output.AMP.RMCUBE.FITS> \
 python3 tests/compare_cubes.py cube_a.AMP.RMCUBE.FITS cube_b.AMP.RMCUBE.FITS --exact
 
 # Relative-tolerance comparison (e.g. GPU vs serial)
-python3 tests/compare_cubes.py cube_a.AMP.RMCUBE.FITS cube_b.AMP.RMCUBE.FITS --rtol 2e-4
+python3 tests/compare_cubes.py cube_a.AMP.RMCUBE.FITS cube_b.AMP.RMCUBE.FITS --rtol 2e-3
 ```
 
 ---
@@ -160,18 +179,21 @@ bash scratch/run_rmsynthesis_test.sh  <config>  [num_threads]  [backend]
 
 ---
 
-### 4a. GMRT / CASA full-image run
+### 4a. Generic full-image run
 
-Config: `cfg/rmsynth-casa.fullim.cfg`  
-Data: `/home/wasim/softwares/CURR_DEVEL/fitsio_utils/myfitsio.1.0/DATA/`  
-RM range: −200 to +200 rad/m², nrm=201, ofac=4  
+Canonical config: `cfg/rmsynth.cfg`  
+Edit the following keys first for your local data:
+- `path`
+- `infileQ`
+- `infileU`
+- `outfile`
 
 **CPU (OpenMP, 8 threads):**
 ```bash
 # Build first if not already done
 make OMP=1 GPU=0
 
-bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-casa.fullim.cfg  8  cpu
+bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth.cfg  8  cpu
 ```
 
 **GPU:**
@@ -179,59 +201,26 @@ bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-casa.fullim.cfg  8  cpu
 # Build GPU binary first
 make GPU=1
 
-bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-casa.fullim.cfg  1  gpu
+bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth.cfg  1  gpu
 ```
 
 **Outputs written to `scratch/`:**
 ```
-MY_CASA_RMSYNTH_FULLIM_TEST.AMP.RMCUBE.FITS    # |P(RM)|
-MY_CASA_RMSYNTH_FULLIM_TEST.PHA.RMCUBE.FITS    # Phase angle (rad)
-MY_CASA_RMSYNTH_FULLIM_TEST.NVALID.MAP.FITS    # Valid channel count per pixel
+RMSYNTH_OUTPUT.AMP.RMCUBE.FITS    # |P(RM)|
+RMSYNTH_OUTPUT.PHA.RMCUBE.FITS    # Phase angle (rad)
+RMSYNTH_OUTPUT.NVALID.MAP.FITS    # Valid channel count per pixel
 ```
 
 **Dry-run** (checks tile memory estimates without touching data):
 ```bash
 # Edit cfg to set dry_run=y, then:
-bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-casa.fullim.cfg  1  cpu
+bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth.cfg  1  cpu
 # Reads tile_autotune.cfg and runtime_estimate.txt in scratch/
 ```
 
-Expected peak: ~5 rad/m² (RL-corrected GMRT 610 MHz data).
-
----
-
-### 4b. ASKAP / Jennifer full-image run
-
-Config: `cfg/rmsynth-jennifer.fullim.cfg`  
-Data: `/data1/tmp/`  
-RM range: −500 to +500 rad/m², nrm=101, ofac=1  
-Bad channels: `cfg/askap_nan_channels.burdies`  
-
-**CPU (OpenMP, 12 threads):**
-```bash
-make OMP=1 GPU=0
-
-bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-jennifer.fullim.cfg  12  cpu
-```
-
-**GPU:**
-```bash
-make GPU=1
-
-bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-jennifer.fullim.cfg  1  gpu
-```
-
-**Outputs written to `scratch/`:**
-```
-JENNIFER_TOO_FULLIM_TEST.AMP.RMCUBE.FITS
-JENNIFER_TOO_FULLIM_TEST.PHA.RMCUBE.FITS
-JENNIFER_TOO_FULLIM_TEST.NVALID.MAP.FITS
-```
-
-**Tip — memory tuning for large ASKAP cubes:**  
+**Tip - memory tuning for large cubes:**  
 The config has `mem_frac_ram=0.30`, which uses 30% of available **host RAM** per
-read block. On machines with ≥64 GB RAM this is usually fine. If you see host
-out-of-memory errors, lower it:
+read block. If you see host out-of-memory errors, lower it:
 ```
 mem_frac_ram=0.15
 ```
@@ -244,14 +233,14 @@ read/compute (requires a reentrant libcfitsio build; default `n`).
 Or run a dry-run first to read the auto-tuned tile hint:
 ```bash
 # Temporarily set dry_run=y in cfg, then:
-bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth-jennifer.fullim.cfg  1  cpu
+bash scratch/run_rmsynthesis_test.sh  cfg/rmsynth.cfg  1  cpu
 cat scratch/tile_autotune.cfg          # copy tile_ra / tile_dec back into cfg
 cat scratch/runtime_estimate.txt       # wall-time estimate
 ```
 
 ---
 
-### 4c. Environment variables (advanced)
+### 4b. Environment variables (advanced)
 
 | Variable | Default (run script) | Effect |
 |---|---|---|
@@ -287,7 +276,7 @@ and GPU lanes from the run log.
 
 ```bash
 python scripts/plot_tile_async_swimlane.py \
-  --log scratch/JENNIFER_TOO_FULLIM_TEST.run.log \
+  --log scratch/RMSYNTH_OUTPUT.run.log \
   --out scratch/tile_async_swimlane.png \
   --run latest \
   --time-axis absolute

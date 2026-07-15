@@ -231,13 +231,13 @@ Example benchmark commands:
 
 ```bash
 make OMP=0 GPU=0
-bin/rm_synthesis_release_cpu_serial cfg/rmsynth-casa.fullim.cfg
+bin/rm_synthesis_release_cpu_serial cfg/rmsynth.cfg
 
 make OMP=1 GPU=0
-bin/rm_synthesis_release_cpu_omp cfg/rmsynth-casa.fullim.cfg
+bin/rm_synthesis_release_cpu_omp cfg/rmsynth.cfg
 
 make OMP=0 GPU=1
-bin/rm_synthesis_release_gpu_offload cfg/rmsynth-casa.fullim.cfg
+bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
 ```
 
 ## Distribution
