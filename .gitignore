@@ -36,6 +36,17 @@ scratch/
 # local sampled diagnostics (do not track)
 sampled_RM.txt
 sampled_freq.txt
+sampled_freq*.txt
+sampled_*.txt
+
+# local tuning/runtime artifacts (do not track)
+runtime_estimate.txt
+tile_autotune.cfg
+tmp.txt
+
+# local TODO/work notes (do not track)
+TODO/
+TODO.*
 
 # local machine/user-specific configs (do not track)
 cfg/*jennifer*.cfg
