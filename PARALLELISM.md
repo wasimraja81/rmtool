@@ -229,6 +229,28 @@ flowchart LR
     SN -->|"gather+prepare\n(CPU orchestrated, HOST_OMP loops)"| GN -->|"collapse(2) kernel"| RN
 ```
 
+### 3c - Memory-budget decoupling (RAM tile vs VRAM strip)
+
+Planner logic now treats host RAM tile sizing and GPU VRAM strip sizing as
+separate constraints:
+
+- RAM tile budget (`bytes_per_tile_pixel_ram`): sizes `tile_ra x tile_dec` for
+  read/write and full-tile host arrays.
+- VRAM strip budget (`bytes_per_vram_pixel`): sizes `ny_sub` for per-offload
+  staged sub-block working sets.
+
+Why it matters:
+
+- CPU/non-staging runs no longer pay an artificial penalty from staging-only
+  VRAM terms, so RAM Dec strips can remain larger when memory allows.
+- GPU staging still remains bounded by VRAM through `ny_sub` planning.
+
+Observed effect in Jennifer full-image runs (6 host threads, this node):
+
+- CPU total improved (`733.758s` -> `721.764s`).
+- GPU total was slightly slower while still fully offloaded
+  (`2110.988s` -> `2133.811s`).
+
 ---
 
 ## 4 — Summary: Parallelism Dimensions
