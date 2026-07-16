@@ -184,14 +184,16 @@ flowchart TB
 
 When the RAM tile does not fit in VRAM, it is further subdivided into **Dec
 strips** (`ny_sub` rows). Each strip is gathered into compact staging buffers,
-offloaded, and results scattered back.
+offloaded, and results scattered back. In HOST_OMP builds, gather/scatter loops
+are host-parallelised while slot dependencies preserve correctness.
 
 ```
 RAM tile  [tile_ra × tile_dec × nz_out]
   │
-  │  for iy_sub_beg = 1 … tile_dec  step ny_sub    ← serial, CPU
+  │  for iy_sub_beg = 1 … tile_dec  step ny_sub    ← serial orchestrator
   │
   ├──► gather:  stQ/stU/stMask_tile_arr  [tile_ra × ny_sub_now × nz_out]
+  │      HOST_OMP: parallel loop over sub-block rows/pixels
   │
   ├──► prepare_gpu_data  →  st_Q_gpu / st_U_gpu / st_wts_gpu
   │
@@ -199,6 +201,7 @@ RAM tile  [tile_ra × tile_dec × nz_out]
   │       GPU parallelism: (tile_ra × ny_sub_now) × nrm_block_size threads
   │
   └──► scatter:  stP / stPhi  back into  p_tile_arr / phi_tile_arr
+         HOST_OMP: parallel loop over sub-block rows/pixels
 ```
 
 ```mermaid
@@ -221,9 +224,9 @@ flowchart LR
         RN["scatter results N"]
     end
 
-    S1 -->|"gather+prepare\n(CPU serial)"| G1 -->|"collapse(2) kernel"| R1
-    S2 -->|"gather+prepare\n(CPU serial)"| G2 -->|"collapse(2) kernel"| R2
-    SN -->|"gather+prepare\n(CPU serial)"| GN -->|"collapse(2) kernel"| RN
+    S1 -->|"gather+prepare\n(CPU orchestrated, HOST_OMP loops)"| G1 -->|"collapse(2) kernel"| R1
+    S2 -->|"gather+prepare\n(CPU orchestrated, HOST_OMP loops)"| G2 -->|"collapse(2) kernel"| R2
+    SN -->|"gather+prepare\n(CPU orchestrated, HOST_OMP loops)"| GN -->|"collapse(2) kernel"| RN
 ```
 
 ---
@@ -237,6 +240,13 @@ flowchart LR
 | **RM bins** | sequential per core | batched per block; collapsed into pixel dimension |
 | **Channels (nz_out)** | sequential (SIMD by compiler) | sequential per GPU thread |
 | **VRAM staging** | N/A | serial Dec-strip loop when tile > VRAM |
+
+HOST_OMP details for staging path:
+- Initial slot gather may use `!$omp parallel do` in HOST_OMP builds.
+- Next-slot gather and scatter phases may use `!$omp taskloop` under async
+  slot orchestration.
+- Dependency tokens (`dep_h2d/dep_kern/dep_d2h`) still define slot ordering;
+  loop parallelism changes throughput, not dependency semantics.
 
 **Key invariant:** `cos_arr` and `sin_arr` are pre-computed once, held
 resident in RAM (CPU) or VRAM (GPU), and never recomputed per-pixel or

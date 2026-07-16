@@ -84,6 +84,9 @@ implicit none
 
 #if HOST_OMP == 1
 integer omp_get_max_threads
+integer omp_get_thread_num
+integer omp_in_parallel
+real(dp) omp_get_wtime
 #endif
 
 
@@ -254,6 +257,8 @@ integer   slot_subid(2)
 integer   dep_h2d(2), dep_kern(2), dep_d2h(2)
 logical   use_async_pipeline
 integer   host_omp_threads
+integer   thread_id_now
+real(dp)  t_thread_stage_start, t_thread_stage_elapsed
 integer   env_len, env_stat, ios_env
 character(len=128) :: env_vram
  ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
@@ -2879,11 +2884,23 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
             slot_ny(slot_idx) =&
             &slot_iy_end(slot_idx)-slot_iy_beg(slot_idx)+1
             n_subblocks_total = n_subblocks_total + 1_int64
+#if HOST_OMP == 1
+            if(use_async_pipeline)then
+               thread_id_now = omp_get_thread_num()
+               t_thread_stage_start = omp_get_wtime()
+               write(message,'(A,I0,A,I0,A,I0,A,I0)') &
+               &'thread_timing stage=prep event=start tid=',thread_id_now,&
+               &' slot=',slot_idx,' sub=',slot_subid(slot_idx)
+               call log_message('debug','tile_thread',&
+               &message(1:nchar(message)))
+            endif
+#endif
             call log_subblock_progress('tile_prep', 'prep',&
             &slot_subid(slot_idx), n_subblocks_tile,&
             &iy_tile_beg + slot_iy_beg(slot_idx) - 1,&
             &iy_tile_beg + slot_iy_end(slot_idx) - 1)
             call timer_start(t_stage)
+            !$omp parallel do default(shared) private(iyl, ix_loc, iy_loc, iz, src_idx, dst_idx)
             do iyl = 1,slot_ny(slot_idx)
                iy_loc = slot_iy_beg(slot_idx) + iyl - 1
                do ix_loc = 1,nx_tile
@@ -2907,7 +2924,21 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   enddo
                enddo
             enddo
+            !$omp end parallel do
             call timer_stop(STAGE_TILE_PREP,t_stage)
+#if HOST_OMP == 1
+            if(use_async_pipeline)then
+               t_thread_stage_elapsed = (omp_get_wtime() - &
+               &t_thread_stage_start) * 1000.0_dp
+               thread_id_now = omp_get_thread_num()
+               write(message,'(A,I0,A,I0,A,I0,A,F10.3)') &
+               &'thread_timing stage=prep event=done tid=',thread_id_now,&
+               &' slot=',slot_idx,' sub=',slot_subid(slot_idx),&
+               &' dur_ms=',t_thread_stage_elapsed
+               call log_message('debug','tile_thread',&
+               &message(1:nchar(message)))
+            endif
+#endif
             if(use_async_pipeline)then
                dep_h2d(slot_idx) = slot_subid(slot_idx)
             else
@@ -2988,9 +3019,18 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   call log_message('debug','tile_async',&
                   &message(1:nchar(message)))
                   !$omp task firstprivate(slot_idx_now, ny_sub_now, subid_now) &
-                  !$omp& private(st_i_rm_block, st_nrm_block_now) &
+                  !$omp& private(st_i_rm_block, st_nrm_block_now, thread_id_now, t_thread_stage_start, t_thread_stage_elapsed) &
                   !$omp& depend(in:dep_h2d(slot_idx_now)) &
                   !$omp& depend(out:dep_kern(slot_idx_now))
+#if HOST_OMP == 1
+                  thread_id_now = omp_get_thread_num()
+                  t_thread_stage_start = omp_get_wtime()
+                  write(message,'(A,I0,A,I0,A,I0,A,I0)') &
+                  &'thread_timing stage=compute event=start tid=',thread_id_now,&
+                  &' slot=',slot_idx_now,' sub=',subid_now
+                  call log_message('debug','tile_thread',&
+                  &message(1:nchar(message)))
+#endif
                   write(message,'(A,I0,A,I0)') 'async start compute slot=',&
                   &slot_idx_now, ' sub=', subid_now
                   call log_message('debug','tile_async',&
@@ -3026,6 +3066,17 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &slot_idx_now, ' sub=', subid_now
                   call log_message('debug','tile_async',&
                   &message(1:nchar(message)))
+#if HOST_OMP == 1
+                  t_thread_stage_elapsed = (omp_get_wtime() - &
+                  &t_thread_stage_start) * 1000.0_dp
+                  thread_id_now = omp_get_thread_num()
+                  write(message,'(A,I0,A,I0,A,I0,A,F10.3)') &
+                  &'thread_timing stage=compute event=done tid=',thread_id_now,&
+                  &' slot=',slot_idx_now,' sub=',subid_now,&
+                  &' dur_ms=',t_thread_stage_elapsed
+                  call log_message('debug','tile_thread',&
+                  &message(1:nchar(message)))
+#endif
                   !$omp end task
                else
                   do st_i_rm_block = 1,nrm_out,nrm_block_size
@@ -3082,6 +3133,18 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &iy_tile_beg + slot_iy_beg(next_slot) - 1,&
                   &iy_tile_beg + slot_iy_end(next_slot) - 1)
                   call timer_start(t_stage)
+#if HOST_OMP == 1
+                  if(use_async_pipeline)then
+                     thread_id_now = omp_get_thread_num()
+                     t_thread_stage_start = omp_get_wtime()
+                     write(message,'(A,I0,A,I0,A,I0,A,I0)') &
+                     &'thread_timing stage=prep event=start tid=',thread_id_now,&
+                     &' slot=',next_slot,' sub=',slot_subid(next_slot)
+                     call log_message('debug','tile_thread',&
+                     &message(1:nchar(message)))
+                  endif
+#endif
+                  !$omp taskloop default(shared) private(iyl, ix_loc, iy_loc, iz, src_idx, dst_idx)
                   do iyl = 1,slot_ny(next_slot)
                      iy_loc = slot_iy_beg(next_slot) + iyl - 1
                      do ix_loc = 1,nx_tile
@@ -3105,7 +3168,21 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                         enddo
                      enddo
                   enddo
+                  !$omp end taskloop
                   call timer_stop(STAGE_TILE_PREP,t_stage)
+#if HOST_OMP == 1
+                  if(use_async_pipeline)then
+                     t_thread_stage_elapsed = (omp_get_wtime() - &
+                     &t_thread_stage_start) * 1000.0_dp
+                     thread_id_now = omp_get_thread_num()
+                     write(message,'(A,I0,A,I0,A,I0,A,F10.3)') &
+                     &'thread_timing stage=prep event=done tid=',thread_id_now,&
+                     &' slot=',next_slot,' sub=',slot_subid(next_slot),&
+                     &' dur_ms=',t_thread_stage_elapsed
+                     call log_message('debug','tile_thread',&
+                     &message(1:nchar(message)))
+                  endif
+#endif
                   if(use_async_pipeline)then
                      dep_h2d(next_slot) = slot_subid(next_slot)
                   else
@@ -3127,9 +3204,18 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   call log_message('debug','tile_async',&
                   &message(1:nchar(message)))
                   !$omp task firstprivate(slot_idx_now, subid_now, ny_sub_now, iy_sub_beg, iy_sub_end, i_subblock) &
-                  !$omp& private(iyl, iy_loc, ix_loc, ipix_full, ipix_sub, irm, iz, dst_idx, src_idx) &
+                  !$omp& private(iyl, iy_loc, ix_loc, ipix_full, ipix_sub, irm, iz, dst_idx, src_idx, thread_id_now, t_thread_stage_start, t_thread_stage_elapsed) &
                   !$omp& depend(in:dep_kern(slot_idx_now)) &
                   !$omp& depend(out:dep_h2d(slot_idx_now))
+#if HOST_OMP == 1
+                  thread_id_now = omp_get_thread_num()
+                  t_thread_stage_start = omp_get_wtime()
+                  write(message,'(A,I0,A,I0,A,I0,A,I0)') &
+                  &'thread_timing stage=scatter event=start tid=',thread_id_now,&
+                  &' slot=',slot_idx_now,' sub=',subid_now
+                  call log_message('debug','tile_thread',&
+                  &message(1:nchar(message)))
+#endif
                   write(message,'(A,I0,A,I0)') 'async start scatter slot=',&
                   &slot_idx_now, ' sub=', subid_now
                   call log_message('debug','tile_async',&
@@ -3146,6 +3232,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &iy_tile_beg + iy_sub_beg - 1,&
                   &iy_tile_beg + iy_sub_end - 1)
                   call timer_start(t_stage)
+                  !$omp taskloop default(shared) private(iyl, ix_loc, iy_loc, ipix_full, ipix_sub, irm, iz, dst_idx, src_idx)
                   do iyl = 1,ny_sub_now
                      iy_loc = iy_sub_beg + iyl - 1
                      do ix_loc = 1,nx_tile
@@ -3170,6 +3257,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                         enddo
                      enddo
                   enddo
+                  !$omp end taskloop
                   call timer_stop(STAGE_TILE_SCATTER,t_stage)
 
                   write(message,'(A,I0,A,I0)') 'dealloc begin slot=',&
@@ -3205,6 +3293,17 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &slot_idx_now, ' sub=', subid_now
                   call log_message('debug','tile_async',&
                   &message(1:nchar(message)))
+#if HOST_OMP == 1
+                  t_thread_stage_elapsed = (omp_get_wtime() - &
+                  &t_thread_stage_start) * 1000.0_dp
+                  thread_id_now = omp_get_thread_num()
+                  write(message,'(A,I0,A,I0,A,I0,A,F10.3)') &
+                  &'thread_timing stage=scatter event=done tid=',thread_id_now,&
+                  &' slot=',slot_idx_now,' sub=',subid_now,&
+                  &' dur_ms=',t_thread_stage_elapsed
+                  call log_message('debug','tile_thread',&
+                  &message(1:nchar(message)))
+#endif
                   !$omp end task
                else
                   ! Deallocate GPU temporary arrays
@@ -3242,6 +3341,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &iy_tile_beg + iy_sub_beg - 1,&
                   &iy_tile_beg + iy_sub_end - 1)
                   call timer_start(t_stage)
+                  !$omp taskloop default(shared) private(iyl, ix_loc, iy_loc, ipix_full, ipix_sub, irm, iz, dst_idx, src_idx)
                   do iyl = 1,ny_sub_now
                      iy_loc = iy_sub_beg + iyl - 1
                      do ix_loc = 1,nx_tile
@@ -3266,6 +3366,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                         enddo
                      enddo
                   enddo
+                  !$omp end taskloop
                   call timer_stop(STAGE_TILE_SCATTER,t_stage)
                   dep_h2d(slot_idx) = 0
                   call log_subblock_progress('tile_scatter', 'done',&

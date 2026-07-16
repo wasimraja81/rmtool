@@ -5,7 +5,7 @@ module rm_synthesis_mod
   
   use iso_fortran_env, only: sp => real32, dp => real64, int8, int16, int32, int64
 #if defined(HOST_OMP) && (HOST_OMP == 1)
-  use omp_lib, only: omp_get_wtime, omp_get_thread_num
+  use omp_lib, only: omp_get_wtime, omp_get_thread_num, omp_in_parallel
 #endif
   implicit none
   
@@ -844,10 +844,17 @@ contains
     real(sp), allocatable, intent(out) :: wsum_gpu(:)
     
     integer(int32) :: npix, ipix, iz, src_idx
+    logical :: pack_loop_omp
     real(sp) :: q_val, u_val
     real(sp) :: wsum, q_sum, u_sum
     
     npix = nx_tile * ny_tile
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    pack_loop_omp = (.not. omp_in_parallel())
+#else
+    pack_loop_omp = .false.
+#endif
     
     ! GPU layout: (npix, nz_out) — pixels fastest for warp coalescing
     allocate(specQ_gpu(npix, nz_out))
@@ -862,6 +869,9 @@ contains
     
     ! Load all channels using unified mask
     ! mask_tile already contains all masking info: global bad channels, NaN/Inf, per-pixel mask
+    !$omp parallel do if(host_omp_enabled .and. pack_loop_omp) collapse(2) default(none) &
+    !$omp     private(iz, ipix, src_idx, q_val, u_val) &
+    !$omp     shared(nz_out, npix, specQ_flat, specU_flat, mask_tile, specQ_gpu, specU_gpu, wts_gpu)
     do iz = 1, nz_out
       do ipix = 1, npix
         src_idx = ipix + (iz - 1) * npix
@@ -876,6 +886,7 @@ contains
         wts_gpu(ipix, iz) = real(mask_tile(src_idx), sp)  ! 0.0 if bad, 1.0 if good
       end do
     end do
+    !$omp end parallel do
     
     ! Always compute per-pixel weight sums.
     ! wsum_gpu(ipix) is RM-independent but pixel-dependent when NaN/Inf or
@@ -949,9 +960,16 @@ contains
     real(sp), allocatable, intent(out) :: wsum_cpu(:)
     
     integer(int32) :: npix, ipix, iz, src_idx
+    logical :: pack_loop_omp
     real(sp) :: q_sum, u_sum
     
     npix = nx_tile * ny_tile
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    pack_loop_omp = (.not. omp_in_parallel())
+#else
+    pack_loop_omp = .false.
+#endif
     
     ! CPU layout: (nz_out, npix) — channels fastest for stride-1 inner loop
     allocate(specQ_cpu(nz_out, npix))
@@ -959,6 +977,9 @@ contains
     allocate(wts_cpu(nz_out, npix))
     
     ! Load all channels using unified mask
+    !$omp parallel do if(host_omp_enabled .and. pack_loop_omp) collapse(2) default(none) &
+    !$omp     private(iz, ipix, src_idx) &
+    !$omp     shared(nz_out, npix, specQ_flat, specU_flat, mask_tile, specQ_cpu, specU_cpu, wts_cpu)
     do iz = 1, nz_out
       do ipix = 1, npix
         src_idx = ipix + (iz - 1) * npix
@@ -967,6 +988,7 @@ contains
         wts_cpu(iz, ipix) = real(mask_tile(src_idx), sp)
       end do
     end do
+    !$omp end parallel do
     
     ! Per-pixel weight sums (RM-independent, precomputed once)
     allocate(wsum_cpu(npix))
@@ -1055,9 +1077,12 @@ contains
     
     integer(int32) :: ipix, npix, i_rm_local, i_rm_global, iz
     integer(int32) :: p_idx
+    integer(int32) :: tid_local
     real(sp) :: rc_cor, rs_cor, ic_cor, is_cor, ryw_tmp, iyw_tmp
     real(sp) :: q_eff, u_eff, wt, mean_q_pix, mean_u_pix
     real(sp) :: zero_val = 0.0_sp  ! Used for runtime NaN generation (0.0/0.0)
+    real(dp) :: t_thread_start, t_thread_elapsed
+    character(len=192) :: thread_msg
 
     npix = nx_tile * ny_tile
     
@@ -1075,8 +1100,8 @@ contains
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix)
 #else
-    !$omp parallel do if(host_omp_enabled) collapse(2) schedule(dynamic,64) default(none) &
-    !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, &
+  !$omp parallel if(host_omp_enabled) default(none) &
+  !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, tid_local, t_thread_start, t_thread_elapsed, thread_msg, &
     !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
     !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
     !$omp             mean_q_pix, mean_u_pix) &
@@ -1086,6 +1111,15 @@ contains
     !$omp            cos_arr_gpu, sin_arr_gpu, &
     !$omp            i_rm_block, rem_mean, output_mode, ap_angle_mode, &
     !$omp            p_tile_arr, phi_tile_arr, zero_val)
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  tid_local = omp_get_thread_num()
+  t_thread_start = omp_get_wtime()
+  write(thread_msg,'(A,I0,A,I0,A,I0)') &
+  &'thread_timing stage=cpu_extract event=start tid=', tid_local, &
+  &' rm_block=', i_rm_block, ' nrm_now=', nrm_block_now
+  call log_message('debug','tile_thread',trim(thread_msg))
+#endif
+  !$omp do collapse(2) schedule(dynamic,64)
 #endif
     do ipix = 1, npix
       do i_rm_local = 1, nrm_block_now
@@ -1163,7 +1197,17 @@ contains
 #ifdef USE_GPU
     !$omp end target teams distribute parallel do
 #else
-    !$omp end parallel do
+      !$omp end do
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+      t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+      tid_local = omp_get_thread_num()
+      write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') &
+      &'thread_timing stage=cpu_extract event=done tid=', tid_local, &
+      &' rm_block=', i_rm_block, ' nrm_now=', nrm_block_now, &
+      &' dur_ms=', t_thread_elapsed
+      call log_message('debug','tile_thread',trim(thread_msg))
+#endif
+      !$omp end parallel
 #endif
 
   end subroutine tile_extract_gpu_rm_blocked
