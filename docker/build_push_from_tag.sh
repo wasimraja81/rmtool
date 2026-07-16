@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+
+# If invoked as `sh docker/build_push_from_tag.sh ...`, re-exec under bash.
+if [ -z "${BASH_VERSION:-}" ]; then
+  if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  fi
+  echo "Error: this script requires bash (please install bash or run with bash)." >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 # Build and push rmtool image from a specific git tag snapshot.
