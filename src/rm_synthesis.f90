@@ -85,6 +85,7 @@ implicit none
 #if HOST_OMP == 1
 integer omp_get_max_threads
 integer omp_get_thread_num
+integer omp_in_parallel
 real(dp) omp_get_wtime
 #endif
 
@@ -2899,6 +2900,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
             &iy_tile_beg + slot_iy_beg(slot_idx) - 1,&
             &iy_tile_beg + slot_iy_end(slot_idx) - 1)
             call timer_start(t_stage)
+            !$omp parallel do default(shared) private(iyl, ix_loc, iy_loc, iz, src_idx, dst_idx)
             do iyl = 1,slot_ny(slot_idx)
                iy_loc = slot_iy_beg(slot_idx) + iyl - 1
                do ix_loc = 1,nx_tile
@@ -2922,6 +2924,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   enddo
                enddo
             enddo
+            !$omp end parallel do
             call timer_stop(STAGE_TILE_PREP,t_stage)
 #if HOST_OMP == 1
             if(use_async_pipeline)then
@@ -3141,6 +3144,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                      &message(1:nchar(message)))
                   endif
 #endif
+                  !$omp taskloop default(shared) private(iyl, ix_loc, iy_loc, iz, src_idx, dst_idx)
                   do iyl = 1,slot_ny(next_slot)
                      iy_loc = slot_iy_beg(next_slot) + iyl - 1
                      do ix_loc = 1,nx_tile
@@ -3164,6 +3168,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                         enddo
                      enddo
                   enddo
+                  !$omp end taskloop
                   call timer_stop(STAGE_TILE_PREP,t_stage)
 #if HOST_OMP == 1
                   if(use_async_pipeline)then
@@ -3227,6 +3232,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &iy_tile_beg + iy_sub_beg - 1,&
                   &iy_tile_beg + iy_sub_end - 1)
                   call timer_start(t_stage)
+                  !$omp taskloop default(shared) private(iyl, ix_loc, iy_loc, ipix_full, ipix_sub, irm, iz, dst_idx, src_idx)
                   do iyl = 1,ny_sub_now
                      iy_loc = iy_sub_beg + iyl - 1
                      do ix_loc = 1,nx_tile
@@ -3251,6 +3257,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                         enddo
                      enddo
                   enddo
+                  !$omp end taskloop
                   call timer_stop(STAGE_TILE_SCATTER,t_stage)
 
                   write(message,'(A,I0,A,I0)') 'dealloc begin slot=',&
@@ -3334,6 +3341,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   &iy_tile_beg + iy_sub_beg - 1,&
                   &iy_tile_beg + iy_sub_end - 1)
                   call timer_start(t_stage)
+                  !$omp taskloop default(shared) private(iyl, ix_loc, iy_loc, ipix_full, ipix_sub, irm, iz, dst_idx, src_idx)
                   do iyl = 1,ny_sub_now
                      iy_loc = iy_sub_beg + iyl - 1
                      do ix_loc = 1,nx_tile
@@ -3358,6 +3366,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                         enddo
                      enddo
                   enddo
+                  !$omp end taskloop
                   call timer_stop(STAGE_TILE_SCATTER,t_stage)
                   dep_h2d(slot_idx) = 0
                   call log_subblock_progress('tile_scatter', 'done',&

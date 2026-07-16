@@ -167,6 +167,28 @@ Example GPU run:
 bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
 ```
 
+## Recent Performance Enhancements
+
+Recent updates improved host-side parallelism around staging and data packing:
+
+- In `src/rm_synthesis.f90`, staged gather/scatter loops now use host OpenMP
+  loop parallelism (`parallel do` / `taskloop`) within the existing async-slot
+  dependency framework.
+- In `src/rm_synthesis_mod.f90`, pack/copy loops in `prepare_cpu_data` and
+  `prepare_gpu_data` are host-parallelised in HOST_OMP builds with an
+  `omp_in_parallel` guard to prevent nested-region oversubscription.
+
+Scope note:
+- The staged gather/scatter enhancement is active only when `use_staging=true`
+	(GPU-active staging path). CPU-only non-staging runs do not execute those
+	staged loops.
+
+Session validation summary:
+- Build matrix: all four `OMP/GPU` variants compile successfully.
+- Tests: `22/22` passing.
+- Jennifer full-image benchmark: GPU path improved in this session, with major
+	reductions in `tile_prep` and `tile_scatter` contributions.
+
 ## GPU Acceleration
 
 rmtool supports OpenMP target offload builds for GPU execution.
@@ -277,7 +299,7 @@ make GPU=1
 ```
 rmtool/
 ├── src/                  Source code (Fortran 77/90)
-│   ├── rm_synthesis.f    Main program
+│   ├── rm_synthesis.f90  Main program
 │   ├── rm_synthesis_mod.f90  Config parser module
 │   └── legacy/           Legacy tools
 ├── cfg/                  Configuration files and examples

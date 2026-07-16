@@ -53,8 +53,8 @@ whether host-side preprocessing loops use OpenMP parallelization:
 - **HOST_OMP=0** (`cpu_serial`, `gpu_offload`): Host loops remain serial
 - **HOST_OMP=1** (`cpu_omp`, `gpu_offload_hostomp`): Host loops parallelized via `!$omp parallel do`
 
-The `HOST_OMP` macro gates preprocessor directives in fixed-form Fortran 
-(`src/rm_synthesis.f`) and runtime variable checks in free-form Fortran 
+The `HOST_OMP` macro gates preprocessor directives in the main program 
+(`src/rm_synthesis.f90`) and runtime variable checks in free-form Fortran 
 (`src/rm_synthesis_mod.f90`), ensuring correct semantic behavior for each variant.
 
 #### Use Cases
@@ -133,7 +133,7 @@ brew install cfitsio
 rmtool/
 ├── src/
 │   ├── rm_synthesis_mod.f90      # Modern Fortran module
-│   ├── rm_synthesis.f            # Main program
+│   ├── rm_synthesis.f90          # Main program
 │   ├── myfits_info.f             # FITS utilities
 │   └── printerror.f              # Error handling
 ├── build/                        # Build artifacts (Makefile)

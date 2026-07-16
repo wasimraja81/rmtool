@@ -53,10 +53,16 @@ The primary driver is scalable processing for very large cubes under constrained
 ### CPU execution
 - OpenMP host parallelism is applied over collapsed loop dimensions in compute kernels.
 - Thread-level work is data-parallel for (pixel, RM-in-block) combinations.
+- Data packing loops in `prepare_cpu_data` and `prepare_gpu_data` are also
+  host-parallelised in HOST_OMP builds, with a guard to avoid nested OpenMP
+  oversubscription when already inside an active parallel region.
 
 ### GPU execution
 - OpenMP target offload is used for device kernels.
 - For staging mode, host-side orchestration can pipeline sub-block phases when host OMP threads are available.
+- In staging mode with HOST_OMP enabled, host gather and scatter loops now run
+  with OpenMP loop parallelism (`parallel do`/`taskloop`) inside the existing
+  dependency-ordered slot pipeline.
 
 ### Synchronisation model
 - Dependency-ordered task sequencing ensures slot reuse safety for staged GPU operation.
@@ -155,6 +161,24 @@ The primary driver is scalable processing for very large cubes under constrained
 - For very large datasets, memory-bound decomposition is essential for successful completion.
 - For CPU-only small-RM jobs, RM blocking is mostly structural; performance gains are not guaranteed.
 - For GPU jobs, RM and spatial blocking are core to fitting and streaming work through limited VRAM.
+- Staging-loop host OpenMP improvements apply only when staging is active, i.e.
+  GPU-active runs where `use_staging` is true. CPU-only runs with
+  `use_staging=false` do not execute those staging gather/scatter loops.
+
+## Recent Enhancements (2026-07)
+- Host OpenMP parallelisation added for staged gather/scatter loops in
+  `src/rm_synthesis.f90` while preserving dependency ordering semantics.
+- Host OpenMP parallelisation added for spectral pack/copy loops in
+  `src/rm_synthesis_mod.f90` (`prepare_cpu_data` and `prepare_gpu_data`) with
+  `omp_in_parallel` guard.
+- Validation status after these changes:
+  - full build matrix successful (`OMP/GPU` combinations),
+  - test suite remains green (`22/22`).
+- Jennifer full-image observations from this session:
+  - GPU run improved versus prior in-session baseline, with large reductions in
+    `tile_prep` and `tile_scatter` time,
+  - CPU runs showed normal run-to-run variance; no evidence that the staging
+    gather/scatter change directly affects the non-staging CPU path.
 
 ## Future Work
 - Add benchmark sweeps for RM block size and OpenMP schedule on CPU-only runs.

@@ -5,7 +5,7 @@ module rm_synthesis_mod
   
   use iso_fortran_env, only: sp => real32, dp => real64, int8, int16, int32, int64
 #if defined(HOST_OMP) && (HOST_OMP == 1)
-  use omp_lib, only: omp_get_wtime, omp_get_thread_num
+  use omp_lib, only: omp_get_wtime, omp_get_thread_num, omp_in_parallel
 #endif
   implicit none
   
@@ -844,10 +844,17 @@ contains
     real(sp), allocatable, intent(out) :: wsum_gpu(:)
     
     integer(int32) :: npix, ipix, iz, src_idx
+    logical :: pack_loop_omp
     real(sp) :: q_val, u_val
     real(sp) :: wsum, q_sum, u_sum
     
     npix = nx_tile * ny_tile
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    pack_loop_omp = (.not. omp_in_parallel())
+#else
+    pack_loop_omp = .false.
+#endif
     
     ! GPU layout: (npix, nz_out) — pixels fastest for warp coalescing
     allocate(specQ_gpu(npix, nz_out))
@@ -862,6 +869,9 @@ contains
     
     ! Load all channels using unified mask
     ! mask_tile already contains all masking info: global bad channels, NaN/Inf, per-pixel mask
+    !$omp parallel do if(host_omp_enabled .and. pack_loop_omp) collapse(2) default(none) &
+    !$omp     private(iz, ipix, src_idx, q_val, u_val) &
+    !$omp     shared(nz_out, npix, specQ_flat, specU_flat, mask_tile, specQ_gpu, specU_gpu, wts_gpu)
     do iz = 1, nz_out
       do ipix = 1, npix
         src_idx = ipix + (iz - 1) * npix
@@ -876,6 +886,7 @@ contains
         wts_gpu(ipix, iz) = real(mask_tile(src_idx), sp)  ! 0.0 if bad, 1.0 if good
       end do
     end do
+    !$omp end parallel do
     
     ! Always compute per-pixel weight sums.
     ! wsum_gpu(ipix) is RM-independent but pixel-dependent when NaN/Inf or
@@ -949,9 +960,16 @@ contains
     real(sp), allocatable, intent(out) :: wsum_cpu(:)
     
     integer(int32) :: npix, ipix, iz, src_idx
+    logical :: pack_loop_omp
     real(sp) :: q_sum, u_sum
     
     npix = nx_tile * ny_tile
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    pack_loop_omp = (.not. omp_in_parallel())
+#else
+    pack_loop_omp = .false.
+#endif
     
     ! CPU layout: (nz_out, npix) — channels fastest for stride-1 inner loop
     allocate(specQ_cpu(nz_out, npix))
@@ -959,6 +977,9 @@ contains
     allocate(wts_cpu(nz_out, npix))
     
     ! Load all channels using unified mask
+    !$omp parallel do if(host_omp_enabled .and. pack_loop_omp) collapse(2) default(none) &
+    !$omp     private(iz, ipix, src_idx) &
+    !$omp     shared(nz_out, npix, specQ_flat, specU_flat, mask_tile, specQ_cpu, specU_cpu, wts_cpu)
     do iz = 1, nz_out
       do ipix = 1, npix
         src_idx = ipix + (iz - 1) * npix
@@ -967,6 +988,7 @@ contains
         wts_cpu(iz, ipix) = real(mask_tile(src_idx), sp)
       end do
     end do
+    !$omp end parallel do
     
     ! Per-pixel weight sums (RM-independent, precomputed once)
     allocate(wsum_cpu(npix))
