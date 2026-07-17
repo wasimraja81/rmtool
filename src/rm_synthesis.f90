@@ -2696,10 +2696,43 @@ if(use_input_mask)then
 endif
 
  ! --- Parallel IO handle setup ---
- ! Clamp io_read_threads to [1, nz_out] and allocate per-thread unit arrays.
- ! For io_read_threads_eff=1 we reuse the existing open handles (no overhead).
- ! For >1 we open io_read_threads_eff independent FITS read handles per file.
-io_read_threads_eff = max(1, min(io_read_threads, nz_out))
+ ! Determine the effective OMP thread ceiling first so io_read/write_threads
+ ! are clamped to what the runtime can actually deliver.  In serial builds
+ ! (HOST_OMP=0) there is no thread pool, so both are forced to 1 -- using
+ ! N>1 in a serial binary would open N handles and then call them sequentially,
+ ! which is strictly worse than a single call.
+#if HOST_OMP == 1
+io_read_threads_eff  = max(1, min(io_read_threads,  omp_get_max_threads()))
+io_write_threads_eff = max(1, min(io_write_threads, omp_get_max_threads()))
+if(io_read_threads .gt. omp_get_max_threads())then
+   write(*,*)" WARNING: io_read_threads=",io_read_threads,&
+   &" > OMP max threads=",omp_get_max_threads(),&
+   &"; clamped to ",io_read_threads_eff
+endif
+if(io_write_threads .gt. omp_get_max_threads())then
+   write(*,*)" WARNING: io_write_threads=",io_write_threads,&
+   &" > OMP max threads=",omp_get_max_threads(),&
+   &"; clamped to ",io_write_threads_eff
+endif
+#else
+if(io_read_threads .gt. 1)then
+   write(*,*)" NOTE: io_read_threads=",io_read_threads,&
+   &" ignored in serial binary (HOST_OMP=0); using 1"
+endif
+if(io_write_threads .gt. 1)then
+   write(*,*)" NOTE: io_write_threads=",io_write_threads,&
+   &" ignored in serial binary (HOST_OMP=0); using 1"
+endif
+io_read_threads_eff  = 1
+io_write_threads_eff = 1
+#endif
+ ! Further clamp to available data depth (can't have more IO threads than
+ ! channels or RM bins respectively).
+io_read_threads_eff  = min(io_read_threads_eff,  nz_out)
+io_write_threads_eff = min(io_write_threads_eff, nrm_out)
+ ! Allocate and populate per-thread unit arrays.
+ ! For _eff=1 we alias the already-open handles (no file re-opens, no overhead).
+ ! For  >1 we open _eff independent FITS handles per file/cube.
 allocate(par_unit_Q(io_read_threads_eff))
 allocate(par_unit_U(io_read_threads_eff))
 allocate(par_unit_mask(io_read_threads_eff))
@@ -2729,12 +2762,10 @@ else
 endif
 
  ! --- Parallel write handle setup ---
- ! Clamp io_write_threads to [1, nrm_out]; alias existing handles for =1.
- ! For >1: open N independent readwrite handles per output cube so each
- ! thread writes a disjoint RM-bin range.  Non-overlapping pwrite to
- ! different byte regions is safe; CFITSIO only updates file-level
- ! metadata at close, not during subset puts.
-io_write_threads_eff = max(1, min(io_write_threads, nrm_out))
+ ! io_write_threads_eff already clamped to OMP thread pool above.
+ ! Alias existing handles for =1; open N readwrite handles for >1.
+ ! Non-overlapping pwrite to different byte regions is safe; CFITSIO
+ ! only updates file-level metadata at close, not during subset puts.
 allocate(par_wunit_amp(io_write_threads_eff))
 allocate(par_wunit_pha(io_write_threads_eff))
 if(io_write_threads_eff .eq. 1)then
