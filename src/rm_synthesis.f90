@@ -262,10 +262,21 @@ integer   thread_id_now
 real(dp)  t_thread_stage_start, t_thread_stage_elapsed
 integer   env_len, env_stat, ios_env
 character(len=128) :: env_vram
- ! (No channel-batch temporaries needed: allocate() uses int64 arithmetic
- !  and CFITSIO 4.x (Ubuntu 24.04) uses LONGLONG for nelem throughout
- !  ffgsve->ffgr4b->ffgbyt, so a single FTGSVE call is safe up to 2^63-1
- !  elements. See docs/ARCHITECTURE.md FITS Read Correctness section.)
+ ! Parallel channel-read IO variables (T2 - IO optimisation branch)
+ ! io_read_threads : cfg-controlled thread count; 1 = serial (default)
+ ! Each thread opens its own FITS handle and reads a disjoint channel range
+ ! into a contiguous slice of the pre-allocated tile buffer.
+integer   io_read_threads, io_read_threads_eff
+integer, allocatable :: par_unit_Q(:), par_unit_U(:)
+integer, allocatable :: par_unit_I(:), par_unit_mask(:)
+integer   io_par_k
+integer(kind=int64) :: io_par_per_plane, io_par_nz_total
+integer(kind=int64) :: io_par_base, io_par_rem
+integer(kind=int64) :: io_par_nz_k, io_par_z_off_k, io_par_buf_off
+integer   io_par_z_beg, io_par_z_end
+integer   io_par_anyflg_priv, io_par_status_priv
+integer   io_par_fpixels(max_axis), io_par_lpixels(max_axis)
+logical   io_par_read_ok
  ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
 real(sp), allocatable :: stQ(:,:), stU(:,:), stMask(:,:), stI(:,:)
 real(sp), allocatable :: stP(:,:), stPhi(:,:)
@@ -406,7 +417,7 @@ call read_cfg_keyval(cfgfile,&
 &mask_trust_mode,&
 &write_mask_output,&
 &write_nvalid_output,cubestat,use_gpu,&
-&io_overlap,log_level,&
+&io_overlap,io_read_threads,log_level,&
 &timing_enabled,timing_tile_enabled,&
 &timing_io_enabled,log_output_file,&
 &timing_csv_file,&
@@ -2675,7 +2686,38 @@ if(use_input_mask)then
    in_mask_open = .true.
 endif
 
-
+ ! --- Parallel IO handle setup ---
+ ! Clamp io_read_threads to [1, nz_out] and allocate per-thread unit arrays.
+ ! For io_read_threads_eff=1 we reuse the existing open handles (no overhead).
+ ! For >1 we open io_read_threads_eff independent FITS read handles per file.
+io_read_threads_eff = max(1, min(io_read_threads, nz_out))
+allocate(par_unit_Q(io_read_threads_eff))
+allocate(par_unit_U(io_read_threads_eff))
+allocate(par_unit_mask(io_read_threads_eff))
+allocate(par_unit_I(io_read_threads_eff))
+if(io_read_threads_eff .eq. 1)then
+   par_unit_Q(1)    = 21
+   par_unit_U(1)    = 22
+   par_unit_mask(1) = 45
+   par_unit_I(1)    = 40
+else
+   do io_par_k = 1, io_read_threads_eff
+      par_unit_Q(io_par_k) = 200 + io_par_k
+      call FTOPEN(par_unit_Q(io_par_k),infileQ,0,blocksize,status)
+      par_unit_U(io_par_k) = 300 + io_par_k
+      call FTOPEN(par_unit_U(io_par_k),infileU,0,blocksize,status)
+      if(need_icube)then
+         par_unit_I(io_par_k) = 400 + io_par_k
+         call FTOPEN(par_unit_I(io_par_k),infileI,0,blocksize,status)
+      endif
+      if(use_input_mask)then
+         par_unit_mask(io_par_k) = 500 + io_par_k
+         call FTOPEN(par_unit_mask(io_par_k),&
+         &mask_input_cube_file,0,blocksize,status)
+      endif
+   enddo
+   write(*,*)" Parallel FITS IO: opened ",io_read_threads_eff," handles/file"
+endif
 
 cnt1 = 0
 n_rm_blocks_total = 0_int64
@@ -2711,22 +2753,78 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
       call timer_start(t_stage)
-      ! Single FTGSVE call per input per tile.  Safe because:
-      !  - allocate() uses int64 arithmetic (no 32-bit wrap on buffer size)
-      !  - CFITSIO 4.x (Ubuntu 24.04) uses LONGLONG for nelem throughout
-      !    ffgsve->ffgr4b->ffgbyt, so 2.8e9-element reads do not overflow.
-      ! See docs/ARCHITECTURE.md: FITS Read Correctness for Large Tiles.
-      call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,&
-      &nullval,specQ,anyflg,status)
-      call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,&
-      &nullval,specU,anyflg,status)
-      if(use_input_mask)then
-         call FTGSVE(45,group,naxis,naxes,fpixels,lpixels,incs,&
-         &nullval,specMask,anyflg,status)
-      endif
-      if(need_icube)then
-         call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,incs,&
-         &nullval,specI,anyflg,status)
+      ! --- Parallel channel-chunked FITS reads ---
+      ! Divide nz_out channels among io_read_threads_eff threads; each
+      ! thread uses its own file handle and writes a contiguous slice of
+      ! the tile buffer.  For io_read_threads_eff=1 the loop runs once
+      ! on the calling thread -- identical to the former single FTGSVE call.
+      io_par_per_plane = int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+      io_par_nz_total  = int((zpix_end-zpix_beg)/incs(freq_axis),&
+      &kind=int64)+1_int64
+      io_par_base = io_par_nz_total / int(io_read_threads_eff,kind=int64)
+      io_par_rem  = mod(io_par_nz_total, int(io_read_threads_eff,kind=int64))
+      io_par_read_ok = .true.
+!$omp parallel do if(io_read_threads_eff.gt.1)&
+!$omp& num_threads(io_read_threads_eff)&
+!$omp& default(none)&
+!$omp& shared(io_read_threads_eff,io_par_base,io_par_rem,&
+!$omp&  io_par_per_plane,zpix_beg,zpix_end,incs,freq_axis,&
+!$omp&  fpixels,lpixels,naxis,naxes,group,nullval,&
+!$omp&  specQ,specU,specMask,specI,&
+!$omp&  par_unit_Q,par_unit_U,par_unit_mask,par_unit_I,&
+!$omp&  use_input_mask,need_icube,io_par_read_ok)&
+!$omp& private(io_par_k,io_par_nz_k,io_par_z_off_k,&
+!$omp&  io_par_z_beg,io_par_z_end,io_par_buf_off,&
+!$omp&  io_par_fpixels,io_par_lpixels,&
+!$omp&  io_par_anyflg_priv,io_par_status_priv)
+      do io_par_k = 0, io_read_threads_eff-1
+         io_par_nz_k = io_par_base + &
+         &merge(1_int64,0_int64,&
+         &int(io_par_k,kind=int64).lt.io_par_rem)
+         io_par_z_off_k = int(io_par_k,kind=int64)*io_par_base + &
+         &min(int(io_par_k,kind=int64),io_par_rem)
+         io_par_z_beg = zpix_beg + &
+         &int(io_par_z_off_k)*incs(freq_axis)
+         io_par_z_end = io_par_z_beg + &
+         &int(io_par_nz_k-1_int64)*incs(freq_axis)
+         io_par_buf_off = io_par_z_off_k * io_par_per_plane + 1_int64
+         io_par_fpixels         = fpixels
+         io_par_lpixels         = lpixels
+         io_par_fpixels(freq_axis) = io_par_z_beg
+         io_par_lpixels(freq_axis) = io_par_z_end
+         io_par_status_priv = 0
+         call FTGSVE(par_unit_Q(io_par_k+1),group,naxis,naxes,&
+         &io_par_fpixels,io_par_lpixels,incs,&
+         &nullval,specQ(io_par_buf_off),io_par_anyflg_priv,&
+         &io_par_status_priv)
+         if(io_par_status_priv.ne.0) io_par_read_ok=.false.
+         io_par_status_priv = 0
+         call FTGSVE(par_unit_U(io_par_k+1),group,naxis,naxes,&
+         &io_par_fpixels,io_par_lpixels,incs,&
+         &nullval,specU(io_par_buf_off),io_par_anyflg_priv,&
+         &io_par_status_priv)
+         if(io_par_status_priv.ne.0) io_par_read_ok=.false.
+         if(use_input_mask)then
+            io_par_status_priv = 0
+            call FTGSVE(par_unit_mask(io_par_k+1),group,naxis,naxes,&
+            &io_par_fpixels,io_par_lpixels,incs,&
+            &nullval,specMask(io_par_buf_off),io_par_anyflg_priv,&
+            &io_par_status_priv)
+            if(io_par_status_priv.ne.0) io_par_read_ok=.false.
+         endif
+         if(need_icube)then
+            io_par_status_priv = 0
+            call FTGSVE(par_unit_I(io_par_k+1),group,naxis,naxes,&
+            &io_par_fpixels,io_par_lpixels,incs,&
+            &nullval,specI(io_par_buf_off),io_par_anyflg_priv,&
+            &io_par_status_priv)
+            if(io_par_status_priv.ne.0) io_par_read_ok=.false.
+         endif
+      enddo
+!$omp end parallel do
+      if(.not.io_par_read_ok)then
+         write(*,*)' ERROR: one or more parallel FITS reads failed'
+         status = 1
       endif
 
       call log_tile_bounds('tile_read','done',&
@@ -3581,6 +3679,20 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       &wall_time_seconds()-t_tile_start)
    enddo
 enddo
+ ! Close parallel IO handles opened for tile reads (io_read_threads_eff > 1
+ ! only; for =1 the handles are the existing 21/22/40/45 closed below).
+if(io_read_threads_eff .gt. 1)then
+   do io_par_k = 1, io_read_threads_eff
+      call FTCLOS(par_unit_Q(io_par_k),status)
+      call FTCLOS(par_unit_U(io_par_k),status)
+      if(use_input_mask) call FTCLOS(par_unit_mask(io_par_k),status)
+      if(need_icube)     call FTCLOS(par_unit_I(io_par_k),status)
+   enddo
+endif
+if(allocated(par_unit_Q))    deallocate(par_unit_Q)
+if(allocated(par_unit_U))    deallocate(par_unit_U)
+if(allocated(par_unit_mask)) deallocate(par_unit_mask)
+if(allocated(par_unit_I))    deallocate(par_unit_I)
  ! CLOSE THE FITS FILES:
 call FTCLOS(21,status)
 if (status .gt. 0)then

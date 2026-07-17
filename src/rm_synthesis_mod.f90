@@ -1421,7 +1421,7 @@ contains
                              mask_input_cube_file, &
                              mask_trust_mode, write_mask_output, &
                              write_nvalid_output, cubestat, use_gpu, io_overlap, &
-                             log_level, timing_enabled, timing_tile_enabled, &
+                             io_read_threads, log_level, timing_enabled, timing_tile_enabled, &
                              timing_io_enabled, log_output_file, &
                              timing_csv_file, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
@@ -1437,6 +1437,7 @@ contains
     logical, intent(inout) :: cubestat
     logical, intent(inout) :: use_gpu
     logical, intent(inout) :: io_overlap
+    integer(int32), intent(inout) :: io_read_threads
     character(len=*), intent(inout) :: log_level
     logical, intent(inout) :: timing_enabled
     logical, intent(inout) :: timing_tile_enabled
@@ -1482,6 +1483,7 @@ contains
     logical :: seen_cubestat
     logical :: seen_use_gpu
     logical :: seen_io_overlap
+    logical :: seen_io_read_threads
     logical :: seen_log_level
     logical :: seen_timing_enabled
     logical :: seen_timing_tile_enabled
@@ -1540,6 +1542,7 @@ contains
     seen_cubestat = .false.
     seen_use_gpu = .false.
     seen_io_overlap = .false.
+    seen_io_read_threads = .false.
     seen_log_level = .false.
     seen_timing_enabled = .false.
     seen_timing_tile_enabled = .false.
@@ -1596,6 +1599,7 @@ contains
     cubestat = .false.
     use_gpu = .false.
     io_overlap = .false.
+    io_read_threads = 1
     log_level = 'info'
     timing_enabled = .false.
     timing_tile_enabled = .false.
@@ -2290,6 +2294,21 @@ contains
         end if
         seen_io_overlap = .true.
         io_overlap = flag_from_value(val)
+      case ('io_read_threads')
+        if (seen_io_read_threads) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_read_threads'
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+        seen_io_read_threads = .true.
+        read(val, *, iostat=io_stat) io_read_threads
+        if (io_stat /= 0 .or. io_read_threads < 1) then
+          write(*,*) 'Error reading io_read_threads at line ', line_no
+          status = -199
+          close(unit_cfg)
+          return
+        end if
       case ('log_level')
         if (seen_log_level) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': log_level'
