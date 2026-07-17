@@ -378,6 +378,51 @@ Verified bit-identical (`io_overlap=n` vs `y`) across a 7-tile run
 (`tests/run_tests.sh` §13) and manually at 32 tiles and on the serial
 (non-OMP) binary.
 
+#### When `io_overlap=y` can be detrimental
+
+Two independent levers determine whether overlap helps, does nothing, or
+actively hurts — they don't move together, so reasoning about "big vs.
+small dataset" alone is not enough.
+
+- **RAM size → how much smaller `io_overlap` forces tiles to be.** The
+  auto-tiler doubles the output-side byte estimate under `io_overlap=y`
+  (see the RAM tile planner above), so `tile_dec` shrinks to compensate
+  under a fixed `mem_frac_ram`. Generous RAM: doubling a big allowance
+  still leaves a big one, tile count barely moves. Tight RAM: doubling can
+  eat a large fraction of an already-small budget, pushing tile count up a
+  lot — and more tiles means more fixed per-tile overhead (OMP region
+  spin-up, mask-build loop launch, log writes, cubestat call), which is
+  pure CPU/software cost independent of disk speed.
+- **Disk speed *and architecture* → how much write-time there is to hide,
+  and whether "concurrent" means genuinely overlapped or contended.**
+  This needs a further split:
+  - *Single-spindle disk* (one actuator, classic HDD): reading file A and
+    writing file B concurrently forces the head to seek back and forth
+    between two locations repeatedly, instead of each operation running
+    as one long, mostly-sequential pass serially. Overlap can make this
+    **actively worse**, not merely less beneficial.
+  - *High-latency but parallel* storage (Lustre, multi-server NFS, cloud
+    block storage): concurrent read+write can genuinely use independent
+    hardware paths, so the latency really is hidden — this is what the
+    Setonix profiling data (and the benefit model in the read/write
+    overlap section above) assumed.
+
+|  | Fast disk | Slow disk |
+|---|---|---|
+| **Small RAM** | Worst case: real cost (more, smaller tiles → more fixed overhead), almost no benefit (fast disk ⇒ little write-time to hide). Likely net *negative*. | Depends on architecture. Parallel FS: probably still a net win, blunted by tile fragmentation and by the OS having less spare page-cache to buffer both streams at once. Single-spindle: likely net *negative* — seek-thrashing stacks on top of the fragmentation cost. |
+| **Large RAM** | Neutral: doubling the buffer costs nothing, but there's little write-time to hide either (likely compute- or read-bound already). Harmless to leave on, no real win. | Best case: lots of write-time to hide, RAM absorbs the buffer doubling without meaningfully shrinking tiles. This is the regime the feature targets, closest to the Setonix profile. |
+
+The single sharpest predictor of "detrimental" is **small RAM combined
+with either a fast disk or a single-spindle slow disk** — both make the
+cost (tile fragmentation) outweigh the benefit (not much I/O time to hide,
+or the "hiding" itself backfiring via seek contention). Before enabling
+`io_overlap=y` on a RAM-constrained machine, check whether the target
+storage is parallel (Lustre/NFS/cloud) or a single physical drive — that
+answer flips the recommendation. Given how architecture-dependent this is,
+treat the table as a starting hypothesis, not a substitute for a short
+head-to-head timing run on the actual target machine (the swim-lane
+plotter's separate I/O read/write lanes make this cheap to check).
+
 ### FITS Read Correctness for Large Tiles
 
 #### Background

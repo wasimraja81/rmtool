@@ -172,6 +172,61 @@ Example GPU run:
 bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
 ```
 
+## Tile Memory Planning and I/O Parallelism
+
+For cubes too large to fit in RAM, the image is auto-tiled into full-RA
+Dec strips sized to a fraction of system RAM, with optional parallel
+reads/writes and background-thread write overlap. All of these are opt-in
+and default to the pre-existing serial behaviour.
+
+```cfg
+# Tile memory planning
+tile_auto = y                # y: auto-size tiles from mem_frac_ram (recommended)
+tile_ra = 0                  # manual override (0 = auto); ignored when tile_auto=y
+tile_dec = 0                 # manual override (0 = auto); ignored when tile_auto=y
+mem_frac_ram = 0.30          # fraction of total system RAM to budget per tile
+mem_frac_vram = 0.70         # fraction of GPU VRAM to budget per sub-block (GPU only)
+
+# I/O parallelism
+io_read_threads = 4          # N independent read-only FITS handles per input
+                              # cube, each reading a disjoint channel range.
+                              # Safe to increase (try your Lustre stripe count).
+io_write_threads = 1         # DO NOT SET ABOVE 1 -- see warning below.
+io_overlap = n               # y: overlap tile N's write with tile N+1's
+                              # read/mask/prep/compute on a background thread.
+```
+
+**`io_write_threads` must stay at `1`.** Setting it higher used to open
+multiple read-write handles onto the same output file for parallel
+RM-chunked writes, but CFITSIO aliases repeat read-write opens of an
+already-open file onto one shared internal buffer — the "independent"
+handles aren't independent, and concurrent writes through them corrupted
+that shared state badly enough to crash with a segfault on a real run.
+The code now hard-clamps `io_write_threads_eff` to `1` and prints a
+warning if you request more, so this is safe to leave in a config file,
+but there is currently no way to get a working speed-up from this key.
+See `docs/ARCHITECTURE.md` ("Parallel write — `io_write_threads`") for the
+full root cause.
+
+**`io_overlap` is not a free win — check your RAM and disk before turning
+it on.** It doubles the RAM used by the per-tile output buffers (to let a
+background thread write tile N while tile N+1 is computed), and the
+benefit depends entirely on how much of your wall time is actually spent
+waiting on I/O:
+
+| | Fast disk | Slow disk |
+|---|---|---|
+| **Small RAM** | Likely **worse**: doubled buffers shrink tiles a lot (more per-tile overhead), fast disk means little write time to hide anyway. | Depends: helps on parallel storage (Lustre/NFS); likely **worse** on a single physical drive (concurrent read+write causes seek-thrashing instead of hiding latency). |
+| **Large RAM** | Harmless but pointless: tile count barely changes, but there's little I/O time to hide either. | Best case — this is what the feature targets. |
+
+Rule of thumb: if you're RAM-constrained *and* not on a parallel
+filesystem (Lustre, multi-server NFS, cloud block storage), leave
+`io_overlap=n`. Full reasoning in `docs/ARCHITECTURE.md` under "When
+`io_overlap=y` can be detrimental" — when in doubt, time a short run both
+ways on your actual target machine; the swim-lane plotter (below) renders
+I/O read and I/O write as separate lanes specifically to make this cheap
+to check.
+
 ## Recent Performance Enhancements
 
 Recent updates improved host-side parallelism around staging and data packing:
