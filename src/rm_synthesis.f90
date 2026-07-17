@@ -262,11 +262,12 @@ integer   thread_id_now
 real(dp)  t_thread_stage_start, t_thread_stage_elapsed
 integer   env_len, env_stat, ios_env
 character(len=128) :: env_vram
- ! Parallel channel-read IO variables (T2 - IO optimisation branch)
- ! io_read_threads : cfg-controlled thread count; 1 = serial (default)
- ! Each thread opens its own FITS handle and reads a disjoint channel range
- ! into a contiguous slice of the pre-allocated tile buffer.
-integer   io_read_threads, io_read_threads_eff
+ ! Parallel IO variables (T2 read / T3 write — IO optimisation branch)
+ ! io_read_threads  : cfg key; 1=serial, N>1 opens N handles per input file
+ ! io_write_threads : cfg key; 1=serial, N>1 opens N handles per output cube
+integer   io_read_threads,  io_read_threads_eff
+integer   io_write_threads, io_write_threads_eff
+ ! Read-side per-thread handles and scratch
 integer, allocatable :: par_unit_Q(:), par_unit_U(:)
 integer, allocatable :: par_unit_I(:), par_unit_mask(:)
 integer   io_par_k
@@ -277,6 +278,14 @@ integer   io_par_z_beg, io_par_z_end
 integer   io_par_anyflg_priv, io_par_status_priv
 integer   io_par_fpixels(max_axis), io_par_lpixels(max_axis)
 logical   io_par_read_ok
+ ! Write-side per-thread handles and scratch (RM-chunked for AMP/PHA cubes)
+integer, allocatable :: par_wunit_amp(:), par_wunit_pha(:)
+integer   io_wpar_k
+integer(kind=int64) :: io_wpar_base, io_wpar_rem
+integer(kind=int64) :: io_wpar_nrm_k, io_wpar_rm_off_k, io_wpar_buf_off
+integer   io_wpar_rm_beg, io_wpar_rm_end
+integer   io_wpar_status_priv
+integer   io_wpar_fpix(3), io_wpar_lpix(3)
  ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
 real(sp), allocatable :: stQ(:,:), stU(:,:), stMask(:,:), stI(:,:)
 real(sp), allocatable :: stP(:,:), stPhi(:,:)
@@ -417,7 +426,7 @@ call read_cfg_keyval(cfgfile,&
 &mask_trust_mode,&
 &write_mask_output,&
 &write_nvalid_output,cubestat,use_gpu,&
-&io_overlap,io_read_threads,log_level,&
+&io_overlap,io_read_threads,io_write_threads,log_level,&
 &timing_enabled,timing_tile_enabled,&
 &timing_io_enabled,log_output_file,&
 &timing_csv_file,&
@@ -2719,6 +2728,28 @@ else
    write(*,*)" Parallel FITS IO: opened ",io_read_threads_eff," handles/file"
 endif
 
+ ! --- Parallel write handle setup ---
+ ! Clamp io_write_threads to [1, nrm_out]; alias existing handles for =1.
+ ! For >1: open N independent readwrite handles per output cube so each
+ ! thread writes a disjoint RM-bin range.  Non-overlapping pwrite to
+ ! different byte regions is safe; CFITSIO only updates file-level
+ ! metadata at close, not during subset puts.
+io_write_threads_eff = max(1, min(io_write_threads, nrm_out))
+allocate(par_wunit_amp(io_write_threads_eff))
+allocate(par_wunit_pha(io_write_threads_eff))
+if(io_write_threads_eff .eq. 1)then
+   par_wunit_amp(1) = 41
+   par_wunit_pha(1) = 42
+else
+   do io_wpar_k = 1, io_write_threads_eff
+      par_wunit_amp(io_wpar_k) = 600 + io_wpar_k
+      call FTOPEN(par_wunit_amp(io_wpar_k),outfileAMP,1,blocksize,status)
+      par_wunit_pha(io_wpar_k) = 700 + io_wpar_k
+      call FTOPEN(par_wunit_pha(io_wpar_k),outfileANG,1,blocksize,status)
+   enddo
+   write(*,*)" Parallel FITS write: opened ",io_write_threads_eff," handles/cube"
+endif
+
 cnt1 = 0
 n_rm_blocks_total = 0_int64
 n_subblocks_total = 0_int64
@@ -3584,16 +3615,48 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       fpixels_out(3) = 1
       lpixels_out(3) = nrm_out
 
-      call ftpsse(41,group,3,naxes_out,fpixels_out,lpixels_out,&
-      &p_tile_arr,status)
-      if(status.gt.0)then
-         call printerror(status)
-      endif
-      call ftpsse(42,group,3,naxes_out,fpixels_out,lpixels_out,&
-      &phi_tile_arr,status)
-      if(status.gt.0)then
-         call printerror(status)
-      endif
+      ! --- RM-chunked parallel write for AMP and PHA cubes ---
+      ! Split nrm_out RM bins across io_write_threads_eff threads; each thread
+      ! writes a contiguous RM-bin slice to a disjoint byte region of the file.
+      ! For io_write_threads_eff=1 the loop runs once on the calling thread
+      ! using the existing unit handles -- identical to the former serial write.
+      io_wpar_base = int(nrm_out,kind=int64) / &
+      &int(io_write_threads_eff,kind=int64)
+      io_wpar_rem  = mod(int(nrm_out,kind=int64), &
+      &int(io_write_threads_eff,kind=int64))
+!$omp parallel do if(io_write_threads_eff.gt.1)&
+!$omp& num_threads(io_write_threads_eff)&
+!$omp& default(none)&
+!$omp& shared(io_write_threads_eff,io_wpar_base,io_wpar_rem,&
+!$omp&  par_wunit_amp,par_wunit_pha,group,naxes_out,&
+!$omp&  fpixels_out,lpixels_out,p_tile_arr,phi_tile_arr,nx_tile,ny_tile)&
+!$omp& private(io_wpar_k,io_wpar_nrm_k,io_wpar_rm_off_k,&
+!$omp&  io_wpar_rm_beg,io_wpar_rm_end,io_wpar_buf_off,&
+!$omp&  io_wpar_fpix,io_wpar_lpix,io_wpar_status_priv)
+      do io_wpar_k = 0, io_write_threads_eff-1
+         io_wpar_nrm_k = io_wpar_base + &
+         &merge(1_int64,0_int64,&
+         &int(io_wpar_k,kind=int64).lt.io_wpar_rem)
+         io_wpar_rm_off_k = int(io_wpar_k,kind=int64)*io_wpar_base + &
+         &min(int(io_wpar_k,kind=int64),io_wpar_rem)
+         io_wpar_rm_beg = int(io_wpar_rm_off_k) + 1
+         io_wpar_rm_end = int(io_wpar_rm_off_k + io_wpar_nrm_k)
+         io_wpar_buf_off = io_wpar_rm_off_k * &
+         &int(nx_tile,kind=int64)*int(ny_tile,kind=int64) + 1_int64
+         io_wpar_fpix = fpixels_out
+         io_wpar_lpix = lpixels_out
+         io_wpar_fpix(3) = io_wpar_rm_beg
+         io_wpar_lpix(3) = io_wpar_rm_end
+         io_wpar_status_priv = 0
+         call ftpsse(par_wunit_amp(io_wpar_k+1),group,3,naxes_out,&
+         &io_wpar_fpix,io_wpar_lpix,&
+         &p_tile_arr(io_wpar_buf_off),io_wpar_status_priv)
+         io_wpar_status_priv = 0
+         call ftpsse(par_wunit_pha(io_wpar_k+1),group,3,naxes_out,&
+         &io_wpar_fpix,io_wpar_lpix,&
+         &phi_tile_arr(io_wpar_buf_off),io_wpar_status_priv)
+      enddo
+!$omp end parallel do
 
       if(out_mask_open)then
          fpixels_out(3) = 1
@@ -3679,8 +3742,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       &wall_time_seconds()-t_tile_start)
    enddo
 enddo
- ! Close parallel IO handles opened for tile reads (io_read_threads_eff > 1
- ! only; for =1 the handles are the existing 21/22/40/45 closed below).
+ ! Close parallel read handles (io_read_threads_eff>1 only; =1 aliases 21/22/40/45).
 if(io_read_threads_eff .gt. 1)then
    do io_par_k = 1, io_read_threads_eff
       call FTCLOS(par_unit_Q(io_par_k),status)
@@ -3693,6 +3755,15 @@ if(allocated(par_unit_Q))    deallocate(par_unit_Q)
 if(allocated(par_unit_U))    deallocate(par_unit_U)
 if(allocated(par_unit_mask)) deallocate(par_unit_mask)
 if(allocated(par_unit_I))    deallocate(par_unit_I)
+ ! Close parallel write handles (io_write_threads_eff>1 only; =1 aliases 41/42).
+if(io_write_threads_eff .gt. 1)then
+   do io_wpar_k = 1, io_write_threads_eff
+      call FTCLOS(par_wunit_amp(io_wpar_k),status)
+      call FTCLOS(par_wunit_pha(io_wpar_k),status)
+   enddo
+endif
+if(allocated(par_wunit_amp)) deallocate(par_wunit_amp)
+if(allocated(par_wunit_pha)) deallocate(par_wunit_pha)
  ! CLOSE THE FITS FILES:
 call FTCLOS(21,status)
 if (status .gt. 0)then
