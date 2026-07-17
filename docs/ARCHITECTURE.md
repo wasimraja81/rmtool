@@ -143,11 +143,147 @@ constrained host RAM and device VRAM.
 - CPU-only binaries warn and fall back to CPU behaviour when `use_gpu` is
   requested.
 
-### IO Architecture Section
-- Tile IO is stage-bounded around compute and currently orchestrated in the
-  main tile loop.
-- IO optimisation is treated as an orchestration concern and must not change RM
-  numerical kernels.
+### IO Architecture
+
+#### Tile IO stage structure
+
+Each tile passes through five sequential stages before the next tile begins:
+
+```
+tile_read → tile_mask → tile_prep → tile_compute → tile_scatter → tile_write
+```
+
+IO is bounded to the `tile_read` and `tile_write` stages. Compute kernels are
+not affected by any IO change.
+
+#### FITS disk layout and access pattern
+
+The output cube is stored RA-fastest on disk (FITS NAXIS ordering):
+
+```
+chan=1 / rm=1:  [ dec=1, ra=1..nx ] [ dec=2, ra=1..nx ] … [ dec=ny, ra=1..nx ]
+chan=2 / rm=2:  …
+…
+```
+
+For a tile read of `[ra=1..nx, dec=d1..d2, chan=1..nz]`, each channel plane
+requires one contiguous read followed by a seek over the remaining Dec rows:
+
+| per tile, per channel | size |
+|---|---|
+| Contiguous read (Dec strip) | `tile_dec × tile_ra × 4 B` |
+| Seek gap to next channel | `(ny − tile_dec) × tile_ra × 4 B` |
+
+With a typical Setonix cube (13 308 × 734 Dec strip × 288 channels), the
+read efficiency is `734/11870 ≈ 6%` — the remaining 94% is seek gaps.  This
+is intrinsic to the FITS layout vs the RM synthesis access pattern (all
+channels needed simultaneously per pixel); it cannot be eliminated without
+re-ordering the cube on disk.
+
+#### Parallel read — `io_read_threads`
+
+Channel-chunked parallel reads using `N` independent CFITSIO handles per
+input file.  Each thread reads a disjoint channel range of the same spatial
+tile into a contiguous slice of the pre-allocated buffer.
+
+```
+Serial (io_read_threads=1):
+  thread 0:  seek→read chan 1   seek→read chan 2   …   seek→read chan 288
+  wall time ∝  288 × (t_seek + t_read)
+
+Parallel (io_read_threads=N):
+  thread 0:  seek→read chan   1..288/N  ─┐
+  thread 1:  seek→read chan 288/N+1..   ├─ simultaneous
+  …                                      ─┘
+  wall time ∝  (288/N) × (t_seek + t_read)
+```
+
+Channel ranges map to widely-separated byte regions in the file, landing on
+different Lustre OSTs and enabling true parallel filesystem throughput.
+
+| Property | Value |
+|---|---|
+| Decomposition axis | Frequency (channel) |
+| Seeks per thread | `nz_out / N` (same total as serial) |
+| Read per seek | `tile_dec × tile_ra × 4 B` (unchanged — no spatial loss) |
+| Spatial tile footprint | Unchanged — full `tile_ra × tile_dec` per call |
+| Buffer layout | Contiguous per thread; no interleaving |
+| Lustre benefit | Channel ranges → different byte offsets → different OSTs |
+
+For `io_read_threads=1` (default): `par_unit_Q(1)=21`, `par_unit_U(1)=22`
+etc. alias the existing open handles.  No file re-opens, no overhead, loop
+runs once — bit-identical to the prior serial path.
+
+#### Parallel write — `io_write_threads`
+
+RM-bin-chunked parallel writes using `N` independent readwrite CFITSIO
+handles per output cube (AMP and PHA).  Each thread writes a disjoint RM-bin
+range of the tile output buffer to non-overlapping byte regions of the file.
+
+```
+Serial (io_write_threads=1):
+  thread 0:  write rm 1..nrm (AMP)   then write rm 1..nrm (PHA)
+
+Parallel (io_write_threads=N):
+  thread 0:  write rm   1..nrm/N  (AMP + PHA)  ─┐
+  thread 1:  write rm nrm/N+1..   (AMP + PHA)  ├─ simultaneous
+  …                                              ─┘
+```
+
+| Property | Value |
+|---|---|
+| Decomposition axis | RM (slowest axis in output cube) |
+| Output files parallelised | AMP cube (unit 41) and PHA cube (unit 42) |
+| 2D map outputs (NVALID, MASK, cubestat) | Remain serial — negligible cost |
+| POSIX safety | Concurrent `pwrite()` to non-overlapping byte regions is guaranteed safe |
+| CFITSIO metadata safety | File-level metadata updated only at `FTCLOS`, not during subset puts |
+
+For `io_write_threads=1` (default): `par_wunit_amp(1)=41`,
+`par_wunit_pha(1)=42` alias existing handles — zero overhead.
+
+#### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
+
+Compute threads and IO threads are constrained by different resources:
+
+| | Compute (`OMP_NUM_THREADS`) | IO threads (`io_read/write_threads`) |
+|---|---|---|
+| Bottleneck | CPU cores | Lustre OST stripe count, CFITSIO handle overhead |
+| Optimal N on Setonix | All available cores (e.g. 128) | File stripe count (typically 4–16) |
+| Cost of over-counting | Idle threads, negligible | Excess handles, metadata pressure, diminishing throughput |
+| Typical value | `OMP_NUM_THREADS` environment variable | `lfs getstripe <file>` stripe count |
+
+Setting `io_read_threads=128` on a 128-core node would open 128 CFITSIO
+handles per input file.  Beyond the Lustre stripe count there is no additional
+throughput and metadata server load increases.  The recommended value is the
+Lustre stripe count of the input/output files.
+
+#### Thread ceiling enforcement
+
+| Build | Behaviour when `io_*_threads > OMP thread pool` |
+|---|---|
+| `HOST_OMP=1` | Clamped to `omp_get_max_threads()`; warning printed at startup |
+| `HOST_OMP=0` (serial) | Forced to 1 with a note; N>1 in serial binary runs handles sequentially (worse than a single call) |
+
+Additional clamp: `io_read_threads_eff ≤ nz_out` and
+`io_write_threads_eff ≤ nrm_out` (can't have more threads than data partitions).
+
+#### Runtime behavior table
+
+| `io_read_threads` | `OMP_NUM_THREADS` | Effective IO threads | Extra file handles |
+|---|---|---|---|
+| 1 (default) | any | 1 | 0 — aliases units 21/22/40/45 |
+| 4 | ≥ 4 | 4 | 3 per input file |
+| 8 | 4 | 4 (clamped, warning) | 3 per input file |
+| 4 | any | 1 (serial binary) | 0 (forced, note printed) |
+
+Same table applies to `io_write_threads` / units 41/42 / `nrm_out`.
+
+#### Design constraints preserved
+- Compute kernels are unchanged.
+- Tile spatial footprint is set by the RAM planner; parallel IO does not
+  alter it.
+- All tests pass at `io_read_threads=1`, `io_write_threads=1` (default).
+- Switching to serial is always possible by omitting both keys from the cfg.
 
 ### FITS Read Correctness for Large Tiles
 
