@@ -117,6 +117,8 @@ The primary driver is scalable processing for very large cubes under constrained
 - `cpu_extract rm_block odd`, `cpu_extract rm_block even`
   - Per-thread extraction intervals from `tile_thread` markers.
   - Even blocks are hatched for parity separation.
+  - If a run executes only one RM block (`nrm_out <= nrm_block_size`), only
+    the odd/non-hatched series appears; hatched-even traces are not expected.
 - Optional stage overlays: `CPU mask`, `CPU prep`, `CPU compute`, `CPU cubestat`.
 - Optional I/O overlays: `I/O read`, `I/O write`.
 
@@ -171,14 +173,22 @@ The primary driver is scalable processing for very large cubes under constrained
 - Host OpenMP parallelisation added for spectral pack/copy loops in
   `src/rm_synthesis_mod.f90` (`prepare_cpu_data` and `prepare_gpu_data`) with
   `omp_in_parallel` guard.
+- Planner memory accounting in `src/rm_synthesis.f90` was split into two
+  independent budgets:
+  - `bytes_per_tile_pixel_ram` for host RAM tile sizing.
+  - `bytes_per_vram_pixel` for GPU VRAM sub-block sizing.
+  This prevents staging-only VRAM terms from over-shrinking RAM tiles on
+  CPU/non-staging paths.
 - Validation status after these changes:
   - full build matrix successful (`OMP/GPU` combinations),
   - test suite remains green (`22/22`).
 - Jennifer full-image observations from this session:
-  - GPU run improved versus prior in-session baseline, with large reductions in
-    `tile_prep` and `tile_scatter` time,
-  - CPU runs showed normal run-to-run variance; no evidence that the staging
-    gather/scatter change directly affects the non-staging CPU path.
+  - CPU improved with the planner split (`733.758s` -> `721.764s`) on the
+    tested host/configuration.
+  - GPU remained correct and fully offloaded, but was slightly slower versus
+    prior baseline in this environment (`2110.988s` -> `2133.811s`).
+  - Implication: planner policy is workload/device dependent; CPU-friendly RAM
+    strip growth does not guarantee GPU speedup.
 
 ## Future Work
 - Add benchmark sweeps for RM block size and OpenMP schedule on CPU-only runs.

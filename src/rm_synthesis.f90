@@ -236,7 +236,8 @@ real(sp)  mask_val
 integer   in_fields
 integer   mem_unit, ios_mem
 integer(kind=int64) :: mem_avail_kb, mem_kb_tmp
-integer(kind=int64) :: mem_safe_bytes, bytes_per_tile_pixel
+integer(kind=int64) :: mem_safe_bytes
+integer(kind=int64) :: bytes_per_tile_pixel_ram, bytes_per_vram_pixel
 integer(kind=int64) :: tile_pixels_max, tile_bytes_est
 integer(kind=int64) :: image_pixels_total
 character(len=256) :: mem_line
@@ -1650,33 +1651,65 @@ endif
 in_fields = 2
 if(need_icube)in_fields = 3
 
- ! Per-output-pixel memory budget. This MUST count every array that
- ! is allocated at RAM-block scale, otherwise the planner picks a
- ! tile that overflows physical RAM and the run aborts on allocate
- ! (leaving 0-byte output cubes).
+ ! RAM tile planner budget (bytes per output pixel).
  !
- ! Allocated at tile_ra*tile_dec scale:
- !   read spectra : specQ, specU [, specI][, specMask] = in_fields*nz
- !                  (in_fields counts I-cube; add mask below)
- !   work spectra : Q_tile, U_tile, wts_tile           = 3*nz
- !   outputs      : p_tile_arr, phi_tile_arr           = 2*nrm
- !   mask (int8)  : mask_tile_arr                       = nz bytes
- ! prepare_gpu_data temporarily allocates specQ_gpu+specU_gpu+wts_gpu
- ! (3*nz, same size as former Q_tile+U_tile+wts_tile) per tile; these
- ! are counted conservatively in the formula below (unchanged).
- ! Staging buffers (sized tile_ra*ny_sub, ny_sub<=tile_dec):
- !   stQ,stU (2*nz) + stMaskOut (nz int8) + stP,stPhi (2*nrm)
-bytes_per_tile_pixel = int(4,kind=int64)*&
-&(int(in_fields + 3 + 5,kind=int64)*int(nz_out,kind=int64) +&
-&int(2 + 2,kind=int64)*int(nrm_out,kind=int64)) +&
-&int(2,kind=int64)*int(nz_out,kind=int64)
+ ! Count arrays that are allocated at tile_ra*tile_dec scale in this run,
+ ! plus non-staging full-tile prep buffers (CPU or GPU path). Do NOT charge
+ ! staging-strip buffers here; they are sized by ny_sub and handled via the
+ ! VRAM planner. This avoids over-shrinking tile_dec for CPU/non-staging jobs.
+bytes_per_tile_pixel_ram = 0_int64
+
+ ! Always allocated full-tile arrays: specQ/specU + p/phi outputs.
+bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram + int(4,kind=int64) * (&
+&int(2,kind=int64)*int(nz_out,kind=int64) +&
+&int(2,kind=int64)*int(nrm_out,kind=int64))
+
+ ! Optional full-tile inputs.
+if(use_input_mask)then
+   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+   &int(4,kind=int64)*int(nz_out,kind=int64)
+endif
+if(need_icube)then
+   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+   &int(4,kind=int64)*int(nz_out,kind=int64)
+endif
+
+ ! Full-tile mask and valid-channel count outputs.
+bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+&int(1,kind=int64)*int(nz_out,kind=int64) + int(2,kind=int64)
+
+ ! Optional cubestat maps (peak/rm_peak/ang_peak/snr), 4 float maps.
+if(cubestat)then
+   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+   &int(4,kind=int64)*int(4,kind=int64)
+endif
+
+ ! Non-staging prep buffers (full tile): Q/U/wts + wsum (+ means if enabled).
+bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram + int(4,kind=int64) * (&
+&int(3,kind=int64)*int(nz_out,kind=int64) + int(1,kind=int64))
+if(rem_mean.gt.0)then
+   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+   &int(4,kind=int64)*int(2,kind=int64)
+endif
+
+ ! VRAM sub-block budget (bytes per sub-block pixel). This is separate from
+ ! RAM planning and should reflect per-offload working sets only.
+bytes_per_vram_pixel = int(4,kind=int64) * (&
+&int(3,kind=int64)*int(nz_out,kind=int64) +&
+&int(2,kind=int64)*int(nrm_out,kind=int64) +&
+&int(1,kind=int64))
+if(rem_mean.gt.0)then
+   bytes_per_vram_pixel = bytes_per_vram_pixel +&
+   &int(4,kind=int64)*int(2,kind=int64)
+endif
+
 mem_safe_bytes = int(mem_frac_ram *&
 &real(mem_avail_kb,kind=dp) * 1024.0_dp,&
 &kind=int64)
-if(mem_safe_bytes.le.bytes_per_tile_pixel)then
-   mem_safe_bytes = bytes_per_tile_pixel
+if(mem_safe_bytes.le.bytes_per_tile_pixel_ram)then
+   mem_safe_bytes = bytes_per_tile_pixel_ram
 endif
-tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel
+tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel_ram
 if(tile_pixels_max.lt.1_int64)tile_pixels_max = 1_int64
 image_pixels_total = nx_out
 image_pixels_total = image_pixels_total * ny_out
@@ -1715,7 +1748,7 @@ endif
  ! Safety shrink: reduce Dec rows first (keep full RA contiguous);
  ! only shrink RA once the strip is already a single Dec row.
 tile_bytes_est = int(tile_ra,kind=int64) *&
-&int(tile_dec,kind=int64) * bytes_per_tile_pixel
+&int(tile_dec,kind=int64) * bytes_per_tile_pixel_ram
 do while(tile_bytes_est.gt.mem_safe_bytes .and.&
 &(tile_ra.gt.1 .or. tile_dec.gt.1))
    if(tile_dec.gt.1)then
@@ -1724,7 +1757,7 @@ do while(tile_bytes_est.gt.mem_safe_bytes .and.&
       tile_ra = max(1,tile_ra/2)
    endif
    tile_bytes_est = int(tile_ra,kind=int64) *&
-   &int(tile_dec,kind=int64) * bytes_per_tile_pixel
+   &int(tile_dec,kind=int64) * bytes_per_tile_pixel_ram
 enddo
 
  !----------------------------------------------------
@@ -1798,14 +1831,14 @@ if(gpu_vram_mib_eff.gt.0)then
    &real(template_bytes,kind=dp)) /&
    &real(inflight_slots_planned,kind=dp)
    if(vram_budget_per_slot_bytes.lt.&
-   &real(bytes_per_tile_pixel,kind=dp))then
-      vram_budget_per_slot_bytes = real(bytes_per_tile_pixel,kind=dp)
+   &real(bytes_per_vram_pixel,kind=dp))then
+      vram_budget_per_slot_bytes = real(bytes_per_vram_pixel,kind=dp)
    endif
    vram_safe_bytes = int(vram_budget_per_slot_bytes,kind=int64)
-   if(vram_safe_bytes.lt.bytes_per_tile_pixel)then
-      vram_safe_bytes = bytes_per_tile_pixel
+   if(vram_safe_bytes.lt.bytes_per_vram_pixel)then
+      vram_safe_bytes = bytes_per_vram_pixel
    endif
-   sub_px_max = vram_safe_bytes / bytes_per_tile_pixel
+   sub_px_max = vram_safe_bytes / bytes_per_vram_pixel
    if(sub_px_max.lt.1_int64)sub_px_max = 1_int64
    ny_sub = int(sub_px_max / int(tile_ra,kind=int64))
    if(ny_sub.lt.1)ny_sub = 1

@@ -49,6 +49,8 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
 - **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM blocking, CPU/GPU parallelization, offload strategy
+- **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
+- **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 
 ## Configuration
 
@@ -177,6 +179,11 @@ Recent updates improved host-side parallelism around staging and data packing:
 - In `src/rm_synthesis_mod.f90`, pack/copy loops in `prepare_cpu_data` and
   `prepare_gpu_data` are host-parallelised in HOST_OMP builds with an
   `omp_in_parallel` guard to prevent nested-region oversubscription.
+- In `src/rm_synthesis.f90`, tile-memory planning now separates:
+	- RAM tile budget (`bytes_per_tile_pixel_ram`) for host read-tile sizing, and
+	- VRAM sub-block budget (`bytes_per_vram_pixel`) for GPU staging/offload sizing.
+	This decouples host tile size from device strip size and avoids
+	over-conservative RAM tiling in CPU or non-staging runs.
 
 Scope note:
 - The staged gather/scatter enhancement is active only when `use_staging=true`
@@ -186,8 +193,10 @@ Scope note:
 Session validation summary:
 - Build matrix: all four `OMP/GPU` variants compile successfully.
 - Tests: `22/22` passing.
-- Jennifer full-image benchmark: GPU path improved in this session, with major
-	reductions in `tile_prep` and `tile_scatter` contributions.
+- Jennifer full-image benchmark (new planner split):
+	- CPU run improved from `733.758s` to `721.764s`.
+	- GPU run completed successfully with active offload, but was slightly slower
+		in this environment (`2110.988s` -> `2133.811s`, about `+1.1%`).
 
 ## GPU Acceleration
 
