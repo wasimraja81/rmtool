@@ -21,14 +21,14 @@ with corresponding documentation and interpretation updates for swim-lane diagno
   - GPU path remained correct with active offload, but showed a small runtime regression on the tested environment.
 
 - Documentation improvements:
-  - Updated architecture/timeline design note for planner split behavior.
+  - Updated architecture/timeline design note for planner split behaviour.
   - Clarified swim-lane odd/even `cpu_extract` semantics for single-RM-block CPU runs.
   - Added project changelog and explicit release note references from README.
 
-## Compatibility and behavior notes
+## Compatibility and behaviour notes
 
 - Configuration keys and public CLI/build entry points are unchanged.
-- RM synthesis numerical behavior remains unchanged by planner split; the change targets tile-size planning.
+- RM synthesis numerical behaviour remains unchanged by planner split; the change targets tile-size planning.
 - Swim-lane visual parity (`odd` solid vs `even` hatched) is expected only when multiple RM blocks are present.
 
 ## Validation snapshot

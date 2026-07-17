@@ -55,7 +55,7 @@ whether host-side preprocessing loops use OpenMP parallelization:
 
 The `HOST_OMP` macro gates preprocessor directives in the main program 
 (`src/rm_synthesis.f90`) and runtime variable checks in free-form Fortran 
-(`src/rm_synthesis_mod.f90`), ensuring correct semantic behavior for each variant.
+(`src/rm_synthesis_mod.f90`), ensuring correct semantic behaviour for each variant.
 
 #### Use Cases
 
@@ -153,7 +153,7 @@ rmtool/
 ### GFortran (Default)
 
 ```bash
-# Release (optimized)
+# Release (optimised)
 make MODE=release
 
 # Debug (with bounds checking)
@@ -200,7 +200,7 @@ For production use:
 # Optimize for your CPU
 make MODE=release
 
-# Or with aggressive optimization
+# Or with aggressive optimisation
 FFLAGS="-O3 -march=native -ffast-math" make
 ```
 
