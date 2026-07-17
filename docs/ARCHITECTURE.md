@@ -149,6 +149,55 @@ constrained host RAM and device VRAM.
 - IO optimisation is treated as an orchestration concern and must not change RM
   numerical kernels.
 
+### FITS Read Correctness for Large Tiles
+
+#### Background
+FITS subset reads are performed via the CFITSIO Fortran wrapper `FTGSVE`.
+Internally `FTGSVE` computes a total element count `nelem` as the product of
+the per-axis extents being read.  In CFITSIO versions prior to 3.47 this
+product was a 32-bit signed integer; in CFITSIO 4.x it is `LONGLONG` (64-bit)
+throughout the call chain (`ffgsve` → `ffgr4b` → `ffgbyt`).
+
+#### Bug
+When the RAM planner selects a large tile (e.g. 13 308 × 734 × 288 channels =
+2.8 × 10⁹ elements), two independent 32-bit integer overflows occur:
+
+1. `allocate(specQ(tile_ra*tile_dec*nz_out))` — size computed in default-integer
+   (32-bit) arithmetic wraps silently, producing an undersized buffer.
+2. Older CFITSIO (< 3.47) computes `nelem` as a 32-bit int inside `ffgsve`;
+   the wrapped negative value reaches `ffgbyt` as an invalid byte count,
+   causing a `SIGSEGV` (backtrace: `ffgbyt ← ffgr4b ← ffgsve ← ftgsve_`).
+
+#### Possible fixes
+- **Reduce tile size** in the planner — defeats the purpose of RAM-driven tiling.
+- **Channel-batch the FTGSVE calls** — keeps the tile intact but splits the read
+  along the frequency axis into chunks ≤ INT32_MAX elements.  Correct for any
+  CFITSIO version, but adds IO calls and complexity.
+- **Fix the integer arithmetic** — correct `allocate()` sizes to use int64 and
+  rely on CFITSIO 4.x (which uses `LONGLONG` for `nelem` throughout its internal
+  call chain) for single large reads.
+
+#### Adopted fix
+The integer arithmetic fix was adopted (`src/rm_synthesis.f90`):
+
+- All `allocate()` size expressions use `int(..., kind=int64)` casts; buffers
+  are correctly sized for any tile the RAM planner selects.
+- FITS reads remain single direct `FTGSVE` calls; no tile size reduction.
+
+Integer-safety after fix:
+
+| Layer | Safe up to | Mechanism |
+|---|---|---|
+| Array allocation | 2^63 − 1 elements | `int(...,int64)` in all `allocate()` size expressions |
+| CFITSIO `nelem` | 2^63 − 1 elements | CFITSIO 4.x uses `LONGLONG` throughout `ffgsve → ffgr4b → ffgbyt` |
+| Coordinate arrays `fpixels` / `lpixels` | 2^31 − 1 per axis | Pixel index values; no current survey axis approaches this limit |
+
+#### Not covered — backward compatibility with CFITSIO < 3.47
+The single-call path requires CFITSIO ≥ 3.47.  On an older library, reads of
+tiles where `tile_ra × tile_dec × nz_out > INT32_MAX` will crash as above.
+The correct mitigation is to update CFITSIO to a current release, not to
+reduce tile size or add call-splitting logic.
+
 ### Observability and Diagnostics
 
 #### Structured logs

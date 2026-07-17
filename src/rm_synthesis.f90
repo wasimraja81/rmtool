@@ -262,6 +262,10 @@ integer   thread_id_now
 real(dp)  t_thread_stage_start, t_thread_stage_elapsed
 integer   env_len, env_stat, ios_env
 character(len=128) :: env_vram
+ ! (No channel-batch temporaries needed: allocate() uses int64 arithmetic
+ !  and CFITSIO 4.x (Ubuntu 24.04) uses LONGLONG for nelem throughout
+ !  ffgsve->ffgr4b->ffgbyt, so a single FTGSVE call is safe up to 2^63-1
+ !  elements. See docs/ARCHITECTURE.md FITS Read Correctness section.)
  ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
 real(sp), allocatable :: stQ(:,:), stU(:,:), stMask(:,:), stI(:,:)
 real(sp), allocatable :: stP(:,:), stPhi(:,:)
@@ -1941,12 +1945,15 @@ endif
  ! allocate would abort and leave 0-byte output cubes; here we
  ! fail loudly with guidance instead.
 ios_mem = 0
-allocate(specQ(tile_ra*tile_dec*nz_out),&
-&specU(tile_ra*tile_dec*nz_out),&
-&p_tile_arr(tile_ra*tile_dec*nrm_out),&
-&phi_tile_arr(tile_ra*tile_dec*nrm_out),&
-&mask_tile_arr(tile_ra*tile_dec*nz_out),&
-&nvalid_tile_arr(tile_ra*tile_dec),&
+ ! Use int64 arithmetic for array sizes: tile_ra*tile_dec*nz_out can exceed
+ ! INT32_MAX (e.g. 13308*734*288 = 2.81e9) causing silent 32-bit wrap and a
+ ! misallocated buffer that FTGSVE then overruns.
+allocate(specQ(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
+&specU(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
+&p_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
+&phi_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
+&mask_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
+&nvalid_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)),&
 &stat=ios_mem)
 if(ios_mem.eq.0 .and. cubestat)then
    allocate(peak_tile_arr(tile_ra*tile_dec),&
@@ -1956,10 +1963,10 @@ if(ios_mem.eq.0 .and. cubestat)then
    &stat=ios_mem)
 endif
 if(ios_mem.eq.0 .and. use_input_mask)then
-   allocate(specMask(tile_ra*tile_dec*nz_out),stat=ios_mem)
+   allocate(specMask(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),stat=ios_mem)
 endif
 if(ios_mem.eq.0 .and. need_icube)then
-   allocate(specI(tile_ra*tile_dec*nz_out),stat=ios_mem)
+   allocate(specI(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),stat=ios_mem)
 endif
 
  ! Compact staging buffers sized to one VRAM sub-block (Dec strip).
@@ -2704,17 +2711,22 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
 
       call timer_start(t_stage)
+      ! Single FTGSVE call per input per tile.  Safe because:
+      !  - allocate() uses int64 arithmetic (no 32-bit wrap on buffer size)
+      !  - CFITSIO 4.x (Ubuntu 24.04) uses LONGLONG for nelem throughout
+      !    ffgsve->ffgr4b->ffgbyt, so 2.8e9-element reads do not overflow.
+      ! See docs/ARCHITECTURE.md: FITS Read Correctness for Large Tiles.
       call FTGSVE(21,group,naxis,naxes,fpixels,lpixels,incs,&
       &nullval,specQ,anyflg,status)
       call FTGSVE(22,group,naxis,naxes,fpixels,lpixels,incs,&
       &nullval,specU,anyflg,status)
       if(use_input_mask)then
-         call FTGSVE(45,group,naxis,naxes,fpixels,lpixels,&
-         &incs,nullval,specMask,anyflg,status)
+         call FTGSVE(45,group,naxis,naxes,fpixels,lpixels,incs,&
+         &nullval,specMask,anyflg,status)
       endif
       if(need_icube)then
-         call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,&
-         &incs,nullval,specI,anyflg,status)
+         call FTGSVE(40,group,naxis,naxes,fpixels,lpixels,incs,&
+         &nullval,specI,anyflg,status)
       endif
 
       call log_tile_bounds('tile_read','done',&

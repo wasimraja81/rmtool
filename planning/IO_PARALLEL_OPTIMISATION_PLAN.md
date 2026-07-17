@@ -33,6 +33,25 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
 5. Operability
    - Runtime switch can disable new IO path immediately.
    - Fallback path is tested and documented.
+6. Setonix Closure
+   - Prior failing large-tile case no longer crashes in tile read.
+   - Results remain numerically consistent with baseline outputs.
+   - IO timings are reported before/after on identical workload.
+
+## Setonix bug discovered during testing
+- Symptom: crash in `FTGSVE` tile-read path on first large subset read in
+  Setonix CPU run.
+- Trigger profile: very large single-call read extent where per-call element
+  count exceeds wrapper-level signed 32-bit safety bounds.
+- Impact: run abort before compute completes, even when host memory is
+  sufficient.
+- Scope lock: compute kernels remain unchanged; remediation is IO interface
+  and orchestration only.
+- Agreed direction on this branch:
+  1. implement a 64-bit-capable read interface path first,
+  2. use call-level read chunking only as fallback if ABI/symbol constraints
+     block direct 64-bit interface usage,
+  3. keep serial fallback switchable at runtime.
 
 ## Work Tickets
 
@@ -52,7 +71,20 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
   - full test pass,
   - unchanged stage marker semantics.
 
-### T2 - Parallel Read MVP
+### T2 - Setonix read-interface hardening (64-bit first)
+- Objective: remove large-read overflow risk without changing compute path.
+- Scope: tile read interface only.
+- Plan:
+  1. introduce a 64-bit-capable FITS subset read interface path,
+  2. keep existing `FTGSVE` path as explicit fallback,
+  3. if direct 64-bit path is unavailable on platform build, enable
+     call-level read chunking fallback for the read call only.
+- Evidence to capture:
+  - Setonix failing case runs without read-stage crash,
+  - outputs match baseline,
+  - fallback mode remains functional.
+
+### T3 - Parallel Read MVP
 - Objective: reduce read bottleneck safely.
 - Scope: read path only.
 - Plan:
@@ -63,7 +95,7 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
   - no corruption/races,
   - reduced read bottleneck in timings.
 
-### T3 - Parallel/Async Write MVP
+### T4 - Parallel/Async Write MVP
 - Objective: reduce write bottleneck safely.
 - Scope: write path only.
 - Plan:
@@ -75,7 +107,7 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
   - deterministic results,
   - improved end-to-end runtime.
 
-### T4 - Integrated IO Overlap Policy
+### T5 - Integrated IO Overlap Policy
 - Objective: combine read-ahead + async write with robust fallback controls.
 - Scope: IO orchestration policy only.
 - Evidence to capture:
@@ -101,8 +133,9 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
    - Require full regressions and benchmark evidence before default enable.
 
 ## Easy-gain priority order
-1. Read-ahead next tile during current tile compute.
-2. Deferred/async write of completed tile during next tile compute.
-3. Parallel Q/U (and optional I/mask) reads with separate handles.
-4. Parallel writes across independent output files.
-5. Extra IO telemetry: bytes, queue depth, and wait reasons.
+1. Stabilize large-read path with 64-bit-capable interface and validated fallback.
+2. Read-ahead next tile during current tile compute.
+3. Deferred/async write of completed tile during next tile compute.
+4. Parallel Q/U (and optional I/mask) reads with separate handles.
+5. Parallel writes across independent output files.
+6. Extra IO telemetry: bytes, queue depth, and wait reasons.
