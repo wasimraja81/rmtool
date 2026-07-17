@@ -2894,7 +2894,7 @@ contains
        lpixels_nvalid(2) = job%iy_out_end
        status = 0
        call ftpsse(job%unit_peak,job%group,2,job%naxes_stat,&
-       &fpixels_nvalid,lpixels_nvalid,job%peak_tile_arr,status)
+       &fpixels_nvalid,lpixels_nvalid,job%peak_tile_arr(1),status)
        if(status.gt.0) call printerror(status)
     endif
 
@@ -2905,7 +2905,7 @@ contains
        lpixels_nvalid(2) = job%iy_out_end
        status = 0
        call ftpsse(job%unit_rmpeak,job%group,2,job%naxes_stat,&
-       &fpixels_nvalid,lpixels_nvalid,job%rm_peak_tile_arr,status)
+       &fpixels_nvalid,lpixels_nvalid,job%rm_peak_tile_arr(1),status)
        if(status.gt.0) call printerror(status)
     endif
 
@@ -2916,7 +2916,7 @@ contains
        lpixels_nvalid(2) = job%iy_out_end
        status = 0
        call ftpsse(job%unit_angpeak,job%group,2,job%naxes_stat,&
-       &fpixels_nvalid,lpixels_nvalid,job%ang_peak_tile_arr,status)
+       &fpixels_nvalid,lpixels_nvalid,job%ang_peak_tile_arr(1),status)
        if(status.gt.0) call printerror(status)
     endif
 
@@ -2927,7 +2927,7 @@ contains
        lpixels_nvalid(2) = job%iy_out_end
        status = 0
        call ftpsse(job%unit_snr,job%group,2,job%naxes_stat,&
-       &fpixels_nvalid,lpixels_nvalid,job%snr_tile_arr,status)
+       &fpixels_nvalid,lpixels_nvalid,job%snr_tile_arr(1),status)
        if(status.gt.0) call printerror(status)
     endif
 

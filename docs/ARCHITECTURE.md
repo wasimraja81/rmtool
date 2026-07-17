@@ -340,11 +340,11 @@ moment `io_overlap` was turned on, with no error. A raw POSIX thread
 (`pthread_create`/`pthread_join` via `iso_c_binding`; see
 `tile_write_job_t` and `do_tile_write` in `rm_synthesis_mod.f90`) has no
 lifetime coupling to OpenMP's team model, so read/mask/prep/compute keep
-using their existing parallel regions completely undisturbed. This is
-safe with respect to the `io_write_threads>1` hazard above because the
-overlap keeps exactly one thread touching a write handle at a time — it
-only changes *which* thread (main vs. the write pthread) and *when*, never
-how many concurrently.
+using their existing parallel regions completely undisturbed. read and
+write always touch different files (input Q/U vs. output AMP/PHA), so
+they were never at risk of the `io_write_threads>1` handle-aliasing
+hazard above — but a *separate* write-vs-write hazard was, and did,
+happen; see the postmortem below.
 
 **Double buffering.** `p_tile_arr`, `phi_tile_arr`, `mask_tile_arr`,
 `nvalid_tile_arr`, and the four cubestat maps (when `cubestat=y`) are
@@ -359,11 +359,65 @@ auto-tiler doubles just the output-side bytes-per-pixel term when
 `io_overlap=y`, so `tile_dec` is planned smaller automatically under the
 same `mem_frac_ram` — nothing new for the user to configure.
 
-**Synchronisation.** A slot's pending write is joined only when that same
-slot is about to be reused (two tiles later) — not before every tile,
-which would serialise everything and defeat the point. Both slots are
-joined unconditionally after the tile loop ends, since the last two tiles'
-writes never get that "two tiles later" trigger.
+**Synchronisation.** Two independent rules apply, guarding two different
+hazards:
+1. *Buffer safety* — a slot's pending write is joined when that same slot
+   is about to be reused (two tiles later), so the next tile's
+   mask/prep/compute never overwrites memory its predecessor's write is
+   still reading.
+2. *Handle safety* — before **any** new write is dispatched, whichever
+   write is currently outstanding (either slot) is joined first,
+   unconditionally. `io_write_threads_eff` is hard-clamped to 1, so every
+   tile's write shares the exact same two FITS handles regardless of
+   slot; two pthreads calling `ftpsse` on the same handle at once is
+   unsafe no matter how well the buffers are separated. This rule is what
+   actually prevents concurrent writes — rule 1 alone does not (see
+   postmortem below) — and it costs nothing in the common case, since a
+   tile's write almost always finishes before the next tile's own
+   pipeline does anyway.
+
+Both slots are also joined unconditionally after the tile loop ends,
+since the last two tiles' writes never get a "reused two tiles later"
+trigger to join them within the loop.
+
+#### Postmortem: tile-write race between consecutive tiles (found on real Setonix-scale data)
+
+The first shipped version of `io_overlap` only implemented synchronisation
+rule 1 above (buffer safety) and asserted, incorrectly, that this was
+sufficient — see the corrected claim earlier in this section. It is not:
+rule 1 only guarantees the write that *previously owned this same slot*
+has finished; it says nothing about whatever write is running in the
+*other* slot at that moment.
+
+This crashed a real run: a 4501×4501 image tiled into 9 Dec-strips of 561
+rows each, except the last, a 13-row leftover (4501 is not a multiple of
+561). Tile 8's entire read→mask→prep→compute→cubestat pipeline finished
+in ~4s — far faster than a full tile's write (~4-27s) — so tile 8's write
+was dispatched while tile 7's write (a *different* buffer slot, so not
+caught by rule 1) was still running. Both pthreads ended up calling
+`ftpsse` on the same AMP/PHA handles concurrently, producing a SIGSEGV
+inside `memmove`, deep in unsymbolised `libcfitsio.so` frames, inside a
+thread stack (`start_thread`/`clone3` in the backtrace) — i.e. inside the
+write pthread, not the main thread.
+
+**Fix:** added synchronisation rule 2 above (join any outstanding write,
+from either slot, before dispatching a new one) in `rm_synthesis.f90`.
+Because `pthread_join()` is a hard block rather than a probabilistic race
+avoidance, this makes "at most one write in flight" a structural
+guarantee rather than a timing-dependent hope — true regardless of how
+fast or slow any individual tile happens to be.
+
+**Why the original test suite didn't catch this:** bit-identical output
+comparisons validate data correctness, not concurrency safety. A race
+that only manifests when one tile's write outlasts the next tile's entire
+compute pipeline is invisible on tiny/fast test data, where every stage
+finishes in milliseconds regardless. `tests/run_tests.sh` §13 now also
+parses the `tile_write` start/done log markers and asserts no two writes'
+time windows ever overlap (`require_no_overlapping_tile_writes`) — a
+structural check of the actual invariant, not a proxy for it via output
+comparison. Re-validated end-to-end on the original crashing case (same
+4501×4501 image, `io_read_threads=4`, `io_overlap=y`) — completed without
+error.
 
 | Property | Value |
 |---|---|
@@ -376,7 +430,8 @@ writes never get that "two tiles later" trigger.
 
 Verified bit-identical (`io_overlap=n` vs `y`) across a 7-tile run
 (`tests/run_tests.sh` §13) and manually at 32 tiles and on the serial
-(non-OMP) binary.
+(non-OMP) binary, plus the no-overlapping-writes structural check
+(§13) and an end-to-end production-scale rerun (see postmortem above).
 
 #### When `io_overlap=y` can be detrimental
 

@@ -208,6 +208,23 @@ but there is currently no way to get a working speed-up from this key.
 See `docs/ARCHITECTURE.md` ("Parallel write — `io_write_threads`") for the
 full root cause.
 
+**`io_overlap`'s writes are fully serialized against each other, by
+design.** Every tile's write shares the same single output handle (see
+above), so `io_overlap` guarantees at most one write is ever in flight —
+enforced with a blocking `pthread_join()` before dispatching the next
+one, not a timing-dependent assumption. (An earlier version of this
+feature only checked this per double-buffer slot, which left a gap: a
+small/fast tile immediately after a large/slow one — e.g. the leftover
+partial tile at the bottom of an image whose height isn't an exact
+multiple of the tile size — could dispatch its write before the previous
+tile's write had finished, corrupting CFITSIO's shared handle state.
+Fixed and re-validated end-to-end on the exact case that crashed; see the
+T5 postmortem in `docs/ARCHITECTURE.md` / `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`.)
+This doesn't reduce the actual overlap benefit — tile N+1's
+read/mask/prep/compute/cubestat already run fully concurrently with
+write(N) regardless; only *dispatch* of write(N+1) waits for write(N)'s
+handle to free up, which write(N) has almost always already done by then.
+
 **`io_overlap` is not a free win — check your RAM and disk before turning
 it on.** It doubles the RAM used by the per-tile output buffers (to let a
 background thread write tile N while tile N+1 is computed), and the

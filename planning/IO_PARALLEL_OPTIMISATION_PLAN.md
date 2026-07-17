@@ -166,11 +166,42 @@ automatically under a fixed `mem_frac_ram` — the user still only sets a
 memory fraction.
 
 #### Synchronisation
-Each buffer slot's pending write is joined (`pthread_join`) only when that
-*same* slot is about to be reused, two tiles later — not before every
-tile, which would serialise everything and defeat the overlap. Both slots
-are joined unconditionally after the tile loop ends, since the last two
-tiles' writes never get a "two tiles later" trigger within the loop.
+Two rules, guarding two different hazards:
+1. *Buffer safety*: each buffer slot's pending write is joined
+   (`pthread_join`) when that *same* slot is about to be reused, two tiles
+   later — not before every tile, which would serialise everything and
+   defeat the overlap.
+2. *Handle safety*: before **any** new write is dispatched, whichever
+   write is currently outstanding (either slot) is joined first,
+   unconditionally. `io_write_threads_eff` is hard-clamped to 1, so every
+   tile's write shares the same two FITS handles regardless of slot — two
+   pthreads calling `ftpsse` on the same handle at once is unsafe no
+   matter how well the buffers are separated. Rule 1 alone does not
+   guarantee this (see postmortem below); rule 2 is what actually does.
+
+Both slots are joined unconditionally after the tile loop ends, since the
+last two tiles' writes never get a "two tiles later" trigger within the
+loop.
+
+#### Postmortem: write-vs-write race, found on real Setonix-scale data — ⚠ shipped once, then fixed
+The version of T5 first merged only implemented synchronisation rule 1
+above, and the design doc asserted (incorrectly) that this was sufficient
+because "the overlap keeps exactly one thread touching a write handle at
+a time." It does not: rule 1 only proves the *same slot's* previous write
+has finished, not that *any* write is finished.
+
+This crashed a real run: 4501×4501 image, 9 tiles of 561 Dec rows except
+the last (13 rows, since 4501 isn't a multiple of 561). Tile 8's entire
+pipeline finished in ~4s, faster than a full tile's write (~4-27s), so
+tile 8's write was dispatched while tile 7's write (a different slot) was
+still running — both pthreads called `ftpsse` on the same AMP/PHA handles
+concurrently. SIGSEGV inside `memmove`, deep in unsymbolised
+`libcfitsio.so` frames, inside a thread stack (`start_thread`/`clone3`),
+i.e. inside the write pthread.
+
+Fix: added synchronisation rule 2 above. `pthread_join()` is a hard block,
+not a probabilistic race avoidance, so "at most one write in flight" is
+now a structural guarantee independent of tile timing.
 
 #### Correctness evidence
 - All 22 pre-existing tests still pass with `io_overlap=n` (default),
@@ -181,6 +212,16 @@ tiles' writes never get a "two tiles later" trigger within the loop.
   ANG_PEAK/SNR outputs. Manually also verified at 32 tiles (single-Dec-row
   tiles, stresses many join cycles) and on the serial (non-OMP) binary
   (the pthread mechanism does not depend on `HOST_OMP`).
+- Bit-identical comparisons do **not** catch write-vs-write races (they
+  validate data correctness, not concurrency safety, and the race is
+  invisible on tiny/fast test data where every stage finishes in
+  milliseconds regardless). `tests/run_tests.sh` §13 now additionally
+  parses the `tile_write` start/done log markers
+  (`require_no_overlapping_tile_writes`) and asserts no two writes'
+  time windows ever overlap — a structural check of the actual invariant.
+- Re-ran the exact case that crashed (same 4501×4501 image,
+  `io_read_threads=4`, `io_overlap=y`, CPU-OMP binary) end-to-end after
+  the fix: completed without error.
 
 #### Scope not covered by this ticket
 - The GPU two-level (VRAM sub-block staging) tile path is not specially
@@ -246,11 +287,18 @@ Lustre stripe count of the data files (`lfs getstripe <file>` on Setonix).
 | T5 Async read/write overlap (`io_overlap`) | Done | — |
 | T6 Safe intra-write parallelism (multi-process or raw `pwrite()`) | Not started | — |
 
-Pending validation: benchmark `io_overlap=y` on Setonix against the
-serial-read baseline log (`JENNIFER_TOO_FULLIM.run.cpu.setonix.log`:
-read ~124s/tile, write ~95-110s/tile) to confirm the wall-time reduction
-predicted from that data (~34% at serial read, scaling down as
-`io_read_threads` increases — see swim-lane analysis). Also benchmark
-`io_read_threads=N` (N = Lustre stripe count) vs baseline `io_read_threads=1`
-to quantify read-side wall-time improvement; do not set
-`io_write_threads>1` until T6 lands.
+Correctness status: `io_overlap=y` with `io_read_threads=4` has completed
+end-to-end without error on a real 4501×4501 image (CPU-OMP binary,
+dev machine) — the same case that originally crashed with the
+write-vs-write race documented in the T5 postmortem above, re-run after
+the fix.
+
+Pending validation: benchmark `io_overlap=y` on Setonix itself (not just
+the dev machine) against the serial-read baseline log
+(`JENNIFER_TOO_FULLIM.run.cpu.setonix.log`: read ~124s/tile,
+write ~95-110s/tile) to confirm the wall-time reduction predicted from
+that data (~34% at serial read, scaling down as `io_read_threads`
+increases — see swim-lane analysis). Also benchmark `io_read_threads=N`
+(N = Lustre stripe count) vs baseline `io_read_threads=1` to quantify
+read-side wall-time improvement; do not set `io_write_threads>1` until
+T6 lands.

@@ -114,6 +114,53 @@ require_timing_csv_row() {
     [[ "$header_cols" -eq "$data_cols" ]] || return 1
 }
 
+# io_overlap must serialize all tile writes against each other (they share
+# a single FITS handle -- io_write_threads_eff is hard-clamped to 1), even
+# though writes overlap in time with the *next* tile's read/mask/prep/
+# compute. This checks that structural invariant directly from the
+# tile_write start/done log markers, since it's a timing-dependent race:
+# bit-identical output comparisons on small/fast test data can pass even
+# when the underlying dispatch logic would crash on production-scale data
+# (this is exactly how a real double-dispatch bug reached production
+# before being caught -- see the git history around this function).
+require_no_overlapping_tile_writes() {
+    local logfile="$1"
+    python3 - "$logfile" <<'PYEOF'
+import re, sys
+from datetime import datetime
+
+path = sys.argv[1]
+starts, ends = [], []
+pat = re.compile(r'^(\S+) \[\w+\] \[tile_write\] \[tid=\d+\] tile write (start|done)')
+with open(path) as f:
+    for line in f:
+        m = pat.match(line)
+        if not m:
+            continue
+        ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S.%f")
+        (starts if m.group(2) == "start" else ends).append(ts)
+
+if len(starts) != len(ends) or len(starts) == 0:
+    print(f"[FAIL] expected matched start/done pairs, got {len(starts)} starts, {len(ends)} ends")
+    sys.exit(1)
+
+# Writes are dispatched/logged in order, so pair them positionally and
+# check each write's start is not before the previous write's done.
+overlaps = []
+for i in range(1, len(starts)):
+    if starts[i] < ends[i-1]:
+        overlaps.append((i, starts[i], ends[i-1]))
+
+if overlaps:
+    for i, s, prev_end in overlaps:
+        print(f"[FAIL] write {i} started at {s} before write {i-1} finished at {prev_end}")
+    sys.exit(1)
+
+print(f"[OK] {len(starts)} tile writes, no overlapping start/done windows")
+sys.exit(0)
+PYEOF
+}
+
 # ---------------------------------------------------------------------------
 # 0. Prepare output directory
 # ---------------------------------------------------------------------------
@@ -622,7 +669,8 @@ io_overlap=n")
 tile_ra=32
 tile_dec=5
 cubestat=y
-io_overlap=y")
+io_overlap=y
+log_level=debug")
     log_ovl_n="$OUT_DIR/ovl_n.log"
     log_ovl_y="$OUT_DIR/ovl_y.log"
     rm -f "$OUT_DIR"/ovl_n.*.FITS "$OUT_DIR"/ovl_y.*.FITS
@@ -655,6 +703,13 @@ io_overlap=y")
         done
         if [[ "$all_match" -eq 1 ]]; then
             pass "io_overlap: all 8 output products bit-identical to io_overlap=n"
+        fi
+
+        if require_no_overlapping_tile_writes "$log_ovl_y" > /dev/null 2>&1; then
+            pass "io_overlap: tile writes never overlap (single-handle serialization holds)"
+        else
+            fail "io_overlap: two tile writes overlapped in time -- concurrent use of the" \
+                 "same FITS handle, will SIGSEGV on production-scale data (see $log_ovl_y)"
         fi
     else
         fail "io_overlap: OMP run failed (see $log_ovl_n / $log_ovl_y)"

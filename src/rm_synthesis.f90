@@ -3869,6 +3869,31 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       endif
 
       if(io_overlap)then
+         ! io_write_threads_eff is hard-clamped to 1 (see the safety clamp
+         ! above), so every tile's write -- regardless of which double-
+         ! buffer slot it used -- goes through the exact same two FITS
+         ! handles (AMP/PHA). Two pthreads calling ftpsse on the same
+         ! handle concurrently is unsafe no matter how well-separated
+         ! their byte ranges or buffers are. The per-slot join above only
+         ! guards buffer reuse (2 tiles apart); it does NOT guarantee the
+         ! *previous* tile's write (a different slot) has finished, and a
+         ! small/fast tile following a large/slow one -- e.g. the leftover
+         ! partial tile at the bottom of an image whose height isn't an
+         ! exact multiple of the tile size -- can easily outrun it. Join
+         ! any still-outstanding write from either slot before starting a
+         ! new one, so at most one write is ever in flight. This does not
+         ! reduce the overlap already achieved: tile N+1's read/mask/prep/
+         ! compute/cubestat above already ran concurrently with write(N)
+         ! regardless; this only delays *dispatch* of write(N+1) until
+         ! write(N)'s handle is free, which is required for correctness.
+         if(write_pending(0))then
+            call tile_write_join(write_thread_id(0))
+            write_pending(0) = .false.
+         endif
+         if(write_pending(1))then
+            call tile_write_join(write_thread_id(1))
+            write_pending(1) = .false.
+         endif
          call tile_write_dispatch_async(write_job(cur_slot),&
          &write_thread_id(cur_slot), write_dispatched_ok)
          write_pending(cur_slot) = write_dispatched_ok
