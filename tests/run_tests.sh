@@ -21,6 +21,8 @@
 #  13. io_overlap (async tile write) – bit-identical to io_overlap=n across
 #      a 7-tile run (odd tile count exercises the ping-pong buffer join
 #      and end-of-loop cleanup, not just a single-tile no-op)
+#  14. io_write_threads>1 – hard safety clamp holds (forced to 1, warns,
+#      never crashes; guards against the CFITSIO handle-aliasing bug)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -659,6 +661,42 @@ io_overlap=y")
     fi
 else
     skip "OMP binary not available; skipping io_overlap test"
+fi
+
+# ---------------------------------------------------------------------------
+# 14. io_write_threads>1 safety clamp – must be forced to 1, never crash
+# ---------------------------------------------------------------------------
+# io_write_threads>1 opens N read-write FTOPEN handles onto the SAME output
+# file; CFITSIO aliases them onto one shared buffer (fits_already_open()),
+# so concurrent ftpsse() calls on them corrupt that buffer -- this produced
+# a real SIGSEGV on a Setonix run. rm_synthesis.f90 hard-clamps
+# io_write_threads_eff to 1 regardless of the cfg value until a safe write
+# path (T6) lands. This test guards that clamp against ever being silently
+# removed: request io_write_threads=4, and require (a) the run completes
+# rather than crashing, (b) the startup warning fires, and (c) the
+# "opened N handles/cube" parallel-write path was NOT taken.
+section "14. io_write_threads>1 – hard safety clamp holds"
+if [[ -x "$BIN_OMP" ]]; then
+    cfg_wtclamp=$(make_cfg "wtclamp" "n" "io_write_threads=4")
+    log_wtclamp="$OUT_DIR/wtclamp.log"
+    rm -f "$OUT_DIR"/wtclamp.*.FITS
+    if run_binary "$BIN_OMP" "$cfg_wtclamp" "$log_wtclamp"; then
+        pass "io_write_threads=4: run completed without crashing"
+        if grep -q "io_write_threads>1 is UNSAFE" "$log_wtclamp"; then
+            pass "io_write_threads=4: safety warning printed"
+        else
+            fail "io_write_threads=4: expected safety warning not found in $log_wtclamp"
+        fi
+        if grep -q "Parallel FITS write: opened" "$log_wtclamp"; then
+            fail "io_write_threads=4: unsafe parallel-write path was taken (clamp not effective)"
+        else
+            pass "io_write_threads=4: parallel-write path correctly not taken (clamped to 1)"
+        fi
+    else
+        fail "io_write_threads=4: run crashed or failed (see $log_wtclamp) -- clamp regression!"
+    fi
+else
+    skip "OMP binary not available; skipping io_write_threads clamp test"
 fi
 
 # ---------------------------------------------------------------------------

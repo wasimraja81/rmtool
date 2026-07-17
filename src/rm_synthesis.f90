@@ -2813,6 +2813,44 @@ io_write_threads_eff = 1
  ! channels or RM bins respectively).
 io_read_threads_eff  = min(io_read_threads_eff,  nz_out)
 io_write_threads_eff = min(io_write_threads_eff, nrm_out)
+
+ ! ===========================================================================
+ ! HARD SAFETY CLAMP -- do not remove without fixing the underlying bug.
+ ! ===========================================================================
+ ! io_write_threads>1 opens N FTOPEN(...,1,...) (read-write) handles onto the
+ ! SAME output file. CFITSIO's fits_already_open() (cfitsio-4.3.1/cfileio.c
+ ! ~lines 1512-1520,1653) aliases repeat read-write opens of an already-open
+ ! file onto ONE shared internal FITSfile buffer -- by CFITSIO's own design
+ ! ("the file MUST only be physically opened once"). The "N independent
+ ! handles" this cfg key implies are therefore not independent at all, and
+ ! concurrent ftpsse() calls on them from the io_write_threads parallel-do
+ ! corrupt that shared buffer. This is not a theoretical risk: it produced a
+ ! real SIGSEGV inside memmove (inside libcfitsio) inside a Setonix run with
+ ! io_write_threads=4, immediately after the first tile's compute finished.
+ ! Read-only opens (io_read_threads) do NOT have this problem -- CFITSIO
+ ! explicitly exempts mode=0 opens from the aliasing for the opposite reason
+ ! ("2 different threads cannot share the same FITSfile pointer"), so those
+ ! N handles genuinely are independent.
+ !
+ ! Until a follow-up lands a write path that's actually safe for N>1 (T6 in
+ ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md: either genuine multi-process
+ ! writers, since CFITSIO's alias table is per-process, or bypassing CFITSIO
+ ! for the pixel write with raw pwrite() at a pre-computed byte offset),
+ ! io_write_threads_eff is forced to 1 here regardless of what the cfg
+ ! requests. See docs/ARCHITECTURE.md "Parallel write -- io_write_threads"
+ ! for the full writeup.
+if(io_write_threads_eff .gt. 1)then
+   write(*,*)" WARNING: io_write_threads=",io_write_threads,&
+   &" requested, but io_write_threads>1 is UNSAFE (CFITSIO"
+   write(*,*)"   aliases read-write handles to the same file -- see"
+   write(*,*)"   docs/ARCHITECTURE.md and the T4 postmortem in"
+   write(*,*)"   planning/IO_PARALLEL_OPTIMISATION_PLAN.md). Forcing"
+   write(*,*)"   io_write_threads_eff=1 until this is fixed properly."
+   call log_message('warn','startup',&
+   &'io_write_threads>1 requested but forced to 1: unsafe CFITSIO '//&
+   &'read-write handle aliasing (see ARCHITECTURE.md / T4 postmortem)')
+   io_write_threads_eff = 1
+endif
  ! Allocate and populate per-thread unit arrays.
  ! For _eff=1 we alias the already-open handles (no file re-opens, no overhead).
  ! For  >1 we open _eff independent FITS handles per file/cube.
