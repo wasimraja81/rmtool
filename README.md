@@ -124,7 +124,7 @@ log_output_file =                 # empty => stdout, else append to file
 timing_csv_file = ./timing.csv    # optional: append one CSV row per run
 ```
 
-Logging behavior:
+Logging behaviour:
 - `log_level` controls structured log lines emitted via `log_message`.
 	- `error`: errors only
 	- `warn`: warnings + errors
@@ -269,7 +269,7 @@ CPU thread-detail view:
 - If your platform is unvalidated, treat swim-lane diagnostics as experimental
 	and confirm with a short controlled run before production execution.
 
-## GPU Runtime Behavior
+## GPU Runtime Behaviour
 
 - `use_gpu=n` runs host execution.
 - `use_gpu=y` requests GPU execution when running a GPU-capable binary (`make GPU=1`).
