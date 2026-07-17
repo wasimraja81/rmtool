@@ -272,7 +272,7 @@ pip install astropy numpy
 
 ## 6. Swim-lane plots
 
-Design and interpretation notes for memory strategy, RM blocking, and
+Design and interpretation notes for memory strategy, RM chunking, and
 CPU/GPU timeline diagnostics are documented in:
 
 - [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)

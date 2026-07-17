@@ -124,7 +124,7 @@ Templates (read-only, stays on device across RM blocks):
   cos_arr(nz_out, nrm_out)
   sin_arr(nz_out, nrm_out)
 
-RM-block loop  (CPU, serial):
+RM-chunk loop  (CPU, serial):
   for i_rm_block = 1 … nrm_out  step nrm_block_size
     ┌────────────────────────────────────────────────────────────────────┐
     │  !$omp target teams distribute parallel do  collapse(2)           │
@@ -153,7 +153,7 @@ flowchart TB
     PREP["prepare_gpu_data\n(CPU, serial)\nreshape + apply mask"]
     VRAM["VRAM\nspecQ_gpu(npix, nz_out)\nspecU_gpu(npix, nz_out)\nwts_gpu (npix, nz_out)\ncos/sin_arr (nz_out, nrm_out)"]
 
-    subgraph RMBLK["RM-block loop  (CPU, serial)"]
+    subgraph RMBLK["RM-chunk loop  (CPU, serial)"]
         direction TB
         BLK["current block: i_rm_block … i_rm_block+nrm_block_size"]
     end
@@ -197,7 +197,7 @@ RAM tile  [tile_ra × tile_dec × nz_out]
   │
   ├──► prepare_gpu_data  →  st_Q_gpu / st_U_gpu / st_wts_gpu
   │
-  ├──► RM-block loop  →  tile_extract_gpu_rm_blocked  (same as §3a)
+  ├──► RM-chunk loop  →  tile_extract_gpu_rm_blocked  (same as §3a)
   │       GPU parallelism: (tile_ra × ny_sub_now) × nrm_block_size threads
   │
   └──► scatter:  stP / stPhi  back into  p_tile_arr / phi_tile_arr
@@ -272,4 +272,4 @@ HOST_OMP details for staging path:
 
 **Key invariant:** `cos_arr` and `sin_arr` are pre-computed once, held
 resident in RAM (CPU) or VRAM (GPU), and never recomputed per-pixel or
-per-RM-block.
+per-RM-chunk.

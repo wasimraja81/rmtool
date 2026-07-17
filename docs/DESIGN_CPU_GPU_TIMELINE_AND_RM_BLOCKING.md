@@ -1,10 +1,15 @@
 # Design Note: Memory, Parallelisation, and Offload Strategy
 
+> Canonical-source note:
+> - The master release architecture document is `docs/ARCHITECTURE.md`.
+> - Planning/proposal material is kept under `planning/`.
+> - This file is retained as a focused deep-dive view for timeline/RM-chunking details.
+
 ## Purpose
 This document records architecture-level design choices in rmtool:
 - how data is tiled and staged in memory,
 - how CPU and GPU execution are parallelised,
-- why RM blocking is used,
+- why RM chunking is used,
 - and how runtime diagnostics map to those design choices.
 
 The primary driver is scalable processing for very large cubes under constrained host RAM and device VRAM, not plotting.
@@ -33,17 +38,17 @@ The primary driver is scalable processing for very large cubes under constrained
 
 ## Compute Kernel Strategy
 
-### RM blocking
+### RM chunking
 - The RM synthesis axis is processed in blocks (nrm_block_size) rather than all RM bins at once.
 - This bounds active template footprint and provides controllable work granularity.
 
-### Why RM blocking exists
+### Why RM chunking exists
 - GPU: required for bounded offload and kernel launch sizing under VRAM constraints.
 - CPU: retained intentionally for code-path alignment and for potential cache and translation lookaside buffer (TLB) benefits when nrm is large.
 - Cross-platform consistency: same high-level decomposition helps validation and maintenance.
 
 ### CPU-specific note
-- CPU path is RM-blocked too; this is algorithmically valid and intentional.
+- CPU path uses RM chunking too; this is algorithmically valid and intentional.
 - Benefit is workload-dependent:
   - large nrm: can improve locality and scheduling behaviour,
   - small nrm (single block): mostly neutral overhead.
@@ -156,12 +161,12 @@ The primary driver is scalable processing for very large cubes under constrained
   - CPU host work and GPU compute are overlapping; expected in effective pipelined runs.
 
 ## Design Trade-offs
-- A unified decomposition (tile + sub-block + RM-block) simplifies verification across backends but can introduce small overhead in trivial workloads.
+- A unified decomposition (tile + sub-block + RM-chunk) simplifies verification across backends but can introduce small overhead in trivial workloads.
 - Dynamic scheduling and conservative memory bounds improve robustness across machines, sometimes at the cost of peak idealized throughput.
 
 ## Practical Implications
 - For very large datasets, memory-bound decomposition is essential for successful completion.
-- For CPU-only small-RM jobs, RM blocking is mostly structural; performance gains are not guaranteed.
+- For CPU-only small-RM jobs, RM chunking is mostly structural; performance gains are not guaranteed.
 - For GPU jobs, RM and spatial blocking are core to fitting and streaming work through limited VRAM.
 - Staging-loop host OpenMP improvements apply only when staging is active, i.e.
   GPU-active runs where `use_staging` is true. CPU-only runs with

@@ -48,7 +48,10 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[QUICKSTART.md](QUICKSTART.md)** — Quick reference and build overview
 - **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
 - **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference
-- **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM blocking, CPU/GPU parallelization, offload strategy
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
+- **[docs/PARALLELISM.md](docs/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
+- **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
+- **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — Interim IO optimisation plan (proposal/in-progress, not adopted architecture)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 

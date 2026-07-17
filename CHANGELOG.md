@@ -17,7 +17,7 @@ All notable changes to this project are documented in this file.
   - CPU full-image Jennifer benchmark improved after planner split.
   - GPU path remained correct but showed a slight regression on the tested environment.
 - Extended swim-lane interpretation notes for CPU thread-detail view:
-  - Clarified that single-RM-block runs (`nrm_out <= nrm_block_size`) show only odd/non-hatched `cpu_extract` traces.
+  - Clarified that single-RM-chunk runs (`nrm_out <= nrm_block_size`) show only odd/non-hatched `cpu_extract` traces.
 
 ### Validation
 - Full build matrix remained successful (`OMP/GPU` combinations).

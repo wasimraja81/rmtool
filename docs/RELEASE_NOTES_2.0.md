@@ -22,7 +22,7 @@ with corresponding documentation and interpretation updates for swim-lane diagno
 
 - Documentation improvements:
   - Updated architecture/timeline design note for planner split behaviour.
-  - Clarified swim-lane odd/even `cpu_extract` semantics for single-RM-block CPU runs.
+  - Clarified swim-lane odd/even `cpu_extract` semantics for single-RM-chunk CPU runs.
   - Added project changelog and explicit release note references from README.
 
 ## Compatibility and behaviour notes
