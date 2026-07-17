@@ -17,6 +17,10 @@
 #      (run for serial, OMP, and GPU binaries)
 #  11. Cubestat outputs – peak/RM-peak/angle-peak/SNR map validation
 #      (serial path, cubestat=y)
+#  12. Timing report + CSV validation
+#  13. io_overlap (async tile write) – bit-identical to io_overlap=n across
+#      a 7-tile run (odd tile count exercises the ping-pong buffer join
+#      and end-of-loop cleanup, not just a single-tile no-op)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -597,6 +601,64 @@ if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" ]]; then
     fi
 else
     skip "GPU binary not available; skipping timing GPU validation"
+fi
+
+# ---------------------------------------------------------------------------
+# 13. io_overlap (async tile write) – must match io_overlap=n exactly
+# ---------------------------------------------------------------------------
+# tile_ra/tile_dec force 7 tiles (32 Dec rows / 5 per tile, uneven remainder)
+# so the ping-pong buffer join logic and the odd-tile-count end-of-loop
+# cleanup both get exercised, not just a single-tile no-op path.
+section "13. io_overlap – bit-identical to io_overlap=n (async tile write)"
+if [[ -x "$BIN_OMP" ]]; then
+    cfg_ovl_n=$(make_cfg "ovl_n" "n" "tile_auto=n
+tile_ra=32
+tile_dec=5
+cubestat=y
+io_overlap=n")
+    cfg_ovl_y=$(make_cfg "ovl_y" "n" "tile_auto=n
+tile_ra=32
+tile_dec=5
+cubestat=y
+io_overlap=y")
+    log_ovl_n="$OUT_DIR/ovl_n.log"
+    log_ovl_y="$OUT_DIR/ovl_y.log"
+    rm -f "$OUT_DIR"/ovl_n.*.FITS "$OUT_DIR"/ovl_y.*.FITS
+
+    if run_binary "$BIN_OMP" "$cfg_ovl_n" "$log_ovl_n" && \
+       run_binary "$BIN_OMP" "$cfg_ovl_y" "$log_ovl_y"; then
+        n_tiles_n=$(grep -c "Doing tile" "$log_ovl_n" || true)
+        n_tiles_y=$(grep -c "Doing tile" "$log_ovl_y" || true)
+        if [[ "$n_tiles_n" -gt 1 && "$n_tiles_y" -eq "$n_tiles_n" ]]; then
+            pass "io_overlap: multi-tile run confirmed (${n_tiles_y} tiles)"
+        else
+            fail "io_overlap: expected >1 matching tile count, got n=$n_tiles_n y=$n_tiles_y"
+        fi
+
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP \
+                      PEAK.MAP RM_PEAK.MAP ANG_PEAK.MAP SNR.MAP; do
+            f_n="$OUT_DIR/ovl_n.${suffix}.FITS"
+            f_y="$OUT_DIR/ovl_y.${suffix}.FITS"
+            if [[ -f "$f_n" && -f "$f_y" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f_n" "$f_y" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "io_overlap: ${suffix} differs from io_overlap=n"
+                fi
+            else
+                all_match=0
+                fail "io_overlap: ${suffix} output missing (expected $f_n and $f_y)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "io_overlap: all 8 output products bit-identical to io_overlap=n"
+        fi
+    else
+        fail "io_overlap: OMP run failed (see $log_ovl_n / $log_ovl_y)"
+    fi
+else
+    skip "OMP binary not available; skipping io_overlap test"
 fi
 
 # ---------------------------------------------------------------------------

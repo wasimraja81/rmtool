@@ -96,18 +96,103 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
   - Clamped to `omp_get_max_threads()` and `nrm_out`; serial binary forced to 1.
   - 22/22 tests pass.
 
-### T5 - Async Read/Write Overlap (next)
-- Objective: overlap tile N+1 read with tile N write and tile N+1 compute.
-- Scope: IO orchestration policy only.
-- Plan:
-  1. Double-buffer the tile output arrays (p_tile_arr / phi_tile_arr) so tile N
-     write can proceed concurrently with tile N+1 read.
-  2. Producer-consumer pipeline: read → compute → write in overlapping phases.
-  3. Barrier before tile N+1 compute to ensure tile N write is complete.
-- Evidence to capture:
-  - long-run stability,
-  - switchable fallback to serial path,
-  - DoD performance/correctness gates met.
+#### T4 postmortem: `io_write_threads>1` crashes on a real Setonix run — ⚠ unresolved
+The "non-overlapping pwrite is POSIX-safe" assumption above does not hold
+for CFITSIO. `io_write_threads>1` opens N independent `FTOPEN(...,1,...)`
+(read-write) handles onto the *same* output file, but CFITSIO's own
+`fits_already_open()` (`cfitsio-4.3.1/cfileio.c:1512-1520,1653`) explicitly
+aliases repeat read-write opens of an already-open file onto one shared
+underlying `FITSfile` buffer/state — the comment there says as much:
+*"If the file is opened/reopened with write access, then the file MUST
+only be physically opened once."* Read-only opens are exempted from this
+aliasing for exactly this reason (*"2 different threads cannot share the
+same FITSfile pointer"*) — which is why `io_read_threads` is safe and
+`io_write_threads` is not: the N "independent" write handles are not
+independent at all, and concurrent unsynchronised `ftpsse` calls on them
+from an `!$omp parallel do` corrupt CFITSIO's shared buffer bookkeeping.
+Root-caused from a real crash: SIGSEGV inside `memmove`, deep in
+unsymbolised `libcfitsio.so` frames, occurring immediately after the first
+tile's compute finished and the parallel write section fired — log showed
+`io_write_threads=4` at the time. `io_write_threads=1` (default) sidesteps
+this entirely (aliases the single pre-existing handle, no parallel region
+is entered). **Action for now: do not set `io_write_threads>1`** until a
+follow-up ticket implements one of: (a) genuine multi-process writers
+(CFITSIO's alias table is per-process, so separate processes each get real
+independent buffers), or (b) bypass CFITSIO for the pixel write entirely —
+pre-compute the byte offset via `fits_get_hduaddrll`, write big-endian
+bytes directly via `pwrite()` on an independently-opened OS file
+descriptor, and let CFITSIO only own the header and final checksum.
+
+### T5 - Async Read/Write Overlap ✓ DONE
+- Objective: overlap tile N write with tile N+1 read/mask/prep/compute/cubestat.
+- Scope: IO orchestration policy only; no compute-kernel changes.
+- Cfg key: `io_overlap` (default `n`, pre-existing placeholder from T2-T4 wired
+  up by this ticket).
+
+#### Why a pthread instead of an OMP task
+An `!$omp task` cannot outlive its enclosing parallel region (region exit is
+always an implicit barrier). Making the write's region span the next tile's
+read/mask/prep/compute would turn every one of *their* existing
+`!$omp parallel do` calls into **nested** parallel regions — and this
+codebase never sets `OMP_NESTED`/`omp_set_max_active_levels`, so libgomp
+silently collapses nested regions to one thread by default. That would
+silently disable `io_read_threads` and the compute kernel's thread count
+the moment `io_overlap` was turned on, with no error or warning.
+A raw POSIX thread (`pthread_create`/`pthread_join` via `iso_c_binding`,
+`tile_write_job_t` in `rm_synthesis_mod.f90`) has no lifetime coupling to
+OpenMP's team model, so read/mask/prep/compute keep using their existing
+parallel regions completely undisturbed. CFITSIO is already built
+`_REENTRANT` (confirmed via the vendored `cfitsio-4.3.1` source), and the
+write pthread only ever touches the output AMP/PHA/MASK/NVALID/stat-map
+handles while the main thread's read touches the *different* input Q/U
+handles — disjoint files, so no risk of the same-file handle-aliasing
+hazard that made `io_write_threads>1` unsafe (see T4 note / crash
+postmortem below).
+
+#### Double buffering
+`p_tile_arr`, `phi_tile_arr`, `mask_tile_arr`, `nvalid_tile_arr`, and (when
+`cubestat=y`) the four cubestat maps are declared as `pointer, contiguous`
+in `rm_synthesis.f90`, each backed by two physical target arrays
+(`..._s0`/`..._s1`). The tile loop ping-pongs the pointers each tile
+(`cur_slot = mod(tile_seq,2)`); a tile's write reads whichever slot it was
+given, while the *next* tile's mask/prep/compute writes into the other
+slot, so there is never a moment where the same memory is being written by
+one tile's compute and read by the previous tile's write. `io_overlap=n`
+(default) allocates only slot 0 and never repoints the pointers — bit-
+identical to the pre-T5 plain-allocatable-array behaviour, zero regression
+risk. The auto-tiler's RAM byte-per-pixel estimate doubles just the
+output-side term when `io_overlap=y`, so `tile_dec` is planned smaller
+automatically under a fixed `mem_frac_ram` — the user still only sets a
+memory fraction.
+
+#### Synchronisation
+Each buffer slot's pending write is joined (`pthread_join`) only when that
+*same* slot is about to be reused, two tiles later — not before every
+tile, which would serialise everything and defeat the overlap. Both slots
+are joined unconditionally after the tile loop ends, since the last two
+tiles' writes never get a "two tiles later" trigger within the loop.
+
+#### Correctness evidence
+- All 22 pre-existing tests still pass with `io_overlap=n` (default),
+  confirming no behavioural change to the existing path.
+- New test (`tests/run_tests.sh` section 13): identical 7-tile run with
+  `io_overlap=n` vs `io_overlap=y` (`tile_auto=n`, `tile_dec=5`,
+  `cubestat=y`) produces bit-identical AMP/PHA/MASK/NVALID/PEAK/RM_PEAK/
+  ANG_PEAK/SNR outputs. Manually also verified at 32 tiles (single-Dec-row
+  tiles, stresses many join cycles) and on the serial (non-OMP) binary
+  (the pthread mechanism does not depend on `HOST_OMP`).
+
+#### Scope not covered by this ticket
+- The GPU two-level (VRAM sub-block staging) tile path is not specially
+  handled, but needs none: its own async sub-block pipeline fully closes
+  its OpenMP region before the tile-write step is reached, so there is no
+  structural conflict, and it reuses the same `p_tile_arr` et al. pointers
+  transparently.
+- `io_write_threads>1` remains unsafe for the reasons in the T4 postmortem
+  below; `io_overlap` does not change that risk (still only one thread
+  ever touches a write handle at a time in the shipped default).
+  Genuine intra-write parallelism (bypassing CFITSIO with raw `pwrite()`
+  at pre-computed byte offsets) is a separate, not-yet-started ticket.
 
 ## Answers to kickoff questions
 1. Can we read FITS cubes in parallel?
@@ -117,12 +202,18 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
    - Channel ranges map to different Lustre OSTs; true parallel IO throughput.
    - `io_read_threads=1` (default) is identical to the prior serial single-call path.
 2. Can we write FITS in parallel?
-   - Yes — implemented via `io_write_threads`.
-   - N independent readwrite handles per output cube write disjoint RM-bin ranges
-     simultaneously from the scatter output buffer.
-   - Non-overlapping `pwrite()` is POSIX-safe; CFITSIO metadata updated only at close.
+   - `io_write_threads` is implemented but **unsafe above 1** — see the T4
+     postmortem above. The "non-overlapping pwrite() is POSIX-safe"
+     assumption this ticket shipped with does not hold: CFITSIO aliases
+     repeat read-write opens of the same file onto one shared buffer, so
+     the N "independent" handles corrupt each other under concurrent
+     `ftpsse` calls. Keep `io_write_threads=1` (default) until a follow-up
+     ticket lands genuine multi-process or raw-`pwrite()` write parallelism.
    - `io_write_threads=1` (default) is identical to the prior serial write path.
    - 2D map outputs (NVALID, MASK, cubestat) remain serial (negligible cost).
+   - Separately, `io_overlap` (T5) overlaps the *whole* write step for tile
+     N with tile N+1's read/mask/prep/compute — this is safe today since it
+     keeps `io_write_threads` at 1 handle, just moves which thread runs it.
 3. How do we avoid breaking compute/staging?
    - Compute and staging routines are unchanged; IO change is orchestration-only.
    - Both cfg keys default to 1 (serial); existing behaviour is the default.
@@ -151,9 +242,15 @@ Lustre stripe count of the data files (`lfs getstripe <file>` on Setonix).
 | T1 IO isolation layer | Deferred | — |
 | T2 Large-tile read hardening | Done | `0ac331f` (`large-tile-read-safe`) |
 | T3 Parallel channel reads | Done | `a072c6e`, `904f75d` |
-| T4 Parallel RM-bin writes | Done | `885f21e`, `904f75d` |
-| T5 Async read/write overlap | Next | — |
+| T4 Parallel RM-bin writes | Done, `io_write_threads>1` unsafe (see postmortem) | `885f21e`, `904f75d` |
+| T5 Async read/write overlap (`io_overlap`) | Done | — |
+| T6 Safe intra-write parallelism (multi-process or raw `pwrite()`) | Not started | — |
 
-Pending validation: benchmark on Setonix with `io_read_threads=N` and
-`io_write_threads=N` (where N = Lustre stripe count) vs baseline
-`io_read_threads=1` to quantify wall-time improvement.
+Pending validation: benchmark `io_overlap=y` on Setonix against the
+serial-read baseline log (`JENNIFER_TOO_FULLIM.run.cpu.setonix.log`:
+read ~124s/tile, write ~95-110s/tile) to confirm the wall-time reduction
+predicted from that data (~34% at serial read, scaling down as
+`io_read_threads` increases — see swim-lane analysis). Also benchmark
+`io_read_threads=N` (N = Lustre stripe count) vs baseline `io_read_threads=1`
+to quantify read-side wall-time improvement; do not set
+`io_write_threads>1` until T6 lands.

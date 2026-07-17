@@ -258,7 +258,7 @@ def plot_cpu_thread_timeline(
     if cpu_stage_intervals:
         lane_labels = ["CPU stage"] + lane_labels
     if io_intervals:
-        lane_labels = ["I/O"] + lane_labels
+        lane_labels = ["I/O read", "I/O write"] + lane_labels
     y_map = {lane: idx for idx, lane in enumerate(lane_labels)}
 
     fig_h = 3.2 + 0.22 * len(tids)
@@ -289,7 +289,7 @@ def plot_cpu_thread_timeline(
         )
 
     for iv in io_intervals:
-        y = y_map["I/O"]
+        y = y_map["I/O read"] if iv.kind == "io_read" else y_map["I/O write"]
         if time_axis == "absolute":
             left = mdates.date2num(iv.start)
             width = max(0.02, (iv.end - iv.start).total_seconds()) / 86400.0
@@ -497,9 +497,9 @@ def build_intervals(events: List[Event]) -> List[Interval]:
                 io_write_done.append(ev.ts)
 
     for s, e in _pair_intervals(io_read_start, io_read_done):
-        intervals.append(Interval("I/O", "io_read", "read", s, e, sub=None))
+        intervals.append(Interval("I/O read", "io_read", "read", s, e, sub=None))
     for s, e in _pair_intervals(io_write_start, io_write_done):
-        intervals.append(Interval("I/O", "io_write", "write", s, e, sub=None))
+        intervals.append(Interval("I/O write", "io_write", "write", s, e, sub=None))
 
     for sub in sorted(scatter_start_ts.keys()):
         starts = sorted(scatter_start_ts.get(sub, []))
@@ -931,7 +931,7 @@ def plot_clean_swimlane(
 
     lane_order = [
         lane
-        for lane in ["GPU", "CPU", "I/O"]
+        for lane in ["GPU", "CPU", "I/O read", "I/O write"]
         if any(iv.lane == lane for iv in intervals)
     ]
     if not lane_order:

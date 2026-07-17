@@ -102,7 +102,10 @@ DEFAULT_BINDIR := bin
 
 # CFITSIO library
 CFITSIO_LIB ?= -lcfitsio
-LIBS := $(CFITSIO_LIB)
+# -lpthread: async tile-write (io_overlap) dispatches writes on a raw POSIX
+# thread outside the OpenMP runtime. A no-op on glibc >= 2.34 (pthread is
+# folded into libc there) but kept explicit for portability to older libc.
+LIBS := $(CFITSIO_LIB) -lpthread
 
 # Source files
 MODSRC := $(SRCDIR)/rm_synthesis_mod.f90

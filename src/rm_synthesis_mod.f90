@@ -4,11 +4,13 @@ module rm_synthesis_mod
   !! Author: Wasim Raja (modernized 2026)
   
   use iso_fortran_env, only: sp => real32, dp => real64, int8, int16, int32, int64
+  use iso_c_binding, only: c_int, c_long, c_ptr, c_funptr, c_null_ptr, &
+       c_loc, c_f_pointer, c_funloc
 #if defined(HOST_OMP) && (HOST_OMP == 1)
   use omp_lib, only: omp_get_wtime, omp_get_thread_num, omp_in_parallel
 #endif
   implicit none
-  
+
   private
   public :: extract_general_setup, extract_general, extract_general_ri
   public :: extract_general_w, extract_general_ri_w
@@ -27,6 +29,8 @@ module rm_synthesis_mod
   public :: STAGE_TILE_PREP, STAGE_TILE_COMPUTE, STAGE_TILE_CUBESTAT
   public :: STAGE_TILE_SCATTER, STAGE_TILE_WRITE, STAGE_FINALIZE
   public :: sp, dp, int32, int64
+  public :: tile_write_job_t, tile_write_dispatch_async, tile_write_join
+  public :: do_tile_write
   
   ! Include file parameters for RM-synthesis
   integer, parameter :: max_axis = 100
@@ -79,6 +83,79 @@ module rm_synthesis_mod
   
   public :: max_axis, max_ra, max_dec, maxchan, max_pix, maxofac, maxnt
   public :: c_velocity
+
+  !===========================================================================
+  ! Asynchronous tile-write support (io_overlap).
+  !===========================================================================
+  ! Runs the tile-write step (AMP/PHA RM-chunked writes plus optional
+  ! MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR writes) on a POSIX thread that is
+  ! independent of the OpenMP runtime, so it can genuinely run concurrently
+  ! with the *next* tile's OpenMP-parallel read/mask/prep/compute. An
+  ! `!$omp task` cannot be used for this: a task can never outlive its
+  ! enclosing parallel region (the region's exit is always a barrier), and
+  ! keeping that region open across the next tile's own `!$omp parallel do`
+  ! calls would make them nested regions, which libgomp silently collapses
+  ! to one thread by default -- this codebase never sets OMP_NESTED /
+  ! omp_set_max_active_levels, so io_read_threads and the compute kernel's
+  ! thread count would silently stop being parallel the moment io_overlap
+  ! was enabled. A raw pthread has no such lifetime coupling to OpenMP's
+  ! team model, so read/mask/prep/compute keep using their existing
+  ! parallel regions completely undisturbed.
+  !
+  ! Platform note: pthread_t is assumed representable as a C long (true for
+  ! glibc/x86_64 Linux -- the only supported build target for this tool).
+  type :: tile_write_job_t
+    ! AMP/PHA parallel write handles (size n_write_threads each).
+    integer, allocatable :: unit_amp(:), unit_pha(:)
+    integer :: n_write_threads = 1
+    ! Single-handle outputs.
+    integer :: unit_mask = 0, unit_nvalid = 0
+    integer :: unit_peak = 0, unit_rmpeak = 0, unit_angpeak = 0, unit_snr = 0
+    logical :: out_mask_open = .false., out_nvalid_open = .false.
+    logical :: out_peak_open = .false., out_rmpeak_open = .false.
+    logical :: out_angpeak_open = .false., out_snr_open = .false.
+    logical :: cubestat_on = .false.
+    ! Geometry.
+    integer :: group = 1
+    integer :: naxes_out(3) = 0, naxes_mask(3) = 0
+    integer :: naxes_nvalid(2) = 0, naxes_stat(2) = 0
+    integer :: ix_out_beg = 0, ix_out_end = 0
+    integer :: iy_out_beg = 0, iy_out_end = 0
+    integer :: nrm_out = 0, nx_tile = 0, ny_tile = 0, nz_out = 0
+    integer :: ix_tile_beg = 0, ix_tile_end = 0
+    integer :: iy_tile_beg = 0, iy_tile_end = 0
+    ! Data: points at the tile-output buffer slot this job owns. Must stay
+    ! untouched by the producer (next tile's mask/prep/compute) until
+    ! tile_write_join() returns for this job.
+    real(sp), pointer :: p_tile_arr(:) => null()
+    real(sp), pointer :: phi_tile_arr(:) => null()
+    integer(int8), pointer :: mask_tile_arr(:) => null()
+    integer(int16), pointer :: nvalid_tile_arr(:) => null()
+    real(sp), pointer :: peak_tile_arr(:) => null()
+    real(sp), pointer :: rm_peak_tile_arr(:) => null()
+    real(sp), pointer :: ang_peak_tile_arr(:) => null()
+    real(sp), pointer :: snr_tile_arr(:) => null()
+  end type tile_write_job_t
+
+  interface
+    function c_pthread_create(thread, attr, start_routine, arg) &
+         bind(C, name="pthread_create") result(rc)
+      import :: c_int, c_long, c_ptr, c_funptr
+      integer(c_long) :: thread
+      type(c_ptr), value :: attr
+      type(c_funptr), value :: start_routine
+      type(c_ptr), value :: arg
+      integer(c_int) :: rc
+    end function c_pthread_create
+
+    function c_pthread_join(thread, retval) &
+         bind(C, name="pthread_join") result(rc)
+      import :: c_int, c_long, c_ptr
+      integer(c_long), value :: thread
+      type(c_ptr), value :: retval
+      integer(c_int) :: rc
+    end function c_pthread_join
+  end interface
 
 contains
 
@@ -843,12 +920,15 @@ contains
     real(sp), allocatable, intent(out) :: mean_Q(:), mean_U(:)
     real(sp), allocatable, intent(out) :: wsum_gpu(:)
     
-    integer(int32) :: npix, ipix, iz, src_idx
+    integer(int32) :: iz
+    ! npix/ipix/src_idx can exceed INT32_MAX for large tiles (npix*nz_out);
+    ! must be int64 to avoid wraparound corrupting the flat-array index.
+    integer(int64) :: npix, ipix, src_idx
     logical :: pack_loop_omp
     real(sp) :: q_val, u_val
     real(sp) :: wsum, q_sum, u_sum
-    
-    npix = nx_tile * ny_tile
+
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
 
 #if defined(HOST_OMP) && (HOST_OMP == 1)
     pack_loop_omp = (.not. omp_in_parallel())
@@ -959,11 +1039,14 @@ contains
     real(sp), allocatable, intent(out) :: mean_Q(:), mean_U(:)
     real(sp), allocatable, intent(out) :: wsum_cpu(:)
     
-    integer(int32) :: npix, ipix, iz, src_idx
+    integer(int32) :: iz
+    ! npix/ipix/src_idx can exceed INT32_MAX for large tiles (npix*nz_out);
+    ! must be int64 to avoid wraparound corrupting the flat-array index.
+    integer(int64) :: npix, ipix, src_idx
     logical :: pack_loop_omp
     real(sp) :: q_sum, u_sum
-    
-    npix = nx_tile * ny_tile
+
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
 
 #if defined(HOST_OMP) && (HOST_OMP == 1)
     pack_loop_omp = (.not. omp_in_parallel())
@@ -1075,8 +1158,10 @@ contains
     real(sp), intent(inout) :: p_tile_arr(:)
     real(sp), intent(inout) :: phi_tile_arr(:)
     
-    integer(int32) :: ipix, npix, i_rm_local, i_rm_global, iz
-    integer(int32) :: p_idx
+    integer(int32) :: i_rm_local, i_rm_global, iz
+    ! ipix/npix/p_idx can exceed INT32_MAX for large tiles (npix*nrm_out);
+    ! must be int64 to avoid wraparound writing outside p_tile_arr/phi_tile_arr.
+    integer(int64) :: ipix, npix, p_idx
     integer(int32) :: tid_local
     real(sp) :: rc_cor, rs_cor, ic_cor, is_cor, ryw_tmp, iyw_tmp
     real(sp) :: q_eff, u_eff, wt, mean_q_pix, mean_u_pix
@@ -1084,7 +1169,7 @@ contains
     real(dp) :: t_thread_start, t_thread_elapsed
     character(len=192) :: thread_msg
 
-    npix = nx_tile * ny_tile
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
     
 #ifdef USE_GPU
     !$omp target teams distribute parallel do collapse(2) if(use_gpu_actual) &
@@ -1229,13 +1314,16 @@ contains
     real(sp), intent(out) :: ang_peak_map(nx_tile*ny_tile)
     real(sp), intent(out) :: snr_map(nx_tile*ny_tile)
 
-    integer(int32) :: npix, ipix, irm, idx, nvalid
+    integer(int32) :: irm, nvalid
     integer(int32) :: idx_peak, i16, i50, i_mad
+    ! npix/ipix/idx can exceed INT32_MAX for large tiles (npix*nrm_out);
+    ! must be int64 to avoid wraparound reading outside p_tile_arr/phi_tile_arr.
+    integer(int64) :: npix, ipix, idx
     real(sp) :: pval, pmax, sigma_noise, q16, q50, median_val, eps_sigma
     real(sp) :: vals(nrm_out), dev(nrm_out)
     real(sp) :: zero_val
 
-    npix = nx_tile * ny_tile
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
     eps_sigma = 1.0e-12_sp
     zero_val = 0.0_sp
 
@@ -2713,5 +2801,188 @@ contains
       flag_from_value = .true.
     end if
   end function flag_from_value
+
+  subroutine do_tile_write(job)
+    !! Writes one tile's AMP/PHA (RM-chunked, parallel if n_write_threads>1)
+    !! plus optional MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR outputs. Callable
+    !! either inline (io_overlap off) or as a pthread entry point's payload
+    !! (io_overlap on) -- identical logic either way, so output is bit-for-bit
+    !! the same regardless of which mode dispatched it.
+    implicit none
+    type(tile_write_job_t), intent(inout) :: job
+    integer :: status, wpar_k
+    integer(int64) :: wpar_base, wpar_rem, wpar_nrm_k, wpar_rm_off_k, wpar_buf_off
+    integer :: wpar_rm_beg, wpar_rm_end
+    integer :: wpar_fpix(3), wpar_lpix(3)
+    integer :: fpixels_out(3), lpixels_out(3)
+    integer :: fpixels_nvalid(2), lpixels_nvalid(2)
+    real(dp) :: t_stage
+    character(len=272) :: message
+
+    write(message,'(A,I0,A,I0,A,I0,A,I0,A)')&
+    &'tile write start x:[',job%ix_tile_beg,',',job%ix_tile_end,&
+    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,']'
+    call log_message('debug','tile_write',trim(message))
+    t_stage = wall_time_seconds()
+
+    fpixels_out(1) = job%ix_out_beg
+    lpixels_out(1) = job%ix_out_end
+    fpixels_out(2) = job%iy_out_beg
+    lpixels_out(2) = job%iy_out_end
+    fpixels_out(3) = 1
+    lpixels_out(3) = job%nrm_out
+
+    ! --- RM-chunked parallel write for AMP and PHA cubes ---
+    ! Identical decomposition to the non-overlap path: split nrm_out RM bins
+    ! across n_write_threads independent handles, each writing a disjoint
+    ! byte region. For n_write_threads=1 this runs once on the calling
+    ! thread (main thread when inline, the write pthread when async).
+    wpar_base = int(job%nrm_out,kind=int64) / int(job%n_write_threads,kind=int64)
+    wpar_rem  = mod(int(job%nrm_out,kind=int64), int(job%n_write_threads,kind=int64))
+!$omp parallel do if(job%n_write_threads.gt.1)&
+!$omp& num_threads(job%n_write_threads)&
+!$omp& default(none)&
+!$omp& shared(job,wpar_base,wpar_rem,fpixels_out,lpixels_out)&
+!$omp& private(wpar_k,wpar_nrm_k,wpar_rm_off_k,wpar_rm_beg,wpar_rm_end,&
+!$omp&  wpar_buf_off,wpar_fpix,wpar_lpix,status)
+    do wpar_k = 0, job%n_write_threads-1
+       wpar_nrm_k = wpar_base + &
+       &merge(1_int64,0_int64,int(wpar_k,kind=int64).lt.wpar_rem)
+       wpar_rm_off_k = int(wpar_k,kind=int64)*wpar_base + &
+       &min(int(wpar_k,kind=int64),wpar_rem)
+       wpar_rm_beg = int(wpar_rm_off_k) + 1
+       wpar_rm_end = int(wpar_rm_off_k + wpar_nrm_k)
+       wpar_buf_off = wpar_rm_off_k * &
+       &int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64) + 1_int64
+       wpar_fpix = fpixels_out
+       wpar_lpix = lpixels_out
+       wpar_fpix(3) = wpar_rm_beg
+       wpar_lpix(3) = wpar_rm_end
+       status = 0
+       call ftpsse(job%unit_amp(wpar_k+1),job%group,3,job%naxes_out,&
+       &wpar_fpix,wpar_lpix,job%p_tile_arr(wpar_buf_off),status)
+       status = 0
+       call ftpsse(job%unit_pha(wpar_k+1),job%group,3,job%naxes_out,&
+       &wpar_fpix,wpar_lpix,job%phi_tile_arr(wpar_buf_off),status)
+    enddo
+!$omp end parallel do
+
+    if(job%out_mask_open)then
+       fpixels_out(3) = 1
+       lpixels_out(3) = job%nz_out
+       status = 0
+       call ftpssb(job%unit_mask,job%group,3,job%naxes_mask,&
+       &fpixels_out,lpixels_out,job%mask_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_nvalid_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpssi(job%unit_nvalid,job%group,2,job%naxes_nvalid,&
+       &fpixels_nvalid,lpixels_nvalid,job%nvalid_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_peak_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_peak,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%peak_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_rmpeak_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_rmpeak,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%rm_peak_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_angpeak_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_angpeak,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%ang_peak_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_snr_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_snr,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%snr_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    call timer_add(STAGE_TILE_WRITE, wall_time_seconds()-t_stage)
+    write(message,'(A,I0,A,I0,A,I0,A,I0,A)')&
+    &'tile write done x:[',job%ix_tile_beg,',',job%ix_tile_end,&
+    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,']'
+    call log_message('debug','tile_write',trim(message))
+  end subroutine do_tile_write
+
+  function tile_write_thread_entry(arg) bind(C) result(res)
+    !! pthread start routine. Unpacks the opaque context pointer back into
+    !! the tile_write_job_t it was created from (same process, same build,
+    !! so the round-trip through c_loc/c_f_pointer is safe even though
+    !! tile_write_job_t is not a bind(C) type) and runs the write.
+    type(c_ptr), value :: arg
+    type(c_ptr) :: res
+    type(tile_write_job_t), pointer :: job
+
+    call c_f_pointer(arg, job)
+    call do_tile_write(job)
+    res = c_null_ptr
+  end function tile_write_thread_entry
+
+  subroutine tile_write_dispatch_async(job, thread_id, dispatched)
+    !! Launches do_tile_write(job) on a background pthread. `job` must have
+    !! the TARGET attribute at the call site and must remain valid --
+    !! untouched and undeallocated -- until tile_write_join(thread_id) has
+    !! returned. On pthread_create failure this runs the write synchronously
+    !! right here instead (safe fallback: a write is never silently
+    !! dropped), and reports dispatched=.false. so the caller knows there is
+    !! nothing to join later.
+    implicit none
+    type(tile_write_job_t), intent(inout), target :: job
+    integer(c_long), intent(out) :: thread_id
+    logical, intent(out) :: dispatched
+    integer(c_int) :: rc
+
+    rc = c_pthread_create(thread_id, c_null_ptr, &
+         c_funloc(tile_write_thread_entry), c_loc(job))
+    if (rc /= 0_c_int) then
+      call log_message('warn','tile_write', &
+           'pthread_create failed for async tile write; running inline')
+      call do_tile_write(job)
+      dispatched = .false.
+    else
+      dispatched = .true.
+    end if
+  end subroutine tile_write_dispatch_async
+
+  subroutine tile_write_join(thread_id)
+    implicit none
+    integer(c_long), intent(in) :: thread_id
+    integer(c_int) :: rc
+    rc = c_pthread_join(thread_id, c_null_ptr)
+  end subroutine tile_write_join
 
 end module rm_synthesis_mod

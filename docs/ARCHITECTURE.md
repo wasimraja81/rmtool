@@ -235,11 +235,31 @@ Parallel (io_write_threads=N):
 | Decomposition axis | RM (slowest axis in output cube) |
 | Output files parallelised | AMP cube (unit 41) and PHA cube (unit 42) |
 | 2D map outputs (NVALID, MASK, cubestat) | Remain serial — negligible cost |
-| POSIX safety | Concurrent `pwrite()` to non-overlapping byte regions is guaranteed safe |
-| CFITSIO metadata safety | File-level metadata updated only at `FTCLOS`, not during subset puts |
 
 For `io_write_threads=1` (default): `par_wunit_amp(1)=41`,
 `par_wunit_pha(1)=42` alias existing handles — zero overhead.
+
+> **⚠ `io_write_threads>1` is currently unsafe — keep it at 1.**
+> The table above originally claimed "concurrent `pwrite()` to
+> non-overlapping byte regions is guaranteed safe" and "CFITSIO metadata
+> updated only at close." Neither holds. `FTOPEN(...,1,...)` (read-write)
+> called N times on the *same* file does not give N independent handles:
+> CFITSIO's `fits_already_open()` (`cfitsio-4.3.1/cfileio.c:1512-1520,1653`)
+> explicitly aliases repeat read-write opens of an already-open file onto
+> one shared `FITSfile` buffer — by CFITSIO's own design ("the file MUST
+> only be physically opened once"). Read-only opens are exempted from this
+> aliasing for the opposite reason CFITSIO gives: *"2 different threads
+> cannot share the same FITSfile pointer"* — which is exactly why
+> `io_read_threads` is safe and `io_write_threads` is not. Concurrent
+> `ftpsse` calls on the "N" write handles from `!$omp parallel do` corrupt
+> CFITSIO's shared buffer bookkeeping. Confirmed against a real crash: a
+> SIGSEGV inside `memmove`, deep in unsymbolised `libcfitsio.so` frames,
+> immediately after the first tile's compute finished with
+> `io_write_threads=4` in the log. Fixing this for real needs either
+> genuine multi-process writers (CFITSIO's alias table is per-process) or
+> bypassing CFITSIO for the pixel write (`pwrite()` at a byte offset from
+> `fits_get_hduaddrll`, with manual big-endian byte-swapping) — not yet
+> implemented; see `planning/IO_PARALLEL_OPTIMISATION_PLAN.md` T6.
 
 #### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
 
@@ -284,6 +304,79 @@ Same table applies to `io_write_threads` / units 41/42 / `nrm_out`.
   alter it.
 - All tests pass at `io_read_threads=1`, `io_write_threads=1` (default).
 - Switching to serial is always possible by omitting both keys from the cfg.
+
+#### Async read/write overlap — `io_overlap`
+
+Even with `io_read_threads`/`io_write_threads` tuned, the tile loop is
+still fully serial *between* tiles: `write(N)` finishes before `read(N+1)`
+even starts, though the two touch entirely different files (output
+AMP/PHA vs. input Q/U) with no data dependency between them. Real Setonix
+timing (`JENNIFER_TOO_FULLIM.run.cpu.setonix.log`, 27 tiles) showed read
+(~124s/tile) and write (~95-110s/tile) together at 84% of wall time —
+overlapping them was the largest single lever available.
+
+```
+Serial (io_overlap=n, default):
+  tile N:   read → mask → prep → compute → cubestat → write(N)
+  tile N+1:                                                    read → mask → ...
+                                                          ^ waits for write(N)
+
+Overlapping (io_overlap=y):
+  tile N:   read → mask → prep → compute → cubestat → write(N) ─────────┐
+  tile N+1:                                            read → mask → prep → compute → cubestat → write(N+1)
+                                                                              ^
+                                                             write(N) hidden behind tile N+1's own pipeline
+```
+
+**Why a pthread, not an `!$omp task`.** An OpenMP task can never outlive
+its enclosing parallel region — the region's exit is always an implicit
+barrier. Keeping the write's region open across tile N+1's own
+`!$omp parallel do` calls (read chunking, mask build, prep, compute) would
+make every one of them a *nested* parallel region, and this codebase never
+configures `OMP_NESTED`/`omp_set_max_active_levels` — libgomp silently
+collapses nested regions to one thread by default. `io_read_threads` and
+the compute kernel's thread count would quietly stop being parallel the
+moment `io_overlap` was turned on, with no error. A raw POSIX thread
+(`pthread_create`/`pthread_join` via `iso_c_binding`; see
+`tile_write_job_t` and `do_tile_write` in `rm_synthesis_mod.f90`) has no
+lifetime coupling to OpenMP's team model, so read/mask/prep/compute keep
+using their existing parallel regions completely undisturbed. This is
+safe with respect to the `io_write_threads>1` hazard above because the
+overlap keeps exactly one thread touching a write handle at a time — it
+only changes *which* thread (main vs. the write pthread) and *when*, never
+how many concurrently.
+
+**Double buffering.** `p_tile_arr`, `phi_tile_arr`, `mask_tile_arr`,
+`nvalid_tile_arr`, and the four cubestat maps (when `cubestat=y`) are
+`pointer, contiguous` in `rm_synthesis.f90`, each backed by two physical
+targets (`..._s0`/`..._s1`). The tile loop ping-pongs which target the
+pointers reference each tile; a tile's write reads whichever slot it was
+given while the next tile's mask/prep/compute writes the other slot, so
+compute and write are never touching the same memory at once. With
+`io_overlap=n` only slot 0 is ever allocated and the pointers never move —
+bit-identical to a plain allocatable array, zero behaviour change. The RAM
+auto-tiler doubles just the output-side bytes-per-pixel term when
+`io_overlap=y`, so `tile_dec` is planned smaller automatically under the
+same `mem_frac_ram` — nothing new for the user to configure.
+
+**Synchronisation.** A slot's pending write is joined only when that same
+slot is about to be reused (two tiles later) — not before every tile,
+which would serialise everything and defeat the point. Both slots are
+joined unconditionally after the tile loop ends, since the last two tiles'
+writes never get that "two tiles later" trigger.
+
+| Property | Value |
+|---|---|
+| Mechanism | `pthread_create`/`pthread_join`, independent of the OpenMP runtime |
+| Buffers doubled | p/phi/mask/nvalid + cubestat maps (if enabled); not specQ/specU (never touched by write) |
+| Default (`io_overlap=n`) | Single buffer, inline write — identical to pre-T5 behaviour |
+| Scope | Non-Negotiable Guardrail: read/mask/prep/compute kernels unchanged |
+| GPU staging path | Not specially handled, needs none — its own async sub-block pipeline fully closes its OpenMP region before tile-write is reached |
+| Platform assumption | `pthread_t` representable as C `long` (glibc/x86_64 Linux) |
+
+Verified bit-identical (`io_overlap=n` vs `y`) across a 7-tile run
+(`tests/run_tests.sh` §13) and manually at 32 tiles and on the serial
+(non-OMP) binary.
 
 ### FITS Read Correctness for Large Tiles
 

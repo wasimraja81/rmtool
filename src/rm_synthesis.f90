@@ -80,6 +80,7 @@
  !
 
 use rm_synthesis_mod
+use iso_c_binding, only: c_long
 implicit none
 
 #if HOST_OMP == 1
@@ -97,14 +98,37 @@ real(sp), allocatable :: specMask(:)
 real(sp), allocatable :: specI(:)
 real(sp), allocatable :: specQ(:)
 real(sp), allocatable :: specU(:)
-real(sp), allocatable :: p_tile_arr(:)
-real(sp), allocatable :: phi_tile_arr(:)
-real(sp), allocatable :: peak_tile_arr(:)
-real(sp), allocatable :: rm_peak_tile_arr(:)
-real(sp), allocatable :: ang_peak_tile_arr(:)
-real(sp), allocatable :: snr_tile_arr(:)
-integer*1, allocatable :: mask_tile_arr(:)
-integer*2, allocatable :: nvalid_tile_arr(:)
+ ! Tile-output arrays: pointers to one of two physical buffer slots.
+ ! io_overlap=n (default): only slot 0 is ever allocated; the pointers are
+ ! set once and never repointed -- bit-identical to plain allocatable
+ ! arrays, zero behaviour change.
+ ! io_overlap=y: both slots are allocated and the tile loop ping-pongs
+ ! between them each tile, so tile N's write (reading slot N mod 2) can run
+ ! on a background thread concurrently with tile N+1's mask/prep/compute
+ ! (writing into the other slot).
+real(sp), pointer, contiguous :: p_tile_arr(:) => null()
+real(sp), pointer, contiguous :: phi_tile_arr(:) => null()
+real(sp), pointer, contiguous :: peak_tile_arr(:) => null()
+real(sp), pointer, contiguous :: rm_peak_tile_arr(:) => null()
+real(sp), pointer, contiguous :: ang_peak_tile_arr(:) => null()
+real(sp), pointer, contiguous :: snr_tile_arr(:) => null()
+integer*1, pointer, contiguous :: mask_tile_arr(:) => null()
+integer*2, pointer, contiguous :: nvalid_tile_arr(:) => null()
+
+real(sp), allocatable, target :: p_tile_arr_s0(:), p_tile_arr_s1(:)
+real(sp), allocatable, target :: phi_tile_arr_s0(:), phi_tile_arr_s1(:)
+real(sp), allocatable, target :: peak_tile_arr_s0(:), peak_tile_arr_s1(:)
+real(sp), allocatable, target :: rm_peak_tile_arr_s0(:), rm_peak_tile_arr_s1(:)
+real(sp), allocatable, target :: ang_peak_tile_arr_s0(:), ang_peak_tile_arr_s1(:)
+real(sp), allocatable, target :: snr_tile_arr_s0(:), snr_tile_arr_s1(:)
+integer*1, allocatable, target :: mask_tile_arr_s0(:), mask_tile_arr_s1(:)
+integer*2, allocatable, target :: nvalid_tile_arr_s0(:), nvalid_tile_arr_s1(:)
+
+integer :: tile_seq, cur_slot
+type(tile_write_job_t), target :: write_job(0:1)
+integer(c_long) :: write_thread_id(0:1)
+logical :: write_pending(0:1)
+logical :: write_dispatched_ok
 real(sp)  resiQ, resiU, slopeQ, slopeU
 logical   remove_QU_bias
 integer   bitpixQ, naxisQ, naxesQ(max_axis)
@@ -223,9 +247,15 @@ integer   ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
 integer   n_subblocks_tile, i_subblock
 integer   ix_loc, iy_loc, iz
 integer   nx_tile, ny_tile
-integer   ipix_tile, pix_base
+ ! Flattened tile-pixel indices: tile_ra*tile_dec*max(nz_out,nrm_out) can
+ ! exceed INT32_MAX for large cubes (same overflow class fixed for the
+ ! allocate() sizes in a prior commit), so these must be int64.
+integer(kind=int64) :: ipix_tile, pix_base
 integer   ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
-integer   cnt_good, nvalid_pix, idx_wts
+integer   cnt_good, nvalid_pix
+ ! Flattened (pixel,channel) index: tile_ra*tile_dec*nz_out can exceed
+ ! INT32_MAX for large cubes, same overflow class as ipix_tile/dst_idx.
+integer(kind=int64) :: idx_wts
 integer   fpixels_nvalid(2), lpixels_nvalid(2)
 integer   naxes_mask(3), naxes_nvalid(2), naxes_stat(2)
 logical   nan_check_on, chan_valid
@@ -238,6 +268,7 @@ integer   mem_unit, ios_mem
 integer(kind=int64) :: mem_avail_kb, mem_kb_tmp
 integer(kind=int64) :: mem_safe_bytes
 integer(kind=int64) :: bytes_per_tile_pixel_ram, bytes_per_vram_pixel
+integer(kind=int64) :: bytes_per_tile_pixel_ram_out
 integer(kind=int64) :: tile_pixels_max, tile_bytes_est
 integer(kind=int64) :: image_pixels_total
 character(len=256) :: mem_line
@@ -249,7 +280,10 @@ integer   inflight_slots_planned
 real(dp)  vram_budget_total_bytes, vram_budget_per_slot_bytes
 real(dp)  mem_frac_vram_per_slot
 integer   iy_sub_beg, iy_sub_end, ny_sub_now
-integer   iyl, src_idx, dst_idx, ipix_full, ipix_sub
+integer   iyl
+ ! Flattened scatter/gather indices into full-tile buffers: same
+ ! INT32_MAX overflow risk as ipix_tile/pix_base above.
+integer(kind=int64) :: src_idx, dst_idx, ipix_full, ipix_sub
 integer   slot_idx, next_slot, sub_idx_next
 integer   slot_idx_now
 integer   subid_now
@@ -1681,12 +1715,21 @@ if(need_icube)in_fields = 3
  ! plus non-staging full-tile prep buffers (CPU or GPU path). Do NOT charge
  ! staging-strip buffers here; they are sized by ny_sub and handled via the
  ! VRAM planner. This avoids over-shrinking tile_dec for CPU/non-staging jobs.
+ !
+ ! bytes_per_tile_pixel_ram_out tracks only the OUTPUT-side arrays (p/phi,
+ ! mask, nvalid, cubestat maps) -- the ones io_overlap double-buffers so a
+ ! tile's write can run on a background thread while the next tile's
+ ! read/mask/prep/compute reuses the other buffer. Everything else (specQ/
+ ! specU/specMask/specI and the non-staging prep buffers) is read/populated
+ ! fresh every tile regardless of io_overlap and is never double-buffered.
 bytes_per_tile_pixel_ram = 0_int64
+bytes_per_tile_pixel_ram_out = 0_int64
 
- ! Always allocated full-tile arrays: specQ/specU + p/phi outputs.
-bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram + int(4,kind=int64) * (&
-&int(2,kind=int64)*int(nz_out,kind=int64) +&
-&int(2,kind=int64)*int(nrm_out,kind=int64))
+ ! Always allocated full-tile arrays: specQ/specU (input) + p/phi (output).
+bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+&int(4,kind=int64)*int(2,kind=int64)*int(nz_out,kind=int64)
+bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out +&
+&int(4,kind=int64)*int(2,kind=int64)*int(nrm_out,kind=int64)
 
  ! Optional full-tile inputs.
 if(use_input_mask)then
@@ -1699,12 +1742,12 @@ if(need_icube)then
 endif
 
  ! Full-tile mask and valid-channel count outputs.
-bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out +&
 &int(1,kind=int64)*int(nz_out,kind=int64) + int(2,kind=int64)
 
  ! Optional cubestat maps (peak/rm_peak/ang_peak/snr), 4 float maps.
 if(cubestat)then
-   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
+   bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out +&
    &int(4,kind=int64)*int(4,kind=int64)
 endif
 
@@ -1715,6 +1758,13 @@ if(rem_mean.gt.0)then
    bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
    &int(4,kind=int64)*int(2,kind=int64)
 endif
+
+ ! io_overlap keeps two copies of the output-side arrays alive at once
+ ! (the tile being written + the tile being computed into the other slot).
+if(io_overlap)then
+   bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out * 2_int64
+endif
+bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram + bytes_per_tile_pixel_ram_out
 
  ! VRAM sub-block budget (bytes per sub-block pixel). This is separate from
  ! RAM planning and should reflect per-offload working sets only.
@@ -1970,18 +2020,51 @@ ios_mem = 0
  ! misallocated buffer that FTGSVE then overruns.
 allocate(specQ(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
 &specU(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
-&p_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
-&phi_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
-&mask_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
-&nvalid_tile_arr(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)),&
+&p_tile_arr_s0(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
+&phi_tile_arr_s0(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
+&mask_tile_arr_s0(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
+&nvalid_tile_arr_s0(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)),&
 &stat=ios_mem)
-if(ios_mem.eq.0 .and. cubestat)then
-   allocate(peak_tile_arr(tile_ra*tile_dec),&
-   &rm_peak_tile_arr(tile_ra*tile_dec),&
-   &ang_peak_tile_arr(tile_ra*tile_dec),&
-   &snr_tile_arr(tile_ra*tile_dec),&
+if(ios_mem.eq.0 .and. io_overlap)then
+   allocate(&
+   &p_tile_arr_s1(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
+   &phi_tile_arr_s1(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
+   &mask_tile_arr_s1(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),&
+   &nvalid_tile_arr_s1(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)),&
    &stat=ios_mem)
 endif
+if(ios_mem.eq.0 .and. cubestat)then
+   allocate(peak_tile_arr_s0(tile_ra*tile_dec),&
+   &rm_peak_tile_arr_s0(tile_ra*tile_dec),&
+   &ang_peak_tile_arr_s0(tile_ra*tile_dec),&
+   &snr_tile_arr_s0(tile_ra*tile_dec),&
+   &stat=ios_mem)
+   if(ios_mem.eq.0 .and. io_overlap)then
+      allocate(peak_tile_arr_s1(tile_ra*tile_dec),&
+      &rm_peak_tile_arr_s1(tile_ra*tile_dec),&
+      &ang_peak_tile_arr_s1(tile_ra*tile_dec),&
+      &snr_tile_arr_s1(tile_ra*tile_dec),&
+      &stat=ios_mem)
+   endif
+endif
+if(ios_mem.eq.0)then
+    ! Slot 0 is tile 0's buffer; the tile loop repoints these to slot 1
+    ! every other tile when io_overlap is on. Left permanently on slot 0
+    ! when io_overlap is off (slot 1 is never allocated in that case).
+   p_tile_arr => p_tile_arr_s0
+   phi_tile_arr => phi_tile_arr_s0
+   mask_tile_arr => mask_tile_arr_s0
+   nvalid_tile_arr => nvalid_tile_arr_s0
+   if(cubestat)then
+      peak_tile_arr => peak_tile_arr_s0
+      rm_peak_tile_arr => rm_peak_tile_arr_s0
+      ang_peak_tile_arr => ang_peak_tile_arr_s0
+      snr_tile_arr => snr_tile_arr_s0
+   endif
+endif
+tile_seq = 0
+write_pending(0) = .false.
+write_pending(1) = .false.
 if(ios_mem.eq.0 .and. use_input_mask)then
    allocate(specMask(int(tile_ra,kind=int64)*int(tile_dec,kind=int64)*int(nz_out,kind=int64)),stat=ios_mem)
 endif
@@ -2781,6 +2864,16 @@ else
    write(*,*)" Parallel FITS write: opened ",io_write_threads_eff," handles/cube"
 endif
 
+if(io_overlap)then
+   write(*,*)" IO overlap: ON -- tile write runs on a background thread,"
+   write(*,*)"   concurrent with the next tile's read/mask/prep/compute."
+   call log_message('info','startup',&
+   &'io_overlap=y: async tile-write pthread active')
+else
+   call log_message('info','startup',&
+   &'io_overlap=n: tile write runs inline (serial)')
+endif
+
 cnt1 = 0
 n_rm_blocks_total = 0_int64
 n_subblocks_total = 0_int64
@@ -2800,6 +2893,45 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       &iy_tile_beg + (tile_dec-1)*incs(2))
       ny_tile = int((iy_tile_end - iy_tile_beg)/incs(2)) + 1
       call timer_start(t_tile_start)
+
+      ! io_overlap buffer ping-pong: tile_seq alternates 0/1 across tiles.
+      ! Slot cur_slot is about to be (re)written by this tile's
+      ! mask/prep/compute; if the write from two tiles ago (the last user
+      ! of this same slot) is still in flight, join it now -- this is the
+      ! one synchronisation point that makes the double buffering safe.
+      ! With io_overlap off, cur_slot is always 0 and write_pending is
+      ! never set, so this block is a no-op and the pointers never move.
+      cur_slot = mod(tile_seq, 2)
+      tile_seq = tile_seq + 1
+      if(io_overlap)then
+         if(write_pending(cur_slot))then
+            call tile_write_join(write_thread_id(cur_slot))
+            write_pending(cur_slot) = .false.
+         endif
+         if(cur_slot.eq.0)then
+            p_tile_arr => p_tile_arr_s0
+            phi_tile_arr => phi_tile_arr_s0
+            mask_tile_arr => mask_tile_arr_s0
+            nvalid_tile_arr => nvalid_tile_arr_s0
+            if(cubestat)then
+               peak_tile_arr => peak_tile_arr_s0
+               rm_peak_tile_arr => rm_peak_tile_arr_s0
+               ang_peak_tile_arr => ang_peak_tile_arr_s0
+               snr_tile_arr => snr_tile_arr_s0
+            endif
+         else
+            p_tile_arr => p_tile_arr_s1
+            phi_tile_arr => phi_tile_arr_s1
+            mask_tile_arr => mask_tile_arr_s1
+            nvalid_tile_arr => nvalid_tile_arr_s1
+            if(cubestat)then
+               peak_tile_arr => peak_tile_arr_s1
+               rm_peak_tile_arr => rm_peak_tile_arr_s1
+               ang_peak_tile_arr => ang_peak_tile_arr_s1
+               snr_tile_arr => snr_tile_arr_s1
+            endif
+         endif
+      endif
 
       write(*,*)"Doing tile x:[",ix_tile_beg,",",ix_tile_end,&
       &"] y:[",iy_tile_beg,",",iy_tile_end,"]"
@@ -2909,12 +3041,12 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
 #if HOST_OMP == 1
 !$omp parallel do default(shared) private(idx_wts, iz)
 #endif
-      do idx_wts = 1, nx_tile*ny_tile*nz_out
+      do idx_wts = 1, int(nx_tile,kind=int64)*int(ny_tile,kind=int64)*int(nz_out,kind=int64)
          ! Initialize as valid
          mask_tile_arr(idx_wts) = 1
 
          ! Extract channel index iz from linear index
-         iz = (idx_wts - 1) / (nx_tile*ny_tile) + 1
+         iz = int((idx_wts - 1) / (int(nx_tile,kind=int64)*int(ny_tile,kind=int64))) + 1
 
          ! Check condition 1: Global bad channel
          if (flag_arr_out(iz) == 0) then
@@ -2970,7 +3102,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
             ! Populate nvalid_tile_arr from precomputed per-pixel weight sums.
             ! wsum_gpu(ipix) is the count of valid channels for that pixel
             ! (same quantity tile_extract_cpu stores in nvalid_tile_arr).
-            do ipix_tile = 1, nx_tile*ny_tile
+            do ipix_tile = 1, int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
                nvalid_tile_arr(ipix_tile) =&
                &int(wsum_gpu(ipix_tile), kind=2)
             enddo
@@ -3024,7 +3156,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
             &specQ_gpu, specU_gpu, wts_gpu,&
             &rem_mean, mean_Q, mean_U, wsum_gpu)
 #endif
-            do ipix_tile = 1, nx_tile*ny_tile
+            do ipix_tile = 1, int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
                nvalid_tile_arr(ipix_tile) =&
                &int(wsum_gpu(ipix_tile), kind=2)
             enddo
@@ -3110,10 +3242,12 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                iy_loc = slot_iy_beg(slot_idx) + iyl - 1
                do ix_loc = 1,nx_tile
                   do iz = 1,nz_out
-                     src_idx = ix_loc + (iy_loc-1)*nx_tile&
-                     &+ (iz-1)*nx_tile*ny_tile
-                     dst_idx = ix_loc + (iyl-1)*nx_tile&
-                     &+ (iz-1)*nx_tile*slot_ny(slot_idx)
+                     src_idx = int(ix_loc,kind=int64) +&
+                     &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)&
+                     &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+                     dst_idx = int(ix_loc,kind=int64) +&
+                     &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)&
+                     &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(slot_ny(slot_idx),kind=int64)
                      stQ(dst_idx,slot_idx) = specQ(src_idx)
                      stU(dst_idx,slot_idx) = specU(src_idx)
                      stMask_tile_arr(dst_idx,slot_idx) =&
@@ -3193,7 +3327,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                endif
 
                ! Populate stNvalid from precomputed per-pixel weight sums
-               do ipix_sub = 1, nx_tile*ny_sub_now
+               do ipix_sub = 1, int(nx_tile,kind=int64)*int(ny_sub_now,kind=int64)
                   if(slot_idx.eq.1)then
                      stNvalid(ipix_sub,slot_idx) =&
                      &int(st_wsum_gpu1(ipix_sub), kind=2)
@@ -3354,10 +3488,12 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                      iy_loc = slot_iy_beg(next_slot) + iyl - 1
                      do ix_loc = 1,nx_tile
                         do iz = 1,nz_out
-                           src_idx = ix_loc + (iy_loc-1)*nx_tile&
-                           &+ (iz-1)*nx_tile*ny_tile
-                           dst_idx = ix_loc + (iyl-1)*nx_tile&
-                           &+ (iz-1)*nx_tile*slot_ny(next_slot)
+                           src_idx = int(ix_loc,kind=int64) +&
+                           &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+                           dst_idx = int(ix_loc,kind=int64) +&
+                           &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(slot_ny(next_slot),kind=int64)
                            stQ(dst_idx,next_slot) = specQ(src_idx)
                            stU(dst_idx,next_slot) = specU(src_idx)
                            stMask_tile_arr(dst_idx,next_slot) =&
@@ -3441,22 +3577,28 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   do iyl = 1,ny_sub_now
                      iy_loc = iy_sub_beg + iyl - 1
                      do ix_loc = 1,nx_tile
-                        ipix_full = ix_loc + (iy_loc-1)*nx_tile
-                        ipix_sub  = ix_loc + (iyl-1)*nx_tile
+                        ipix_full = int(ix_loc,kind=int64) +&
+                        &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)
+                        ipix_sub  = int(ix_loc,kind=int64) +&
+                        &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)
                         nvalid_tile_arr(ipix_full) = stNvalid(ipix_sub,slot_idx_now)
                         do irm = 1,nrm_out
-                           dst_idx = ix_loc + (iy_loc-1)*nx_tile&
-                           &+ (irm-1)*nx_tile*ny_tile
-                           src_idx = ix_loc + (iyl-1)*nx_tile&
-                           &+ (irm-1)*nx_tile*ny_sub_now
+                           dst_idx = int(ix_loc,kind=int64) +&
+                           &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(irm-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+                           src_idx = int(ix_loc,kind=int64) +&
+                           &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(irm-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_sub_now,kind=int64)
                            p_tile_arr(dst_idx) = stP(src_idx,slot_idx_now)
                            phi_tile_arr(dst_idx) = stPhi(src_idx,slot_idx_now)
                         enddo
                         do iz = 1,nz_out
-                           dst_idx = ix_loc + (iy_loc-1)*nx_tile&
-                           &+ (iz-1)*nx_tile*ny_tile
-                           src_idx = ix_loc + (iyl-1)*nx_tile&
-                           &+ (iz-1)*nx_tile*ny_sub_now
+                           dst_idx = int(ix_loc,kind=int64) +&
+                           &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+                           src_idx = int(ix_loc,kind=int64) +&
+                           &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_sub_now,kind=int64)
                            mask_tile_arr(dst_idx) =&
                            &stMask_tile_arr(src_idx,slot_idx_now)
                         enddo
@@ -3550,22 +3692,28 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
                   do iyl = 1,ny_sub_now
                      iy_loc = iy_sub_beg + iyl - 1
                      do ix_loc = 1,nx_tile
-                        ipix_full = ix_loc + (iy_loc-1)*nx_tile
-                        ipix_sub  = ix_loc + (iyl-1)*nx_tile
+                        ipix_full = int(ix_loc,kind=int64) +&
+                        &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)
+                        ipix_sub  = int(ix_loc,kind=int64) +&
+                        &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)
                         nvalid_tile_arr(ipix_full) = stNvalid(ipix_sub,slot_idx)
                         do irm = 1,nrm_out
-                           dst_idx = ix_loc + (iy_loc-1)*nx_tile&
-                           &+ (irm-1)*nx_tile*ny_tile
-                           src_idx = ix_loc + (iyl-1)*nx_tile&
-                           &+ (irm-1)*nx_tile*ny_sub_now
+                           dst_idx = int(ix_loc,kind=int64) +&
+                           &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(irm-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+                           src_idx = int(ix_loc,kind=int64) +&
+                           &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(irm-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_sub_now,kind=int64)
                            p_tile_arr(dst_idx) = stP(src_idx,slot_idx)
                            phi_tile_arr(dst_idx) = stPhi(src_idx,slot_idx)
                         enddo
                         do iz = 1,nz_out
-                           dst_idx = ix_loc + (iy_loc-1)*nx_tile&
-                           &+ (iz-1)*nx_tile*ny_tile
-                           src_idx = ix_loc + (iyl-1)*nx_tile&
-                           &+ (iz-1)*nx_tile*ny_sub_now
+                           dst_idx = int(ix_loc,kind=int64) +&
+                           &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
+                           src_idx = int(ix_loc,kind=int64) +&
+                           &int(iyl-1,kind=int64)*int(nx_tile,kind=int64)&
+                           &+ int(iz-1,kind=int64)*int(nx_tile,kind=int64)*int(ny_sub_now,kind=int64)
                            mask_tile_arr(dst_idx) =&
                            &stMask_tile_arr(src_idx,slot_idx)
                         enddo
@@ -3592,8 +3740,9 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
          do ix_loc = 1,nx_tile
             ix = ix_tile_beg + (ix_loc-1)*incs(1)
             cnt1 = cnt1 + 1
-            ipix_tile = ix_loc + (iy_loc-1)*nx_tile
-            pix_base = (ipix_tile-1)*nz_out
+            ipix_tile = int(ix_loc,kind=int64) +&
+            &int(iy_loc-1,kind=int64)*int(nx_tile,kind=int64)
+            pix_base = (ipix_tile-1)*int(nz_out,kind=int64)
 
             if(progress_total.gt.0)then
                do while(cnt1.ge.progress_next_count .and.&
@@ -3633,146 +3782,79 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       call log_message('debug','tile_cubestat',&
       &message(1:nchar(message)))
 
-      write(message,'(A,I0,A,I0,A,I0,A,I0,A)')&
-      &'tile write start x:[',ix_tile_beg,',',ix_tile_end,&
-      &'] y:[',iy_tile_beg,',',iy_tile_end,']'
-      call log_message('debug','tile_write',&
-      &message(1:nchar(message)))
-      call timer_start(t_stage)
-      fpixels_out(1) = ix_out_beg
-      lpixels_out(1) = ix_out_end
-      fpixels_out(2) = iy_out_beg
-      lpixels_out(2) = iy_out_end
-      fpixels_out(3) = 1
-      lpixels_out(3) = nrm_out
-
-      ! --- RM-chunked parallel write for AMP and PHA cubes ---
-      ! Split nrm_out RM bins across io_write_threads_eff threads; each thread
-      ! writes a contiguous RM-bin slice to a disjoint byte region of the file.
-      ! For io_write_threads_eff=1 the loop runs once on the calling thread
-      ! using the existing unit handles -- identical to the former serial write.
-      io_wpar_base = int(nrm_out,kind=int64) / &
-      &int(io_write_threads_eff,kind=int64)
-      io_wpar_rem  = mod(int(nrm_out,kind=int64), &
-      &int(io_write_threads_eff,kind=int64))
-!$omp parallel do if(io_write_threads_eff.gt.1)&
-!$omp& num_threads(io_write_threads_eff)&
-!$omp& default(none)&
-!$omp& shared(io_write_threads_eff,io_wpar_base,io_wpar_rem,&
-!$omp&  par_wunit_amp,par_wunit_pha,group,naxes_out,&
-!$omp&  fpixels_out,lpixels_out,p_tile_arr,phi_tile_arr,nx_tile,ny_tile)&
-!$omp& private(io_wpar_k,io_wpar_nrm_k,io_wpar_rm_off_k,&
-!$omp&  io_wpar_rm_beg,io_wpar_rm_end,io_wpar_buf_off,&
-!$omp&  io_wpar_fpix,io_wpar_lpix,io_wpar_status_priv)
-      do io_wpar_k = 0, io_write_threads_eff-1
-         io_wpar_nrm_k = io_wpar_base + &
-         &merge(1_int64,0_int64,&
-         &int(io_wpar_k,kind=int64).lt.io_wpar_rem)
-         io_wpar_rm_off_k = int(io_wpar_k,kind=int64)*io_wpar_base + &
-         &min(int(io_wpar_k,kind=int64),io_wpar_rem)
-         io_wpar_rm_beg = int(io_wpar_rm_off_k) + 1
-         io_wpar_rm_end = int(io_wpar_rm_off_k + io_wpar_nrm_k)
-         io_wpar_buf_off = io_wpar_rm_off_k * &
-         &int(nx_tile,kind=int64)*int(ny_tile,kind=int64) + 1_int64
-         io_wpar_fpix = fpixels_out
-         io_wpar_lpix = lpixels_out
-         io_wpar_fpix(3) = io_wpar_rm_beg
-         io_wpar_lpix(3) = io_wpar_rm_end
-         io_wpar_status_priv = 0
-         call ftpsse(par_wunit_amp(io_wpar_k+1),group,3,naxes_out,&
-         &io_wpar_fpix,io_wpar_lpix,&
-         &p_tile_arr(io_wpar_buf_off),io_wpar_status_priv)
-         io_wpar_status_priv = 0
-         call ftpsse(par_wunit_pha(io_wpar_k+1),group,3,naxes_out,&
-         &io_wpar_fpix,io_wpar_lpix,&
-         &phi_tile_arr(io_wpar_buf_off),io_wpar_status_priv)
-      enddo
-!$omp end parallel do
-
-      if(out_mask_open)then
-         fpixels_out(3) = 1
-         lpixels_out(3) = nz_out
-         call ftpssb(43,group,3,naxes_mask,&
-         &fpixels_out,lpixels_out,mask_tile_arr,status)
-         if(status.gt.0)then
-            call printerror(status)
-         endif
+      ! --- Tile write: dispatched via do_tile_write, either inline
+      ! (io_overlap=n, identical to the historical serial behaviour) or on
+      ! a background pthread (io_overlap=y) so it can run concurrently with
+      ! the next tile's read/mask/prep/compute. See tile_write_job_t in
+      ! rm_synthesis_mod.f90 for why a pthread and not an OMP task.
+      write_job(cur_slot)%unit_amp = par_wunit_amp
+      write_job(cur_slot)%unit_pha = par_wunit_pha
+      write_job(cur_slot)%n_write_threads = io_write_threads_eff
+      write_job(cur_slot)%unit_mask    = 43
+      write_job(cur_slot)%unit_nvalid  = 44
+      write_job(cur_slot)%unit_peak    = 46
+      write_job(cur_slot)%unit_rmpeak  = 47
+      write_job(cur_slot)%unit_angpeak = 48
+      write_job(cur_slot)%unit_snr     = 49
+      write_job(cur_slot)%out_mask_open    = out_mask_open
+      write_job(cur_slot)%out_nvalid_open  = out_nvalid_open
+      write_job(cur_slot)%out_peak_open    = out_peak_open
+      write_job(cur_slot)%out_rmpeak_open  = out_rmpeak_open
+      write_job(cur_slot)%out_angpeak_open = out_angpeak_open
+      write_job(cur_slot)%out_snr_open     = out_snr_open
+      write_job(cur_slot)%group        = group
+      write_job(cur_slot)%naxes_out    = naxes_out(1:3)
+      write_job(cur_slot)%naxes_mask   = naxes_mask
+      write_job(cur_slot)%naxes_nvalid = naxes_nvalid
+      write_job(cur_slot)%naxes_stat   = naxes_stat
+      write_job(cur_slot)%ix_out_beg = ix_out_beg
+      write_job(cur_slot)%ix_out_end = ix_out_end
+      write_job(cur_slot)%iy_out_beg = iy_out_beg
+      write_job(cur_slot)%iy_out_end = iy_out_end
+      write_job(cur_slot)%nrm_out  = nrm_out
+      write_job(cur_slot)%nx_tile  = nx_tile
+      write_job(cur_slot)%ny_tile  = ny_tile
+      write_job(cur_slot)%nz_out   = nz_out
+      write_job(cur_slot)%ix_tile_beg = ix_tile_beg
+      write_job(cur_slot)%ix_tile_end = ix_tile_end
+      write_job(cur_slot)%iy_tile_beg = iy_tile_beg
+      write_job(cur_slot)%iy_tile_end = iy_tile_end
+      write_job(cur_slot)%p_tile_arr      => p_tile_arr
+      write_job(cur_slot)%phi_tile_arr    => phi_tile_arr
+      write_job(cur_slot)%mask_tile_arr   => mask_tile_arr
+      write_job(cur_slot)%nvalid_tile_arr => nvalid_tile_arr
+      if(cubestat)then
+         write_job(cur_slot)%peak_tile_arr     => peak_tile_arr
+         write_job(cur_slot)%rm_peak_tile_arr  => rm_peak_tile_arr
+         write_job(cur_slot)%ang_peak_tile_arr => ang_peak_tile_arr
+         write_job(cur_slot)%snr_tile_arr      => snr_tile_arr
       endif
 
-      if(out_nvalid_open)then
-         fpixels_nvalid(1) = ix_out_beg
-         lpixels_nvalid(1) = ix_out_end
-         fpixels_nvalid(2) = iy_out_beg
-         lpixels_nvalid(2) = iy_out_end
-         call ftpssi(44,group,2,naxes_nvalid,&
-         &fpixels_nvalid,lpixels_nvalid,&
-         &nvalid_tile_arr,status)
-         if(status.gt.0)then
-            call printerror(status)
-         endif
+      if(io_overlap)then
+         call tile_write_dispatch_async(write_job(cur_slot),&
+         &write_thread_id(cur_slot), write_dispatched_ok)
+         write_pending(cur_slot) = write_dispatched_ok
+      else
+         call do_tile_write(write_job(cur_slot))
       endif
-
-      if(out_peak_open)then
-         fpixels_nvalid(1) = ix_out_beg
-         lpixels_nvalid(1) = ix_out_end
-         fpixels_nvalid(2) = iy_out_beg
-         lpixels_nvalid(2) = iy_out_end
-         call ftpsse(46,group,2,naxes_stat,&
-         &fpixels_nvalid,lpixels_nvalid,&
-         &peak_tile_arr,status)
-         if(status.gt.0)then
-            call printerror(status)
-         endif
-      endif
-
-      if(out_rmpeak_open)then
-         fpixels_nvalid(1) = ix_out_beg
-         lpixels_nvalid(1) = ix_out_end
-         fpixels_nvalid(2) = iy_out_beg
-         lpixels_nvalid(2) = iy_out_end
-         call ftpsse(47,group,2,naxes_stat,&
-         &fpixels_nvalid,lpixels_nvalid,&
-         &rm_peak_tile_arr,status)
-         if(status.gt.0)then
-            call printerror(status)
-         endif
-      endif
-
-      if(out_angpeak_open)then
-         fpixels_nvalid(1) = ix_out_beg
-         lpixels_nvalid(1) = ix_out_end
-         fpixels_nvalid(2) = iy_out_beg
-         lpixels_nvalid(2) = iy_out_end
-         call ftpsse(48,group,2,naxes_stat,&
-         &fpixels_nvalid,lpixels_nvalid,&
-         &ang_peak_tile_arr,status)
-         if(status.gt.0)then
-            call printerror(status)
-         endif
-      endif
-
-      if(out_snr_open)then
-         fpixels_nvalid(1) = ix_out_beg
-         lpixels_nvalid(1) = ix_out_end
-         fpixels_nvalid(2) = iy_out_beg
-         lpixels_nvalid(2) = iy_out_end
-         call ftpsse(49,group,2,naxes_stat,&
-         &fpixels_nvalid,lpixels_nvalid,&
-         &snr_tile_arr,status)
-         if(status.gt.0)then
-            call printerror(status)
-         endif
-      endif
-      call timer_stop(STAGE_TILE_WRITE,t_stage)
-      write(message,'(A,I0,A,I0,A,I0,A,I0,A)')&
-      &'tile write done x:[',ix_tile_beg,',',ix_tile_end,&
-      &'] y:[',iy_tile_beg,',',iy_tile_end,']'
-      call log_message('debug','tile_write',&
-      &message(1:nchar(message)))
       call timer_add(STAGE_TILE_TOTAL,&
       &wall_time_seconds()-t_tile_start)
    enddo
 enddo
+ ! Join any tile writes still in flight. At most the last two tiles' writes
+ ! can reach here undispatched-for-join: each slot's write is only joined
+ ! when that slot is reused two tiles later, so the final tile (and the
+ ! one before it, in the other slot) never gets that second chance.
+if(io_overlap)then
+   if(write_pending(0))then
+      call tile_write_join(write_thread_id(0))
+      write_pending(0) = .false.
+   endif
+   if(write_pending(1))then
+      call tile_write_join(write_thread_id(1))
+      write_pending(1) = .false.
+   endif
+endif
  ! Close parallel read handles (io_read_threads_eff>1 only; =1 aliases 21/22/40/45).
 if(io_read_threads_eff .gt. 1)then
    do io_par_k = 1, io_read_threads_eff
@@ -3866,14 +3948,30 @@ if(allocated(stPhi)) deallocate(stPhi)
 if(allocated(stMaskOut)) deallocate(stMaskOut)
 if(allocated(stMask_tile_arr)) deallocate(stMask_tile_arr)
 if(allocated(stNvalid)) deallocate(stNvalid)
-if(allocated(p_tile_arr)) deallocate(p_tile_arr)
-if(allocated(phi_tile_arr)) deallocate(phi_tile_arr)
-if(allocated(peak_tile_arr)) deallocate(peak_tile_arr)
-if(allocated(rm_peak_tile_arr)) deallocate(rm_peak_tile_arr)
-if(allocated(ang_peak_tile_arr)) deallocate(ang_peak_tile_arr)
-if(allocated(snr_tile_arr)) deallocate(snr_tile_arr)
-if(allocated(mask_tile_arr)) deallocate(mask_tile_arr)
-if(allocated(nvalid_tile_arr)) deallocate(nvalid_tile_arr)
+if(associated(p_tile_arr)) nullify(p_tile_arr)
+if(associated(phi_tile_arr)) nullify(phi_tile_arr)
+if(associated(peak_tile_arr)) nullify(peak_tile_arr)
+if(associated(rm_peak_tile_arr)) nullify(rm_peak_tile_arr)
+if(associated(ang_peak_tile_arr)) nullify(ang_peak_tile_arr)
+if(associated(snr_tile_arr)) nullify(snr_tile_arr)
+if(associated(mask_tile_arr)) nullify(mask_tile_arr)
+if(associated(nvalid_tile_arr)) nullify(nvalid_tile_arr)
+if(allocated(p_tile_arr_s0)) deallocate(p_tile_arr_s0)
+if(allocated(p_tile_arr_s1)) deallocate(p_tile_arr_s1)
+if(allocated(phi_tile_arr_s0)) deallocate(phi_tile_arr_s0)
+if(allocated(phi_tile_arr_s1)) deallocate(phi_tile_arr_s1)
+if(allocated(peak_tile_arr_s0)) deallocate(peak_tile_arr_s0)
+if(allocated(peak_tile_arr_s1)) deallocate(peak_tile_arr_s1)
+if(allocated(rm_peak_tile_arr_s0)) deallocate(rm_peak_tile_arr_s0)
+if(allocated(rm_peak_tile_arr_s1)) deallocate(rm_peak_tile_arr_s1)
+if(allocated(ang_peak_tile_arr_s0)) deallocate(ang_peak_tile_arr_s0)
+if(allocated(ang_peak_tile_arr_s1)) deallocate(ang_peak_tile_arr_s1)
+if(allocated(snr_tile_arr_s0)) deallocate(snr_tile_arr_s0)
+if(allocated(snr_tile_arr_s1)) deallocate(snr_tile_arr_s1)
+if(allocated(mask_tile_arr_s0)) deallocate(mask_tile_arr_s0)
+if(allocated(mask_tile_arr_s1)) deallocate(mask_tile_arr_s1)
+if(allocated(nvalid_tile_arr_s0)) deallocate(nvalid_tile_arr_s0)
+if(allocated(nvalid_tile_arr_s1)) deallocate(nvalid_tile_arr_s1)
 call timer_stop(STAGE_FINALIZE,t_stage)
 call timer_stop(STAGE_TOTAL,t_total_start)
  ! Sample /proc/self/io at run end for I/O accounting
