@@ -117,6 +117,8 @@ The primary driver is scalable processing for very large cubes under constrained
 - `cpu_extract rm_block odd`, `cpu_extract rm_block even`
   - Per-thread extraction intervals from `tile_thread` markers.
   - Even blocks are hatched for parity separation.
+  - If a run executes only one RM block (`nrm_out <= nrm_block_size`), only
+    the odd/non-hatched series appears; hatched-even traces are not expected.
 - Optional stage overlays: `CPU mask`, `CPU prep`, `CPU compute`, `CPU cubestat`.
 - Optional I/O overlays: `I/O read`, `I/O write`.
 

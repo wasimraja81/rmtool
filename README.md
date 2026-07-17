@@ -49,6 +49,8 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
 - **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM blocking, CPU/GPU parallelization, offload strategy
+- **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
+- **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 
 ## Configuration
 
