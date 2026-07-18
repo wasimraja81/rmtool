@@ -688,6 +688,11 @@ reduce tile size or add call-splitting logic.
 #### Structured logs
 - Stage logs include `tile_read`, `tile_compute`, `tile_scatter`,
   `tile_write` lifecycle markers.
+- `tile_read`/`tile_write` start/done lines also carry a `bytes=<N>` field
+  -- the actual payload size for that call (read: Q+U plus optional input
+  mask/I cube; write: AMP+PHA plus whichever of MASK/NVALID/PEAK/RM_PEAK/
+  ANG_PEAK/SNR are enabled), letting the swim-lane plotter compute real
+  MB/s per interval instead of only duration.
 - GPU async paths emit `tile_async` markers for enqueue/start/done transitions.
 - CPU extraction emits `tile_thread` timing markers (thread id, RM block,
   duration).
@@ -727,6 +732,18 @@ reduce tile size or add call-splitting logic.
   - Side-panel `Thread IDs` were dropped in favour of just `Threads
     active` (a count) — the full ID list added noise without adding
     diagnostic value once thread counts got into the teens.
+- `I/O throughput (MB/s)` (middle panel, both views, only when the log's
+  `tile_read`/`tile_write` lines carry a `bytes=` field)
+  - One flat horizontal segment per I/O interval, at that interval's
+    average MB/s (`bytes / duration`) — a per-operation average, not a
+    continuously sampled signal, so segments are flat for their duration
+    with gaps in between where nothing was in flight.
+  - Stacked directly below the swim-lane/thread panel, sharing its time
+    axis (unlike the stage-totals bar, which is categorical) — a dip or
+    spike here lines up visually with the Gantt bar directly above it.
+  - Absent entirely (no empty panel shown) for older logs predating the
+    `bytes=` field, or for any run where every I/O interval lacks a byte
+    count.
 
 ##### Legend semantics (pipeline view)
 - `I/O read`, `I/O write`

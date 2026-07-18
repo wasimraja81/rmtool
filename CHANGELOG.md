@@ -32,6 +32,11 @@ throughput gain is the main remaining item. See
   (previously one shared lane distinguished only by colour), and every
   plot now includes a stage-time-totals bar panel (seconds and % of wall
   time per stage, largest first).
+- `tile_read`/`tile_write` log lines now carry a `bytes=<N>` field, and
+  the swim-lane plotter renders a new I/O throughput (MB/s) panel from
+  it -- stacked directly below the swim-lane/thread panel, sharing its
+  time axis so a dip or spike lines up with the Gantt bar above it.
+  Absent (no empty panel) for logs predating this field.
 - New regression tests: bit-identical `io_overlap=n` vs `y` comparison, a
   structural "no two tile writes ever overlap" invariant check, and a
   bit-identical `io_write_threads=1` vs `=4` comparison across all 8
