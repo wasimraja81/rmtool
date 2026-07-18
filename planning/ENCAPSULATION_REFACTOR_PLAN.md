@@ -73,7 +73,7 @@ Set / Correctness Gate / Rollback Criteria / Effort.
 
 ---
 
-### T1 — Config Encapsulation (shallow: call-site wrapper only) — OPEN
+### T1 — Config Encapsulation (shallow: call-site wrapper only) — DONE
 - **Objective:** `read_cfg_keyval` returns one `type(rmsynth_config_t)` instead of populating ~56 separate `intent(inout)`/`intent(out)` arguments. The struct is unpacked into the existing loose locals immediately after the call, in the same place the call already is — nothing downstream in the 4000+ lines changes.
 - **Scope:** `rm_synthesis_mod.f90:1519-2630` (`read_cfg_keyval` signature and its internal assignments only — the `select case` body, duplicate detection, and cross-key validation at `2580-2628` are untouched, just renamed `var` → `cfg%var` inside the subroutine). Call site `rm_synthesis.f90:447-471` gets a mechanical unpack block right after the call.
 - **Change Set:** New `rmsynth_config_t` derived type, one field per current argument, grouped by the same clusters the args are already grouped in (paths, subimage bounds, tile/mem planner inputs, RM range, output-mode flags, mask/cubestat flags, IO-thread/logging/timing flags).
@@ -83,6 +83,7 @@ Set / Correctness Gate / Rollback Criteria / Effort.
   - Zero new compiler warnings across all 4 binary variants (unused-argument/typo risk in the unpack block is the one new failure class here).
 - **Rollback Criteria:** Any output byte differs from T0; any of the 28 tests newly fail; any new compiler warning. This ticket is mechanical — a failure means a transcription bug, fix and re-verify rather than reconsider the approach.
 - **Effort:** 1 session.
+- **Evidence (2026-07-19):** New `rmsynth_config_t` (56 fields, `rm_synthesis_mod.f90`), `read_cfg_keyval` signature reduced to `(cfgfile, cfg, status)` — internal `select case`/duplicate-detection/cross-validation logic untouched, only `var` → `cfg%var` renamed via a quote-aware scripted substitution (154 substitutions; string literals like `'Duplicate key ... path'` and `case ('tile_ra')` selectors correctly left untouched, verified by direct inspection). Call site (`rm_synthesis.f90`) reduced to the single call plus a 56-line mechanical unpack block. Clean 4-variant rebuild: 0 errors, 0 new warnings (same 4 pre-existing GPU linker warnings as T0). `tests/run_tests.sh`: 28/28 pass. Full bit-identical sweep against all 140 T0-archived FITS outputs: 134 exact matches, 6 flagged by `compare_cubes.py --exact` (`badchan_{serial,omp,gpu}.{AMP,PHA}.RMCUBE.FITS`) — investigated directly: all 6 have exactly 201 NaN values in both T0 and new output, at identical locations (the intentionally-NaN fully-masked test pixel), and all 205,623 non-NaN elements bit-for-bit identical — a NaN-vs-NaN comparison artifact in the tool's `--exact` mode, not a regression.
 
 ---
 

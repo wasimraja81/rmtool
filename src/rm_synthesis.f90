@@ -198,6 +198,7 @@ character(len=272) :: outfileANGPEAK, outfileSNR
 character(len=272) :: mask_cube_file, mask_input_cube_file,&
 &mask_trust_mode
 character(len=272) :: subim_parfile, cfgfile, cfgfile_in
+type(rmsynth_config_t) :: cfg
 character(len=172) :: path, path_I
 character(len=1) :: yorn
 
@@ -444,31 +445,7 @@ if(.not.anyflg)then
 endif
 
 t_cfg_start = wall_time_seconds()
-call read_cfg_keyval(cfgfile,&
-&path,infileQ,infileU,outfile,&
-&remove_badchan,global_badchan_file,&
-&subim,subim_parfile,&
-&subim_ra_blc,subim_ra_trc,subim_ra_inc,&
-&subim_dec_blc,subim_dec_trc,subim_dec_inc,&
-&subim_chan_blc,subim_chan_trc,subim_chan_inc,&
-&tile_ra,tile_dec,mem_frac_ram,mem_frac_vram,&
-&gpu_vram_mib,tile_auto,dry_run,&
-&rem_mean,remove_QU_bias,&
-&resiQ,slopeQ,resiU,slopeU,&
-&path_I,infileI,&
-&ofac,fac,beg_rm,end_rm,nrm_out_par,&
-&use_auto_rm_range,output_mode,&
-&ap_angle_mode,&
-&mask_cube_file,&
-&mask_input_cube_file,&
-&mask_trust_mode,&
-&write_mask_output,&
-&write_nvalid_output,cubestat,use_gpu,&
-&io_overlap,io_read_threads,io_write_threads,log_level,&
-&timing_enabled,timing_tile_enabled,&
-&timing_io_enabled,log_output_file,&
-&timing_csv_file,&
-&status)
+call read_cfg_keyval(cfgfile, cfg, status)
 t_cfg_end = wall_time_seconds()
 if(status.ne.0)then
    write(*,*)"Error opening/parsing config file: "
@@ -476,6 +453,68 @@ if(status.ne.0)then
    write(*,*)"Quitting now..."
    stop
 endif
+
+! T1 encapsulation ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+! read_cfg_keyval now returns one rmsynth_config_t instead of ~54
+! separate arguments. Unpacked here, in the same place the call already
+! was, into the same loose locals used throughout the rest of this file
+! -- nothing downstream of this block changes.
+path = cfg%path
+infileQ = cfg%infileQ
+infileU = cfg%infileU
+outfile = cfg%outfile
+remove_badchan = cfg%remove_badchan
+global_badchan_file = cfg%badchan_file
+subim = cfg%subim
+subim_parfile = cfg%subim_parfile
+subim_ra_blc = cfg%subim_ra_blc
+subim_ra_trc = cfg%subim_ra_trc
+subim_ra_inc = cfg%subim_ra_inc
+subim_dec_blc = cfg%subim_dec_blc
+subim_dec_trc = cfg%subim_dec_trc
+subim_dec_inc = cfg%subim_dec_inc
+subim_chan_blc = cfg%subim_chan_blc
+subim_chan_trc = cfg%subim_chan_trc
+subim_chan_inc = cfg%subim_chan_inc
+tile_ra = cfg%tile_ra
+tile_dec = cfg%tile_dec
+mem_frac_ram = cfg%mem_frac_ram
+mem_frac_vram = cfg%mem_frac_vram
+gpu_vram_mib = cfg%gpu_vram_mib
+tile_auto = cfg%tile_auto
+dry_run = cfg%dry_run
+rem_mean = cfg%rem_mean
+remove_QU_bias = cfg%remove_qu_bias
+resiQ = cfg%resiQ
+slopeQ = cfg%slopeQ
+resiU = cfg%resiU
+slopeU = cfg%slopeU
+path_I = cfg%path_I
+infileI = cfg%infileI
+ofac = cfg%ofac
+fac = cfg%fac
+beg_rm = cfg%beg_rm
+end_rm = cfg%end_rm
+nrm_out_par = cfg%nrm_out_par
+use_auto_rm_range = cfg%use_auto_rm_range
+output_mode = cfg%output_mode
+ap_angle_mode = cfg%ap_angle_mode
+mask_cube_file = cfg%mask_cube_file
+mask_input_cube_file = cfg%mask_input_cube_file
+mask_trust_mode = cfg%mask_trust_mode
+write_mask_output = cfg%write_mask_output
+write_nvalid_output = cfg%write_nvalid_output
+cubestat = cfg%cubestat
+use_gpu = cfg%use_gpu
+io_overlap = cfg%io_overlap
+io_read_threads = cfg%io_read_threads
+io_write_threads = cfg%io_write_threads
+log_level = cfg%log_level
+timing_enabled = cfg%timing_enabled
+timing_tile_enabled = cfg%timing_tile_enabled
+timing_io_enabled = cfg%timing_io_enabled
+log_output_file = cfg%log_output_file
+timing_csv_file = cfg%timing_csv_file
 
 call init_logging(log_level,timing_enabled,&
 &timing_tile_enabled,timing_io_enabled,&

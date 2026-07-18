@@ -17,7 +17,7 @@ module rm_synthesis_mod
   public :: prepare_gpu_data, prepare_cpu_data, tile_extract_gpu_rm_blocked
   public :: cubestat_tail_quantile_maps
   public :: linspace, nchar
-  public :: read_cfg_keyval
+  public :: read_cfg_keyval, rmsynth_config_t
   public :: write_runtime_estimate
   public :: init_logging, log_message, log_tile_bounds, log_tile_note, log_subblock_progress
   public :: timer_reset, timer_start, timer_stop, timer_add
@@ -84,6 +84,67 @@ module rm_synthesis_mod
   
   public :: max_axis, max_ra, max_dec, maxchan, max_pix, maxofac, maxnt
   public :: c_velocity
+
+  !===========================================================================
+  ! Config bundle (T1 encapsulation ticket, planning/ENCAPSULATION_REFACTOR_PLAN.md).
+  !===========================================================================
+  ! One field per read_cfg_keyval argument (cfgfile/status excluded --
+  ! cfgfile is the input path, status is a plain error-code out-arg, both
+  ! stay as direct subroutine arguments). Field grouping mirrors the
+  ! sectioning in README.md's "Configuration" reference and the cfg
+  ! parser's own case-statement clusters, purely for readability -- it
+  ! carries no behavioural meaning. Character lengths match the caller's
+  ! existing declared lengths in rm_synthesis.f90 exactly (172/16/272),
+  ! not chosen fresh, so nothing about how config values are stored
+  ! changes for this ticket.
+  type :: rmsynth_config_t
+    ! Input / output paths
+    character(len=172) :: path = ' '
+    character(len=272) :: infileQ = ' ', infileU = ' ', outfile = ' '
+    ! Bad-channel handling
+    logical :: remove_badchan = .false.
+    character(len=172) :: badchan_file = ' '
+    ! Subimage extraction
+    logical :: subim = .false.
+    character(len=272) :: subim_parfile = ' '
+    integer(int32) :: subim_ra_blc = 1, subim_ra_trc = 0, subim_ra_inc = 1
+    integer(int32) :: subim_dec_blc = 1, subim_dec_trc = 0, subim_dec_inc = 1
+    integer(int32) :: subim_chan_blc = 0, subim_chan_trc = 0, subim_chan_inc = 1
+    ! Tile memory planning
+    integer(int32) :: tile_ra = 0, tile_dec = 0
+    real(sp) :: mem_frac_ram = 0.25_sp, mem_frac_vram = 0.70_sp
+    integer(int32) :: gpu_vram_mib = 0
+    logical :: tile_auto = .true.
+    ! Q/U processing & bias correction
+    integer(int32) :: rem_mean = 0
+    logical :: remove_qu_bias = .false.
+    real(sp) :: resiQ = 0.0_sp, slopeQ = 0.0_sp, resiU = 0.0_sp, slopeU = 0.0_sp
+    character(len=272) :: path_I = ' ', infileI = ' '
+    ! RM synthesis sampling
+    integer(int32) :: ofac = 4
+    real(sp) :: fac = 3.14159265358979_sp, beg_rm = -50.0_sp, end_rm = 50.0_sp
+    integer(int32) :: nrm_out_par = 100, use_auto_rm_range = 1
+    ! Output format
+    integer(int32) :: output_mode = 0, ap_angle_mode = 0
+    ! Masking & optional outputs
+    character(len=272) :: mask_cube_file = ' ', mask_input_cube_file = ' '
+    character(len=272) :: mask_trust_mode = 'safe'
+    logical :: write_mask_output = .true., write_nvalid_output = .true.
+    ! Cubestat / peak maps
+    logical :: cubestat = .false.
+    ! GPU
+    logical :: use_gpu = .false.
+    ! I/O parallelism
+    logical :: io_overlap = .false.
+    integer(int32) :: io_read_threads = 1, io_write_threads = 1
+    ! Logging & timing
+    character(len=16) :: log_level = 'info'
+    logical :: timing_enabled = .false., timing_tile_enabled = .false.
+    logical :: timing_io_enabled = .false.
+    character(len=272) :: log_output_file = ' ', timing_csv_file = ' '
+    ! Misc
+    logical :: dry_run = .false.
+  end type rmsynth_config_t
 
   !===========================================================================
   ! Asynchronous tile-write support (io_overlap).
@@ -1516,56 +1577,16 @@ contains
     end do
   end function nchar
 
-  subroutine read_cfg_keyval(cfgfile, path, infileQ, infileU, outfile, &
-                             remove_badchan, badchan_file, subim, subim_parfile, &
-                             subim_ra_blc, subim_ra_trc, subim_ra_inc, &
-                             subim_dec_blc, subim_dec_trc, subim_dec_inc, &
-                             subim_chan_blc, subim_chan_trc, subim_chan_inc, &
-                             tile_ra, tile_dec, mem_frac_ram, mem_frac_vram, &
-                             gpu_vram_mib, tile_auto, dry_run, &
-                             rem_mean, remove_qu_bias, resiQ, slopeQ, resiU, slopeU, &
-                             path_I, infileI, ofac, fac, beg_rm, end_rm, nrm_out_par, &
-                             use_auto_rm_range, output_mode, &
-                             ap_angle_mode, mask_cube_file, &
-                             mask_input_cube_file, &
-                             mask_trust_mode, write_mask_output, &
-                             write_nvalid_output, cubestat, use_gpu, io_overlap, &
-                             io_read_threads, io_write_threads, log_level, timing_enabled, timing_tile_enabled, &
-                             timing_io_enabled, log_output_file, &
-                             timing_csv_file, status)
+  subroutine read_cfg_keyval(cfgfile, cfg, status)
     !! Read all runtime parameters from a single KEY=VALUE config file.
+    !! T1 encapsulation ticket: cfg bundles what used to be ~54 separate
+    !! intent(inout)/intent(out) arguments into one derived type (see
+    !! rmsynth_config_t above) -- the parsing logic below (the select
+    !! case body, duplicate detection, cross-key validation) is otherwise
+    !! unchanged, just addressed as cfg%field instead of a bare local.
     implicit none
     character(len=*), intent(in) :: cfgfile
-    character(len=*), intent(inout) :: path, infileQ, infileU, outfile
-    character(len=*), intent(inout) :: badchan_file, subim_parfile, path_I, infileI
-    character(len=*), intent(inout) :: mask_cube_file
-    character(len=*), intent(inout) :: mask_input_cube_file
-    character(len=*), intent(inout) :: mask_trust_mode
-    logical, intent(inout) :: write_mask_output
-    logical, intent(inout) :: write_nvalid_output
-    logical, intent(inout) :: cubestat
-    logical, intent(inout) :: use_gpu
-    logical, intent(inout) :: io_overlap
-    integer(int32), intent(inout) :: io_read_threads
-    integer(int32), intent(inout) :: io_write_threads
-    character(len=*), intent(inout) :: log_level
-    logical, intent(inout) :: timing_enabled
-    logical, intent(inout) :: timing_tile_enabled
-    logical, intent(inout) :: timing_io_enabled
-    character(len=*), intent(inout) :: log_output_file
-    character(len=*), intent(inout) :: timing_csv_file
-    logical, intent(inout) :: remove_badchan, subim, remove_qu_bias
-    integer(int32), intent(inout) :: subim_ra_blc, subim_ra_trc, subim_ra_inc
-    integer(int32), intent(inout) :: subim_dec_blc, subim_dec_trc, subim_dec_inc
-    integer(int32), intent(inout) :: subim_chan_blc, subim_chan_trc, subim_chan_inc
-    integer(int32), intent(inout) :: tile_ra, tile_dec
-    integer(int32), intent(inout) :: rem_mean, ofac, nrm_out_par, use_auto_rm_range
-    integer(int32), intent(inout) :: output_mode
-    integer(int32), intent(inout) :: ap_angle_mode
-    logical, intent(inout) :: tile_auto, dry_run
-    real(sp), intent(inout) :: resiQ, slopeQ, resiU, slopeU, fac, beg_rm, end_rm
-    real(sp), intent(inout) :: mem_frac_ram, mem_frac_vram
-    integer(int32), intent(inout) :: gpu_vram_mib
+    type(rmsynth_config_t), intent(inout) :: cfg
     integer(int32), intent(out) :: status
 
     character(len=512) :: line, key, val, key_lc
@@ -1663,62 +1684,62 @@ contains
     seen_timing_csv_file = .false.
 
     ! Defaults can be overridden by the config.
-    path = '../DATA/'
-    infileQ = ' '
-    infileU = ' '
-    outfile = 'output'
-    remove_badchan = .false.
-    badchan_file = 'bad_channels.txt'
-    subim = .false.
-    subim_parfile = 'subimage.par'
-    subim_ra_blc = 1
-    subim_ra_trc = 0
-    subim_ra_inc = 1
-    subim_dec_blc = 1
-    subim_dec_trc = 0
-    subim_dec_inc = 1
-    subim_chan_blc = 0
-    subim_chan_trc = 0
-    subim_chan_inc = 1
-    tile_ra = 0
-    tile_dec = 0
-    mem_frac_ram = 0.25_sp
-    mem_frac_vram = 0.70_sp
-    gpu_vram_mib = 0
-    tile_auto = .true.
-    dry_run = .false.
-    rem_mean = 0
-    remove_qu_bias = .false.
-    resiQ = 0.0_sp
-    slopeQ = 0.0_sp
-    resiU = 0.0_sp
-    slopeU = 0.0_sp
-    path_I = path
-    infileI = ' '
-    ofac = 4
-    fac = 3.14159265358979_sp
-    beg_rm = -50.0_sp
-    end_rm = 50.0_sp
-    nrm_out_par = 100
-    use_auto_rm_range = 1
-    output_mode = 0
-    ap_angle_mode = 0
-    mask_cube_file = ''
-    mask_input_cube_file = ''
-    mask_trust_mode = 'safe'
-    write_mask_output = .true.
-    write_nvalid_output = .true.
-    cubestat = .false.
-    use_gpu = .false.
-    io_overlap = .false.
-    io_read_threads = 1
-    io_write_threads = 1
-    log_level = 'info'
-    timing_enabled = .false.
-    timing_tile_enabled = .false.
-    timing_io_enabled = .false.
-    log_output_file = ''
-    timing_csv_file = ''
+    cfg%path = '../DATA/'
+    cfg%infileQ = ' '
+    cfg%infileU = ' '
+    cfg%outfile = 'output'
+    cfg%remove_badchan = .false.
+    cfg%badchan_file = 'bad_channels.txt'
+    cfg%subim = .false.
+    cfg%subim_parfile = 'subimage.par'
+    cfg%subim_ra_blc = 1
+    cfg%subim_ra_trc = 0
+    cfg%subim_ra_inc = 1
+    cfg%subim_dec_blc = 1
+    cfg%subim_dec_trc = 0
+    cfg%subim_dec_inc = 1
+    cfg%subim_chan_blc = 0
+    cfg%subim_chan_trc = 0
+    cfg%subim_chan_inc = 1
+    cfg%tile_ra = 0
+    cfg%tile_dec = 0
+    cfg%mem_frac_ram = 0.25_sp
+    cfg%mem_frac_vram = 0.70_sp
+    cfg%gpu_vram_mib = 0
+    cfg%tile_auto = .true.
+    cfg%dry_run = .false.
+    cfg%rem_mean = 0
+    cfg%remove_qu_bias = .false.
+    cfg%resiQ = 0.0_sp
+    cfg%slopeQ = 0.0_sp
+    cfg%resiU = 0.0_sp
+    cfg%slopeU = 0.0_sp
+    cfg%path_I = cfg%path
+    cfg%infileI = ' '
+    cfg%ofac = 4
+    cfg%fac = 3.14159265358979_sp
+    cfg%beg_rm = -50.0_sp
+    cfg%end_rm = 50.0_sp
+    cfg%nrm_out_par = 100
+    cfg%use_auto_rm_range = 1
+    cfg%output_mode = 0
+    cfg%ap_angle_mode = 0
+    cfg%mask_cube_file = ''
+    cfg%mask_input_cube_file = ''
+    cfg%mask_trust_mode = 'safe'
+    cfg%write_mask_output = .true.
+    cfg%write_nvalid_output = .true.
+    cfg%cubestat = .false.
+    cfg%use_gpu = .false.
+    cfg%io_overlap = .false.
+    cfg%io_read_threads = 1
+    cfg%io_write_threads = 1
+    cfg%log_level = 'info'
+    cfg%timing_enabled = .false.
+    cfg%timing_tile_enabled = .false.
+    cfg%timing_io_enabled = .false.
+    cfg%log_output_file = ''
+    cfg%timing_csv_file = ''
 
     unit_cfg = 11
     open(unit_cfg, file=cfgfile, status='old', iostat=ios)
@@ -1746,7 +1767,7 @@ contains
           return
         end if
         seen_path = .true.
-        path = trim(val)
+        cfg%path = trim(val)
       case ('infileq')
         if (seen_infileQ) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileQ'
@@ -1755,7 +1776,7 @@ contains
           return
         end if
         seen_infileQ = .true.
-        infileQ = trim(val)
+        cfg%infileQ = trim(val)
       case ('infileu')
         if (seen_infileU) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileU'
@@ -1764,7 +1785,7 @@ contains
           return
         end if
         seen_infileU = .true.
-        infileU = trim(val)
+        cfg%infileU = trim(val)
       case ('outfile')
         if (seen_outfile) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': outfile'
@@ -1773,7 +1794,7 @@ contains
           return
         end if
         seen_outfile = .true.
-        outfile = trim(val)
+        cfg%outfile = trim(val)
       case ('remove_badchan')
         if (seen_remove_badchan) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': remove_badchan'
@@ -1782,7 +1803,7 @@ contains
           return
         end if
         seen_remove_badchan = .true.
-        remove_badchan = flag_from_value(val)
+        cfg%remove_badchan = flag_from_value(val)
       case ('badchan_file', 'global_badchan_file')
         if (seen_badchan_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': global_badchan_file'
@@ -1791,7 +1812,7 @@ contains
           return
         end if
         seen_badchan_file = .true.
-        badchan_file = trim(val)
+        cfg%badchan_file = trim(val)
       case ('subim')
         if (seen_subim) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim'
@@ -1800,7 +1821,7 @@ contains
           return
         end if
         seen_subim = .true.
-        subim = flag_from_value(val)
+        cfg%subim = flag_from_value(val)
       case ('subim_parfile')
         if (seen_subim_parfile) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_parfile'
@@ -1809,7 +1830,7 @@ contains
           return
         end if
         seen_subim_parfile = .true.
-        subim_parfile = trim(val)
+        cfg%subim_parfile = trim(val)
       case ('subim_ra_blc')
         if (seen_subim_ra_blc) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_ra_blc'
@@ -1818,14 +1839,14 @@ contains
           return
         end if
         seen_subim_ra_blc = .true.
-        read(val, *, iostat=io_stat) subim_ra_blc
+        read(val, *, iostat=io_stat) cfg%subim_ra_blc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_ra_blc at line ', line_no
           status = -171
           close(unit_cfg)
           return
         end if
-        if (subim_ra_blc < 1) then
+        if (cfg%subim_ra_blc < 1) then
           write(*,*) 'Error: subim_ra_blc must be >= 1 at line ', line_no
           status = -171
           close(unit_cfg)
@@ -1839,14 +1860,14 @@ contains
           return
         end if
         seen_subim_ra_trc = .true.
-        read(val, *, iostat=io_stat) subim_ra_trc
+        read(val, *, iostat=io_stat) cfg%subim_ra_trc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_ra_trc at line ', line_no
           status = -172
           close(unit_cfg)
           return
         end if
-        if (subim_ra_trc > 0 .and. subim_ra_trc < subim_ra_blc) then
+        if (cfg%subim_ra_trc > 0 .and. cfg%subim_ra_trc < cfg%subim_ra_blc) then
           write(*,*) 'Error: subim_ra_trc must be >= subim_ra_blc at line ', line_no
           status = -172
           close(unit_cfg)
@@ -1860,14 +1881,14 @@ contains
           return
         end if
         seen_subim_ra_inc = .true.
-        read(val, *, iostat=io_stat) subim_ra_inc
+        read(val, *, iostat=io_stat) cfg%subim_ra_inc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_ra_inc at line ', line_no
           status = -173
           close(unit_cfg)
           return
         end if
-        if (subim_ra_inc < 1) then
+        if (cfg%subim_ra_inc < 1) then
           write(*,*) 'Error: subim_ra_inc must be >= 1 at line ', line_no
           status = -173
           close(unit_cfg)
@@ -1881,14 +1902,14 @@ contains
           return
         end if
         seen_subim_dec_blc = .true.
-        read(val, *, iostat=io_stat) subim_dec_blc
+        read(val, *, iostat=io_stat) cfg%subim_dec_blc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_dec_blc at line ', line_no
           status = -174
           close(unit_cfg)
           return
         end if
-        if (subim_dec_blc < 1) then
+        if (cfg%subim_dec_blc < 1) then
           write(*,*) 'Error: subim_dec_blc must be >= 1 at line ', line_no
           status = -174
           close(unit_cfg)
@@ -1902,14 +1923,14 @@ contains
           return
         end if
         seen_subim_dec_trc = .true.
-        read(val, *, iostat=io_stat) subim_dec_trc
+        read(val, *, iostat=io_stat) cfg%subim_dec_trc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_dec_trc at line ', line_no
           status = -175
           close(unit_cfg)
           return
         end if
-        if (subim_dec_trc > 0 .and. subim_dec_trc < subim_dec_blc) then
+        if (cfg%subim_dec_trc > 0 .and. cfg%subim_dec_trc < cfg%subim_dec_blc) then
           write(*,*) 'Error: subim_dec_trc must be >= subim_dec_blc at line ', line_no
           status = -175
           close(unit_cfg)
@@ -1923,14 +1944,14 @@ contains
           return
         end if
         seen_subim_dec_inc = .true.
-        read(val, *, iostat=io_stat) subim_dec_inc
+        read(val, *, iostat=io_stat) cfg%subim_dec_inc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_dec_inc at line ', line_no
           status = -176
           close(unit_cfg)
           return
         end if
-        if (subim_dec_inc < 1) then
+        if (cfg%subim_dec_inc < 1) then
           write(*,*) 'Error: subim_dec_inc must be >= 1 at line ', line_no
           status = -176
           close(unit_cfg)
@@ -1944,14 +1965,14 @@ contains
           return
         end if
         seen_subim_chan_blc = .true.
-        read(val, *, iostat=io_stat) subim_chan_blc
+        read(val, *, iostat=io_stat) cfg%subim_chan_blc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_chan_blc at line ', line_no
           status = -177
           close(unit_cfg)
           return
         end if
-        if (subim_chan_blc < 0) then
+        if (cfg%subim_chan_blc < 0) then
           write(*,*) 'Error: subim_chan_blc must be >= 0 at line ', line_no
           status = -177
           close(unit_cfg)
@@ -1965,14 +1986,14 @@ contains
           return
         end if
         seen_subim_chan_trc = .true.
-        read(val, *, iostat=io_stat) subim_chan_trc
+        read(val, *, iostat=io_stat) cfg%subim_chan_trc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_chan_trc at line ', line_no
           status = -178
           close(unit_cfg)
           return
         end if
-        if (subim_chan_trc > 0 .and. subim_chan_trc < subim_chan_blc) then
+        if (cfg%subim_chan_trc > 0 .and. cfg%subim_chan_trc < cfg%subim_chan_blc) then
           write(*,*) 'Error: subim_chan_trc must be >= subim_chan_blc at line ', line_no
           status = -178
           close(unit_cfg)
@@ -1986,14 +2007,14 @@ contains
           return
         end if
         seen_subim_chan_inc = .true.
-        read(val, *, iostat=io_stat) subim_chan_inc
+        read(val, *, iostat=io_stat) cfg%subim_chan_inc
         if (io_stat /= 0) then
           write(*,*) 'Error reading subim_chan_inc at line ', line_no
           status = -179
           close(unit_cfg)
           return
         end if
-        if (subim_chan_inc < 1) then
+        if (cfg%subim_chan_inc < 1) then
           write(*,*) 'Error: subim_chan_inc must be >= 1 at line ', line_no
           status = -179
           close(unit_cfg)
@@ -2007,7 +2028,7 @@ contains
           return
         end if
         seen_tile_ra = .true.
-        read(val, *, iostat=io_stat) tile_ra
+        read(val, *, iostat=io_stat) cfg%tile_ra
         if (io_stat /= 0) then
           write(*,*) 'Error reading tile_ra at line ', line_no
           status = -180
@@ -2022,7 +2043,7 @@ contains
           return
         end if
         seen_tile_dec = .true.
-        read(val, *, iostat=io_stat) tile_dec
+        read(val, *, iostat=io_stat) cfg%tile_dec
         if (io_stat /= 0) then
           write(*,*) 'Error reading tile_dec at line ', line_no
           status = -181
@@ -2037,7 +2058,7 @@ contains
           return
         end if
         seen_mem_frac_ram = .true.
-        read(val, *, iostat=io_stat) mem_frac_ram
+        read(val, *, iostat=io_stat) cfg%mem_frac_ram
         if (io_stat /= 0) then
           write(*,*) 'Error reading mem_frac_ram at line ', line_no
           status = -182
@@ -2052,7 +2073,7 @@ contains
           return
         end if
         seen_mem_frac_vram = .true.
-        read(val, *, iostat=io_stat) mem_frac_vram
+        read(val, *, iostat=io_stat) cfg%mem_frac_vram
         if (io_stat /= 0) then
           write(*,*) 'Error reading mem_frac_vram at line ', line_no
           status = -190
@@ -2067,7 +2088,7 @@ contains
           return
         end if
         seen_gpu_vram_mib = .true.
-        read(val, *, iostat=io_stat) gpu_vram_mib
+        read(val, *, iostat=io_stat) cfg%gpu_vram_mib
         if (io_stat /= 0) then
           write(*,*) 'Error reading gpu_vram_mib at line ', line_no
           status = -191
@@ -2082,7 +2103,7 @@ contains
           return
         end if
         seen_tile_auto = .true.
-        tile_auto = flag_from_value(val)
+        cfg%tile_auto = flag_from_value(val)
       case ('dry_run')
         if (seen_dry_run) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': dry_run'
@@ -2091,7 +2112,7 @@ contains
           return
         end if
         seen_dry_run = .true.
-        dry_run = flag_from_value(val)
+        cfg%dry_run = flag_from_value(val)
       case ('rem_mean')
         if (seen_rem_mean) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': rem_mean'
@@ -2100,7 +2121,7 @@ contains
           return
         end if
         seen_rem_mean = .true.
-        read(val, *, iostat=ios) rem_mean
+        read(val, *, iostat=ios) cfg%rem_mean
         if (ios /= 0) then
           write(*,*) 'Invalid integer for rem_mean at cfg line ', line_no
           status = -109
@@ -2115,7 +2136,7 @@ contains
           return
         end if
         seen_remove_qu_bias = .true.
-        remove_qu_bias = flag_from_value(val)
+        cfg%remove_qu_bias = flag_from_value(val)
       case ('resiq')
         if (seen_resiQ) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': resiQ'
@@ -2124,7 +2145,7 @@ contains
           return
         end if
         seen_resiQ = .true.
-        read(val, *, iostat=ios) resiQ
+        read(val, *, iostat=ios) cfg%resiQ
         if (ios /= 0) then
           write(*,*) 'Invalid real for resiQ at cfg line ', line_no
           status = -112
@@ -2139,7 +2160,7 @@ contains
           return
         end if
         seen_slopeQ = .true.
-        read(val, *, iostat=ios) slopeQ
+        read(val, *, iostat=ios) cfg%slopeQ
         if (ios /= 0) then
           write(*,*) 'Invalid real for slopeQ at cfg line ', line_no
           status = -114
@@ -2154,7 +2175,7 @@ contains
           return
         end if
         seen_resiU = .true.
-        read(val, *, iostat=ios) resiU
+        read(val, *, iostat=ios) cfg%resiU
         if (ios /= 0) then
           write(*,*) 'Invalid real for resiU at cfg line ', line_no
           status = -116
@@ -2169,7 +2190,7 @@ contains
           return
         end if
         seen_slopeU = .true.
-        read(val, *, iostat=ios) slopeU
+        read(val, *, iostat=ios) cfg%slopeU
         if (ios /= 0) then
           write(*,*) 'Invalid real for slopeU at cfg line ', line_no
           status = -118
@@ -2184,7 +2205,7 @@ contains
           return
         end if
         seen_path_I = .true.
-        path_I = trim(val)
+        cfg%path_I = trim(val)
       case ('infilei')
         if (seen_infileI) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileI'
@@ -2193,7 +2214,7 @@ contains
           return
         end if
         seen_infileI = .true.
-        infileI = trim(val)
+        cfg%infileI = trim(val)
       case ('ofac')
         if (seen_ofac) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': ofac'
@@ -2202,7 +2223,7 @@ contains
           return
         end if
         seen_ofac = .true.
-        read(val, *, iostat=ios) ofac
+        read(val, *, iostat=ios) cfg%ofac
         if (ios /= 0) then
           write(*,*) 'Invalid integer for ofac at cfg line ', line_no
           status = -122
@@ -2217,7 +2238,7 @@ contains
           return
         end if
         seen_fac = .true.
-        read(val, *, iostat=ios) fac
+        read(val, *, iostat=ios) cfg%fac
         if (ios /= 0) then
           write(*,*) 'Invalid real for fac at cfg line ', line_no
           status = -124
@@ -2232,7 +2253,7 @@ contains
           return
         end if
         seen_beg_rm = .true.
-        read(val, *, iostat=ios) beg_rm
+        read(val, *, iostat=ios) cfg%beg_rm
         if (ios /= 0) then
           write(*,*) 'Invalid real for beg_rm at cfg line ', line_no
           status = -126
@@ -2247,7 +2268,7 @@ contains
           return
         end if
         seen_end_rm = .true.
-        read(val, *, iostat=ios) end_rm
+        read(val, *, iostat=ios) cfg%end_rm
         if (ios /= 0) then
           write(*,*) 'Invalid real for end_rm at cfg line ', line_no
           status = -162
@@ -2262,7 +2283,7 @@ contains
           return
         end if
         seen_nrm_out = .true.
-        read(val, *, iostat=ios) nrm_out_par
+        read(val, *, iostat=ios) cfg%nrm_out_par
         if (ios /= 0) then
           write(*,*) 'Invalid integer for nrm at cfg line ', line_no
           status = -128
@@ -2277,7 +2298,7 @@ contains
           return
         end if
         seen_use_auto_rm_range = .true.
-        read(val, *, iostat=ios) use_auto_rm_range
+        read(val, *, iostat=ios) cfg%use_auto_rm_range
         if (ios /= 0) then
           write(*,*) 'Invalid integer for use_auto_rm_range at cfg line ', line_no
           status = -130
@@ -2294,9 +2315,9 @@ contains
         seen_output_mode = .true.
         select case (trim(lower_ascii(val)))
         case ('ap')
-          output_mode = 0
+          cfg%output_mode = 0
         case ('ri')
-          output_mode = 1
+          cfg%output_mode = 1
         case default
           write(*,*) 'Invalid output_mode at cfg line ', line_no
           write(*,*) 'Allowed values: ap, ri'
@@ -2314,9 +2335,9 @@ contains
         seen_ap_angle_mode = .true.
         select case (trim(lower_ascii(val)))
         case ('phase')
-          ap_angle_mode = 0
+          cfg%ap_angle_mode = 0
         case ('pol')
-          ap_angle_mode = 1
+          cfg%ap_angle_mode = 1
         case default
           write(*,*) 'Invalid ap_angle_mode at cfg line ', line_no
           write(*,*) 'Allowed values: phase, pol'
@@ -2332,7 +2353,7 @@ contains
           return
         end if
         seen_mask_cube_file = .true.
-        mask_cube_file = trim(val)
+        cfg%mask_cube_file = trim(val)
       case ('mask_input_cube_file')
         if (seen_mask_input_cube_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_input_cube_file'
@@ -2341,7 +2362,7 @@ contains
           return
         end if
         seen_mask_input_cube_file = .true.
-        mask_input_cube_file = trim(val)
+        cfg%mask_input_cube_file = trim(val)
       case ('mask_trust_mode')
         if (seen_mask_trust_mode) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_trust_mode'
@@ -2352,9 +2373,9 @@ contains
         seen_mask_trust_mode = .true.
         select case (trim(lower_ascii(val)))
         case ('safe')
-          mask_trust_mode = 'safe'
+          cfg%mask_trust_mode = 'safe'
         case ('strict')
-          mask_trust_mode = 'strict'
+          cfg%mask_trust_mode = 'strict'
         case default
           write(*,*) 'Invalid mask_trust_mode at cfg line ', line_no
           write(*,*) 'Allowed values: safe, strict'
@@ -2370,7 +2391,7 @@ contains
           return
         end if
         seen_write_mask_output = .true.
-        write_mask_output = flag_from_value(val)
+        cfg%write_mask_output = flag_from_value(val)
       case ('write_nvalid_output')
         if (seen_write_nvalid_output) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': write_nvalid_output'
@@ -2379,7 +2400,7 @@ contains
           return
         end if
         seen_write_nvalid_output = .true.
-        write_nvalid_output = flag_from_value(val)
+        cfg%write_nvalid_output = flag_from_value(val)
       case ('cubestat')
         if (seen_cubestat) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': cubestat'
@@ -2388,7 +2409,7 @@ contains
           return
         end if
         seen_cubestat = .true.
-        cubestat = flag_from_value(val)
+        cfg%cubestat = flag_from_value(val)
       case ('use_gpu', 'use_gpus')
         if (seen_use_gpu) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': use_gpu/use_gpus'
@@ -2397,7 +2418,7 @@ contains
           return
         end if
         seen_use_gpu = .true.
-        use_gpu = flag_from_value(val)
+        cfg%use_gpu = flag_from_value(val)
       case ('io_overlap')
         if (seen_io_overlap) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_overlap'
@@ -2406,7 +2427,7 @@ contains
           return
         end if
         seen_io_overlap = .true.
-        io_overlap = flag_from_value(val)
+        cfg%io_overlap = flag_from_value(val)
       case ('io_read_threads')
         if (seen_io_read_threads) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_read_threads'
@@ -2415,8 +2436,8 @@ contains
           return
         end if
         seen_io_read_threads = .true.
-        read(val, *, iostat=io_stat) io_read_threads
-        if (io_stat /= 0 .or. io_read_threads < 1) then
+        read(val, *, iostat=io_stat) cfg%io_read_threads
+        if (io_stat /= 0 .or. cfg%io_read_threads < 1) then
           write(*,*) 'Error reading io_read_threads at line ', line_no
           status = -199
           close(unit_cfg)
@@ -2430,8 +2451,8 @@ contains
           return
         end if
         seen_io_write_threads = .true.
-        read(val, *, iostat=io_stat) io_write_threads
-        if (io_stat /= 0 .or. io_write_threads < 1) then
+        read(val, *, iostat=io_stat) cfg%io_write_threads
+        if (io_stat /= 0 .or. cfg%io_write_threads < 1) then
           write(*,*) 'Error reading io_write_threads at line ', line_no
           status = -199
           close(unit_cfg)
@@ -2445,7 +2466,7 @@ contains
           return
         end if
         seen_log_level = .true.
-        log_level = trim(lower_ascii(val))
+        cfg%log_level = trim(lower_ascii(val))
       case ('timing_enabled')
         if (seen_timing_enabled) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_enabled'
@@ -2454,7 +2475,7 @@ contains
           return
         end if
         seen_timing_enabled = .true.
-        timing_enabled = flag_from_value(val)
+        cfg%timing_enabled = flag_from_value(val)
       case ('timing_tile_enabled')
         if (seen_timing_tile_enabled) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_tile_enabled'
@@ -2463,7 +2484,7 @@ contains
           return
         end if
         seen_timing_tile_enabled = .true.
-        timing_tile_enabled = flag_from_value(val)
+        cfg%timing_tile_enabled = flag_from_value(val)
       case ('timing_io_enabled')
         if (seen_timing_io_enabled) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_io_enabled'
@@ -2472,7 +2493,7 @@ contains
           return
         end if
         seen_timing_io_enabled = .true.
-        timing_io_enabled = flag_from_value(val)
+        cfg%timing_io_enabled = flag_from_value(val)
       case ('log_output_file')
         if (seen_log_output_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': log_output_file'
@@ -2481,7 +2502,7 @@ contains
           return
         end if
         seen_log_output_file = .true.
-        log_output_file = trim(val)
+        cfg%log_output_file = trim(val)
       case ('timing_csv_file')
         if (seen_timing_csv_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_csv_file'
@@ -2490,7 +2511,7 @@ contains
           return
         end if
         seen_timing_csv_file = .true.
-        timing_csv_file = trim(val)
+        cfg%timing_csv_file = trim(val)
       case default
         write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
         status = -131
@@ -2556,50 +2577,50 @@ contains
       status = -153
     end if
 
-    if (status == 0 .and. use_auto_rm_range /= 0 .and. use_auto_rm_range /= 1) then
+    if (status == 0 .and. cfg%use_auto_rm_range /= 0 .and. cfg%use_auto_rm_range /= 1) then
       write(*,*) 'Invalid use_auto_rm_range: expected 0 or 1'
       status = -154
     end if
-    if (status == 0 .and. output_mode /= 0 .and. output_mode /= 1) then
+    if (status == 0 .and. cfg%output_mode /= 0 .and. cfg%output_mode /= 1) then
       write(*,*) 'Invalid output_mode: expected ap or ri'
       status = -170
     end if
-    if (status == 0 .and. ofac < 1) then
+    if (status == 0 .and. cfg%ofac < 1) then
       write(*,*) 'Invalid ofac: expected >= 1'
       status = -155
     end if
-    if (status == 0 .and. tile_ra < 0) then
+    if (status == 0 .and. cfg%tile_ra < 0) then
       write(*,*) 'Invalid tile_ra: expected >= 0 (0 means auto)'
       status = -185
     end if
-    if (status == 0 .and. tile_dec < 0) then
+    if (status == 0 .and. cfg%tile_dec < 0) then
       write(*,*) 'Invalid tile_dec: expected >= 0 (0 means auto)'
       status = -186
     end if
-    if (status == 0 .and. (mem_frac_ram <= 0.0_sp .or. mem_frac_ram > 0.95_sp)) then
+    if (status == 0 .and. (cfg%mem_frac_ram <= 0.0_sp .or. cfg%mem_frac_ram > 0.95_sp)) then
       write(*,*) 'Invalid mem_frac_ram: expected 0 < mem_frac_ram <= 0.95'
       status = -187
     end if
-    if (status == 0 .and. (mem_frac_vram <= 0.0_sp .or. mem_frac_vram > 0.95_sp)) then
+    if (status == 0 .and. (cfg%mem_frac_vram <= 0.0_sp .or. cfg%mem_frac_vram > 0.95_sp)) then
       write(*,*) 'Invalid mem_frac_vram: expected 0 < mem_frac_vram <= 0.95'
       status = -190
     end if
-    if (status == 0 .and. gpu_vram_mib < 0) then
+    if (status == 0 .and. cfg%gpu_vram_mib < 0) then
       write(*,*) 'Invalid gpu_vram_mib: expected >= 0 (0 means auto-detect)'
       status = -191
     end if
     if (status == 0) then
-      if (trim(log_level) /= 'error' .and. trim(log_level) /= 'warn' .and. &
-          trim(log_level) /= 'info' .and. trim(log_level) /= 'debug') then
+      if (trim(cfg%log_level) /= 'error' .and. trim(cfg%log_level) /= 'warn' .and. &
+          trim(cfg%log_level) /= 'info' .and. trim(cfg%log_level) /= 'debug') then
         write(*,*) 'Invalid log_level: expected error|warn|info|debug'
         status = -198
       end if
     end if
-    if (status == 0 .and. nrm_out_par < 1) then
+    if (status == 0 .and. cfg%nrm_out_par < 1) then
       write(*,*) 'Invalid nrm: expected >= 1'
       status = -156
     end if
-    if (status == 0 .and. use_auto_rm_range == 0) then
+    if (status == 0 .and. cfg%use_auto_rm_range == 0) then
       if (.not. seen_beg_rm) then
         write(*,*) 'Missing required cfg key: beg_rm (needed for use_auto_rm_range=0)'
         status = -165
@@ -2609,14 +2630,14 @@ contains
       else if (.not. seen_nrm_out) then
         write(*,*) 'Missing required cfg key: nrm (needed for use_auto_rm_range=0)'
         status = -167
-      else if (end_rm <= beg_rm) then
+      else if (cfg%end_rm <= cfg%beg_rm) then
         write(*,*) 'Invalid end_rm: expected end_rm > beg_rm'
         status = -168
       end if
     end if
 
     ! I-cube is only needed when Q/U bias correction is enabled.
-    if (status == 0 .and. remove_qu_bias) then
+    if (status == 0 .and. cfg%remove_qu_bias) then
       if (.not. seen_path_I) then
         write(*,*) 'Missing required cfg key: path_I (needed for remove_qu_bias=1)'
         status = -157
