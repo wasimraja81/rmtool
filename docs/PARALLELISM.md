@@ -130,6 +130,39 @@ that many threads is no longer negligible.
 | `io_write_threads` | Same ballpark (4–16), not close to your full core count | Runs concurrently with the next tile's compute if `io_overlap=y`; I/O-bound so contention is mild at modest values |
 | `io_overlap` | `y` on parallel/networked storage with spare RAM; `n` on a single disk or tight RAM | Determines whether write(N) and read/compute(N+1) run concurrently at all — see `docs/ARCHITECTURE.md` ("When `io_overlap=y` can be detrimental") for the full RAM/disk-speed decision matrix |
 
+#### HPC scheduler sizing: request more CPUs than `OMP_NUM_THREADS`
+
+On a scheduler (Slurm `--cpus-per-task` and similar) you explicitly request
+a CPU allocation, unlike a desktop where "all available cores" is just
+whatever the machine has. Requesting **more** CPUs than `OMP_NUM_THREADS`
+gives the OS genuinely idle cores in the job's allocation to place the
+`io_write_threads` team on, instead of time-slicing it against the
+compute pool -- worth doing given the "additive, not shared" cost from
+the table above.
+
+The caveat: whether the write team actually *lands* on those spare cores
+depends on `OMP_PROC_BIND`/`OMP_PLACES`, which are process-wide settings
+libgomp applies to *every* team it creates -- not just the compute team.
+Whether libgomp's place-list partitioning for the write pthread's second
+team correctly avoids the places compute already claimed, or restarts
+from place 0 and collides with it, is not something verified empirically
+here (our own libgomp test confirming two teams run as genuinely separate
+OS threads used no explicit `OMP_PROC_BIND`/`OMP_PLACES` at all, i.e. the
+default OS scheduler placement case, not a pinned-affinity HPC one). The
+write pthread itself has no affinity set by this code either; it inherits
+the process's full allocated CPU mask.
+
+Robust recommendation regardless of that open question: size the request
+as `cpus-per-task ≈ OMP_NUM_THREADS + io_write_threads`. That guarantees
+enough physical cores exist for both pools even in the worst case where
+binding doesn't cleanly separate them -- true independent of exactly how
+libgomp partitions places across teams from different initiating threads.
+To actually confirm rather than reason about it on a given cluster:
+compare `tile_write` wall-clock time with and without the extra headroom
+at a fixed `io_write_threads`, or inspect live thread placement with
+`taskset -pc <pid>` / `hwloc-ps` against the compute and write-pthread OS
+threads mid-run.
+
 ---
 
 ## 2 — CPU Parallelism
