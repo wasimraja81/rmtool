@@ -40,6 +40,8 @@ SUBBLOCK_RE = re.compile(
 
 STAGE_BOUNDS_RE = re.compile(r"\b(?P<ev>start|done)\b.*x:\[")
 
+GPU_SYNC_RE = re.compile(r"^gpu (send|recv)$")
+
 BYTES_RE = re.compile(r"bytes=(?P<bytes>\d+)")
 
 THREAD_CPU_RE = re.compile(
@@ -155,6 +157,27 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
                             message=msg,
                             label=ms.group("label"),
                             sub=int(ms.group("sub")),
+                        )
+                    )
+                    continue
+
+            if cat == "tile_compute":
+                mgs = GPU_SYNC_RE.match(msg.strip())
+                if mgs:
+                    # Non-staged, non-async GPU compute (single-shot: whole
+                    # tile fits in one VRAM sub-block) logs plain 'gpu send'/
+                    # 'gpu recv' notes -- no sub-block index, unlike the
+                    # staged/async path's 'async enqueue/start/done ...
+                    # slot=/sub=' markers. This is the only signal available
+                    # to bound that interval, so it's captured here rather
+                    # than falling through unmatched.
+                    events.append(
+                        Event(
+                            ts=ts,
+                            category=cat,
+                            tid=tid,
+                            message=msg,
+                            label="gpu_" + mgs.group(1),
                         )
                     )
                     continue
@@ -774,35 +797,38 @@ def build_intervals(events: List[Event]) -> List[Interval]:
 
 
 def build_gpu_sync_intervals(events: List[Event]) -> List[Interval]:
-    send_ts: Dict[int, List[datetime]] = {}
-    done_ts: Dict[int, List[datetime]] = {}
+    """Synchronous (non-staged, non-async) GPU compute intervals, from the
+    'gpu send'/'gpu recv' notes logged when a tile fits in one VRAM
+    sub-block (use_async_pipeline=.false. in the Fortran source, so none of
+    the async enqueue/start/done slot=/sub= markers tile_async parsing looks
+    for are ever emitted). These notes carry no sub-block index of their
+    own, so pairing is chronological -- correct here because this code path
+    only ever runs one compute call at a time on the main thread, exactly
+    like the io_read/io_write pairing below it in build_intervals."""
+    send_ts: List[datetime] = []
+    recv_ts: List[datetime] = []
     intervals: List[Interval] = []
 
     for ev in events:
-        if ev.category != "tile_compute" or ev.sub is None:
+        if ev.category != "tile_compute":
             continue
-        if ev.label == "send":
-            send_ts.setdefault(ev.sub, []).append(ev.ts)
-        elif ev.label == "done":
-            done_ts.setdefault(ev.sub, []).append(ev.ts)
+        if ev.label == "gpu_send":
+            send_ts.append(ev.ts)
+        elif ev.label == "gpu_recv":
+            recv_ts.append(ev.ts)
 
-    for sub in sorted(set(send_ts.keys()) | set(done_ts.keys())):
-        starts = sorted(send_ts.get(sub, []))
-        ends = sorted(done_ts.get(sub, []))
-        n = min(len(starts), len(ends))
-        for i in range(n):
-            if ends[i] > starts[i]:
-                intervals.append(
-                    Interval(
-                        "GPU",
-                        "gpu_compute_sync",
-                        f"compute {sub} (sync)",
-                        starts[i],
-                        ends[i],
-                        sub=sub,
-                        slot=None,
-                    )
-                )
+    for i, (s, e) in enumerate(_pair_intervals(sorted(send_ts), sorted(recv_ts))):
+        intervals.append(
+            Interval(
+                "GPU",
+                "gpu_compute_sync",
+                f"compute {i + 1} (sync)",
+                s,
+                e,
+                sub=i + 1,
+                slot=None,
+            )
+        )
 
     intervals.sort(key=lambda x: (x.start, x.lane, x.kind))
     return intervals

@@ -58,58 +58,144 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 
 ## Configuration
 
-RM synthesis is controlled via configuration files in the `cfg/` directory. Every configuration must provide required KEY=VALUE pairs for input/output paths, processing parameters, and RM sampling.
+RM synthesis is controlled via configuration files in the `cfg/` directory: plain
+`KEY=VALUE` pairs, one per line, `#` for comments. The parser is strict —
+unknown keys, duplicate keys, and unparsable values are all rejected outright
+(see [cfg/CONFIG_README.md](cfg/CONFIG_README.md) for the exact rules), so a
+config that loads at all is already validated in that sense.
 
-**Example:**
+Keys marked **(required)** below must always be present. Keys marked
+**(required if ...)** are conditionally required. Everything else is optional
+and defaults to the value shown if omitted — an omitted optional key is not an
+error, unlike an omitted required one.
+
+**Full annotated example, sectioned by purpose:**
 
 ```cfg
-# Paths and files
-path = /path/to/data/
-infileQ = Q_cube.fits
-infileU = U_cube.fits
-outfile = my_rm_synthesis
+# --- Input / output paths (required) ---
+path    = /path/to/data/        # directory containing both input cubes
+infileQ = Q_cube.fits           # Stokes Q input cube, relative to `path`
+infileU = U_cube.fits           # Stokes U input cube, relative to `path`
+outfile = my_rm_synthesis       # output basename; cube-type suffixes are
+                                 # appended automatically (see "Output format"
+                                 # below for exactly which files this produces)
 
-# RM sampling (linear grid from beg_rm to end_rm with nrm points)
-beg_rm = -500
-end_rm = 500
-nrm = 101
-use_auto_rm_range = 0      # 0=manual range, 1=auto from data
-ofac = 4                    # Oversampling factor
-fac = 3.14159265358979      # Pi for lambda^2 calculations
+# --- Bad-channel handling (required) ---
+remove_badchan = n              # y: drop channels listed in the file below
+badchan_file   = unused.txt     # one channel index per line; alias: global_badchan_file
+                                 # (the key must be present even when
+                                 # remove_badchan=n, but the file is only
+                                 # ever opened when remove_badchan=y, so any
+                                 # placeholder path is fine -- it doesn't
+                                 # need to exist)
 
-# Processing options
-remove_badchan = n          # Remove channels with RFI (y/n)
-badchan_file = unused.txt   # File listing bad channels
-rem_mean = 0                # Remove mean Q/U (0 or 1)
-remove_qu_bias = n          # Remove I-based bias from Q/U (y/n)
-use_gpu = n                 # GPU offload request (y/n). Alias: use_gpus
-output_mode = ap            # Output format: ap (amp+phase) or ri (real+imag)
-ap_angle_mode = phase       # Phase mode: phase (arg) or pol (0.5*arg)
+# --- Subimage extraction (required: subim; rest optional, default = full cube) ---
+subim = n                       # y: only process the pixel/channel ranges below;
+                                 # n: process the entire cube (ranges below are ignored)
+subim_ra_blc   = 1              # RA first pixel (>= 1)
+subim_ra_trc   = 0              # RA last pixel (0 = max)
+subim_ra_inc   = 1              # RA step (>= 1)
+subim_dec_blc  = 1              # Dec first pixel (>= 1)
+subim_dec_trc  = 0              # Dec last pixel (0 = max)
+subim_dec_inc  = 1              # Dec step (>= 1)
+subim_chan_blc = 0              # channel first pixel (0 = first)
+subim_chan_trc = 0              # channel last pixel (0 = max)
+subim_chan_inc = 1              # channel step (>= 1)
 
-# Residuals for bias correction
-resiQ = 0.0
-slopeQ = 0.0
-resiU = 0.0
+# --- Q/U processing & bias correction (required) ---
+rem_mean       = 0              # 1: subtract the per-pixel mean from Q/U before
+                                 # synthesis; 0: use Q/U as-is
+remove_qu_bias = n              # y: apply an I-cube-based bias correction to Q/U
+                                 # (requires path_I/infileI below); n: skip it
+resiQ  = 0.0                    # bias-correction residual/slope terms -- only
+slopeQ = 0.0                    # meaningful when remove_qu_bias=y; leave at 0.0
+resiU  = 0.0                    # otherwise
 slopeU = 0.0
 
-# Subimage extraction (optional)
-subim = y
-subim_ra_blc = 1            # RA first pixel
-subim_ra_trc = 256          # RA last pixel (0 = max)
-subim_ra_inc = 1            # RA step
-subim_dec_blc = 1           # Dec first pixel
-subim_dec_trc = 256         # Dec last pixel (0 = max)
-subim_dec_inc = 1           # Dec step
-subim_chan_blc = 1          # Channel first (0 = first)
-subim_chan_trc = 0          # Channel last (0 = all)
-subim_chan_inc = 1          # Channel step
-
-# Bias correction inputs (required if remove_qu_bias = y)
-path_I = /path/to/data/
+# path_I/infileI (required if remove_qu_bias = y)
+path_I  = /path/to/data/
 infileI = I_cube.fits
+
+# --- RM synthesis sampling (required: ofac, fac, use_auto_rm_range) ---
+use_auto_rm_range = 0           # 0: use beg_rm/end_rm/nrm below (manual grid);
+                                 # 1: derive the RM range from the data instead
+                                 # (beg_rm/end_rm/nrm become optional overrides)
+ofac = 4                        # oversampling factor (>= 1); nrm_out = nrm * ofac
+fac  = 3.14159265358979         # pi, for lambda^2 conversion -- leave as-is
+
+# beg_rm/end_rm/nrm (required if use_auto_rm_range = 0)
+beg_rm = -500                   # RM grid start (rad/m^2)
+end_rm =  500                   # RM grid end (rad/m^2). Alias: max_rm
+nrm    =  101                   # number of RM samples before oversampling. Alias: nrm_out
+
+# --- Output format (optional) ---
+output_mode   = ap              # ap: write amplitude+phase cubes (default);
+                                 # ri: write real+imaginary cubes instead
+ap_angle_mode = phase           # (output_mode=ap only) phase: PHA cube is arg(F);
+                                 # pol: PHA cube is 0.5*arg(F) (polarization angle)
+                                 # ap+phase -> OUTBASE.AMP.RMCUBE.FITS + OUTBASE.PHA.RMCUBE.FITS
+                                 # ap+pol   -> OUTBASE.AMP.RMCUBE.FITS + OUTBASE.POLA.RMCUBE.FITS
+                                 # ri       -> OUTBASE.REAL.RMCUBE.FITS + OUTBASE.IMAG.RMCUBE.FITS
+
+# --- Masking & optional outputs (optional) ---
+mask_cube_file       =          # empty: mask cube (if write_mask_output=y) is
+                                 # written to OUTBASE.MASK.CUBE.FITS; non-empty:
+                                 # overrides that output path instead
+mask_input_cube_file =          # empty: no external input mask; non-empty: path
+                                 # to a FITS mask applied on top of NaN/Inf and
+                                 # global-bad-channel masking
+mask_trust_mode      = safe     # safe: tolerate minor mask/data shape mismatches;
+                                 # strict: reject on any mismatch
+write_mask_output    = y        # y: write the per-channel MASK cube (default on)
+write_nvalid_output  = y        # y: write the per-pixel NVALID map (default on)
+
+# --- Cubestat / peak maps (optional) ---
+cubestat = n                    # y: also write PEAK/RM_PEAK/ANG_PEAK/SNR 2D maps
+                                 # (per-pixel peak amplitude, its RM, angle at
+                                 # peak, and S/N) alongside the RM cubes
+
+# --- GPU (optional) ---
+use_gpu      = n                # y: request GPU offload (alias: use_gpus).
+                                 # On a gpu_offload* binary this enables offload;
+                                 # on a CPU-only binary it prints a warning and
+                                 # falls back to CPU (not an error, not silent)
+gpu_vram_mib = 0                # 0: auto-detect available VRAM; non-zero: override
+                                 # the detected size (MiB) used for sub-block planning
+mem_frac_vram = 0.70            # fraction of VRAM to budget per compute sub-block
+
+# --- Tile memory planning & I/O parallelism (optional) ---
+# Full explanation, defaults, and tuning guidance in "Tile Memory Planning
+# and I/O Parallelism" below -- these are usually left at their defaults
+# unless you're on a large cube or a specific HPC filesystem.
+tile_auto        = y            # y: auto-size tiles from mem_frac_ram (recommended)
+tile_ra          = 0            # manual override (0 = auto); ignored when tile_auto=y
+tile_dec         = 0            # manual override (0 = auto); ignored when tile_auto=y
+mem_frac_ram     = 0.25         # fraction of total system RAM to budget per tile
+io_read_threads  = 1            # N independent read-only FITS handles per input cube
+io_write_threads = 1            # N-way parallel AMP/PHA writes (raw stream I/O)
+io_overlap       = n            # y: overlap tile N's write with tile N+1's compute
+
+# --- Logging & timing (optional) ---
+# Full explanation in "Timing And Benchmark CSV Output" below.
+log_level            = info     # error|warn|info|debug
+log_output_file      =          # empty: stdout; non-empty: append to this file
+timing_enabled       = n        # y: print the Timing summary / Macro breakdown
+timing_tile_enabled  = n        # y: include tile-level stage timers
+timing_io_enabled    = n        # y: include I/O stage timers
+timing_csv_file      =          # empty: no CSV; non-empty: append one row per run
+
+# --- Misc (optional) ---
+dry_run = n                     # y: read input cube headers, run the tile
+                                 # planner, write tile_autotune.cfg (suggested
+                                 # tile_ra/tile_dec/mem_frac_* KEY=VALUE lines
+                                 # to copy into a real cfg) and
+                                 # runtime_estimate.txt, then exit -- no pixel
+                                 # data is read and no output cubes are created
 ```
 
-For complete documentation, see [cfg/CONFIG_README.md](cfg/CONFIG_README.md).
+For the parser's exact validation rules (which combinations are required,
+range checks, duplicate/unknown-key rejection), see
+[cfg/CONFIG_README.md](cfg/CONFIG_README.md).
 
 ## Timing And Benchmark CSV Output
 
@@ -361,18 +447,21 @@ stopped being useful information once thread counts got into the teens.
 Design rationale and diagnostic interpretation notes are documented in
 [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md).
 
-Example swim-lane plots (predate the stage-totals panel and thread-ID
-simplification above; illustrative of lane layout only):
+Example swim-lane plots, current as of the I/O throughput (MB/s) panel and
+the "CPU stage" row's compute segment (both described above):
 
-Pipeline/stage-overlap view (long-run async example):
+Pipeline/stage-overlap view (async, double-buffered GPU dispatch --
+`gpu_offload_hostomp` binary, staged VRAM sub-blocks):
 
 ![Swim-lane GPU async example](docs/images/swimlane_gpu_example.png)
 
-Pipeline/stage-overlap view (sync-fallback/smaller-run example):
+Pipeline/stage-overlap view (synchronous-fallback GPU dispatch -- a tile
+that fits in one VRAM sub-block, so there's no double-buffering to overlap):
 
 ![Swim-lane pipeline example](docs/images/swimlane_pipeline_example.png)
 
-CPU thread-detail view:
+CPU thread-detail view (`io_read_threads`/`io_write_threads`/`io_overlap`
+all active):
 
 ![Swim-lane CPU thread example](docs/images/swimlane_cpu_thread_example.png)
 
