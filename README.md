@@ -51,9 +51,10 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
 - **[docs/PARALLELISM.md](docs/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
-- **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — Interim IO optimisation plan (proposal/in-progress, not adopted architecture)
+- **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write and async overlap (T0-T5 adopted; T6, genuine write-throughput parallelism, still a proposal)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
+- **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Draft release notes for the anticipated 3.0 (IO-efficiency milestone, in progress)
 
 ## Configuration
 
@@ -318,10 +319,22 @@ Key options:
 The script also prints summary metrics (interval count, window seconds,
 GPU-GPU overlap, CPU-GPU overlap) to stdout.
 
+Every plot now includes a **stage time totals** bar panel underneath the
+timeline: total wall-clock seconds per stage, sorted largest-first, with
+seconds and % of total run wall time labelled on each bar. A bar chart
+rather than a pie, since real runs are often extremely skewed (one stage
+at >90% of wall time) -- a pie would render that as one slice and an
+unreadable sliver soup. Percentages can add up to more than 100%; that's
+expected when stages overlap in wall time (e.g. `io_overlap=y`), not a
+bug. The side panel's `Thread IDs` line (CPU thread detail view) was
+dropped in favour of just `Threads active` (a count) -- the full ID list
+stopped being useful information once thread counts got into the teens.
+
 Design rationale and diagnostic interpretation notes are documented in
 [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md).
 
-Example swim-lane plots:
+Example swim-lane plots (predate the stage-totals panel and thread-ID
+simplification above; illustrative of lane layout only):
 
 Pipeline/stage-overlap view (long-run async example):
 

@@ -433,6 +433,60 @@ Verified bit-identical (`io_overlap=n` vs `y`) across a 7-tile run
 (non-OMP) binary, plus the no-overlapping-writes structural check
 (§13) and an end-to-end production-scale rerun (see postmortem above).
 
+#### Real Setonix production result: write is now the dominant, and largely unhidden, cost
+
+First full-scale production run after the fix: real ASKAP/EMU Q/U cubes
+(13308×11870, 288 channels), `io_read_threads=8`, `io_overlap=y`, 16
+Dec-strip tiles. Completed end-to-end with no error — the crash is fixed.
+The per-stage numbers are worth recording because they reveal a limit of
+`io_overlap` that the original (serial-read) profiling data didn't
+surface:
+
+| Stage | Total (16 tiles) | % of 2586.7s wall time |
+|---|---|---|
+| I/O write | 2479.9s | 96% |
+| CPU prep | 733.5s | 28% |
+| CPU compute | 464.7s | 18% |
+| I/O read | 364.1s | 14% |
+| CPU cubestat | 28.9s | 1% |
+| CPU mask | 12.1s | 0% |
+
+(Percentages sum past 100% because stages genuinely overlap in wall
+time — that's the point of `io_overlap`. See the stage-totals bar panel
+now included in the swim-lane plots, which renders exactly this table.)
+
+Steady-state write is ~140-150s/tile (one 394s outlier on the very first
+tile — a one-off cost from creating/extending the output file on Lustre;
+subsequent writes only update already-allocated sub-regions of the
+existing cube, hence the much shorter steady state). The rest of the
+pipeline (read+mask+prep+compute+cubestat) totals only ~95-115s/tile.
+Because `io_read_threads=8` made read fast (~22-30s vs. ~124s in the
+original serial-read profile), the "budget" available to hide write
+behind is now *smaller* than write itself — so most of write's cost is
+exposed rather than hidden. Concretely: the join-before-dispatch fix
+(see postmortem above) runs on the main thread, and `read(N+2)` is the
+very next statement after that join in program order — so whenever
+write(N) outlasts tile N+1's own pipeline, the main thread blocks there,
+and read(N+2) waits too. The concurrency window is real but bounded to
+one tile's worth of work; it does not compound across multiple tiles.
+
+Despite that, `io_overlap` still delivered a real reduction: a fully
+serial equivalent (sum of every stage: 364+12+733+465+29+2480 ≈ 4083s)
+would have taken ~68 minutes; the actual overlapped run took 2586.7s
+(~43 minutes) — **≈37% wall-time reduction**, in the same range as the
+~34% predicted from the original serial-read profile, just achieved
+differently (mostly by hiding write behind *compute* now, since read
+got fast enough on its own to no longer be the thing doing the hiding).
+
+**Implication for what to build next:** `io_read_threads` and
+`io_overlap` have both done their job — write is now overwhelmingly the
+dominant cost (96% of wall time) specifically *because* it's stuck at a
+single serial handle (`io_write_threads` hard-clamped to 1). This makes
+T6 (genuine write-throughput parallelism) the highest-value remaining
+work, not a nice-to-have: unlike the read/overlap work, which was
+fighting a bottleneck that was already a *minority* of wall time, T6
+would be attacking the piece that is now, by a wide margin, most of it.
+
 #### When `io_overlap=y` can be detrimental
 
 Two independent levers determine whether overlap helps, does nothing, or
@@ -549,12 +603,28 @@ reduce tile size or add call-splitting logic.
 ##### Two view modes
 - `Process timeline` + `View: Pipeline timeline`
   - Use when GPU/CPU/IO stage overlap is the main question.
-  - Lanes are coarse (`GPU`, `CPU`, `I/O`) and bars show stage intervals.
+  - Lanes are coarse (`GPU`, `CPU`, `I/O read`, `I/O write` — read and
+    write are separate lanes specifically so overlapping reads/writes
+    under `io_overlap` render as genuinely concurrent bars instead of
+    colliding in one shared lane).
 - `Process timeline` + `View: CPU thread detail`
   - Use when thread balance, per-thread gaps, and extraction distribution are
     the main question.
-  - Lanes include `CPU stage`, optional `I/O`, and one lane per OpenMP thread
-    (`T<tid>`).
+  - Lanes include `CPU stage`, `I/O read`/`I/O write`, and one lane per
+    OpenMP thread (`T<tid>`).
+- `Stage time totals` (bottom panel, both views)
+  - Horizontal bar chart of total wall-clock seconds per stage, largest on
+    top, labelled with seconds and % of the run's total wall time.
+  - A bar rather than a pie: real runs are often extremely skewed (one
+    stage at >90% of wall time with everything else in single digits),
+    which a pie renders as one slice and an unreadable sliver soup.
+  - Percentages can sum past 100% — that's expected, not a bug: stages
+    genuinely overlap in wall time when `io_overlap=y` (write(N)
+    concurrent with tile N+1's read/compute), so their individual shares
+    of the wall clock aren't mutually exclusive slices of a whole.
+  - Side-panel `Thread IDs` were dropped in favour of just `Threads
+    active` (a count) — the full ID list added noise without adding
+    diagnostic value once thread counts got into the teens.
 
 ##### Legend semantics (pipeline view)
 - `I/O read`, `I/O write`

@@ -232,6 +232,102 @@ def build_cpu_thread_intervals(events: List[Event]) -> List[ThreadInterval]:
     return intervals
 
 
+# Stage label/color table shared by the swim-lane and the stage-totals bar
+# chart, so the two panels stay visually consistent. Covers both views'
+# Interval.kind vocabularies: CPU-thread-detail uses cpu_stage_*, the
+# pipeline/GPU view uses cpu_prep/cpu_scatter/gpu_compute_*.
+_STAGE_TOTAL_STYLE: List[Tuple[str, str, str]] = [
+    # (interval kind, display label, color)
+    ("io_read", "I/O read", "#2a78d6"),
+    ("io_write", "I/O write", "#1f4f99"),
+    ("cpu_stage_mask", "CPU mask", "#85b86f"),
+    ("cpu_stage_prep", "CPU prep", "#b8b36a"),
+    ("cpu_stage_compute", "CPU compute", "#8a8a8a"),
+    ("cpu_stage_cubestat", "CPU cubestat", "#5aa3a5"),
+    ("cpu_prep", "CPU prep", "#eda100"),
+    ("cpu_scatter", "CPU scatter", "#e34948"),
+    ("gpu_compute_slot1", "GPU compute (slot 1)", "#4a3aa7"),
+    ("gpu_compute_slot2", "GPU compute (slot 2)", "#7d6fd1"),
+    ("gpu_compute_sync", "GPU compute (sync)", "#5b4bc0"),
+]
+
+
+def compute_stage_totals(*interval_lists: List[Interval]) -> List[Tuple[str, float, str]]:
+    """Total wall-clock seconds per pipeline stage, sorted descending.
+
+    Accepts one or more interval lists (e.g. io_intervals, cpu_stage_intervals)
+    and sums durations by Interval.kind across all of them. Uses the
+    tile-level start/done intervals (not per-thread bursts), so a stage
+    that runs on 16 parallel threads for 30s each still counts as 30s, not
+    480s -- this reflects wall time, matching the binary's own
+    'Timing summary (seconds)' block.
+    """
+    by_kind: Dict[str, float] = {}
+    for intervals in interval_lists:
+        for iv in intervals:
+            by_kind[iv.kind] = by_kind.get(iv.kind, 0.0) + (iv.end - iv.start).total_seconds()
+
+    totals = [
+        (label, by_kind[kind], color)
+        for kind, label, color in _STAGE_TOTAL_STYLE
+        if by_kind.get(kind, 0.0) > 0.0
+    ]
+    totals.sort(key=lambda t: t[1], reverse=True)
+    return totals
+
+
+def draw_stage_totals_bar(
+    ax, totals: List[Tuple[str, float, str]], wall_time_s: Optional[float] = None
+) -> None:
+    """Horizontal bar chart of total stage time, largest on top.
+
+    A bar chart rather than a pie: stage totals in real runs are often
+    extremely skewed (e.g. one write stage at >90% of wall time with
+    everything else in single digits), which a pie renders as one slice
+    and a sliver soup. A sorted bar with value labels stays readable at
+    any skew and lets exact seconds be read off directly.
+
+    Percentages are of `wall_time_s` (the run's actual elapsed time) when
+    given, matching the binary's own 'Timing summary (seconds)' block --
+    NOT percent-of-summed-stages, which would quietly overstate things
+    whenever stages overlap in real time (e.g. io_overlap=y write running
+    concurrently with the next tile's read/compute: the two durations
+    both count in full, so they'd sum to more than the wall clock ever
+    elapsed). Falls back to percent-of-summed-stages only if wall_time_s
+    isn't available.
+    """
+    if not totals:
+        ax.axis("off")
+        return
+
+    labels = [t[0] for t in totals]
+    values = [t[1] for t in totals]
+    colors = [t[2] for t in totals]
+    y_pos = list(range(len(totals)))[::-1]  # largest at top
+
+    ax.barh(y_pos, values, color=colors, edgecolor="black", linewidth=0.5, height=0.65)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("total wall-clock seconds")
+    subtitle = " (% of run wall time)" if wall_time_s else " (% of summed stage time)"
+    ax.set_title(f"Stage time totals{subtitle}", fontsize=10)
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+
+    denom = wall_time_s if wall_time_s else (sum(values) or 1.0)
+    xmax = max(values) if values else 1.0
+    for y, v in zip(y_pos, values):
+        pct = 100.0 * v / denom
+        ax.text(
+            v + xmax * 0.015,
+            y,
+            f"{v:.1f}s ({pct:.0f}%)",
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+    ax.set_xlim(0, xmax * 1.22)
+
+
 def plot_cpu_thread_timeline(
     thread_intervals: List[ThreadInterval],
     io_intervals: List[Interval],
@@ -240,6 +336,7 @@ def plot_cpu_thread_timeline(
     title: str,
     time_axis: str,
     right_info_lines: Optional[List[str]] = None,
+    stage_totals: Optional[List[Tuple[str, float, str]]] = None,
 ) -> None:
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
@@ -262,7 +359,15 @@ def plot_cpu_thread_timeline(
     y_map = {lane: idx for idx, lane in enumerate(lane_labels)}
 
     fig_h = 3.2 + 0.22 * len(tids)
-    fig, ax = plt.subplots(figsize=(14, fig_h))
+    if stage_totals:
+        bar_h = 1.0 + 0.32 * len(stage_totals)
+        fig, (ax, ax2) = plt.subplots(
+            2, 1, figsize=(14, fig_h + bar_h),
+            gridspec_kw={"height_ratios": [fig_h, bar_h]},
+        )
+    else:
+        ax2 = None
+        fig, ax = plt.subplots(figsize=(14, fig_h))
 
     for iv in thread_intervals:
         lane = f"T{iv.tid}"
@@ -375,6 +480,8 @@ def plot_cpu_thread_timeline(
             ]
         )
         labels.extend(["CPU mask", "CPU prep", "CPU compute", "CPU cubestat"])
+    if ax2 is not None:
+        draw_stage_totals_bar(ax2, stage_totals, wall_time_s=wall)
     fig.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
     _layout_right_panel(fig, ax, handles, labels, right_info_lines)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -909,6 +1016,7 @@ def plot_clean_swimlane(
     title: str,
     time_axis: str,
     right_info_lines: Optional[List[str]] = None,
+    stage_totals: Optional[List[Tuple[str, float, str]]] = None,
 ) -> None:
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
@@ -953,7 +1061,15 @@ def plot_clean_swimlane(
     t1 = max(iv.end for iv in intervals)
     wall = max(0.001, (t1 - t0).total_seconds())
 
-    fig, ax = plt.subplots(figsize=(14, 3.8))
+    if stage_totals:
+        bar_h = 1.0 + 0.32 * len(stage_totals)
+        fig, (ax, ax2) = plt.subplots(
+            2, 1, figsize=(14, 3.8 + bar_h),
+            gridspec_kw={"height_ratios": [3.8, bar_h]},
+        )
+    else:
+        ax2 = None
+        fig, ax = plt.subplots(figsize=(14, 3.8))
 
     for iv in intervals:
         if time_axis == "absolute":
@@ -1042,6 +1158,8 @@ def plot_clean_swimlane(
     for name, color, hatch in legend_items:
         handles.append(plt.Rectangle((0, 0), 1, 1, color=color, ec="black", lw=0.5, hatch=hatch))
     labels = [n for n, _, _ in legend_items]
+    if ax2 is not None:
+        draw_stage_totals_bar(ax2, stage_totals, wall_time_s=wall)
     # Keep room on the right for the out-of-axes legend.
     fig.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
     _layout_right_panel(fig, ax, handles, labels, right_info_lines)
@@ -1187,10 +1305,10 @@ def main() -> int:
                 (None, ""),
                 (None, "Thread layout"),
                 ("Threads active", str(len(thread_tids))),
-                ("Thread IDs", ", ".join(str(t) for t in thread_tids)),
             ]
         )
         right_info_lines = _format_info_block(info_rows)
+        stage_totals = compute_stage_totals(io_only, cpu_stage_intervals)
         plot_cpu_thread_timeline(
             thread_intervals,
             io_only,
@@ -1199,15 +1317,18 @@ def main() -> int:
             title=title,
             time_axis=args.time_axis,
             right_info_lines=right_info_lines,
+            stage_totals=stage_totals,
         )
     else:
         right_info_lines = _format_info_block(info_rows)
+        stage_totals = compute_stage_totals(intervals)
         plot_clean_swimlane(
             intervals,
             out_path,
             title,
             time_axis=args.time_axis,
             right_info_lines=right_info_lines,
+            stage_totals=stage_totals,
         )
 
     print(f"log: {log_path}")
