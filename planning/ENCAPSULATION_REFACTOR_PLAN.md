@@ -51,7 +51,7 @@ Set / Correctness Gate / Rollback Criteria / Effort.
 
 ---
 
-### T0 — Baseline Lock — OPEN
+### T0 — Baseline Lock — DONE
 - **Objective:** Freeze an exact reference before any code changes, so every later ticket has something concrete to diff against.
 - **Scope:** Measurement only.
 - **Change Set:** None.
@@ -61,6 +61,15 @@ Set / Correctness Gate / Rollback Criteria / Effort.
   - For every `tests/*.cfg` (and any real-workload cfg available), run once and archive the full output FITS set plus run log under `scratch/baseline_encapsulation/` — the bit-identical reference for every later ticket.
 - **Rollback Criteria:** N/A.
 - **Effort:** 0.5 session.
+- **Evidence (2026-07-19, commit `043c7cf`):** Build clean, 0 compiler
+  errors/warnings, 4 pre-existing GPU-offload linker warnings (unchanged
+  from every prior build this cycle). `tests/run_tests.sh`: 28/28 pass.
+  174 output files (FITS/cfg/log/csv, 42M) archived to
+  `scratch/baseline_encapsulation/tests_output/` (gitignored, local-only
+  — see `scratch/baseline_encapsulation/T0_MANIFEST.md` for the full
+  record and exact commit hash, reproducible from there). No real
+  Setonix-scale workload available locally — T3b's large-case re-run
+  will need to happen on Setonix directly.
 
 ---
 
