@@ -177,6 +177,7 @@ logical   cubeQ
 logical   cubeU
 logical   cubeM
 logical   out_amp_open, out_ang_open, out_exists
+logical   ampha_handles_closed_early
 logical   out_mask_open, out_nvalid_open
 logical   out_peak_open, out_rmpeak_open
 logical   out_angpeak_open, out_snr_open
@@ -312,14 +313,16 @@ integer   io_par_z_beg, io_par_z_end
 integer   io_par_anyflg_priv, io_par_status_priv
 integer   io_par_fpixels(max_axis), io_par_lpixels(max_axis)
 logical   io_par_read_ok
- ! Write-side per-thread handles and scratch (RM-chunked for AMP/PHA cubes)
-integer, allocatable :: par_wunit_amp(:), par_wunit_pha(:)
-integer   io_wpar_k
-integer(kind=int64) :: io_wpar_base, io_wpar_rem
-integer(kind=int64) :: io_wpar_nrm_k, io_wpar_rm_off_k, io_wpar_buf_off
-integer   io_wpar_rm_beg, io_wpar_rm_end
-integer   io_wpar_status_priv
-integer   io_wpar_fpix(3), io_wpar_lpix(3)
+ ! Write-side handle and scratch (RM-chunked for AMP/PHA cubes). Always a
+ ! single handle now regardless of io_write_threads_eff -- see the T6
+ ! comment above "Parallel write handle setup" for why.
+integer   par_wunit_amp, par_wunit_pha
+ ! 0-based byte offset of each output HDU's pixel data (CFITSIO FTGHAD),
+ ! fetched once; feeds write_rm_chunk_raw() when io_write_threads_eff>1.
+integer(kind=int64) :: datastart_amp, datastart_pha
+ ! FTGHAD also reports these; unused here (we only need datastart) but
+ ! required as call arguments.
+integer(kind=int64) :: io_wpar_headstart, io_wpar_dataend
  ! Staging buffers for VRAM sub-blocks (compact, sized to one sub-block):
 real(sp), allocatable :: stQ(:,:), stU(:,:), stMask(:,:), stI(:,:)
 real(sp), allocatable :: stP(:,:), stPhi(:,:)
@@ -1102,6 +1105,7 @@ nbuffer = naxes(1)
 rwmode = 1
 blocksize = 1
 out_amp_open = .false.
+ampha_handles_closed_early = .false.
 out_ang_open = .false.
 out_mask_open = .false.
 out_nvalid_open = .false.
@@ -2815,41 +2819,39 @@ io_read_threads_eff  = min(io_read_threads_eff,  nz_out)
 io_write_threads_eff = min(io_write_threads_eff, nrm_out)
 
  ! ===========================================================================
- ! HARD SAFETY CLAMP -- do not remove without fixing the underlying bug.
+ ! io_write_threads>1: safe via raw stream writes, NOT via multiple CFITSIO
+ ! handles (T6). Read this before touching the code below.
  ! ===========================================================================
- ! io_write_threads>1 opens N FTOPEN(...,1,...) (read-write) handles onto the
- ! SAME output file. CFITSIO's fits_already_open() (cfitsio-4.3.1/cfileio.c
- ! ~lines 1512-1520,1653) aliases repeat read-write opens of an already-open
- ! file onto ONE shared internal FITSfile buffer -- by CFITSIO's own design
- ! ("the file MUST only be physically opened once"). The "N independent
- ! handles" this cfg key implies are therefore not independent at all, and
- ! concurrent ftpsse() calls on them from the io_write_threads parallel-do
- ! corrupt that shared buffer. This is not a theoretical risk: it produced a
- ! real SIGSEGV inside memmove (inside libcfitsio) inside a Setonix run with
- ! io_write_threads=4, immediately after the first tile's compute finished.
- ! Read-only opens (io_read_threads) do NOT have this problem -- CFITSIO
- ! explicitly exempts mode=0 opens from the aliasing for the opposite reason
- ! ("2 different threads cannot share the same FITSfile pointer"), so those
- ! N handles genuinely are independent.
+ ! io_write_threads>1 used to open N FTOPEN(...,1,...) (read-write) handles
+ ! onto the SAME output file. CFITSIO's fits_already_open() (cfitsio-4.3.1/
+ ! cfileio.c ~lines 1512-1520,1653) aliases repeat read-write opens of an
+ ! already-open file onto ONE shared internal FITSfile buffer -- by
+ ! CFITSIO's own design ("the file MUST only be physically opened once").
+ ! The "N independent handles" that implied were therefore not independent
+ ! at all, and concurrent ftpsse() calls on them corrupted that shared
+ ! buffer -- a real SIGSEGV inside memmove (inside libcfitsio) on a
+ ! Setonix run with io_write_threads=4 (see the T4 postmortem in
+ ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md). io_write_threads_eff was
+ ! hard-clamped to 1 as a result.
  !
- ! Until a follow-up lands a write path that's actually safe for N>1 (T6 in
- ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md: either genuine multi-process
- ! writers, since CFITSIO's alias table is per-process, or bypassing CFITSIO
- ! for the pixel write with raw pwrite() at a pre-computed byte offset),
- ! io_write_threads_eff is forced to 1 here regardless of what the cfg
- ! requests. See docs/ARCHITECTURE.md "Parallel write -- io_write_threads"
- ! for the full writeup.
+ ! That clamp is gone. Instead, when io_write_threads_eff>1, the tile
+ ! write uses write_rm_chunk_raw() (rm_synthesis_mod.f90), which writes
+ ! pixel data directly to the output file's path via Fortran STREAM I/O,
+ ! never asking CFITSIO to touch the file concurrently at all -- so its
+ ! handle-aliasing behaviour never enters the picture. par_wunit_amp/
+ ! par_wunit_pha below are therefore now ALWAYS a single aliased handle,
+ ! regardless of io_write_threads_eff; see "Parallel write handle setup".
+ ! Read-only opens (io_read_threads) were never affected by any of this --
+ ! CFITSIO explicitly exempts mode=0 opens from the aliasing ("2 different
+ ! threads cannot share the same FITSfile pointer"), so those N handles
+ ! genuinely are independent.
 if(io_write_threads_eff .gt. 1)then
-   write(*,*)" WARNING: io_write_threads=",io_write_threads,&
-   &" requested, but io_write_threads>1 is UNSAFE (CFITSIO"
-   write(*,*)"   aliases read-write handles to the same file -- see"
-   write(*,*)"   docs/ARCHITECTURE.md and the T4 postmortem in"
-   write(*,*)"   planning/IO_PARALLEL_OPTIMISATION_PLAN.md). Forcing"
-   write(*,*)"   io_write_threads_eff=1 until this is fixed properly."
-   call log_message('warn','startup',&
-   &'io_write_threads>1 requested but forced to 1: unsafe CFITSIO '//&
-   &'read-write handle aliasing (see ARCHITECTURE.md / T4 postmortem)')
-   io_write_threads_eff = 1
+   write(*,*)" Parallel FITS write: io_write_threads=",io_write_threads_eff,&
+   &" via raw stream writes (CFITSIO handle aliasing bypassed -- see"
+   write(*,*)"   docs/ARCHITECTURE.md 'Parallel write -- io_write_threads')."
+   call log_message('info','startup',&
+   &'io_write_threads>1: using raw stream writes, bypassing CFITSIO '//&
+   &'handle aliasing (see ARCHITECTURE.md)')
 endif
  ! Allocate and populate per-thread unit arrays.
  ! For _eff=1 we alias the already-open handles (no file re-opens, no overhead).
@@ -2883,23 +2885,62 @@ else
 endif
 
  ! --- Parallel write handle setup ---
- ! io_write_threads_eff already clamped to OMP thread pool above.
- ! Alias existing handles for =1; open N readwrite handles for >1.
- ! Non-overlapping pwrite to different byte regions is safe; CFITSIO
- ! only updates file-level metadata at close, not during subset puts.
-allocate(par_wunit_amp(io_write_threads_eff))
-allocate(par_wunit_pha(io_write_threads_eff))
-if(io_write_threads_eff .eq. 1)then
-   par_wunit_amp(1) = 41
-   par_wunit_pha(1) = 42
-else
-   do io_wpar_k = 1, io_write_threads_eff
-      par_wunit_amp(io_wpar_k) = 600 + io_wpar_k
-      call FTOPEN(par_wunit_amp(io_wpar_k),outfileAMP,1,blocksize,status)
-      par_wunit_pha(io_wpar_k) = 700 + io_wpar_k
-      call FTOPEN(par_wunit_pha(io_wpar_k),outfileANG,1,blocksize,status)
-   enddo
-   write(*,*)" Parallel FITS write: opened ",io_write_threads_eff," handles/cube"
+ ! Always alias the single existing handles -- io_write_threads_eff>1 no
+ ! longer opens extra CFITSIO handles (that was the unsafe mechanism; see
+ ! the T6 comment above). Instead, fetch each file's data-start byte
+ ! offset once via FTGHAD on this same handle, right after its header was
+ ! written and before any tile write happens. write_rm_chunk_raw() uses
+ ! this offset to compute every subsequent byte position by pure
+ ! arithmetic, with CFITSIO never touched concurrently.
+par_wunit_amp = 41
+par_wunit_pha = 42
+status = 0
+call ftghad(par_wunit_amp,io_wpar_headstart,datastart_amp,io_wpar_dataend,status)
+if(status.gt.0)then
+   write(*,*)"Error getting AMP data-start offset (FTGHAD)"
+   call printerror(status)
+   stop
+endif
+status = 0
+call ftghad(par_wunit_pha,io_wpar_headstart,datastart_pha,io_wpar_dataend,status)
+if(status.gt.0)then
+   write(*,*)"Error getting PHA data-start offset (FTGHAD)"
+   call printerror(status)
+   stop
+endif
+
+! Close the CFITSIO handles for AMP/PHA right now, before any tile write
+! happens, when raw-write mode is active. CFITSIO keeps its own internal
+! buffer cache per open file and flushes any buffers it still considers
+! "dirty" back to disk when the handle is closed (ffclos -> ffchdu ->
+! ffflsh); a buffer left over from header setup can be flushed at whatever
+! later moment the handle finally closes, unconditionally overwriting
+! bytes in that same file offset range -- including pixel data our raw
+! stream writes already placed there, since CFITSIO has no idea those
+! out-of-band writes happened. The only way to make that race impossible
+! (rather than just improbable) is to not keep the handle open at all:
+! once FTGHAD has given us datastart, CFITSIO's job for this file is
+! done, so close it immediately and let write_rm_chunk_raw() own the file
+! exclusively for the rest of the run. (Confirmed empirically: pre-close
+! the raw-written bytes read back correctly; post-close they read back as
+! zero, with datastart/dataend unchanged -- i.e. not a header-growth
+! shift, but exactly this stale-buffer-flush mechanism.)
+if(io_write_threads_eff.gt.1)then
+   status = 0
+   call FTCLOS(par_wunit_amp,status)
+   if(status.gt.0)then
+      write(*,*)"Error closing AMP handle early (raw-write setup)"
+      call printerror(status)
+      stop
+   endif
+   status = 0
+   call FTCLOS(par_wunit_pha,status)
+   if(status.gt.0)then
+      write(*,*)"Error closing PHA handle early (raw-write setup)"
+      call printerror(status)
+      stop
+   endif
+   ampha_handles_closed_early = .true.
 endif
 
 if(io_overlap)then
@@ -3827,7 +3868,12 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       ! rm_synthesis_mod.f90 for why a pthread and not an OMP task.
       write_job(cur_slot)%unit_amp = par_wunit_amp
       write_job(cur_slot)%unit_pha = par_wunit_pha
+      write_job(cur_slot)%path_amp = outfileAMP
+      write_job(cur_slot)%path_pha = outfileANG
+      write_job(cur_slot)%datastart_amp = datastart_amp
+      write_job(cur_slot)%datastart_pha = datastart_pha
       write_job(cur_slot)%n_write_threads = io_write_threads_eff
+      write_job(cur_slot)%use_raw_write = (io_write_threads_eff .gt. 1)
       write_job(cur_slot)%unit_mask    = 43
       write_job(cur_slot)%unit_nvalid  = 44
       write_job(cur_slot)%unit_peak    = 46
@@ -3931,15 +3977,9 @@ if(allocated(par_unit_Q))    deallocate(par_unit_Q)
 if(allocated(par_unit_U))    deallocate(par_unit_U)
 if(allocated(par_unit_mask)) deallocate(par_unit_mask)
 if(allocated(par_unit_I))    deallocate(par_unit_I)
- ! Close parallel write handles (io_write_threads_eff>1 only; =1 aliases 41/42).
-if(io_write_threads_eff .gt. 1)then
-   do io_wpar_k = 1, io_write_threads_eff
-      call FTCLOS(par_wunit_amp(io_wpar_k),status)
-      call FTCLOS(par_wunit_pha(io_wpar_k),status)
-   enddo
-endif
-if(allocated(par_wunit_amp)) deallocate(par_wunit_amp)
-if(allocated(par_wunit_pha)) deallocate(par_wunit_pha)
+ ! par_wunit_amp/par_wunit_pha are always aliases of units 41/42 now (see
+ ! "Parallel write handle setup" above) -- no separate handles were opened,
+ ! so there is nothing extra to close here; 41/42 are closed below.
  ! CLOSE THE FITS FILES:
 call FTCLOS(21,status)
 if (status .gt. 0)then
@@ -4135,7 +4175,7 @@ call log_message('info','finalize',&
 !              call printerror(status)
 !      endif
 
-if(out_amp_open)then
+if(out_amp_open .and. .not. ampha_handles_closed_early)then
    status = 0
    call FTCLOS(41,status)
    if (status .gt. 0)then
@@ -4143,7 +4183,7 @@ if(out_amp_open)then
       call printerror(status)
    endif
 endif
-if(out_ang_open)then
+if(out_ang_open .and. .not. ampha_handles_closed_early)then
    status = 0
    call FTCLOS(42,status)
    if (status .gt. 0)then

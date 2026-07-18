@@ -21,8 +21,10 @@
 #  13. io_overlap (async tile write) – bit-identical to io_overlap=n across
 #      a 7-tile run (odd tile count exercises the ping-pong buffer join
 #      and end-of-loop cleanup, not just a single-tile no-op)
-#  14. io_write_threads>1 – hard safety clamp holds (forced to 1, warns,
-#      never crashes; guards against the CFITSIO handle-aliasing bug)
+#  14. io_write_threads>1 – bit-identical to io_write_threads=1 across a
+#      7-tile run (T6 raw-write path bypasses CFITSIO for AMP/PHA pixel
+#      writes; guards against the CFITSIO handle-aliasing bug and the
+#      stale-buffer-at-close bug that raw-write mode replaced it with)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -114,10 +116,10 @@ require_timing_csv_row() {
     [[ "$header_cols" -eq "$data_cols" ]] || return 1
 }
 
-# io_overlap must serialize all tile writes against each other (they share
-# a single FITS handle -- io_write_threads_eff is hard-clamped to 1), even
-# though writes overlap in time with the *next* tile's read/mask/prep/
-# compute. This checks that structural invariant directly from the
+# io_overlap must serialize all tile writes against each other (this test
+# runs with the io_write_threads=1 default, so all tiles share a single
+# FITS handle), even though writes overlap in time with the *next* tile's
+# read/mask/prep/compute. This checks that structural invariant directly from the
 # tile_write start/done log markers, since it's a timing-dependent race:
 # bit-identical output comparisons on small/fast test data can pass even
 # when the underlying dispatch logic would crash on production-scale data
@@ -719,39 +721,72 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 14. io_write_threads>1 safety clamp – must be forced to 1, never crash
+# 14. io_write_threads>1 (T6 raw-write) – bit-identical to io_write_threads=1
 # ---------------------------------------------------------------------------
-# io_write_threads>1 opens N read-write FTOPEN handles onto the SAME output
-# file; CFITSIO aliases them onto one shared buffer (fits_already_open()),
-# so concurrent ftpsse() calls on them corrupt that buffer -- this produced
-# a real SIGSEGV on a Setonix run. rm_synthesis.f90 hard-clamps
-# io_write_threads_eff to 1 regardless of the cfg value until a safe write
-# path (T6) lands. This test guards that clamp against ever being silently
-# removed: request io_write_threads=4, and require (a) the run completes
-# rather than crashing, (b) the startup warning fires, and (c) the
-# "opened N handles/cube" parallel-write path was NOT taken.
-section "14. io_write_threads>1 – hard safety clamp holds"
+# io_write_threads>1 used to open N read-write FTOPEN handles onto the SAME
+# output file; CFITSIO aliases them onto one shared buffer
+# (fits_already_open()), so concurrent ftpsse() calls on them corrupted that
+# buffer -- a real SIGSEGV on a Setonix run. That mechanism is gone: N>1 now
+# bypasses CFITSIO for AMP/PHA pixel writes entirely via independent raw
+# STREAM-I/O writes to disjoint byte ranges (write_rm_chunk_raw), with the
+# CFITSIO handle for those two files closed immediately after FTGHAD -- see
+# the "Parallel write handle setup" comment in rm_synthesis.f90 for why the
+# handle can't be left open (ffclos's own data-fill-check machinery treats
+# out-of-band writes it never saw as "past EOF" and zero-fills over them).
+# tile_ra/tile_dec force 7 tiles (32 Dec rows / 5 per tile, uneven
+# remainder) so the RM-chunk split logic is exercised across a tile whose
+# width equals the full output width (fast path) with an uneven trailing
+# tile, not just a single-tile no-op.
+section "14. io_write_threads>1 – bit-identical to io_write_threads=1 (T6)"
 if [[ -x "$BIN_OMP" ]]; then
-    cfg_wtclamp=$(make_cfg "wtclamp" "n" "io_write_threads=4")
-    log_wtclamp="$OUT_DIR/wtclamp.log"
-    rm -f "$OUT_DIR"/wtclamp.*.FITS
-    if run_binary "$BIN_OMP" "$cfg_wtclamp" "$log_wtclamp"; then
-        pass "io_write_threads=4: run completed without crashing"
-        if grep -q "io_write_threads>1 is UNSAFE" "$log_wtclamp"; then
-            pass "io_write_threads=4: safety warning printed"
+    cfg_wt1=$(make_cfg "wt1" "n" "tile_auto=n
+tile_ra=32
+tile_dec=5
+cubestat=y
+io_write_threads=1")
+    cfg_wt4=$(make_cfg "wt4" "n" "tile_auto=n
+tile_ra=32
+tile_dec=5
+cubestat=y
+io_write_threads=4")
+    log_wt1="$OUT_DIR/wt1.log"
+    log_wt4="$OUT_DIR/wt4.log"
+    rm -f "$OUT_DIR"/wt1.*.FITS "$OUT_DIR"/wt4.*.FITS
+
+    if run_binary "$BIN_OMP" "$cfg_wt1" "$log_wt1" && \
+       run_binary "$BIN_OMP" "$cfg_wt4" "$log_wt4"; then
+        pass "io_write_threads=1 and =4: both runs completed without crashing"
+
+        if grep -q "using raw stream writes" "$log_wt4"; then
+            pass "io_write_threads=4: raw-write path confirmed taken"
         else
-            fail "io_write_threads=4: expected safety warning not found in $log_wtclamp"
+            fail "io_write_threads=4: expected raw-write startup message not found in $log_wt4"
         fi
-        if grep -q "Parallel FITS write: opened" "$log_wtclamp"; then
-            fail "io_write_threads=4: unsafe parallel-write path was taken (clamp not effective)"
-        else
-            pass "io_write_threads=4: parallel-write path correctly not taken (clamped to 1)"
+
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP \
+                      PEAK.MAP RM_PEAK.MAP ANG_PEAK.MAP SNR.MAP; do
+            f1="$OUT_DIR/wt1.${suffix}.FITS"
+            f4="$OUT_DIR/wt4.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f4" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f4" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "io_write_threads=4: ${suffix} differs from io_write_threads=1"
+                fi
+            else
+                all_match=0
+                fail "io_write_threads=4: ${suffix} output missing (expected $f1 and $f4)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "io_write_threads=4: all 8 output products bit-identical to io_write_threads=1"
         fi
     else
-        fail "io_write_threads=4: run crashed or failed (see $log_wtclamp) -- clamp regression!"
+        fail "io_write_threads test: OMP run failed (see $log_wt1 / $log_wt4)"
     fi
 else
-    skip "OMP binary not available; skipping io_write_threads clamp test"
+    skip "OMP binary not available; skipping io_write_threads test"
 fi
 
 # ---------------------------------------------------------------------------

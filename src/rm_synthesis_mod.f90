@@ -31,6 +31,7 @@ module rm_synthesis_mod
   public :: sp, dp, int32, int64
   public :: tile_write_job_t, tile_write_dispatch_async, tile_write_join
   public :: do_tile_write
+  public :: host_is_big_endian, write_rm_chunk_raw
   
   ! Include file parameters for RM-synthesis
   integer, parameter :: max_axis = 100
@@ -105,9 +106,19 @@ module rm_synthesis_mod
   ! Platform note: pthread_t is assumed representable as a C long (true for
   ! glibc/x86_64 Linux -- the only supported build target for this tool).
   type :: tile_write_job_t
-    ! AMP/PHA parallel write handles (size n_write_threads each).
-    integer, allocatable :: unit_amp(:), unit_pha(:)
+    ! AMP/PHA: written either through this single CFITSIO handle (ftpsse,
+    ! n_write_threads==1, the always-safe default) or, when
+    ! n_write_threads>1, via raw stream writes straight to path_amp/
+    ! path_pha, bypassing CFITSIO entirely for the pixel data -- see
+    ! write_rm_chunk_raw and use_raw_write below.
+    integer :: unit_amp = 0, unit_pha = 0
+    character(len=272) :: path_amp = ' ', path_pha = ' '
+    ! 0-based byte offset of this HDU's pixel data, from CFITSIO's FTGHAD,
+    ! fetched once by the caller before any tile writes begin. Only
+    ! meaningful (and only used) when use_raw_write is .true.
+    integer(kind=int64) :: datastart_amp = 0_int64, datastart_pha = 0_int64
     integer :: n_write_threads = 1
+    logical :: use_raw_write = .false.
     ! Single-handle outputs.
     integer :: unit_mask = 0, unit_nvalid = 0
     integer :: unit_peak = 0, unit_rmpeak = 0, unit_angpeak = 0, unit_snr = 0
@@ -2802,6 +2813,174 @@ contains
     end if
   end function flag_from_value
 
+  !===========================================================================
+  ! Safe intra-write parallelism for io_write_threads>1 (T6).
+  !===========================================================================
+  ! io_write_threads>1 used to open N CFITSIO handles onto the same output
+  ! file, which CFITSIO silently aliases onto one shared internal buffer
+  ! (fits_already_open() -- see the T4 postmortem in
+  ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md), corrupting that buffer
+  ! under concurrent ftpsse() calls and hard-clamped to 1 as a result.
+  !
+  ! The three routines below make N>1 safe by never asking CFITSIO to
+  ! touch the output file concurrently at all: write_rm_chunk_raw() writes
+  ! pixel data directly to the file's *path* via plain Fortran STREAM I/O,
+  ! completely bypassing CFITSIO's handle/buffer machinery for the pixel
+  ! data. Each call opens its own OS-level file descriptor (via
+  ! `newunit=`), so concurrent calls from different threads -- each
+  ! writing a disjoint byte range -- rely only on the POSIX guarantee that
+  ! writes to disjoint byte ranges of one file are safe from multiple
+  ! threads/processes, not on any assumption about CFITSIO's internals.
+  ! CFITSIO itself is only ever used, on a single handle, to create the
+  ! file and write its header (before this code runs) and to close it
+  ! (after) -- see the "Parallel write handle setup" section in
+  ! rm_synthesis.f90 for how the byte offset these routines need is
+  ! obtained (FTGHAD, called once).
+
+  logical function host_is_big_endian() result(is_be)
+    !! True if the host's native byte order is big-endian. FITS mandates
+    !! big-endian (IEEE-754) for all binary data; every realistic
+    !! deployment target for this tool (x86_64, ARM64 -- Setonix included)
+    !! is little-endian, so write_rm_chunk_raw always ends up swapping in
+    !! practice. Checking at runtime rather than hard-coding "always swap"
+    !! means this is also *correct* (a no-op) on the rare big-endian host,
+    !! instead of silently double-swapping and corrupting the output --
+    !! this is the one piece of this feature where "assume the common
+    !! case" would be an actual portability bug, not just a missed
+    !! optimisation.
+    implicit none
+    integer(int32) :: probe
+    integer(int8) :: bytes(4)
+
+    probe = 1_int32
+    bytes = transfer(probe, bytes)
+    is_be = (bytes(1) == 0_int8)
+  end function host_is_big_endian
+
+  subroutine swap_bytes_r4_inplace(buf, n)
+    !! Reverses the 4 bytes of every real(sp) element of buf, in place.
+    !! Self-inverse (applying it twice restores the original bytes), so
+    !! the same routine converts host-native -> big-endian and back --
+    !! only ever called in the host-native -> big-endian direction here.
+    implicit none
+    integer(kind=int64), intent(in) :: n
+    real(sp), intent(inout) :: buf(n)
+    integer(kind=int64) :: i
+    integer(int8) :: b(4), t
+
+    do i = 1_int64, n
+      b = transfer(buf(i), b)
+      t = b(1); b(1) = b(4); b(4) = t
+      t = b(2); b(2) = b(3); b(3) = t
+      buf(i) = transfer(b, buf(i))
+    end do
+  end subroutine swap_bytes_r4_inplace
+
+  subroutine write_rm_chunk_raw(file_path, datastart, nx_out, ny_out,&
+       &ix_out_beg, ix_out_end, iy_out_beg, iy_out_end,&
+       &rm_beg, rm_end, data)
+    !! Writes one contiguous RM-bin range [rm_beg,rm_end] of one tile's
+    !! output data directly to disk, bypassing CFITSIO's ftpsse for the
+    !! pixel data entirely -- see the module-level comment above for why.
+    !!
+    !! BYTE-OFFSET MATH: `datastart` is the 0-based byte offset of the
+    !! start of this HDU's pixel data (from CFITSIO's FTGHAD, fetched once
+    !! by the caller). For output cube shape (nx_out, ny_out, nrm_out),
+    !! pixel (ix,iy,irm) [1-based] sits at 0-based pixel index
+    !! (irm-1)*ny_out*nx_out + (iy-1)*nx_out + (ix-1) from datastart, i.e.
+    !! byte offset datastart + 4*(that index) for real*4 (BITPIX=-32)
+    !! data -- matching the FITS convention (x fastest, then y, then RM
+    !! slowest) that p_tile_arr/phi_tile_arr already use in memory.
+    !!
+    !! TWO WRITE PATTERNS, chosen by whether the tile spans the cube's
+    !! full RA width (ix_out_beg=1 .and. ix_out_end=nx_out):
+    !!   - full width (the normal/recommended tiling mode -- see the RAM
+    !!     tile planner in rm_synthesis.f90): consecutive output rows
+    !!     follow each other with no gap on disk, so one RM-plane's worth
+    !!     of tile rows is a SINGLE contiguous run -- one write per plane.
+    !!   - partial width (rare: only reached via an explicit tile_ra
+    !!     override, or the "single Dec row still too big" auto-tiler
+    !!     fallback): rows are contiguous in *memory* (p_tile_arr has x as
+    !!     the fastest-varying dimension) but NOT contiguous on *disk*
+    !!     with the next row (the columns outside this tile belong to a
+    !!     different tile and sit in between) -- one write per row.
+    !! Both patterns share one buffer, sized for a single RM-plane and
+    !! reused across the whole chunk; only the number of writes issued
+    !! from it differs.
+    !!
+    !! ENDIANNESS: byte-swapped via swap_bytes_r4_inplace on a *copy*
+    !! (plane_buf) before writing -- the caller's data array (the live
+    !! tile-output buffer) is never modified.
+    implicit none
+    character(len=*), intent(in) :: file_path
+    integer(kind=int64), intent(in) :: datastart
+    integer, intent(in) :: nx_out, ny_out
+    integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
+    integer, intent(in) :: rm_beg, rm_end
+    real(sp), intent(in) :: data(:)
+      !! This thread's contiguous (x,y,rm) chunk: nx_tile*ny_tile reals
+      !! per RM-plane, planes back-to-back -- exactly how p_tile_arr/
+      !! phi_tile_arr are laid out, so the caller just passes a section
+      !! starting at this chunk's first element.
+
+    integer :: u, ios
+    logical :: full_width, need_swap
+    integer(kind=int64) :: row_len, n_rows, plane_elems, plane_stride
+    integer(kind=int64) :: irm, iy_local, mem_off, byte_pos
+    real(sp), allocatable :: plane_buf(:)
+
+    full_width = (ix_out_beg == 1 .and. ix_out_end == nx_out)
+    need_swap  = .not. host_is_big_endian()
+    row_len      = int(ix_out_end - ix_out_beg + 1, kind=int64)
+    n_rows       = int(iy_out_end - iy_out_beg + 1, kind=int64)
+    plane_elems  = row_len * n_rows
+    plane_stride = int(nx_out, kind=int64) * int(ny_out, kind=int64)
+
+    ! newunit= hands back a unit number guaranteed unused by any other
+    ! open file in this process, so concurrent calls from different
+    ! threads never collide on the unit itself; status='old' because
+    ! CFITSIO has already created and header-written this file before any
+    ! raw write is ever dispatched.
+    open(newunit=u, file=trim(file_path), access='stream',&
+    &form='unformatted', status='old', action='write', iostat=ios)
+    if(ios .ne. 0)then
+      call log_message('error','tile_write',&
+      &'write_rm_chunk_raw: failed to open '//trim(file_path))
+      return
+    endif
+
+    allocate(plane_buf(plane_elems))
+    mem_off = 1_int64
+    do irm = int(rm_beg,kind=int64), int(rm_end,kind=int64)
+      plane_buf = data(mem_off : mem_off+plane_elems-1_int64)
+      if(need_swap) call swap_bytes_r4_inplace(plane_buf, plane_elems)
+
+      if(full_width)then
+        byte_pos = datastart&
+        &+ (irm-1_int64)*plane_stride*4_int64&
+        &+ int(iy_out_beg-1,kind=int64)*int(nx_out,kind=int64)*4_int64&
+        &+ 1_int64
+        write(u, pos=byte_pos, iostat=ios) plane_buf
+        if(ios .ne. 0) call log_message('error','tile_write',&
+        &'write_rm_chunk_raw: write failed (full-width) for '//trim(file_path))
+      else
+        do iy_local = 0_int64, n_rows-1_int64
+          byte_pos = datastart&
+          &+ (irm-1_int64)*plane_stride*4_int64&
+          &+ (int(iy_out_beg,kind=int64)-1_int64+iy_local)*int(nx_out,kind=int64)*4_int64&
+          &+ int(ix_out_beg-1,kind=int64)*4_int64 + 1_int64
+          write(u, pos=byte_pos, iostat=ios)&
+          &plane_buf(iy_local*row_len+1_int64 : iy_local*row_len+row_len)
+          if(ios .ne. 0) call log_message('error','tile_write',&
+          &'write_rm_chunk_raw: write failed (row) for '//trim(file_path))
+        enddo
+      endif
+      mem_off = mem_off + plane_elems
+    enddo
+    deallocate(plane_buf)
+    close(u)
+  end subroutine write_rm_chunk_raw
+
   subroutine do_tile_write(job)
     !! Writes one tile's AMP/PHA (RM-chunked, parallel if n_write_threads>1)
     !! plus optional MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR outputs. Callable
@@ -2813,7 +2992,6 @@ contains
     integer :: status, wpar_k
     integer(int64) :: wpar_base, wpar_rem, wpar_nrm_k, wpar_rm_off_k, wpar_buf_off
     integer :: wpar_rm_beg, wpar_rm_end
-    integer :: wpar_fpix(3), wpar_lpix(3)
     integer :: fpixels_out(3), lpixels_out(3)
     integer :: fpixels_nvalid(2), lpixels_nvalid(2)
     real(dp) :: t_stage
@@ -2832,40 +3010,53 @@ contains
     fpixels_out(3) = 1
     lpixels_out(3) = job%nrm_out
 
-    ! --- RM-chunked parallel write for AMP and PHA cubes ---
-    ! Identical decomposition to the non-overlap path: split nrm_out RM bins
-    ! across n_write_threads independent handles, each writing a disjoint
-    ! byte region. For n_write_threads=1 this runs once on the calling
-    ! thread (main thread when inline, the write pthread when async).
-    wpar_base = int(job%nrm_out,kind=int64) / int(job%n_write_threads,kind=int64)
-    wpar_rem  = mod(int(job%nrm_out,kind=int64), int(job%n_write_threads,kind=int64))
-!$omp parallel do if(job%n_write_threads.gt.1)&
-!$omp& num_threads(job%n_write_threads)&
-!$omp& default(none)&
-!$omp& shared(job,wpar_base,wpar_rem,fpixels_out,lpixels_out)&
-!$omp& private(wpar_k,wpar_nrm_k,wpar_rm_off_k,wpar_rm_beg,wpar_rm_end,&
-!$omp&  wpar_buf_off,wpar_fpix,wpar_lpix,status)
-    do wpar_k = 0, job%n_write_threads-1
-       wpar_nrm_k = wpar_base + &
-       &merge(1_int64,0_int64,int(wpar_k,kind=int64).lt.wpar_rem)
-       wpar_rm_off_k = int(wpar_k,kind=int64)*wpar_base + &
-       &min(int(wpar_k,kind=int64),wpar_rem)
-       wpar_rm_beg = int(wpar_rm_off_k) + 1
-       wpar_rm_end = int(wpar_rm_off_k + wpar_nrm_k)
-       wpar_buf_off = wpar_rm_off_k * &
-       &int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64) + 1_int64
-       wpar_fpix = fpixels_out
-       wpar_lpix = lpixels_out
-       wpar_fpix(3) = wpar_rm_beg
-       wpar_lpix(3) = wpar_rm_end
+    ! --- AMP/PHA write: two mutually-exclusive mechanisms ---
+    ! n_write_threads==1 (default, always safe): a single ftpsse() call
+    ! through the one CFITSIO handle already open for this file. There is
+    ! only ever one handle in this branch, so CFITSIO's handle-aliasing
+    ! behaviour (T4 postmortem) has nothing to conflict with.
+    !
+    ! n_write_threads>1: split nrm_out RM bins into n_write_threads
+    ! disjoint chunks and write each with write_rm_chunk_raw(), bypassing
+    ! CFITSIO's ftpsse/handle machinery entirely for the pixel data -- see
+    ! that routine's header comment for why this is what actually makes
+    ! N>1 safe (CFITSIO is never asked to touch the file concurrently from
+    ! more than one place, so its aliasing behaviour never enters into it).
+    if(.not. job%use_raw_write)then
        status = 0
-       call ftpsse(job%unit_amp(wpar_k+1),job%group,3,job%naxes_out,&
-       &wpar_fpix,wpar_lpix,job%p_tile_arr(wpar_buf_off),status)
+       call ftpsse(job%unit_amp,job%group,3,job%naxes_out,&
+       &fpixels_out,lpixels_out,job%p_tile_arr(1),status)
        status = 0
-       call ftpsse(job%unit_pha(wpar_k+1),job%group,3,job%naxes_out,&
-       &wpar_fpix,wpar_lpix,job%phi_tile_arr(wpar_buf_off),status)
-    enddo
+       call ftpsse(job%unit_pha,job%group,3,job%naxes_out,&
+       &fpixels_out,lpixels_out,job%phi_tile_arr(1),status)
+    else
+       wpar_base = int(job%nrm_out,kind=int64) / int(job%n_write_threads,kind=int64)
+       wpar_rem  = mod(int(job%nrm_out,kind=int64), int(job%n_write_threads,kind=int64))
+!$omp parallel do num_threads(job%n_write_threads) default(none)&
+!$omp& shared(job,wpar_base,wpar_rem)&
+!$omp& private(wpar_k,wpar_nrm_k,wpar_rm_off_k,wpar_rm_beg,wpar_rm_end,wpar_buf_off)
+       do wpar_k = 0, job%n_write_threads-1
+          wpar_nrm_k = wpar_base + &
+          &merge(1_int64,0_int64,int(wpar_k,kind=int64).lt.wpar_rem)
+          wpar_rm_off_k = int(wpar_k,kind=int64)*wpar_base + &
+          &min(int(wpar_k,kind=int64),wpar_rem)
+          wpar_rm_beg = int(wpar_rm_off_k) + 1
+          wpar_rm_end = int(wpar_rm_off_k + wpar_nrm_k)
+          wpar_buf_off = wpar_rm_off_k * &
+          &int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64) + 1_int64
+
+          call write_rm_chunk_raw(job%path_amp, job%datastart_amp,&
+          &job%naxes_out(1), job%naxes_out(2),&
+          &job%ix_out_beg, job%ix_out_end, job%iy_out_beg, job%iy_out_end,&
+          &wpar_rm_beg, wpar_rm_end, job%p_tile_arr(wpar_buf_off:))
+
+          call write_rm_chunk_raw(job%path_pha, job%datastart_pha,&
+          &job%naxes_out(1), job%naxes_out(2),&
+          &job%ix_out_beg, job%ix_out_end, job%iy_out_beg, job%iy_out_end,&
+          &wpar_rm_beg, wpar_rm_end, job%phi_tile_arr(wpar_buf_off:))
+       enddo
 !$omp end parallel do
+    endif
 
     if(job%out_mask_open)then
        fpixels_out(3) = 1
