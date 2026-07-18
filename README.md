@@ -51,7 +51,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
 - **[docs/PARALLELISM.md](docs/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
-- **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write and async overlap (T0-T5 adopted; T6, genuine write-throughput parallelism, still a proposal)
+- **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Draft release notes for the anticipated 3.0 (IO-efficiency milestone, in progress)
@@ -192,39 +192,67 @@ mem_frac_vram = 0.70         # fraction of GPU VRAM to budget per sub-block (GPU
 io_read_threads = 4          # N independent read-only FITS handles per input
                               # cube, each reading a disjoint channel range.
                               # Safe to increase (try your Lustre stripe count).
-io_write_threads = 1         # DO NOT SET ABOVE 1 -- see warning below.
+io_write_threads = 1         # N-way parallel AMP/PHA writes via raw stream
+                              # I/O (bypasses CFITSIO for pixel data). Safe
+                              # to increase (try your Lustre stripe count).
 io_overlap = n               # y: overlap tile N's write with tile N+1's
                               # read/mask/prep/compute on a background thread.
 ```
 
-**`io_write_threads` must stay at `1`.** Setting it higher used to open
-multiple read-write handles onto the same output file for parallel
-RM-chunked writes, but CFITSIO aliases repeat read-write opens of an
-already-open file onto one shared internal buffer — the "independent"
-handles aren't independent, and concurrent writes through them corrupted
-that shared state badly enough to crash with a segfault on a real run.
-The code now hard-clamps `io_write_threads_eff` to `1` and prints a
-warning if you request more, so this is safe to leave in a config file,
-but there is currently no way to get a working speed-up from this key.
-See `docs/ARCHITECTURE.md` ("Parallel write — `io_write_threads`") for the
-full root cause.
+**`io_write_threads>1` bypasses CFITSIO for AMP/PHA pixel writes.**
+Setting it higher used to open multiple read-write handles onto the same
+output file for parallel RM-chunked writes, but CFITSIO aliases repeat
+read-write opens of an already-open file onto one shared internal
+buffer — the "independent" handles weren't independent, and concurrent
+writes through them corrupted that shared state badly enough to crash
+with a segfault on a real run. Rather than clamp this to 1 forever, each
+RM-chunk is now written by an independent Fortran STREAM unit directly to
+its byte offset (computed once via `FTGHAD`), relying only on the POSIX
+guarantee that concurrent writes to disjoint byte ranges of one file are
+safe — CFITSIO itself is closed for these two files as soon as that byte
+offset is fetched, before any tile write happens, so there's no shared
+handle left to corrupt. See `docs/ARCHITECTURE.md` ("Parallel write —
+`io_write_threads`") for the full root cause and the design.
 
-**`io_overlap`'s writes are fully serialized against each other, by
-design.** Every tile's write shares the same single output handle (see
-above), so `io_overlap` guarantees at most one write is ever in flight —
-enforced with a blocking `pthread_join()` before dispatching the next
-one, not a timing-dependent assumption. (An earlier version of this
-feature only checked this per double-buffer slot, which left a gap: a
-small/fast tile immediately after a large/slow one — e.g. the leftover
-partial tile at the bottom of an image whose height isn't an exact
-multiple of the tile size — could dispatch its write before the previous
-tile's write had finished, corrupting CFITSIO's shared handle state.
-Fixed and re-validated end-to-end on the exact case that crashed; see the
-T5 postmortem in `docs/ARCHITECTURE.md` / `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`.)
+**`io_overlap`'s writes are still serialized against each other, by
+design — independent of `io_write_threads`.** `io_overlap` guarantees at
+most one tile's write is ever in flight — enforced with a blocking
+`pthread_join()` before dispatching the next one, not a timing-dependent
+assumption. (An earlier version of this feature only checked this per
+double-buffer slot, which left a gap: a small/fast tile immediately after
+a large/slow one — e.g. the leftover partial tile at the bottom of an
+image whose height isn't an exact multiple of the tile size — could
+dispatch its write before the previous tile's write had finished,
+corrupting CFITSIO's shared handle state at the time. Fixed and
+re-validated end-to-end on the exact case that crashed; see the T5
+postmortem in `docs/ARCHITECTURE.md` / `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`.)
 This doesn't reduce the actual overlap benefit — tile N+1's
 read/mask/prep/compute/cubestat already run fully concurrently with
-write(N) regardless; only *dispatch* of write(N+1) waits for write(N)'s
-handle to free up, which write(N) has almost always already done by then.
+write(N) regardless; only *dispatch* of write(N+1) waits for write(N) to
+finish, which write(N) has almost always already done by then. Both
+`io_write_threads>1` and `io_overlap=y` together are validated
+bit-identical to the fully serial path.
+
+**`io_write_threads` and `io_overlap` are independent keys — use either
+alone, or both.** `io_write_threads=N>1` with `io_overlap=n` still gives
+each tile's write N-way parallelism; it just means the main thread waits
+for that write to finish before starting the next tile's read (no
+hide-behind-the-next-tile benefit, but also no doubled RAM buffers). Set
+`io_overlap=y` on top only once you also have the RAM and the parallel
+storage to benefit from it (see below).
+
+**Thread budget: give compute all your cores; read/write don't need
+their own.** `OMP_NUM_THREADS` should be all available cores — it's the
+only genuinely CPU-bound thread type here. `io_read_threads` never
+competes with compute (they run sequentially on the main thread, same
+tile), so it's essentially free to set to your storage's stripe count.
+`io_write_threads` *does* run concurrently with the next tile's compute
+when `io_overlap=y`, but read/write threads spend most of their time
+blocked on the actual disk/network operation rather than burning CPU, so
+a modest value (stripe count, typically 4–16) costs little even stacked
+on top of a fully-subscribed compute pool — just don't set it close to
+your full core count. Full mechanics (which threads share libgomp's pool
+and which don't) in `docs/PARALLELISM.md` ("Thread-pool interplay").
 
 **`io_overlap` is not a free win — check your RAM and disk before turning
 it on.** It doubles the RAM used by the per-tile output buffers (to let a

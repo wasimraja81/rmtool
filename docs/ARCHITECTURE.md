@@ -216,50 +216,119 @@ runs once — bit-identical to the prior serial path.
 
 #### Parallel write — `io_write_threads`
 
-RM-bin-chunked parallel writes using `N` independent readwrite CFITSIO
-handles per output cube (AMP and PHA).  Each thread writes a disjoint RM-bin
-range of the tile output buffer to non-overlapping byte regions of the file.
+RM-bin-chunked parallel writes for the AMP and PHA output cubes. Each
+thread writes a disjoint RM-bin range of the tile output buffer directly
+to its byte range on disk via independent Fortran STREAM I/O
+(`write_rm_chunk_raw` in `rm_synthesis_mod.f90`), bypassing CFITSIO's
+`ftpsse`/handle machinery for the pixel data entirely.
 
 ```
 Serial (io_write_threads=1):
-  thread 0:  write rm 1..nrm (AMP)   then write rm 1..nrm (PHA)
+  thread 0:  ftpsse rm 1..nrm (AMP)   then ftpsse rm 1..nrm (PHA)
 
 Parallel (io_write_threads=N):
-  thread 0:  write rm   1..nrm/N  (AMP + PHA)  ─┐
-  thread 1:  write rm nrm/N+1..   (AMP + PHA)  ├─ simultaneous
-  …                                              ─┘
+  thread 0:  raw-write rm   1..nrm/N  (AMP + PHA)  ─┐
+  thread 1:  raw-write rm nrm/N+1..   (AMP + PHA)  ├─ simultaneous
+  …                                                  ─┘
 ```
 
 | Property | Value |
 |---|---|
 | Decomposition axis | RM (slowest axis in output cube) |
-| Output files parallelised | AMP cube (unit 41) and PHA cube (unit 42) |
-| 2D map outputs (NVALID, MASK, cubestat) | Remain serial — negligible cost |
+| Output files parallelised | AMP cube and PHA cube |
+| Mechanism (N>1) | Independent `newunit=` STREAM units, one `open`/`write`/`close` cycle per thread per RM-chunk, byte position computed from `datastart + pixel_offset*4` |
+| 2D map outputs (NVALID, MASK, cubestat) | Remain serial via `ftpsse`/`ftpssb`/`ftpssi` — negligible cost |
 
-For `io_write_threads=1` (default): `par_wunit_amp(1)=41`,
-`par_wunit_pha(1)=42` alias existing handles — zero overhead.
+For `io_write_threads=1` (default): a single `ftpsse` call per tile through
+the one CFITSIO handle already open for the file, unchanged from the
+original serial path — bit-identical, zero overhead.
 
-> **⚠ `io_write_threads>1` is currently unsafe — keep it at 1.**
-> The table above originally claimed "concurrent `pwrite()` to
-> non-overlapping byte regions is guaranteed safe" and "CFITSIO metadata
-> updated only at close." Neither holds. `FTOPEN(...,1,...)` (read-write)
-> called N times on the *same* file does not give N independent handles:
+For `io_write_threads>1`: **CFITSIO's handle for the AMP/PHA files
+(units 41/42) is closed immediately** after `FTGHAD` fetches the
+data-start byte offset (`datastart_amp`/`datastart_pha` in
+`rm_synthesis.f90`), *before* any tile write happens — see the postmortem
+below for why this early close is load-bearing, not just tidiness.
+`write_rm_chunk_raw` computes every subsequent byte position by pure
+arithmetic from that one fetched offset:
+
+```
+byte_pos = datastart + (irm-1)*ny_out*nx_out*4 + (iy_out_beg-1)*nx_out*4 + 1
+```
+
+Each RM-chunk's plane data is copied into a scratch buffer, byte-swapped
+to big-endian in place (`host_is_big_endian`/`swap_bytes_r4_inplace` —
+checked at runtime, not assumed, so this is also correct on a big-endian
+host), and written with a single `write(u, pos=byte_pos) plane_buf` per
+RM-plane when the tile spans the cube's full RA width (the recommended
+tiling mode — one contiguous run per plane), or one `write` per row when
+it doesn't (rare: only reached via an explicit `tile_ra` override or the
+single-Dec-row auto-tiler fallback).
+
+> **History: `io_write_threads>1` was unsafe from 2.0 through most of the
+> 3.0 cycle, before this raw-write mechanism replaced the CFITSIO-handle
+> approach.** The original design opened N independent
+> `FTOPEN(...,1,...)` (read-write) handles onto the same file, on the
+> (false) assumption that this gave N independent CFITSIO buffers.
 > CFITSIO's `fits_already_open()` (`cfitsio-4.3.1/cfileio.c:1512-1520,1653`)
 > explicitly aliases repeat read-write opens of an already-open file onto
 > one shared `FITSfile` buffer — by CFITSIO's own design ("the file MUST
-> only be physically opened once"). Read-only opens are exempted from this
-> aliasing for the opposite reason CFITSIO gives: *"2 different threads
-> cannot share the same FITSfile pointer"* — which is exactly why
-> `io_read_threads` is safe and `io_write_threads` is not. Concurrent
-> `ftpsse` calls on the "N" write handles from `!$omp parallel do` corrupt
-> CFITSIO's shared buffer bookkeeping. Confirmed against a real crash: a
-> SIGSEGV inside `memmove`, deep in unsymbolised `libcfitsio.so` frames,
-> immediately after the first tile's compute finished with
-> `io_write_threads=4` in the log. Fixing this for real needs either
-> genuine multi-process writers (CFITSIO's alias table is per-process) or
-> bypassing CFITSIO for the pixel write (`pwrite()` at a byte offset from
-> `fits_get_hduaddrll`, with manual big-endian byte-swapping) — not yet
-> implemented; see `planning/IO_PARALLEL_OPTIMISATION_PLAN.md` T6.
+> only be physically opened once"). Read-only opens are exempted from
+> this aliasing for the opposite reason CFITSIO gives: *"2 different
+> threads cannot share the same FITSfile pointer"* — which is exactly why
+> `io_read_threads` was safe from the start and the original
+> `io_write_threads` design was not. Concurrent `ftpsse` calls on the "N"
+> write handles from `!$omp parallel do` corrupted CFITSIO's shared
+> buffer bookkeeping, confirmed against a real crash: a SIGSEGV inside
+> `memmove`, deep in unsymbolised `libcfitsio.so` frames, immediately
+> after the first tile's compute finished with `io_write_threads=4` in
+> the log. Hard-clamped to 1 as an interim measure until the raw-write
+> mechanism above (T6) replaced the whole approach — no CFITSIO handle is
+> ever opened more than once for these files now, so there is nothing
+> left for `fits_already_open()` to alias.
+
+#### Postmortem: stale CFITSIO buffer flush zeroed raw-written pixel data (found while implementing T6)
+
+The first version of the raw-write mechanism kept the CFITSIO handle for
+units 41/42 open until the very end of the program (as the serial path
+always had), only using it for header keywords and calling `FTCLOS` at
+final cleanup alongside every other output file. This produced silent
+data loss, not a crash: every raw write reported `iostat=0` and read back
+correctly immediately afterward, `datastart`/`dataend` were confirmed
+correct, and the file was the right size — but after the program exited,
+every AMP/PHA pixel was `0.0`.
+
+Bisected by reading the file's own bytes from inside the running program,
+directly before and after the final `FTCLOS(41,...)` call: the pixel data
+was intact right up to that call and zero immediately after it, with
+`FTGHAD` re-queried at that same point confirming `datastart`/`dataend`
+hadn't shifted (ruling out a header-growth/data-relocation explanation).
+Tracing CFITSIO 4.3.1's own source confirmed the mechanism: `ffclos` →
+`ffchdu` → `ffpdfl` ("insure correct data fill values") checks/pads the
+tail of the data unit against CFITSIO's own `Fptr->filesize`/
+`Fptr->logfilesize` bookkeeping — fields updated *only* by CFITSIO's own
+write calls. Since the raw stream writer never went through CFITSIO, that
+bookkeeping never advanced past "header only" for the whole run. When
+`ffpdfl` (via `ffmbyt`/`ffldrc` in `buffers.c`) tried to check the real
+end of the pixel data, it saw a position past its own stale `filesize`,
+concluded "past EOF", and fabricated an all-zero in-memory buffer marked
+dirty — which then got flushed to disk by `ffflsh`, overwriting the real
+data with zeros.
+
+**Fix:** close the CFITSIO handle for AMP/PHA right after `FTGHAD`, before
+any raw write happens, so CFITSIO's bookkeeping for that file is retired
+(and its buffers freed) before there is anything to disagree with. The
+final cleanup section skips re-closing units 41/42 when this early close
+already happened (`ampha_handles_closed_early` flag in
+`rm_synthesis.f90`), avoiding a double-close error.
+
+**Why this wasn't caught immediately:** the bug is invisible to anything
+that checks "did the write report an error" or "is the data on disk right
+after I wrote it" — both were true. It only shows up in the *final*
+on-disk state, after a CFITSIO call that has nothing to do with pixel
+data on its face ("close the file"). `tests/run_tests.sh` §14 now
+compares full AMP/PHA/MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR output
+bit-for-bit between `io_write_threads=1` and `=4` specifically because a
+mid-write `iostat` check would not have caught this class of bug.
 
 #### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
 
@@ -346,6 +415,28 @@ they were never at risk of the `io_write_threads>1` handle-aliasing
 hazard above — but a *separate* write-vs-write hazard was, and did,
 happen; see the postmortem below.
 
+**Thread-pool cost of this design.** The independence from OpenMP's team
+model that makes the pthread safe also means it doesn't *share* anything
+with the main thread's OpenMP teams — it competes with them for cores
+instead. libgomp's worker-thread pool is owned by whichever host thread
+first encounters a parallel region, not shared globally; verified
+empirically (a background pthread and the main thread each entering
+their own 4-thread `omp parallel` region at the same instant produced 8
+distinct OS threads running fully concurrently, not 4 shared between
+them). Concretely: the write pthread — spawned fresh per tile by
+`tile_write_dispatch_async` — is, itself, always +1 OS thread on top of
+whatever the main thread is doing. If `io_write_threads>1` as well, that
+pthread's own `!$omp parallel do` over RM-chunks spins up a *second*,
+separate team of that many OS threads (fresh every tile, since the
+pthread itself is fresh every tile), fully additive to the main thread's
+concurrent read or compute team. This is usually cheap in practice —
+read/write threads are I/O-bound (mostly blocked on the actual
+disk/network operation) rather than CPU-bound like compute, so the OS
+scheduler gives compute the core time whenever a read/write thread is
+blocked — but it is genuine core oversubscription, not something the
+runtime silently avoids. See `docs/PARALLELISM.md` ("Thread-pool
+interplay") for the full breakdown and a thread-count rule of thumb.
+
 **Double buffering.** `p_tile_arr`, `phi_tile_arr`, `mask_tile_arr`,
 `nvalid_tile_arr`, and the four cubestat maps (when `cubestat=y`) are
 `pointer, contiguous` in `rm_synthesis.f90`, each backed by two physical
@@ -367,14 +458,20 @@ hazards:
    still reading.
 2. *Handle safety* — before **any** new write is dispatched, whichever
    write is currently outstanding (either slot) is joined first,
-   unconditionally. `io_write_threads_eff` is hard-clamped to 1, so every
-   tile's write shares the exact same two FITS handles regardless of
-   slot; two pthreads calling `ftpsse` on the same handle at once is
-   unsafe no matter how well the buffers are separated. This rule is what
-   actually prevents concurrent writes — rule 1 alone does not (see
-   postmortem below) — and it costs nothing in the common case, since a
-   tile's write almost always finishes before the next tile's own
-   pipeline does anyway.
+   unconditionally, regardless of `io_write_threads`. This predates the
+   T6 raw-write mechanism, from when every tile's write shared the same
+   two FITS handles regardless of slot and two pthreads calling `ftpsse`
+   on the same handle at once was unsafe no matter how well the buffers
+   were separated (see postmortem below) — that hazard is what motivated
+   the rule. It remains in force unconditionally today, including under
+   `io_write_threads>1`'s raw-write path (each tile's own RM-chunks
+   already write to genuinely disjoint byte ranges via independent
+   stream units, so two *different* tiles' writes could in principle also
+   overlap safely by the same POSIX guarantee — but the rule doesn't
+   special-case that, since it costs nothing: a tile's write almost
+   always finishes before the next tile's own read/mask/prep/compute
+   pipeline does anyway, so the join is rarely the thing actually being
+   waited on).
 
 Both slots are also joined unconditionally after the tile loop ends,
 since the last two tiles' writes never get a "reused two tiles later"
@@ -478,14 +575,19 @@ would have taken ~68 minutes; the actual overlapped run took 2586.7s
 differently (mostly by hiding write behind *compute* now, since read
 got fast enough on its own to no longer be the thing doing the hiding).
 
-**Implication for what to build next:** `io_read_threads` and
-`io_overlap` have both done their job — write is now overwhelmingly the
-dominant cost (96% of wall time) specifically *because* it's stuck at a
-single serial handle (`io_write_threads` hard-clamped to 1). This makes
-T6 (genuine write-throughput parallelism) the highest-value remaining
-work, not a nice-to-have: unlike the read/overlap work, which was
-fighting a bottleneck that was already a *minority* of wall time, T6
-would be attacking the piece that is now, by a wide margin, most of it.
+**Implication that motivated T6:** `io_read_threads` and `io_overlap` had
+both done their job — write was overwhelmingly the dominant cost (96% of
+wall time) specifically *because* it was stuck at a single serial handle
+(`io_write_threads` hard-clamped to 1 at the time this run was measured).
+That made T6 (genuine write-throughput parallelism, described above) the
+highest-value remaining work rather than a nice-to-have: unlike the
+read/overlap work, which was fighting a bottleneck that was already a
+*minority* of wall time, T6 was attacking the piece that was, by a wide
+margin, most of it. T6 has since landed (see "Parallel write —
+`io_write_threads`" above); a production-scale Setonix rerun to measure
+the actual wall-time improvement from raw-write parallelism is still
+pending — the validation so far is bit-identical correctness on
+dev-machine test data, not a production throughput measurement.
 
 #### When `io_overlap=y` can be detrimental
 

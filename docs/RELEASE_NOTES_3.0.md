@@ -1,19 +1,22 @@
 # Release Notes 3.0 (draft — in progress)
 
-Status: **milestone checkpoint on `develop`, not yet tagged**. This document
-describes the IO-efficiency work anticipated to ship as `3.0`. T6 (genuine
-write-throughput parallelism) is expected to land before the formal tag.
+Status: **milestone checkpoint on `optimise-io`, not yet tagged**. This
+document describes the IO-efficiency work anticipated to ship as `3.0`.
+All planned tickets (T0-T6) are now done; what remains before a formal tag
+is production-scale Setonix validation of T6's actual throughput gain (see
+"What's next" below) and merging to `develop`.
 
 ## Summary
 
 rmtool 3.0 targets IO efficiency for large cubes that don't fit in memory:
-parallel channel reads, a parallel-write mechanism (subsequently found unsafe
-above 1 thread and hard-capped there), and asynchronous tile-write overlap so
-a tile's write can proceed on a background thread concurrently with the next
-tile's read/compute. Two real, production-scale bugs were found and fixed
-during this cycle rather than in the field — both are documented in detail
-in `docs/ARCHITECTURE.md` and `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`,
-since they carry lessons (about CFITSIO's threading model and about what
+parallel channel reads, genuine parallel writes via raw stream I/O,
+asynchronous tile-write overlap so a tile's write can proceed on a
+background thread concurrently with the next tile's read/compute, and the
+crash/correctness work that came with building all three. Three real,
+production-scale bugs were found and fixed during this cycle rather than
+in the field — all are documented in detail in `docs/ARCHITECTURE.md` and
+`planning/IO_PARALLEL_OPTIMISATION_PLAN.md`, since they carry lessons
+(about CFITSIO's threading model, its own internal bookkeeping, and what
 bit-identical output tests can and can't catch) that matter for anyone
 extending this code later.
 
@@ -25,15 +28,19 @@ extending this code later.
   opens the way it does read-write opens (confirmed against the CFITSIO
   source). Default (`io_read_threads=1`) is bit-identical to the prior
   serial path.
-- **Parallel writes** (`io_write_threads`): implemented, but found to be
-  unsafe above 1 during this cycle — CFITSIO aliases repeat read-write
-  opens of an already-open file onto one shared internal buffer, so the
-  "independent" handles corrupt each other under concurrent writes. This
-  produced a real SIGSEGV during testing. **Hard-clamped to 1 at runtime**
-  regardless of the cfg value, with a startup warning if a higher value is
-  requested. Fixing this for real (T6) needs either genuine multi-process
-  writers or bypassing CFITSIO with raw `pwrite()` at pre-computed byte
-  offsets.
+- **Parallel writes** (`io_write_threads`): N independent Fortran STREAM
+  I/O units write disjoint RM-bin byte ranges of the AMP/PHA output cubes
+  directly, bypassing CFITSIO's `ftpsse`/handle machinery for pixel data
+  entirely — relying only on the POSIX guarantee that concurrent writes
+  to disjoint byte ranges of one file are safe. The original design (N
+  independent read-write CFITSIO handles) was found unsafe during this
+  cycle — CFITSIO aliases repeat read-write opens of an already-open file
+  onto one shared internal buffer, producing a real SIGSEGV during
+  testing — and was hard-clamped to 1 as an interim measure. That
+  mechanism is now gone entirely: CFITSIO's handle for these two files is
+  closed as soon as the byte offset it's needed for is fetched, before
+  any raw write happens, so there's no CFITSIO state left for the raw
+  writes to conflict with.
 - **Async tile-write overlap** (`io_overlap`): a tile's write runs on a
   background POSIX thread (`pthread_create`/`pthread_join`), concurrent
   with the next tile's read/mask/prep/compute/cubestat. Deliberately not
@@ -56,7 +63,7 @@ extending this code later.
   includes a stage-time-totals bar panel; the side-panel thread list was
   trimmed to a count.
 
-## Two production bugs, found and fixed during this cycle
+## Three production bugs, found and fixed during this cycle
 
 1. **`io_write_threads>1` handle aliasing.** CFITSIO's `fits_already_open()`
    explicitly aliases repeat read-write opens of an already-open file onto
@@ -64,7 +71,9 @@ extending this code later.
    exempted for the opposite reason). Concurrent `ftpsse` calls on the
    resulting "independent" handles corrupted that shared buffer, producing
    a SIGSEGV inside `memmove` deep in `libcfitsio.so`. Root-caused against
-   the vendored CFITSIO source; fixed by hard-clamping to one handle.
+   the vendored CFITSIO source; fixed by hard-clamping to one handle as an
+   interim measure, then permanently by the T6 raw-write mechanism below
+   (which never opens more than one CFITSIO handle onto the file at all).
 2. **`io_overlap` write-vs-write race.** The first version only guarded
    buffer-slot reuse (joining a slot's previous write when that same slot
    was needed again, two tiles later) — it never guaranteed the
@@ -77,13 +86,33 @@ extending this code later.
    dispatching a new one — a hard `pthread_join()` barrier, not a
    probabilistic race avoidance, so "at most one write in flight" is now
    a structural guarantee independent of tile timing.
+3. **Stale CFITSIO buffer flush zeroed T6's raw-written data.** Found
+   during T6 development, before it ever shipped. The first raw-write
+   implementation kept the CFITSIO handle for the AMP/PHA files open
+   until final program cleanup (as the serial path always had); every raw
+   write reported success and read back correctly immediately afterward,
+   but every pixel was zero once the program exited. Root cause: CFITSIO
+   tracks its own "how big is this file" bookkeeping, updated only by its
+   own write calls — since the raw writer never went through CFITSIO,
+   that bookkeeping stayed pinned at "header only" all run. At final
+   close, CFITSIO's data-fill-check saw the real (raw-written) data as
+   "past its own stale end of file," treated that as uninitialized space
+   needing zero-fill, and overwrote it. Fixed by closing CFITSIO's handle
+   for these two files immediately after fetching the byte offset it
+   provides, before any raw write happens — retiring CFITSIO's
+   bookkeeping before there's anything left for it to disagree with.
 
-Neither bug was caught by bit-identical output comparisons on small/fast
-test data, because both are timing-dependent races invisible when every
-stage finishes in milliseconds regardless. The test suite now also
-includes structural checks (an explicit "no two writes overlap in time"
-assertion, and an `io_write_threads=4` safety-clamp check) that verify the
-actual concurrency invariants, not just output correctness.
+Bugs 1 and 2 were timing-dependent races, invisible on small/fast test
+data where every stage finishes in milliseconds regardless of ordering —
+bit-identical output comparisons alone could not have caught them. Bug 3
+was deterministic (reproduced on every run) but only visible in the
+*final* on-disk state, after a call ("close the file") that has nothing
+to do with pixel data on its face — every write-time signal available
+(iostat, an immediate read-back) reported success. The test suite now
+includes structural checks alongside output comparisons: an explicit
+"no two writes overlap in time" assertion for bug 2, and a full
+bit-for-bit `io_write_threads=1` vs `=4` comparison across all 8 output
+products (run to completion, including final close) for bug 3.
 
 ## Real-world validation
 
@@ -123,24 +152,34 @@ it's capped at a single serial handle.
 - RM synthesis numerical output is unchanged; all of this cycle's work is
   IO orchestration, not compute-kernel changes (Non-Negotiable Guardrail
   preserved throughout).
-- `io_write_threads>1` remains accepted in a cfg file without erroring —
-  it just has no effect beyond a startup warning, so existing configs
-  that set it are safe but get no speed-up from it.
+- `io_write_threads>1` now actually parallelises AMP/PHA writes rather
+  than being accepted-but-ignored; existing configs that set it will see
+  a behaviour change (real speed-up instead of a silent no-op), though
+  output remains bit-identical to `io_write_threads=1`.
 
 ## Validation snapshot
 
 - Build matrix: CPU serial, CPU OMP, GPU offload, GPU offload + host OMP
   built successfully with zero compiler warnings.
-- Tests: full suite passing (`28/28`), including the new structural
-  concurrency-invariant checks.
-- Production: end-to-end validated on real Setonix hardware against real
-  ASKAP/EMU data — the exact case that originally crashed now completes
-  without error.
+- Tests: full suite passing (`28/28`), including the structural
+  concurrency-invariant check for `io_overlap` and the bit-for-bit
+  `io_write_threads=1` vs `=4` comparison for T6.
+- Production (`io_read_threads`, `io_overlap`): end-to-end validated on
+  real Setonix hardware against real ASKAP/EMU data — the exact case that
+  originally crashed now completes without error.
+- T6 (`io_write_threads>1` raw-write mechanism): validated bit-identical
+  on dev-machine test data only so far, including combined with
+  `io_overlap=y`. Production-scale Setonix validation is the main
+  remaining item before this ships as a tagged `3.0` — see "What's next".
 
 ## What's next (before formal `3.0` tag)
 
-- T6: genuine write-throughput parallelism (multi-process writers, or
-  bypassing CFITSIO with raw `pwrite()` at pre-computed byte offsets) —
-  see `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`.
+- Benchmark `io_write_threads=N` on real Setonix-scale data to measure
+  T6's actual write-throughput improvement — the Setonix run that
+  motivated building T6 in the first place (write at 96% of wall time,
+  see `docs/ARCHITECTURE.md`) is the case this should be measured
+  against. Everything above is correctness validation, not yet a
+  production timing result.
 - Benchmark `io_read_threads=N` against the Lustre stripe count on
   Setonix to tune the recommended default.
+- Merge `optimise-io` to `develop` and tag `3.0` once the above lands.

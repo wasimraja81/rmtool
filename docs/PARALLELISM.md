@@ -5,18 +5,29 @@ RAM/VRAM, and distributes work across CPU cores or GPU threads.
 
 ---
 
-## 1 — Serial FITS Load into RAM (Tiled I/O)
+## 1 — Tiled FITS I/O: read, write, and cross-tile overlap
 
 The full sky image is too large to hold in RAM at once (e.g. 25k×25k×236
 channels). The code reads it in **spatial tiles** chosen to fit within a
-user-controlled fraction of available RAM (`mem_frac_ram`).
+user-controlled fraction of available RAM (`mem_frac_ram`). The *tile
+loop itself* is always serial (tile N+1 is never computed before tile N
+is), but each tile's read, write, and the boundary between consecutive
+tiles can each independently be made concurrent via three orthogonal cfg
+keys — `io_read_threads`, `io_write_threads`, and `io_overlap`. All three
+default to the fully serial behaviour below; see
+`docs/ARCHITECTURE.md` ("Parallel read/write" and "Async read/write
+overlap") and `planning/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full
+design, safety history, and postmortems.
 
 ```
 DISK  ─────────────────────────────────────────────────────────────────────────
   Q.FITS  [nx_total × ny_total × nz_out]   (e.g. 25600 × 25600 × 236 ch)
   U.FITS  [nx_total × ny_total × nz_out]
             │
-            │  FTGSVE  (CFITSIO strided sub-image read)  ← serial, one tile
+            │  FTGSVE  (CFITSIO strided sub-image read)
+            │    io_read_threads=1 (default): one serial call
+            │    io_read_threads=N: N read-only CFITSIO handles, each
+            │    reading a disjoint channel range concurrently
             ▼
 RAM  ──────────────────────────────────────────────────────────────────────────
   specQ  [tile_ra × tile_dec × nz_out]     flat float32 array
@@ -27,17 +38,97 @@ RAM  ─────────────────────────
         └─ input mask FITS       (if provided)
 ```
 
-The outer loops over tiles are **purely serial** — tiles are processed one at a
-time, each written back to the output FITS before the next tile is read:
+The outer loop over tiles is always serial — tile N+1's read never starts
+before tile N's compute has produced the data its own write depends on —
+but write(N) and read/compute(N+1) touch entirely different files (output
+AMP/PHA vs. input Q/U) with no data dependency between them, so they can
+run concurrently instead of one waiting on the other:
 
 ```
-for ix_tile = xpix_beg … xpix_end  step tile_ra          ← serial
-  for iy_tile = ypix_beg … ypix_end  step tile_dec        ← serial
-    FTGSVE → specQ, specU                                  ← serial disk read
-    build mask_tile_arr                                    ← serial single pass
-    extract P(RM, pixel)  [CPU or GPU — see §2/§3]
-    FTPSSE → output FITS                                   ← serial disk write
+Fully serial (io_overlap=n, default):
+for ix_tile, iy_tile  (serial)
+    FTGSVE → specQ, specU                     ← read (parallel if io_read_threads>1)
+    build mask_tile_arr                        ← serial single pass
+    extract P(RM, pixel)                       ← CPU or GPU, see §2/§3
+    write AMP/PHA/… → output FITS               ← write (parallel if io_write_threads>1)
+                                                   ^ next tile's read waits for this
+
+Overlapping (io_overlap=y):
+  tile N:   read → mask → prep → compute → write(N) ──────────────┐
+  tile N+1:                                   read → mask → prep → compute → write(N+1)
+                                                    ^ write(N) now runs on a background
+                                                      pthread, hidden behind tile N+1's
+                                                      own read/mask/prep/compute
 ```
+
+**Write parallelism (`io_write_threads`)**, independent of the above:
+each tile's AMP/PHA write splits its RM bins into N disjoint chunks, each
+written by its own Fortran STREAM I/O unit directly to its byte offset —
+bypassing CFITSIO's write path for pixel data entirely, so N independent
+writes to disjoint byte ranges of the same file are POSIX-safe. 2D map
+outputs (MASK, NVALID, cubestat) always write via a single serial CFITSIO
+call regardless of `io_write_threads` — their cost is negligible next to
+the RM cube writes.
+
+`io_overlap`'s background write and `io_write_threads`'s RM-chunk split
+compose: the write pthread dispatched for tile N can itself fan out into
+N raw-write threads, all while tile N+1's read/compute proceeds on the
+main thread. Both are validated bit-identical to the fully serial path,
+together and separately. **The two keys are fully independent** — either
+can be set without the other:
+
+| `io_write_threads` | `io_overlap` | Behaviour |
+|---|---|---|
+| 1 | n | Fully serial — pre-T5/T6 behaviour |
+| N>1 | n | Each tile's write is N-way parallel, but the main thread waits for it to finish before starting the next tile's read |
+| 1 | y | Write(N) hidden behind tile N+1's read/compute, but the write itself is a single serial writer |
+| N>1 | y | Both: write(N) is N-way parallel *and* hidden behind tile N+1 |
+
+If RAM is tight (so `io_overlap`'s doubled buffers are a problem) but the
+output storage is parallel (Lustre/NFS/cloud), `io_write_threads=N>1`
+alone with `io_overlap=n` is a lower-memory way to still get a real write
+speedup — you just don't get the "hide it behind the next tile" benefit
+on top.
+
+### Thread-pool interplay: how `OMP_NUM_THREADS`, `io_read_threads`, `io_write_threads`, and `io_overlap` actually share cores
+
+Every `!$omp parallel do` region draws its worker OS threads from
+libgomp's thread pool — but that pool is **owned by whichever host
+thread encounters the region**, not shared globally across threads.
+Verified empirically: a background pthread and the main thread each
+entering their own 4-thread `omp parallel` region at the same instant
+produced **8 distinct OS threads running fully concurrently** — not 4
+threads shared between the two regions, serializing them. Practically:
+
+| Mechanism | Which thread runs it | Threads it uses | Concurrent with |
+|---|---|---|---|
+| `io_read_threads=N` | Main thread | Up to N, from the main thread's own pool — reused for every `!$omp parallel do` the main thread issues | Nothing else: read finishes before mask/prep/compute starts, same tile, same thread |
+| Mask/prep/compute (`OMP_NUM_THREADS`) | Main thread | Up to `OMP_NUM_THREADS`, same pool as read | The **write pthread**, if `io_overlap=y` and a previous tile's write is still running |
+| `io_overlap=y` write dispatch | A fresh pthread, spawned per tile (`tile_write_dispatch_async`) | Just the pthread itself (1 extra OS thread) if `io_write_threads=1` | The main thread's entire next-tile read → mask → prep → compute → cubestat sequence |
+| `io_write_threads=N>1` | The write pthread (not the main thread) | A **second, separate** pool of N OS threads — created fresh every tile, since the write pthread itself is fresh every tile | Whatever the main thread is doing at that moment |
+
+So `io_read_threads` never competes with compute for cores — they run
+sequentially on the same thread. `io_write_threads` and `io_overlap`,
+together, genuinely add OS threads on top of whatever the main thread is
+using at that moment — real, additive demand on cores, not shared reuse.
+In practice this is usually cheap: read/write threads are I/O-bound
+(mostly blocked waiting on the actual disk/network operation) rather
+than CPU-bound like compute, so the OS scheduler hands compute the core
+time whenever a read/write thread is blocked — but it *is* genuine
+oversubscription, not something the runtime silently avoids. Setting
+`io_write_threads` to something close to `OMP_NUM_THREADS` (rather than
+a modest value like the storage's stripe count) is where this actually
+starts to cost real compute throughput, since the byte-swap work across
+that many threads is no longer negligible.
+
+#### Rule of thumb for setting thread counts
+
+| Setting | Recommendation | Why |
+|---|---|---|
+| `OMP_NUM_THREADS` | All available cores | The only thread type here that's genuinely CPU-bound and wants a dedicated core continuously |
+| `io_read_threads` | Storage stripe count (e.g. `lfs getstripe`, typically 4–16) | Runs before compute starts, same thread — effectively free to raise |
+| `io_write_threads` | Same ballpark (4–16), not close to your full core count | Runs concurrently with the next tile's compute if `io_overlap=y`; I/O-bound so contention is mild at modest values |
+| `io_overlap` | `y` on parallel/networked storage with spare RAM; `n` on a single disk or tight RAM | Determines whether write(N) and read/compute(N+1) run concurrently at all — see `docs/ARCHITECTURE.md` ("When `io_overlap=y` can be detrimental") for the full RAM/disk-speed decision matrix |
 
 ---
 
