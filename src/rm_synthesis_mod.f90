@@ -301,14 +301,24 @@ contains
 #endif
   end subroutine log_message
 
-  subroutine log_tile_bounds(stage_name, event, x_beg, x_end, y_beg, y_end)
+  subroutine log_tile_bounds(stage_name, event, x_beg, x_end, y_beg, y_end, nbytes)
+    !! nbytes is optional and only passed by tile_read/tile_write callers,
+    !! which know the payload size for this interval; other stages (mask/
+    !! prep/compute) have no comparable byte count and omit it, so the
+    !! swim-lane plotter's throughput panel only ever sees I/O intervals.
     implicit none
     character(len=*), intent(in) :: stage_name, event
     integer(int32), intent(in) :: x_beg, x_end, y_beg, y_end
+    integer(int64), intent(in), optional :: nbytes
     character(len=160) :: message
 
-    write(message, '(A,1X,"x:[",I0,",",I0,"] y:[",I0,",",I0,"]")') &
-      trim(event), x_beg, x_end, y_beg, y_end
+    if(present(nbytes))then
+      write(message, '(A,1X,"x:[",I0,",",I0,"] y:[",I0,",",I0,"] bytes=",I0)') &
+        trim(event), x_beg, x_end, y_beg, y_end, nbytes
+    else
+      write(message, '(A,1X,"x:[",I0,",",I0,"] y:[",I0,",",I0,"]")') &
+        trim(event), x_beg, x_end, y_beg, y_end
+    endif
     call log_message('debug', stage_name, trim(message))
   end subroutine log_tile_bounds
 
@@ -2995,11 +3005,27 @@ contains
     integer :: fpixels_out(3), lpixels_out(3)
     integer :: fpixels_nvalid(2), lpixels_nvalid(2)
     real(dp) :: t_stage
+    integer(int64) :: nbytes_write, tile_pix
     character(len=272) :: message
 
-    write(message,'(A,I0,A,I0,A,I0,A,I0,A)')&
+    ! Bytes this call will write, for the swim-lane plotter's throughput
+    ! panel. AMP/PHA are always written (real*4); the rest are optional,
+    ! gated by the same out_*_open flags that gate the ftpsse/ftpssb/ftpssi
+    ! calls below them, so this total tracks exactly what actually hits
+    ! disk in this call, tile-shape and cfg-dependent.
+    tile_pix = int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64)
+    nbytes_write = 2_int64*tile_pix*int(job%nrm_out,kind=int64)*4_int64
+    if(job%out_mask_open) nbytes_write = nbytes_write + &
+    &tile_pix*int(job%nz_out,kind=int64)*1_int64
+    if(job%out_nvalid_open) nbytes_write = nbytes_write + tile_pix*2_int64
+    if(job%out_peak_open) nbytes_write = nbytes_write + tile_pix*4_int64
+    if(job%out_rmpeak_open) nbytes_write = nbytes_write + tile_pix*4_int64
+    if(job%out_angpeak_open) nbytes_write = nbytes_write + tile_pix*4_int64
+    if(job%out_snr_open) nbytes_write = nbytes_write + tile_pix*4_int64
+
+    write(message,'(A,I0,A,I0,A,I0,A,I0,A,I0)')&
     &'tile write start x:[',job%ix_tile_beg,',',job%ix_tile_end,&
-    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,']'
+    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,'] bytes=',nbytes_write
     call log_message('debug','tile_write',trim(message))
     t_stage = wall_time_seconds()
 
@@ -3123,9 +3149,9 @@ contains
     endif
 
     call timer_add(STAGE_TILE_WRITE, wall_time_seconds()-t_stage)
-    write(message,'(A,I0,A,I0,A,I0,A,I0,A)')&
+    write(message,'(A,I0,A,I0,A,I0,A,I0,A,I0)')&
     &'tile write done x:[',job%ix_tile_beg,',',job%ix_tile_end,&
-    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,']'
+    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,'] bytes=',nbytes_write
     call log_message('debug','tile_write',trim(message))
   end subroutine do_tile_write
 

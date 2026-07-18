@@ -40,6 +40,8 @@ SUBBLOCK_RE = re.compile(
 
 STAGE_BOUNDS_RE = re.compile(r"\b(?P<ev>start|done)\b.*x:\[")
 
+BYTES_RE = re.compile(r"bytes=(?P<bytes>\d+)")
+
 THREAD_CPU_RE = re.compile(
     r"thread_timing\s+stage=cpu_extract\s+event=(?P<event>start|done)\s+"
     r"tid=(?P<tid>\d+)\s+rm_block=(?P<rm_block>\d+)\s+nrm_now=(?P<nrm_now>\d+)"
@@ -58,6 +60,7 @@ class Event:
     kind: Optional[str] = None
     stage: Optional[str] = None
     slot: Optional[int] = None
+    nbytes: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,7 @@ class Interval:
     end: datetime
     sub: Optional[int] = None
     slot: Optional[int] = None
+    nbytes: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,7 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
             }:
                 mb = STAGE_BOUNDS_RE.search(msg)
                 if mb:
+                    mbytes = BYTES_RE.search(msg)
                     events.append(
                         Event(
                             ts=ts,
@@ -172,6 +177,7 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
                             tid=tid,
                             message=msg,
                             label=mb.group("ev"),
+                            nbytes=int(mbytes.group("bytes")) if mbytes else None,
                         )
                     )
 
@@ -328,6 +334,105 @@ def draw_stage_totals_bar(
     ax.set_xlim(0, xmax * 1.22)
 
 
+def draw_io_throughput_panel(
+    ax,
+    io_intervals: List[Interval],
+    t0: datetime,
+    time_axis: str,
+) -> None:
+    """Read/write throughput (MB/s), one flat horizontal segment per I/O
+    interval spanning its actual [start, end] window at that interval's
+    average MB/s (nbytes / duration) -- a per-operation average, not a
+    continuously sampled signal, so segments are flat for their duration
+    with gaps in between where nothing was in flight. Stacked directly
+    below the swim lane / thread panel on the SAME time x-axis (unlike
+    the stage-totals bar, which is categorical) so a dip or spike here
+    lines up visually with the Gantt bar above it.
+    """
+    import matplotlib.dates as mdates
+
+    colors = {"io_read": "#2a78d6", "io_write": "#1f4f99"}
+    seen_labels = set()
+    for iv in io_intervals:
+        if iv.kind not in colors or iv.nbytes is None:
+            continue
+        # MB/s uses the TRUE duration (scientifically accurate); the drawn
+        # width uses the same 0.02s minimum-visibility floor the Gantt bars
+        # above use for their `width = max(0.02, ...)`. Without matching
+        # that floor here, a very short interval (e.g. the last, smaller
+        # remainder tile's write) would draw narrower in this panel than
+        # its own bar directly above, making the two panels look
+        # misaligned even though both start at the same true timestamp.
+        dur_s = max(1e-6, (iv.end - iv.start).total_seconds())
+        disp_dur_s = max(0.02, dur_s)
+        mbps = (iv.nbytes / 1.0e6) / dur_s
+        if time_axis == "absolute":
+            x0 = mdates.date2num(iv.start)
+            x1 = x0 + disp_dur_s / 86400.0
+        else:
+            x0 = (iv.start - t0).total_seconds()
+            x1 = x0 + disp_dur_s
+        label = "I/O read" if iv.kind == "io_read" else "I/O write"
+        ax.hlines(
+            mbps, x0, x1,
+            color=colors[iv.kind], linewidth=2.6, capstyle="butt",
+            label=None if label in seen_labels else label,
+        )
+        ax.vlines(x0, 0.0, mbps, color=colors[iv.kind], linewidth=0.6, alpha=0.35)
+        seen_labels.add(label)
+
+    ax.set_ylabel("MB/s")
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="both", linestyle="--", alpha=0.3)
+    if seen_labels:
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+
+
+def _build_stacked_axes(
+    base_height: float,
+    has_throughput: bool,
+    stage_totals: Optional[List[Tuple[str, float, str]]],
+):
+    """Builds a 1-3 row stacked figure and returns (fig, ax, ax_thr, ax2).
+
+    ax: the swim-lane/thread panel (always present, height base_height).
+    ax_thr: I/O throughput panel, if has_throughput -- shares the same
+      time x-axis as ax, so it's stacked directly beneath it.
+    ax2: stage-totals bar panel, if stage_totals -- a different, non-time
+      x-axis (stage name vs seconds/percent), so it never shares limits
+      with ax/ax_thr regardless of row order.
+    Either or both of ax_thr/ax2 are None when not requested.
+    """
+    import matplotlib.pyplot as plt
+
+    height_ratios = [base_height]
+    if has_throughput:
+        height_ratios.append(1.7)
+    if stage_totals:
+        height_ratios.append(1.0 + 0.32 * len(stage_totals))
+
+    if len(height_ratios) == 1:
+        fig, ax = plt.subplots(figsize=(14, height_ratios[0]))
+        return fig, ax, None, None
+
+    fig, axes = plt.subplots(
+        len(height_ratios), 1, figsize=(14, sum(height_ratios)),
+        gridspec_kw={"height_ratios": height_ratios},
+    )
+    axes = list(axes)
+    ax = axes[0]
+    idx = 1
+    ax_thr = None
+    if has_throughput:
+        ax_thr = axes[idx]
+        idx += 1
+    ax2 = None
+    if stage_totals:
+        ax2 = axes[idx]
+        idx += 1
+    return fig, ax, ax_thr, ax2
+
+
 def plot_cpu_thread_timeline(
     thread_intervals: List[ThreadInterval],
     io_intervals: List[Interval],
@@ -359,15 +464,8 @@ def plot_cpu_thread_timeline(
     y_map = {lane: idx for idx, lane in enumerate(lane_labels)}
 
     fig_h = 3.2 + 0.22 * len(tids)
-    if stage_totals:
-        bar_h = 1.0 + 0.32 * len(stage_totals)
-        fig, (ax, ax2) = plt.subplots(
-            2, 1, figsize=(14, fig_h + bar_h),
-            gridspec_kw={"height_ratios": [fig_h, bar_h]},
-        )
-    else:
-        ax2 = None
-        fig, ax = plt.subplots(figsize=(14, fig_h))
+    has_throughput = any(iv.nbytes is not None for iv in io_intervals)
+    fig, ax, ax_thr, ax2 = _build_stacked_axes(fig_h, has_throughput, stage_totals)
 
     for iv in thread_intervals:
         lane = f"T{iv.tid}"
@@ -443,17 +541,27 @@ def plot_cpu_thread_timeline(
     ax.set_yticks([y_map[k] for k in lane_labels])
     ax.set_yticklabels(lane_labels)
     ax.set_ylim(-0.8, len(lane_labels) - 0.2)
+    # The throughput panel (if present) shares this time axis and sits
+    # directly below, so it -- not this panel -- gets the x tick labels.
+    time_ax = ax_thr if ax_thr is not None else ax
     if time_axis == "absolute":
-        ax.set_xlabel("absolute time")
+        time_ax.set_xlabel("absolute time")
         ax.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        if ax_thr is not None:
+            ax_thr.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
+        time_ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
     else:
-        ax.set_xlabel("seconds since run start")
+        time_ax.set_xlabel("seconds since run start")
         ax.set_xlim(0.0, wall)
+        if ax_thr is not None:
+            ax_thr.set_xlim(0.0, wall)
     ax.set_ylabel("CPU thread")
     ax.set_title(title)
     ax.grid(axis="x", linestyle="--", alpha=0.35)
-    for tick in ax.get_xticklabels():
+    if ax_thr is not None:
+        ax.tick_params(labelbottom=False)
+        draw_io_throughput_panel(ax_thr, io_intervals, t0, time_axis)
+    for tick in time_ax.get_xticklabels():
         tick.set_rotation(30)
         tick.set_ha("right")
 
@@ -546,6 +654,23 @@ def _pair_intervals(starts: List[datetime], ends: List[datetime]) -> List[Tuple[
     return pairs
 
 
+def _pair_intervals_bytes(
+    starts: List[Tuple[datetime, Optional[int]]],
+    ends: List[Tuple[datetime, Optional[int]]],
+) -> List[Tuple[datetime, datetime, Optional[int]]]:
+    """Like _pair_intervals, but also carries each interval's byte count
+    through (from whichever of its start/done event logged one -- both
+    do today, but only one is required)."""
+    pairs: List[Tuple[datetime, datetime, Optional[int]]] = []
+    n = min(len(starts), len(ends))
+    for i in range(n):
+        s_ts, s_bytes = starts[i]
+        e_ts, e_bytes = ends[i]
+        if e_ts > s_ts:
+            pairs.append((s_ts, e_ts, s_bytes if s_bytes is not None else e_bytes))
+    return pairs
+
+
 def build_intervals(events: List[Event]) -> List[Interval]:
     if not events:
         return []
@@ -556,10 +681,10 @@ def build_intervals(events: List[Event]) -> List[Interval]:
     gpu_compute_start_ts: Dict[Tuple[int, int], List[datetime]] = {}
     gpu_compute_done_ts: Dict[Tuple[int, int], List[datetime]] = {}
 
-    io_read_start: List[datetime] = []
-    io_read_done: List[datetime] = []
-    io_write_start: List[datetime] = []
-    io_write_done: List[datetime] = []
+    io_read_start: List[Tuple[datetime, Optional[int]]] = []
+    io_read_done: List[Tuple[datetime, Optional[int]]] = []
+    io_write_start: List[Tuple[datetime, Optional[int]]] = []
+    io_write_done: List[Tuple[datetime, Optional[int]]] = []
 
     intervals: List[Interval] = []
 
@@ -594,19 +719,19 @@ def build_intervals(events: List[Event]) -> List[Interval]:
                 gpu_compute_done_ts.setdefault(key, []).append(ev.ts)
         elif ev.category == "tile_read" and ev.label in {"start", "done"}:
             if ev.label == "start":
-                io_read_start.append(ev.ts)
+                io_read_start.append((ev.ts, ev.nbytes))
             else:
-                io_read_done.append(ev.ts)
+                io_read_done.append((ev.ts, ev.nbytes))
         elif ev.category == "tile_write" and ev.label in {"start", "done"}:
             if ev.label == "start":
-                io_write_start.append(ev.ts)
+                io_write_start.append((ev.ts, ev.nbytes))
             else:
-                io_write_done.append(ev.ts)
+                io_write_done.append((ev.ts, ev.nbytes))
 
-    for s, e in _pair_intervals(io_read_start, io_read_done):
-        intervals.append(Interval("I/O read", "io_read", "read", s, e, sub=None))
-    for s, e in _pair_intervals(io_write_start, io_write_done):
-        intervals.append(Interval("I/O write", "io_write", "write", s, e, sub=None))
+    for s, e, nb in _pair_intervals_bytes(io_read_start, io_read_done):
+        intervals.append(Interval("I/O read", "io_read", "read", s, e, sub=None, nbytes=nb))
+    for s, e, nb in _pair_intervals_bytes(io_write_start, io_write_done):
+        intervals.append(Interval("I/O write", "io_write", "write", s, e, sub=None, nbytes=nb))
 
     for sub in sorted(scatter_start_ts.keys()):
         starts = sorted(scatter_start_ts.get(sub, []))
@@ -1061,15 +1186,10 @@ def plot_clean_swimlane(
     t1 = max(iv.end for iv in intervals)
     wall = max(0.001, (t1 - t0).total_seconds())
 
-    if stage_totals:
-        bar_h = 1.0 + 0.32 * len(stage_totals)
-        fig, (ax, ax2) = plt.subplots(
-            2, 1, figsize=(14, 3.8 + bar_h),
-            gridspec_kw={"height_ratios": [3.8, bar_h]},
-        )
-    else:
-        ax2 = None
-        fig, ax = plt.subplots(figsize=(14, 3.8))
+    has_throughput = any(
+        iv.kind in {"io_read", "io_write"} and iv.nbytes is not None for iv in intervals
+    )
+    fig, ax, ax_thr, ax2 = _build_stacked_axes(3.8, has_throughput, stage_totals)
 
     for iv in intervals:
         if time_axis == "absolute":
@@ -1122,17 +1242,29 @@ def plot_clean_swimlane(
     ax.set_yticklabels(lane_order)
     # Add extra bottom margin so GPU lane does not crowd the x-axis labels.
     ax.set_ylim(-0.8, len(lane_order) - 0.2)
+    # The throughput panel (if present) shares this time axis and sits
+    # directly below, so it -- not this panel -- gets the x tick labels.
+    time_ax = ax_thr if ax_thr is not None else ax
     if time_axis == "absolute":
-        ax.set_xlabel("absolute time")
+        time_ax.set_xlabel("absolute time")
         ax.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        if ax_thr is not None:
+            ax_thr.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
+        time_ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
     else:
-        ax.set_xlabel("seconds since band start")
+        time_ax.set_xlabel("seconds since band start")
         ax.set_xlim(0.0, wall)
+        if ax_thr is not None:
+            ax_thr.set_xlim(0.0, wall)
     ax.set_ylabel("lane")
     ax.set_title(title)
     ax.grid(axis="x", linestyle="--", alpha=0.35)
-    for tick in ax.get_xticklabels():
+    if ax_thr is not None:
+        ax.tick_params(labelbottom=False)
+        draw_io_throughput_panel(
+            ax_thr, [iv for iv in intervals if iv.kind in {"io_read", "io_write"}], t0, time_axis
+        )
+    for tick in time_ax.get_xticklabels():
         tick.set_rotation(30)
         tick.set_ha("right")
 

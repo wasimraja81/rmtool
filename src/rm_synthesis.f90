@@ -307,6 +307,7 @@ integer, allocatable :: par_unit_Q(:), par_unit_U(:)
 integer, allocatable :: par_unit_I(:), par_unit_mask(:)
 integer   io_par_k
 integer(kind=int64) :: io_par_per_plane, io_par_nz_total
+integer(kind=int64) :: nbytes_read
 integer(kind=int64) :: io_par_base, io_par_rem
 integer(kind=int64) :: io_par_nz_k, io_par_z_off_k, io_par_buf_off
 integer   io_par_z_beg, io_par_z_end
@@ -3022,18 +3023,34 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       fpixels(freq_axis) = zpix_beg
       lpixels(freq_axis) = zpix_end
 
-      call log_tile_bounds('tile_read','start',&
-      &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
-
-      call timer_start(t_stage)
       ! --- Parallel channel-chunked FITS reads ---
       ! Divide nz_out channels among io_read_threads_eff threads; each
       ! thread uses its own file handle and writes a contiguous slice of
       ! the tile buffer.  For io_read_threads_eff=1 the loop runs once
       ! on the calling thread -- identical to the former single FTGSVE call.
+      ! Computed here, ahead of the 'tile_read start' log line, so the
+      ! byte count logged for the swim-lane plotter's throughput panel
+      ! and the actual per-thread split below come from the same numbers.
       io_par_per_plane = int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
       io_par_nz_total  = int((zpix_end-zpix_beg)/incs(freq_axis),&
       &kind=int64)+1_int64
+
+      ! Bytes this tile's read will move: Q+U always (real*4), plus input
+      ! mask and/or I cube if enabled -- assumes those input cubes are
+      ! also real*4 on disk (CFITSIO converts whatever BITPIX they are
+      ! into the real*4 buffers here regardless, so this is an
+      ! approximation if an input cube's on-disk BITPIX differs from
+      ! that, off by the corresponding byte-width ratio).
+      nbytes_read = io_par_per_plane*io_par_nz_total*4_int64*2_int64
+      if(use_input_mask) nbytes_read = nbytes_read + &
+      &io_par_per_plane*io_par_nz_total*4_int64
+      if(need_icube) nbytes_read = nbytes_read + &
+      &io_par_per_plane*io_par_nz_total*4_int64
+
+      call log_tile_bounds('tile_read','start',&
+      &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end, nbytes_read)
+
+      call timer_start(t_stage)
       io_par_base = io_par_nz_total / int(io_read_threads_eff,kind=int64)
       io_par_rem  = mod(io_par_nz_total, int(io_read_threads_eff,kind=int64))
       io_par_read_ok = .true.
@@ -3101,7 +3118,7 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       endif
 
       call log_tile_bounds('tile_read','done',&
-      &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end)
+      &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end, nbytes_read)
       call timer_stop(STAGE_TILE_READ,t_stage)
 
       call log_tile_bounds('tile_mask','start',&
