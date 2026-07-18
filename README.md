@@ -361,32 +361,40 @@ to check.
 
 ## Recent Performance Enhancements
 
-Recent updates improved host-side parallelism around staging and data packing:
+`3.0`'s IO-efficiency milestone (T0-T6, see `docs/RELEASE_NOTES_3.0.md` and
+`planning/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full history):
 
-- In `src/rm_synthesis.f90`, staged gather/scatter loops now use host OpenMP
-  loop parallelism (`parallel do` / `taskloop`) within the existing async-slot
-  dependency framework.
-- In `src/rm_synthesis_mod.f90`, pack/copy loops in `prepare_cpu_data` and
-  `prepare_gpu_data` are host-parallelised in HOST_OMP builds with an
-  `omp_in_parallel` guard to prevent nested-region oversubscription.
-- In `src/rm_synthesis.f90`, tile-memory planning now separates:
-	- RAM tile budget (`bytes_per_tile_pixel_ram`) for host read-tile sizing, and
-	- VRAM sub-block budget (`bytes_per_vram_pixel`) for GPU staging/offload sizing.
-	This decouples host tile size from device strip size and avoids
-	over-conservative RAM tiling in CPU or non-staging runs.
+- **Parallel reads** (`io_read_threads`): N independent read-only CFITSIO
+  handles per input cube, each reading a disjoint channel range concurrently.
+- **Genuine parallel writes** (`io_write_threads`, T6): N independent
+  Fortran STREAM I/O units write disjoint RM-bin byte ranges of the
+  AMP/PHA output cubes directly, bypassing CFITSIO for pixel data entirely.
+- **Async tile-write overlap** (`io_overlap`): a tile's write runs on a
+  background thread concurrent with the next tile's read/compute.
+- int64-safe tile indexing throughout, closing an INT32_MAX overflow class
+  in the runtime arithmetic that reads/writes tile buffers.
 
-Scope note:
-- The staged gather/scatter enhancement is active only when `use_staging=true`
-	(GPU-active staging path). CPU-only non-staging runs do not execute those
-	staged loops.
+All three cfg keys default to the pre-existing serial behaviour; existing
+configs are unaffected until a user opts in.
 
-Session validation summary:
-- Build matrix: all four `OMP/GPU` variants compile successfully.
-- Tests: `22/22` passing.
-- Jennifer full-image benchmark (new planner split):
-	- CPU run improved from `733.758s` to `721.764s`.
-	- GPU run completed successfully with active offload, but was slightly slower
-		in this environment (`2110.988s` -> `2133.811s`, about `+1.1%`).
+Real Setonix production validation (13308×11870 pixels, 288 channels,
+16 tiles), before vs. after this milestone:
+
+| Stage | Before | After | Δ |
+|---|---|---|---|
+| I/O write | 2479.9s (96%) | 108.3s (6%) | **−95.6%** |
+| Total wall time | 2586.7s | 1945.4s | **−24.9%** |
+
+Write dropped ~23x — from 96% of wall time to 6% — by far the largest
+single lever in the tool to date. Full before/after breakdown by stage in
+`docs/RELEASE_NOTES_3.0.md`.
+
+Validation summary:
+- Build matrix: all four `OMP/GPU` variants compile with zero warnings.
+- Tests: `28/28` passing.
+- Production: end-to-end validated on real Setonix hardware against real
+  ASKAP/EMU data — the exact case that originally crashed (see the T4/T5
+  postmortems in `docs/ARCHITECTURE.md`) now completes without error.
 
 ## GPU Acceleration
 

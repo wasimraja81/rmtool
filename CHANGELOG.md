@@ -2,13 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - working toward 3.0
+## [3.0] - 2026-07-18
 
 IO-efficiency milestone: parallel reads, genuine parallel writes, async
 tile-write overlap, and the crash/correctness work that came with
-building them. All planned tickets (T0-T6) are done; not yet tagged as a
-formal `3.0` release -- production-scale Setonix validation of T6's
-throughput gain is the main remaining item. See
+building them. All planned tickets (T0-T6) are done and validated
+end-to-end on real Setonix production hardware, including T6's actual
+write-throughput gain (see Validation below). See
 `docs/RELEASE_NOTES_3.0.md` for the full writeup.
 
 ### Added
@@ -41,6 +41,10 @@ throughput gain is the main remaining item. See
   structural "no two tile writes ever overlap" invariant check, and a
   bit-identical `io_write_threads=1` vs `=4` comparison across all 8
   output products (`tests/run_tests.sh` §13-14).
+- Full, sectioned cfg reference in `README.md`: every key the parser
+  accepts, marked required/required-if/optional with its real default,
+  cross-checked against `read_cfg_keyval`'s case statements rather than
+  written from memory.
 
 ### Fixed
 - int64-safe flattened tile indices throughout the tile/scatter/mask
@@ -79,6 +83,20 @@ throughput gain is the main remaining item. See
   not a crash, and only visible in the final on-disk state after close.
   Fixed by closing CFITSIO's handle for AMP/PHA immediately after
   fetching the byte offset it provides, before any raw write happens.
+- Swim-lane plotter: the "CPU stage" row (CPU thread-detail view) was
+  silently missing its compute segment -- filtered out on the assumption
+  that the per-thread lanes above already covered it, which left the row
+  summing to less than the tile's actual non-I/O time and a legend entry
+  ("CPU compute") that never had a corresponding bar. Restored; the two
+  views aren't redundant (the stage row shows *when* the stage ran as a
+  whole, the thread lanes show *how* it was parallelised).
+- Swim-lane plotter: the GPU pipeline view's synchronous-fallback path
+  (a tile that fits in one VRAM sub-block, so there's no async
+  double-buffering) expected an old `send N/M` log format the Fortran
+  code no longer emits -- current single-shot GPU compute logs plain
+  `gpu send`/`gpu recv` notes instead, so non-staged GPU runs were
+  silently rendering with no GPU lane at all. Fixed to recognize the
+  current format.
 
 ### Validation
 - Full build matrix remained successful (`OMP/GPU` combinations, zero
@@ -87,12 +105,14 @@ throughput gain is the main remaining item. See
   `io_write_threads=1` vs `=4` output comparison and manual verification
   that `io_write_threads>1` combined with `io_overlap=y` also produces
   bit-identical output.
-- Setonix production validation covers `io_read_threads`/`io_overlap`
-  (see below); T6's actual write-throughput gain on Setonix-scale data is
-  still pending measurement -- see `docs/RELEASE_NOTES_3.0.md`.
 - End-to-end production-scale validation on real Setonix hardware and
-  ASKAP/EMU data: the exact case that originally crashed now completes
-  without error.
+  ASKAP/EMU data (13308x11870, 288 channels): the exact case that
+  originally crashed now completes without error, `io_read_threads`/
+  `io_overlap` confirmed on the real workload, and T6's write-throughput
+  gain measured directly -- `io_write_threads=8` dropped write from
+  2479.9s (96% of wall time) to 108.3s (6%), a ~23x reduction, taking
+  total wall time from 2586.7s to 1945.4s (~25% faster end-to-end). Full
+  before/after table in `docs/RELEASE_NOTES_3.0.md`.
 
 ## [2.0] - 2026-07-17
 
