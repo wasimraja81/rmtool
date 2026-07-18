@@ -1430,7 +1430,6 @@ def main() -> int:
 
     if cpu_only_thread_mode:
         io_only = [iv for iv in intervals if iv.kind in {"io_read", "io_write"}]
-        cpu_stage_only = [iv for iv in cpu_stage_intervals if iv.kind != "cpu_stage_compute"]
         thread_tids = sorted(set(iv.tid for iv in thread_intervals))
         info_rows.extend(
             [
@@ -1441,10 +1440,17 @@ def main() -> int:
         )
         right_info_lines = _format_info_block(info_rows)
         stage_totals = compute_stage_totals(io_only, cpu_stage_intervals)
+        # cpu_stage_intervals includes cpu_stage_compute (the tile-level
+        # compute makespan, same data behind the "CPU compute" stage total)
+        # so the "CPU stage" row is a complete mask->prep->compute->cubestat
+        # sequence, matching the legend and summing to the tile's non-I/O
+        # time -- not redundant with the per-thread T<tid> lanes above it,
+        # which show *how* compute was parallelised, not *when* the stage
+        # ran as a whole.
         plot_cpu_thread_timeline(
             thread_intervals,
             io_only,
-            cpu_stage_only,
+            cpu_stage_intervals,
             out_path,
             title=title,
             time_axis=args.time_axis,
