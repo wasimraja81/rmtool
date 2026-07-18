@@ -838,3 +838,30 @@ reduce tile size or add call-splitting logic.
   - `bytes_per_tile_pixel_ram` for host tile sizing.
   - `bytes_per_vram_pixel` for VRAM sub-block sizing.
 
+### Released Design Baseline (3.0)
+Full detail in the "IO Architecture" section above; summary here for the
+same at-a-glance baseline record the 2.0 entry provides:
+- `io_read_threads`: N independent read-only CFITSIO handles per input
+  cube, reading disjoint channel ranges concurrently.
+- `io_write_threads`: N independent Fortran STREAM I/O units write
+  disjoint RM-bin byte ranges of the AMP/PHA output cubes directly,
+  bypassing CFITSIO for pixel data entirely (the original CFITSIO-handle
+  design was found unsafe -- see the T4 postmortem -- and is gone, not
+  merely clamped).
+- `io_overlap`: a tile's write runs on a background pthread concurrent
+  with the next tile's read/mask/prep/compute/cubestat, double-buffered,
+  serialized against itself via a hard `pthread_join()` barrier.
+- All three default to the pre-existing serial behaviour; existing
+  configs are unaffected until a user opts in.
+- Real Setonix production validation: write dropped from 96% to 6% of
+  wall time (~23x reduction) with `io_write_threads=8`; total wall time
+  fell ~25% end-to-end on a 13308×11870×288 ASKAP/EMU workload. Full
+  before/after breakdown in `docs/RELEASE_NOTES_3.0.md`.
+- Swim-lane plotter: separate I/O read/write lanes, stage-totals bar
+  panel, I/O throughput (MB/s) panel, complete CPU-stage row (mask/prep/
+  compute/cubestat), working GPU synchronous-fallback rendering.
+- Test suite grown from 22 to 28, adding structural concurrency-invariant
+  checks (no-overlapping-writes for `io_overlap`, bit-identical
+  `io_write_threads=1` vs `=4`) alongside the existing output-correctness
+  checks.
+

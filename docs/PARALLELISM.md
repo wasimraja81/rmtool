@@ -278,6 +278,31 @@ strips** (`ny_sub` rows). Each strip is gathered into compact staging buffers,
 offloaded, and results scattered back. In HOST_OMP builds, gather/scatter loops
 are host-parallelised while slot dependencies preserve correctness.
 
+**Staging alone does not give you overlapping GPU compute.** Whether
+adjacent Dec strips' GPU work actually double-buffers (slot 1's compute
+running concurrently with slot 2's, `gpu_compute_slot1`/`gpu_compute_slot2`
+in the swim-lane plots) is a *separate* condition from whether staging
+itself is active:
+
+```fortran
+use_async_pipeline = use_gpu_actual .and. n_subblocks_tile.gt.1 .and. host_omp_threads.gt.1
+```
+
+Staging (`n_subblocks_tile>1`) only requires a `use_gpu=y` run where the
+RAM tile doesn't fit in one VRAM sub-block. But `host_omp_threads>1`
+requires the binary itself to be compiled with `HOST_OMP=1` --
+`rm_synthesis_release_gpu_offload_hostomp`, not plain
+`rm_synthesis_release_gpu_offload`. On the plain (non-HOST_OMP) GPU
+binary, `use_async_pipeline` is unconditionally `.false.` regardless of
+staging, and each sub-block runs synchronously instead (`gpu send`/
+`gpu recv` notes, rendered as the swim-lane plotter's "GPU compute
+(synchronous fallback)" — see "Swim-lane plotting behaviour" in
+`docs/ARCHITECTURE.md`). Confirmed directly while regenerating this
+repo's own example plots: the plain `gpu_offload` binary produced zero
+async markers on a staged run, and switching only the binary (same cfg,
+same forced-small `gpu_vram_mib`) to `gpu_offload_hostomp` was what
+produced genuine slot 1/slot 2 overlap.
+
 ```
 RAM tile  [tile_ra × tile_dec × nz_out]
   │
@@ -336,7 +361,8 @@ Why it matters:
   VRAM terms, so RAM Dec strips can remain larger when memory allows.
 - GPU staging still remains bounded by VRAM through `ny_sub` planning.
 
-Observed effect in Jennifer full-image runs (6 host threads, this node):
+Observed effect at the time this planner split shipped (6 host threads,
+dev machine; pre-dates the `3.0` IO-efficiency milestone above):
 
 - CPU total improved (`733.758s` -> `721.764s`).
 - GPU total was slightly slower while still fully offloaded

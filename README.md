@@ -1,7 +1,7 @@
 # rmtool
 
 
-An HPC package for conducting Faraday Tomography (RM-Synthesis) on radio spectro-polarimetric data. The package is built for all machines - scaling from Low-RAM Desktop PCs to HPC Clusters, with GPU acceleration integration underway.
+An HPC package for conducting Faraday Tomography (RM-Synthesis) on radio spectro-polarimetric data. The package is built for all machines - scaling from Low-RAM Desktop PCs to HPC Clusters, with GPU acceleration via OpenMP target offload.
 
 ## Features
 
@@ -54,7 +54,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
-- **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Draft release notes for the anticipated 3.0 (IO-efficiency milestone, in progress)
+- **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
 
 ## Configuration
 
@@ -509,7 +509,10 @@ make GPU=1
 - `AP + phase mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.PHA.RMCUBE.FITS`
 - `AP + pol mode`: `OUTBASE.AMP.RMCUBE.FITS` and `OUTBASE.POLA.RMCUBE.FITS`
 - `RI mode`: `OUTBASE.REAL.RMCUBE.FITS` and `OUTBASE.IMAG.RMCUBE.FITS`
-- `Common diagnostics`: `OUTBASE.NVALID.MAP.FITS` (valid-channel count map)
+- `Common diagnostics` (on by default; disable with `write_mask_output=n`/
+  `write_nvalid_output=n`):
+	- `OUTBASE.MASK.CUBE.FITS` (per-channel validity mask cube)
+	- `OUTBASE.NVALID.MAP.FITS` (valid-channel count map)
 - `When cubestat=y`:
 	- `OUTBASE.PEAK.MAP.FITS`
 	- `OUTBASE.RM_PEAK.MAP.FITS`
@@ -520,16 +523,26 @@ make GPU=1
 
 ```
 rmtool/
-├── src/                  Source code (Fortran 77/90)
-│   ├── rm_synthesis.f90  Main program
-│   ├── rm_synthesis_mod.f90  Config parser module
-│   └── legacy/           Legacy tools
-├── cfg/                  Configuration files and examples
-├── bin/                  Compiled executables
-├── build/                Build artifacts (Makefile)
-├── Makefile              Build configuration
-├── CMakeLists.txt        CMake build configuration
-└── BUILD.md              Build documentation
+├── src/                       Source code (Fortran 77/90)
+│   ├── rm_synthesis.f90       Main program (free-form F90)
+│   ├── rm_synthesis_mod.f90   Shared module: config parser, timers/logging, helpers
+│   ├── myfits_info.f, printerror.f   Fixed-form F77 helpers (actually compiled --
+│   │                                  see Makefile's INCSRC, not the same-named .f90 files)
+│   └── legacy/                Older standalone FITS utilities, not part of the build
+├── cfg/                        Configuration files, examples, and ARCHIVED/ (63 historical configs)
+├── docs/                       Architecture, parallelism, and design deep-dives; release notes
+├── planning/                   IO optimisation plan and ticket history
+├── scripts/                    Swim-lane plotting and benchmark tooling
+├── tests/                      Regression suite (tests/run_tests.sh)
+├── TODO/                       Historical development logs and assessments
+├── docker/                     Container build/release helpers
+├── scratch/                    Ad-hoc run outputs, example logs/plots (gitignored)
+├── bin/                        Compiled executables
+├── build/, build_cmake/        Build artifacts (Makefile / CMake respectively)
+├── Makefile                    Primary development build (OMP/GPU variants)
+├── CMakeLists.txt              CMake build configuration
+├── build.sh, cmake_build.sh    Quick build wrapper scripts
+└── BUILD.md, QUICKSTART.md     Build and quick-start documentation
 ```
 
 ## Development

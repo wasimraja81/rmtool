@@ -13,7 +13,7 @@
 
 ## 1. Build variants and binary capabilities
 
-Three independent binaries can be produced; each lives under `bin/` and is also
+Four independent binaries can be produced; each lives under `bin/` and is also
 symlinked to `bin/rm_synthesis` (last build wins the symlink).
 
 | Make flags | Binary produced | What it can do |
@@ -104,6 +104,9 @@ validation workflow that currently includes:
 - bad-channel masking checks (serial/OMP/GPU)
 - cubestat output map checks
 - timing summary/CSV emission checks
+- `io_overlap` bit-identical comparison plus a structural "no two tile
+  writes ever overlap" invariant check
+- `io_write_threads>1` bit-identical comparison across all 8 output products
 
 ### 3a. One-shot run (builds + tests everything)
 
@@ -229,8 +232,13 @@ For **GPU** runs, the device-memory footprint is controlled separately by
 `mem_frac_vram` (fraction of VRAM used per offload block) and `gpu_vram_mib`
 (VRAM size in MiB; 0 = auto-detect, else override). If you hit a GPU
 out-of-memory (`nvptx_alloc error`), lower `mem_frac_vram` (e.g. 0.4) or set
-`gpu_vram_mib` to your card's size. `io_overlap=y` opts into overlapped
-read/compute (requires a reentrant libcfitsio build; default `n`).
+`gpu_vram_mib` to your card's size. `io_overlap=y` opts into running tile
+N's write on a background thread concurrent with tile N+1's read/compute
+(CFITSIO is already built reentrant -- nothing extra to install; default
+`n`). Doubles the per-tile output buffer RAM; see "Tile Memory Planning
+and I/O Parallelism" in `README.md` for when this helps vs. hurts, and
+`io_read_threads`/`io_write_threads` for parallelising the read/write
+themselves (independent of `io_overlap`).
 Or run a dry-run first to read the auto-tuned tile hint:
 ```bash
 # Temporarily set dry_run=y in cfg, then:
@@ -281,7 +289,14 @@ CPU/GPU timeline diagnostics are documented in:
 
 ## 7. Architecture notes
 
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) -- master architecture
+  document (start here); includes the IO parallelism design
+  (`io_read_threads`/`io_write_threads`/`io_overlap`) and their postmortems.
+- [docs/PARALLELISM.md](docs/PARALLELISM.md) -- memory/execution
+  decomposition deep-dive, including the thread-pool interplay between
+  `OMP_NUM_THREADS` and the I/O thread keys.
 - [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
+  -- timeline/RM-chunking and swim-lane interpretation deep-dive.
 
 Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
 and GPU lanes from the run log.

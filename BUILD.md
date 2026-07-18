@@ -6,8 +6,8 @@ This package supports two modern build approaches for maximum flexibility.
 
 ### Release Tagging Policy
 
-- Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`).
-- Current formal release: `1.0` (on `main`).
+- Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`, `3.0`).
+- Current formal release: `3.0` (on `main`).
 
 ### Option 1: Simple Makefile (Recommended for Development)
 
@@ -245,12 +245,14 @@ bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
 For distributing the package:
 
 1. Use CMake for configuration
-2. Create source tarball: `tar czf rm_synthesis-1.0.tar.gz .`
+2. Create source tarball: `tar czf rm_synthesis-3.0.tar.gz .` (match the current release tag)
 3. Users build with: `cmake . && make && make install`
 
 ## Support
 
 See individual file comments:
 - `src/rm_synthesis_mod.f90` - Module documentation
-- `src/rm_synthesis.f` - Main program documentation
+- `src/rm_synthesis.f90` - Main program documentation (`src/rm_synthesis.f`,
+  the old fixed-form version, is dead code -- not referenced by the
+  Makefile at all)
 - `src/myfits_info.f` - FITS interface

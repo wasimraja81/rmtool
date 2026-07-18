@@ -102,6 +102,19 @@ The primary driver is scalable processing for very large cubes under constrained
   - Use when thread balance, per-thread gaps, and extraction distribution are the main question.
   - Lanes include `CPU stage`, optional `I/O`, and one lane per OpenMP thread (`T<tid>`).
 
+#### Additional panels (both views)
+- `I/O throughput (MB/s)` -- present only when the log's `tile_read`/
+  `tile_write` lines carry a `bytes=<N>` field. Stacked directly below the
+  timeline panel, sharing its time axis (unlike the stage-totals bar
+  below, which is categorical) so a dip or spike lines up with the Gantt
+  bar directly above it. One flat segment per I/O interval at that
+  interval's average MB/s (`bytes / duration`), not a continuously sampled
+  signal -- see `docs/ARCHITECTURE.md` ("Swim-lane plotting behaviour").
+- `Stage time totals` -- bottom panel, horizontal bar chart of total
+  wall-clock seconds per stage, largest on top, labelled with seconds and
+  % of the run's total wall time. Percentages can sum past 100% when
+  stages genuinely overlap (`io_overlap=y`) -- not a bug.
+
 #### Legend semantics (pipeline view)
 - `I/O read`, `I/O write`
   - FITS or intermediate read/write intervals.
@@ -172,7 +185,7 @@ The primary driver is scalable processing for very large cubes under constrained
   GPU-active runs where `use_staging` is true. CPU-only runs with
   `use_staging=false` do not execute those staging gather/scatter loops.
 
-## Recent Enhancements (2026-07)
+## Historical Enhancements (2026-07, pre-3.0)
 - Host OpenMP parallelisation added for staged gather/scatter loops in
   `src/rm_synthesis.f90` while preserving dependency ordering semantics.
 - Host OpenMP parallelisation added for spectral pack/copy loops in
@@ -184,18 +197,17 @@ The primary driver is scalable processing for very large cubes under constrained
   - `bytes_per_vram_pixel` for GPU VRAM sub-block sizing.
   This prevents staging-only VRAM terms from over-shrinking RAM tiles on
   CPU/non-staging paths.
-- Validation status after these changes:
-  - full build matrix successful (`OMP/GPU` combinations),
-  - test suite remains green (`22/22`).
-- Jennifer full-image observations from this session:
-  - CPU improved with the planner split (`733.758s` -> `721.764s`) on the
-    tested host/configuration.
-  - GPU remained correct and fully offloaded, but was slightly slower versus
-    prior baseline in this environment (`2110.988s` -> `2133.811s`).
-  - Implication: planner policy is workload/device dependent; CPU-friendly RAM
-    strip growth does not guarantee GPU speedup.
+- Validation status at the time (test suite has since grown to 28 tests):
+  full build matrix successful, `22/22` tests passing.
+
+This section predates, and is superseded by, the `3.0` IO-efficiency
+milestone (`io_read_threads`/`io_write_threads`/`io_overlap`, T0-T6) --
+see `docs/RELEASE_NOTES_3.0.md` and `CHANGELOG.md` for what's actually
+most recent; this file's scope is timeline/RM-chunking, not I/O.
 
 ## Future Work
 - Add benchmark sweeps for RM block size and OpenMP schedule on CPU-only runs.
 - Extend summaries with per-thread utilisation statistics.
-- Add an optional plot annotation that states whether GPU timing is explicit async markers or synchronous fallback proxy.
+- ~~Add an optional plot annotation that states whether GPU timing is
+  explicit async markers or synchronous fallback proxy~~ -- done: the
+  `GPU async s1/s2/sync-fb` side-panel line above reports exactly this.

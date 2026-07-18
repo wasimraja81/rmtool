@@ -93,8 +93,14 @@ Conditionally required keys:
 ## Example
 
 See:
-- cfg/myfits_spec2rm.cfg
-- cfg/example_myfits_spec2rm.cfg
+- The full annotated, sectioned cfg reference in the top-level
+  [`README.md`](../README.md) ("Configuration" section) -- every key the
+  parser accepts, marked required/required-if/optional with its real
+  default.
+- `cfg/rmsynth-subim.cfg` for a runnable example.
+
+(`cfg/myfits_spec2rm.cfg` and `cfg/example_myfits_spec2rm.cfg`, previously
+linked here, no longer exist -- superseded by the above.)
 
 ## Adding New Config Variables
 
