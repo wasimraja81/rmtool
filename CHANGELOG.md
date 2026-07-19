@@ -2,6 +2,63 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+Internal encapsulation refactor of `src/rm_synthesis.f90` /
+`src/rm_synthesis_mod.f90`: zero change in functional/observable behaviour,
+gated at every step by a clean 4-variant rebuild, the full 28-test suite,
+and a bit-identical FITS sweep against a frozen pre-refactor baseline. See
+`planning/ENCAPSULATION_REFACTOR_PLAN.md` for the full ticket history.
+
+### Changed
+- All ~56 config values (paths, tiling/memory-planning knobs, RM sampling,
+  masking, GPU, I/O-parallelism, logging/timing keys) are now bundled into
+  one `rmsynth_config_t` derived type and read directly as `cfg%field` at
+  every use site, replacing a flat scope of loose local variables that
+  `read_cfg_keyval` used to populate through a ~56-argument signature (now
+  just `(cfgfile, cfg, status)`). One value, one place it lives, instead
+  of a config-parsed copy and a separately-mutated local that could in
+  principle drift apart.
+- The RAM/VRAM tile-size planner (auto-tiling policy, safety-shrink loop,
+  VRAM sub-block sizing) is now a named `plan_tile` routine operating on a
+  `tile_plan_t` bundle, instead of ~150 lines of inline arithmetic in the
+  middle of the main tile loop.
+- The per-tile write dispatch's field assembly is now a named
+  `populate_write_job` call; the synchronisation code around it (the
+  join-before-reuse/join-before-dispatch invariants documented in
+  `docs/ARCHITECTURE.md`, the two safeguards behind a real historical
+  production SIGSEGV) is untouched, in its exact original order.
+- Read-side byte-count and thread-split arithmetic in the tile loop moved
+  into two small named helpers (`compute_tile_read_bytes`,
+  `split_channels_across_threads`).
+
+### Validation
+- Every ticket independently gated: clean 4-variant rebuild (0 errors, 0
+  new warnings), 28/28 tests, and a bit-identical sweep of all 140
+  archived FITS outputs against a frozen baseline.
+- Additionally validated on a real production-scale run (`io_overlap=y`,
+  `io_read_threads=4`, `io_write_threads=2`, real ASKAP-style cube) —
+  confirmed data integrity and passed the structural
+  no-overlapping-tile-writes check, the same invariant the historical
+  postmortem in `docs/ARCHITECTURE.md` was written to guard.
+
+### Fixed
+- Swim-lane plotter (`scripts/plot_tile_async_swimlane.py`): the
+  legend/info side panel could silently vanish entirely on plots with
+  enough content (e.g. a run with both GPU staging slots and a full
+  info block) that no candidate layout in a fixed search grid happened
+  to fit — every artist got removed and nothing was drawn, with no error.
+  A related case rendered both boxes but let their rounded corners
+  visually overlap by a few pixels, because the layout check measured
+  the info box's raw text extent and missed the padded border box drawn
+  around it. Replaced the search entirely with a deterministic layout:
+  the side panel is split into a fixed bottom region (legend, narrow
+  column count so it can't dwarf the info box) and a top region (info
+  box, continuously font-sized to fill whatever the legend left behind).
+  The two regions are stacked, not independently placed, so they cannot
+  collide by construction, and the info box now uses the space it's
+  given instead of stopping at an arbitrary integer point size.
+
 ## [3.0] - 2026-07-18
 
 IO-efficiency milestone: parallel reads, genuine parallel writes, async

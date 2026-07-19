@@ -1,7 +1,50 @@
 # rmtool
 
-
 An HPC package for conducting Faraday Tomography (RM-Synthesis) on radio spectro-polarimetric data. The package is built for all machines - scaling from Low-RAM Desktop PCs to HPC Clusters, with GPU acceleration via OpenMP target offload.
+
+## Why rmtool? (No jargon, promise)
+
+Radio telescope data cubes keep getting bigger — sometimes bigger than
+the RAM on your laptop, sometimes bigger than the RAM on an entire HPC
+node. Most tools in this space quietly force you into one of two bad
+deals: load the whole cube into memory and hope it fits (until one day
+it doesn't, and your job dies — or takes the shared machine down with
+it), or play it safe and grind through everything on a single CPU core
+while the other 63 cores on your cluster node sit there doing nothing.
+
+**rmtool doesn't make you choose.** Here's how, in plain terms:
+
+- **It never needs your whole cube in memory at once.** It works
+  through the image in bite-sized strips sized to whatever RAM you
+  actually have, and figures out a safe strip size for you automatically
+  — no manual tuning required. The same tool that runs on a modest
+  desktop scales straight up to a supercomputer node with the same
+  config file, unchanged.
+- **It reads, computes, and writes at the same time — not one after
+  the other.** While one strip is being read off disk, another is being
+  crunched, and a third is being saved, all at once, like a kitchen
+  running several dishes in parallel instead of one cook doing every
+  step start-to-finish before touching the next dish. Plenty of tools
+  do these strictly in sequence, leaving a fast disk and a fast CPU
+  waiting on each other for no reason.
+- **It reads and writes with many hands at once, not one.** On shared
+  cluster storage, a single reader or writer barely uses the bandwidth
+  on offer — rmtool can open several read and write channels in
+  parallel to actually use it.
+- **It'll happily use your GPU — and won't sulk if you don't have
+  one.** Flip one setting and the heavy math offloads to the graphics
+  card for a real speed-up. No GPU? Same config file, same command:
+  it just runs on the CPU instead. No separate "GPU edition" to keep
+  in sync, no rewritten scripts.
+- **Every one of the above is a switch in a plain text config file —
+  never a line of code.** More read threads, more write threads,
+  overlapping I/O with compute, GPU offload: all opt-in, all off by
+  default, all tunable without recompiling anything or knowing what a
+  thread even is.
+
+Put together: one binary, one config format, no code changes — it scales
+itself to whatever machine it's handed, from a spare laptop to a
+national HPC facility.
 
 ## Features
 
