@@ -147,9 +147,6 @@ real(sp) xinc_imQ, yinc_imQ, zinc_imQ
 integer   xpix_beg, xpix_end
 integer   ypix_beg, ypix_end
 integer   zpix_beg, zpix_end
-integer   subim_ra_blc, subim_ra_trc, subim_ra_inc
-integer   subim_dec_blc, subim_dec_trc, subim_dec_inc
-integer   subim_chan_blc, subim_chan_trc, subim_chan_inc
 integer   nrm_block_size
 parameter(nrm_block_size = 256)  ! RM bins per GPU offload block
 
@@ -187,15 +184,14 @@ real(dp) cval,cdelt, pi
 real(sp) cpix, dRM
 
 integer   rwmode
-character(len=272) :: infileQ, infileU, message
-character(len=272) :: outfile, outfileAMP, outfileANG
+character(len=272) :: message
+character(len=272) :: outfileAMP, outfileANG
 character(len=272) :: outfileMASK, outfileNVALID
 character(len=272) :: outfilePEAK, outfileRMPEAK
 character(len=272) :: outfileANGPEAK, outfileSNR
-character(len=272) :: subim_parfile, cfgfile, cfgfile_in
+character(len=272) :: cfgfile, cfgfile_in
 type(rmsynth_config_t) :: cfg
 type(tile_plan_t) :: plan
-character(len=172) :: path
 character(len=1) :: yorn
 
 integer   nx_1st, nx_2nd, ny_1st, ny_2nd, nz_1st, nz_2nd
@@ -208,7 +204,6 @@ real(sp) x1, xn, y1, yn, z1, zn
 
 integer   data_precision
 real(sp) nullval
-logical   subim
 real(sp) conv_fac ! freq-to-lambda conversion factor
 integer   log_init_status
 real(dp)  t_cfg_start, t_cfg_end
@@ -344,8 +339,6 @@ real(sp), allocatable :: bad_chan(:)
 integer   nbad_chan, ngood_chan
 integer, allocatable :: flag_arr(:)
 integer, allocatable :: flag_arr_out(:)
-logical   remove_badchan
-character(len=172) :: global_badchan_file
 character(len=16) :: masksrc_key, nanchk_key
 
  ! processing related:
@@ -427,37 +420,12 @@ if(status.ne.0)then
    stop
 endif
 
-! T1 encapsulation ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
-! read_cfg_keyval now returns one rmsynth_config_t instead of ~54
-! separate arguments. Unpacked here, in the same place the call already
-! was, into the same loose locals used throughout the rest of this file
-! -- nothing downstream of this block changes.
-!
-! This unpack block is a deliberately temporary bridge (T1, shallow
-! encapsulation): every other usage site in this file still reads bare
-! locals, not cfg%, so read_cfg_keyval's caller has to re-expose them
-! here. It goes away entirely once T5 (deep cfg threading, see
-! planning/ENCAPSULATION_REFACTOR_PLAN.md) replaces every local
-! reference with cfg%field directly -- not by wrapping this block in a
-! subroutine, which would just relocate the same large-argument-list
-! problem T1 just removed from read_cfg_keyval's signature.
-path = cfg%path
-infileQ = cfg%infileQ
-infileU = cfg%infileU
-outfile = cfg%outfile
-remove_badchan = cfg%remove_badchan
-global_badchan_file = cfg%badchan_file
-subim = cfg%subim
-subim_parfile = cfg%subim_parfile
-subim_ra_blc = cfg%subim_ra_blc
-subim_ra_trc = cfg%subim_ra_trc
-subim_ra_inc = cfg%subim_ra_inc
-subim_dec_blc = cfg%subim_dec_blc
-subim_dec_trc = cfg%subim_dec_trc
-subim_dec_inc = cfg%subim_dec_inc
-subim_chan_blc = cfg%subim_chan_blc
-subim_chan_trc = cfg%subim_chan_trc
-subim_chan_inc = cfg%subim_chan_inc
+! T1/T5 encapsulation tickets (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+! read_cfg_keyval returns one rmsynth_config_t instead of ~54 separate
+! arguments (T1). The unpack-into-locals bridge T1 left here has since
+! been fully threaded out by T5 -- every field is now read as cfg%field
+! directly at its point of use throughout this file, so there is nothing
+! left to unpack at the call site.
 
 call init_logging(cfg%log_level,cfg%timing_enabled,&
 &cfg%timing_tile_enabled,cfg%timing_io_enabled,&
@@ -546,14 +514,14 @@ else
 endif
 
  ! Process file paths:
-infileQ(1:) = path(1:nchar(path))//infileQ(1:nchar(infileQ))
-infileU(1:) = path(1:nchar(path))//infileU(1:nchar(infileU))
+cfg%infileQ(1:) = cfg%path(1:nchar(cfg%path))//cfg%infileQ(1:nchar(cfg%infileQ))
+cfg%infileU(1:) = cfg%path(1:nchar(cfg%path))//cfg%infileU(1:nchar(cfg%infileU))
 if(nchar(cfg%mask_input_cube_file).gt.0)then
    inquire(file=cfg%mask_input_cube_file(&
    &1:nchar(cfg%mask_input_cube_file)),exist=anyflg)
    if(.not.anyflg)then
       cfg%mask_input_cube_file(1:) =&
-      &path(1:nchar(path))//&
+      &cfg%path(1:nchar(cfg%path))//&
       &cfg%mask_input_cube_file(&
       &1:nchar(cfg%mask_input_cube_file))
    endif
@@ -564,41 +532,41 @@ if(need_icube)then
    write(*,*)"I-fitscube in: ",cfg%infileI(1:nchar(cfg%infileI))
 endif
 
-outfileAMP(1:) = outfile(1:nchar(outfile))//'.AMP.RMCUBE.FITS'
+outfileAMP(1:) = cfg%outfile(1:nchar(cfg%outfile))//'.AMP.RMCUBE.FITS'
 if(cfg%output_mode.eq.1)then
-   outfileAMP(1:) = outfile(1:nchar(outfile))//&
+   outfileAMP(1:) = cfg%outfile(1:nchar(cfg%outfile))//&
    &'.REAL.RMCUBE.FITS'
-   outfileANG(1:) = outfile(1:nchar(outfile))//&
+   outfileANG(1:) = cfg%outfile(1:nchar(cfg%outfile))//&
    &'.IMAG.RMCUBE.FITS'
 else
    if(cfg%ap_angle_mode.eq.1)then
-      outfileANG(1:) = outfile(1:nchar(outfile))//&
+      outfileANG(1:) = cfg%outfile(1:nchar(cfg%outfile))//&
       &'.POLA.RMCUBE.FITS'
    else
-      outfileANG(1:) = outfile(1:nchar(outfile))//&
+      outfileANG(1:) = cfg%outfile(1:nchar(cfg%outfile))//&
       &'.PHA.RMCUBE.FITS'
    endif
 endif
-outfileMASK(1:) = outfile(1:nchar(outfile))//'.MASK.CUBE.FITS'
+outfileMASK(1:) = cfg%outfile(1:nchar(cfg%outfile))//'.MASK.CUBE.FITS'
 if(nchar(cfg%mask_cube_file).gt.0)then
    outfileMASK(1:) = cfg%mask_cube_file(1:nchar(cfg%mask_cube_file))
 endif
-outfileNVALID(1:) = outfile(1:nchar(outfile))//'.NVALID.MAP.FITS'
-outfilePEAK(1:) = outfile(1:nchar(outfile))//'.PEAK.MAP.FITS'
-outfileRMPEAK(1:) = outfile(1:nchar(outfile))//&
+outfileNVALID(1:) = cfg%outfile(1:nchar(cfg%outfile))//'.NVALID.MAP.FITS'
+outfilePEAK(1:) = cfg%outfile(1:nchar(cfg%outfile))//'.PEAK.MAP.FITS'
+outfileRMPEAK(1:) = cfg%outfile(1:nchar(cfg%outfile))//&
 &'.RM_PEAK.MAP.FITS'
-outfileANGPEAK(1:) = outfile(1:nchar(outfile))//&
+outfileANGPEAK(1:) = cfg%outfile(1:nchar(cfg%outfile))//&
 &'.ANG_PEAK.MAP.FITS'
-outfileSNR(1:) = outfile(1:nchar(outfile))//'.SNR.MAP.FITS'
+outfileSNR(1:) = cfg%outfile(1:nchar(cfg%outfile))//'.SNR.MAP.FITS'
 
-global_badchan_file(1:) = global_badchan_file(&
-&1:nchar(global_badchan_file))
+cfg%badchan_file(1:) = cfg%badchan_file(&
+&1:nchar(cfg%badchan_file))
 
  ! Bad channels will be read after cube dimensions are known
 nbad_chan = 0
 
  ! Extract Some basic INFO from the FITS files:
-call myfits_info(infileQ,&
+call myfits_info(cfg%infileQ,&
 &bitpixQ,naxisQ,naxesQ,&
 &cxval_imQ,cxpix_imQ,xinc_imQ,&
 &cyval_imQ,cypix_imQ,yinc_imQ,&
@@ -616,7 +584,7 @@ if (status.ne.0)then
    !goto 9999
 endif
 
-call myfits_info(infileU,&
+call myfits_info(cfg%infileU,&
 &bitpixU,naxisU,naxesU,&
 &cxval_imU,cxpix_imU,xinc_imU,&
 &cyval_imU,cypix_imU,yinc_imU,&
@@ -909,16 +877,16 @@ allocate(flag_arr(nz_totpix))
 allocate(bad_chan(nz_totpix))
 
  ! Read the bad channel list now that nz_totpix is known
-if(remove_badchan)then
-   open(71,file=global_badchan_file(&
-   &1:nchar(global_badchan_file)),&
+if(cfg%remove_badchan)then
+   open(71,file=cfg%badchan_file(&
+   &1:nchar(cfg%badchan_file)),&
    &status='old',iostat=ios_mem)
    if(ios_mem .ne. 0)then
       write(*,*)"Error opening bad channel file:"
-      write(*,*)global_badchan_file(&
-      &1:nchar(global_badchan_file))
+      write(*,*)cfg%badchan_file(&
+      &1:nchar(cfg%badchan_file))
       write(*,*)"Skipping bad channel flagging."
-      remove_badchan = .false.
+      cfg%remove_badchan = .false.
    else
       nbad_chan = 0
       do while(.true.)
@@ -942,7 +910,7 @@ endif
 
 masksrc_key = 'generated'
 if(use_input_mask)masksrc_key = 'input'
-if(use_input_mask .and. remove_badchan .and.&
+if(use_input_mask .and. cfg%remove_badchan .and.&
 &nbad_chan.gt.0)masksrc_key = 'combined'
 
 if(mod(nx_totpix,2) .eq. 0)then
@@ -1103,7 +1071,7 @@ if(nchar(cfg%mask_input_cube_file).gt.0)then
    use_input_mask = .true.
    masksrc_key = 'input'
 endif
-if(remove_badchan .and. use_input_mask)masksrc_key = 'combined'
+if(cfg%remove_badchan .and. use_input_mask)masksrc_key = 'combined'
 nanchk_key = 'on'
 nan_check_on = .true.
 if(index(cfg%mask_trust_mode,'strict').gt.0 .or.&
@@ -1116,27 +1084,27 @@ endif
  ! Initialise STATUS to zero:
 status = 0
 
-call FTOPEN(21,infileQ,rwmode,blocksize,status)
+call FTOPEN(21,cfg%infileQ,rwmode,blocksize,status)
 
 if(status.ne.0)then
    write(*,*)" "
-   write(*,*)"Q-infile chosen:",infileQ(1:nchar(infileQ))
+   write(*,*)"Q-infile chosen:",cfg%infileQ(1:nchar(cfg%infileQ))
    write(*,*)"status = ", status
    write(*,*)"Error opening Q-FITS file..."
    stop
 else
    write(*,*)" "
-   write(*,*)"Q-infile chosen:",infileQ(1:nchar(infileQ))
+   write(*,*)"Q-infile chosen:",cfg%infileQ(1:nchar(cfg%infileQ))
 endif
 
-call FTOPEN(22,infileU,rwmode,blocksize,status)
+call FTOPEN(22,cfg%infileU,rwmode,blocksize,status)
 if(status.ne.0)then
-   write(*,*)"U-infile chosen:",infileU(1:nchar(infileU))
+   write(*,*)"U-infile chosen:",cfg%infileU(1:nchar(cfg%infileU))
    write(*,*)"status = ", status
    write(*,*)"Error opening U-FITS file..."
    stop
 else
-   write(*,*)"U-infile chosen:",infileU(1:nchar(infileU))
+   write(*,*)"U-infile chosen:",cfg%infileU(1:nchar(cfg%infileU))
 endif
 
 
@@ -1362,7 +1330,7 @@ call timer_start(t_stage)
  ! Decide whether the entire cubes need to be read or a
  ! part of them...
 
-if(.not.subim)then
+if(.not.cfg%subim)then
    junkchar(1:) = 'nopar'
    write(*,*)" "
    write(*,*)"Entire Q and U-cubes will be used..."
@@ -1404,41 +1372,41 @@ else
    enddo
 
    ! Use subimage parameters directly from config
-   if (subim_ra_blc .eq. 0) then
+   if (cfg%subim_ra_blc .eq. 0) then
       fpixels(1) = 1
    else
-      fpixels(1) = subim_ra_blc
+      fpixels(1) = cfg%subim_ra_blc
    endif
-   if (subim_ra_trc .eq. 0) then
+   if (cfg%subim_ra_trc .eq. 0) then
       lpixels(1) = naxes(1)
    else
-      lpixels(1) = subim_ra_trc
+      lpixels(1) = cfg%subim_ra_trc
    endif
-   incs(1) = subim_ra_inc
+   incs(1) = cfg%subim_ra_inc
 
-   if (subim_dec_blc .eq. 0) then
+   if (cfg%subim_dec_blc .eq. 0) then
       fpixels(2) = 1
    else
-      fpixels(2) = subim_dec_blc
+      fpixels(2) = cfg%subim_dec_blc
    endif
-   if (subim_dec_trc .eq. 0) then
+   if (cfg%subim_dec_trc .eq. 0) then
       lpixels(2) = naxes(2)
    else
-      lpixels(2) = subim_dec_trc
+      lpixels(2) = cfg%subim_dec_trc
    endif
-   incs(2) = subim_dec_inc
+   incs(2) = cfg%subim_dec_inc
 
-   if (subim_chan_blc .eq. 0) then
+   if (cfg%subim_chan_blc .eq. 0) then
       fpixels(freq_axis) = 1
    else
-      fpixels(freq_axis) = subim_chan_blc
+      fpixels(freq_axis) = cfg%subim_chan_blc
    endif
-   if (subim_chan_trc .eq. 0) then
+   if (cfg%subim_chan_trc .eq. 0) then
       lpixels(freq_axis) = naxes(freq_axis)
    else
-      lpixels(freq_axis) = subim_chan_trc
+      lpixels(freq_axis) = cfg%subim_chan_trc
    endif
-   incs(freq_axis) = subim_chan_inc
+   incs(freq_axis) = cfg%subim_chan_inc
 
    write(*,*)"Using subimage from config:"
    write(*,*)"RA: ",fpixels(1)," to ",lpixels(1),&
@@ -2571,8 +2539,8 @@ else
    write(*,*)"Successfully read and closed FITS Ucube..."
 endif
 
-call FTOPEN(21,infileQ,rwmode,blocksize,status)
-call FTOPEN(22,infileU,rwmode,blocksize,status)
+call FTOPEN(21,cfg%infileQ,rwmode,blocksize,status)
+call FTOPEN(22,cfg%infileU,rwmode,blocksize,status)
 if(need_icube)then
    call FTOPEN(40,cfg%infileI,rwmode,blocksize,status)
 endif
@@ -2676,9 +2644,9 @@ if(io_read_threads_eff .eq. 1)then
 else
    do io_par_k = 1, io_read_threads_eff
       par_unit_Q(io_par_k) = 200 + io_par_k
-      call FTOPEN(par_unit_Q(io_par_k),infileQ,0,blocksize,status)
+      call FTOPEN(par_unit_Q(io_par_k),cfg%infileQ,0,blocksize,status)
       par_unit_U(io_par_k) = 300 + io_par_k
-      call FTOPEN(par_unit_U(io_par_k),infileU,0,blocksize,status)
+      call FTOPEN(par_unit_U(io_par_k),cfg%infileU,0,blocksize,status)
       if(need_icube)then
          par_unit_I(io_par_k) = 400 + io_par_k
          call FTOPEN(par_unit_I(io_par_k),cfg%infileI,0,blocksize,status)
