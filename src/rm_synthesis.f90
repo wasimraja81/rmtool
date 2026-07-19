@@ -209,12 +209,7 @@ real(sp) x1, xn, y1, yn, z1, zn
 integer   data_precision
 real(sp) nullval
 logical   subim
-logical   timing_enabled, timing_tile_enabled
-logical   timing_io_enabled
 real(sp) conv_fac ! freq-to-lambda conversion factor
-character(len=16) :: log_level
-character(len=272) :: log_output_file
-character(len=272) :: timing_csv_file
 integer   log_init_status
 real(dp)  t_cfg_start, t_cfg_end
 real(dp)  t_total_start, t_stage, t_tile_start
@@ -463,25 +458,19 @@ subim_dec_inc = cfg%subim_dec_inc
 subim_chan_blc = cfg%subim_chan_blc
 subim_chan_trc = cfg%subim_chan_trc
 subim_chan_inc = cfg%subim_chan_inc
-log_level = cfg%log_level
-timing_enabled = cfg%timing_enabled
-timing_tile_enabled = cfg%timing_tile_enabled
-timing_io_enabled = cfg%timing_io_enabled
-log_output_file = cfg%log_output_file
-timing_csv_file = cfg%timing_csv_file
 
-call init_logging(log_level,timing_enabled,&
-&timing_tile_enabled,timing_io_enabled,&
-&log_output_file,log_init_status)
+call init_logging(cfg%log_level,cfg%timing_enabled,&
+&cfg%timing_tile_enabled,cfg%timing_io_enabled,&
+&cfg%log_output_file,log_init_status)
 if(log_init_status.ne.0)then
    write(*,*)"Error initializing logger/timing output"
    write(*,*)"log_output_file: ",&
-   &log_output_file(1:nchar(log_output_file))
+   &cfg%log_output_file(1:nchar(cfg%log_output_file))
    stop
 endif
-if(nchar(log_output_file).gt.0)then
+if(nchar(cfg%log_output_file).gt.0)then
    write(*,'(A,A)')'Logging/timing output file: ',&
-   &log_output_file(1:nchar(log_output_file))
+   &cfg%log_output_file(1:nchar(cfg%log_output_file))
 endif
 call timer_reset()
 call timer_add(STAGE_CFG_PARSE,t_cfg_end - t_cfg_start)
@@ -3943,14 +3932,14 @@ write(*,'(A,I0)')'  RM blocks processed: ',n_rm_blocks_total
 write(*,'(A,I0)')'  VRAM sub-blocks   : ',n_subblocks_total
 call timer_report_summary()
 
-if(nchar(timing_csv_file).gt.0)then
+if(nchar(cfg%timing_csv_file).gt.0)then
    call date_and_time(values=run_vals)
    write(run_id,'(I4.4,I2.2,I2.2,"T",I2.2,I2.2,I2.2)')&
    &run_vals(1),run_vals(2),run_vals(3),&
    &run_vals(5),run_vals(6),run_vals(7)
 
    call write_timing_csv_line(&
-   &timing_csv_file(1:nchar(timing_csv_file)),&
+   &cfg%timing_csv_file(1:nchar(cfg%timing_csv_file)),&
    &run_id(1:nchar(run_id)),&
    &binary_flavor(1:nchar(binary_flavor)),&
    &nx_out,ny_out,nz_out,nrm_out,cfg%tile_ra,cfg%tile_dec,&
@@ -3963,7 +3952,7 @@ if(nchar(timing_csv_file).gt.0)then
       write(*,'(A)')&
       &'WARNING: unable to append timing_csv_file:'
       write(*,'(A)')&
-      &timing_csv_file(1:nchar(timing_csv_file))
+      &cfg%timing_csv_file(1:nchar(cfg%timing_csv_file))
    endif
 endif
 call log_message('info','finalize',&
