@@ -3747,72 +3747,51 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       ! a background pthread (io_overlap=y) so it can run concurrently with
       ! the next tile's read/mask/prep/compute. See tile_write_job_t in
       ! rm_synthesis_mod.f90 for why a pthread and not an OMP task.
-      write_job(cur_slot)%unit_amp = par_wunit_amp
-      write_job(cur_slot)%unit_pha = par_wunit_pha
-      write_job(cur_slot)%path_amp = outfileAMP
-      write_job(cur_slot)%path_pha = outfileANG
-      write_job(cur_slot)%datastart_amp = datastart_amp
-      write_job(cur_slot)%datastart_pha = datastart_pha
-      write_job(cur_slot)%n_write_threads = io_write_threads_eff
-      write_job(cur_slot)%use_raw_write = (io_write_threads_eff .gt. 1)
-      write_job(cur_slot)%unit_mask    = 43
-      write_job(cur_slot)%unit_nvalid  = 44
-      write_job(cur_slot)%unit_peak    = 46
-      write_job(cur_slot)%unit_rmpeak  = 47
-      write_job(cur_slot)%unit_angpeak = 48
-      write_job(cur_slot)%unit_snr     = 49
-      write_job(cur_slot)%out_mask_open    = out_mask_open
-      write_job(cur_slot)%out_nvalid_open  = out_nvalid_open
-      write_job(cur_slot)%out_peak_open    = out_peak_open
-      write_job(cur_slot)%out_rmpeak_open  = out_rmpeak_open
-      write_job(cur_slot)%out_angpeak_open = out_angpeak_open
-      write_job(cur_slot)%out_snr_open     = out_snr_open
-      write_job(cur_slot)%group        = group
-      write_job(cur_slot)%naxes_out    = naxes_out(1:3)
-      write_job(cur_slot)%naxes_mask   = naxes_mask
-      write_job(cur_slot)%naxes_nvalid = naxes_nvalid
-      write_job(cur_slot)%naxes_stat   = naxes_stat
-      write_job(cur_slot)%ix_out_beg = ix_out_beg
-      write_job(cur_slot)%ix_out_end = ix_out_end
-      write_job(cur_slot)%iy_out_beg = iy_out_beg
-      write_job(cur_slot)%iy_out_end = iy_out_end
-      write_job(cur_slot)%nrm_out  = nrm_out
-      write_job(cur_slot)%nx_tile  = nx_tile
-      write_job(cur_slot)%ny_tile  = ny_tile
-      write_job(cur_slot)%nz_out   = nz_out
-      write_job(cur_slot)%ix_tile_beg = ix_tile_beg
-      write_job(cur_slot)%ix_tile_end = ix_tile_end
-      write_job(cur_slot)%iy_tile_beg = iy_tile_beg
-      write_job(cur_slot)%iy_tile_end = iy_tile_end
-      write_job(cur_slot)%p_tile_arr      => p_tile_arr
-      write_job(cur_slot)%phi_tile_arr    => phi_tile_arr
-      write_job(cur_slot)%mask_tile_arr   => mask_tile_arr
-      write_job(cur_slot)%nvalid_tile_arr => nvalid_tile_arr
-      if(cubestat)then
-         write_job(cur_slot)%peak_tile_arr     => peak_tile_arr
-         write_job(cur_slot)%rm_peak_tile_arr  => rm_peak_tile_arr
-         write_job(cur_slot)%ang_peak_tile_arr => ang_peak_tile_arr
-         write_job(cur_slot)%snr_tile_arr      => snr_tile_arr
-      endif
+      ! T3b encapsulation ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+      ! populate_write_job (rm_synthesis_mod.f90) holds the mechanical field
+      ! assignment that used to be ~47 lines of write_job(cur_slot)%field =
+      ! local right here -- moved verbatim, only var -> argument. The
+      ! synchronisation below (join-before-reuse above, join-before-dispatch
+      ! below) is untouched, in its exact original order: encapsulate the
+      ! data, never the control flow.
+      call populate_write_job(write_job(cur_slot), par_wunit_amp,&
+      &par_wunit_pha, outfileAMP, outfileANG, datastart_amp,&
+      &datastart_pha, io_write_threads_eff, out_mask_open,&
+      &out_nvalid_open, out_peak_open, out_rmpeak_open,&
+      &out_angpeak_open, out_snr_open, group, naxes_out(1:3),&
+      &naxes_mask, naxes_nvalid, naxes_stat, ix_out_beg, ix_out_end,&
+      &iy_out_beg, iy_out_end, nrm_out, nx_tile, ny_tile, nz_out,&
+      &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end, p_tile_arr,&
+      &phi_tile_arr, mask_tile_arr, nvalid_tile_arr, cubestat,&
+      &peak_tile_arr, rm_peak_tile_arr, ang_peak_tile_arr, snr_tile_arr)
 
       if(io_overlap)then
-         ! io_write_threads_eff is hard-clamped to 1 (see the safety clamp
-         ! above), so every tile's write -- regardless of which double-
-         ! buffer slot it used -- goes through the exact same two FITS
-         ! handles (AMP/PHA). Two pthreads calling ftpsse on the same
-         ! handle concurrently is unsafe no matter how well-separated
-         ! their byte ranges or buffers are. The per-slot join above only
-         ! guards buffer reuse (2 tiles apart); it does NOT guarantee the
-         ! *previous* tile's write (a different slot) has finished, and a
-         ! small/fast tile following a large/slow one -- e.g. the leftover
-         ! partial tile at the bottom of an image whose height isn't an
-         ! exact multiple of the tile size -- can easily outrun it. Join
-         ! any still-outstanding write from either slot before starting a
-         ! new one, so at most one write is ever in flight. This does not
-         ! reduce the overlap already achieved: tile N+1's read/mask/prep/
-         ! compute/cubestat above already ran concurrently with write(N)
-         ! regardless; this only delays *dispatch* of write(N+1) until
-         ! write(N)'s handle is free, which is required for correctness.
+         ! Handle safety: before any new write is dispatched, whichever
+         ! write is currently outstanding (either slot) is joined first,
+         ! unconditionally, regardless of io_write_threads_eff. This rule
+         ! predates the T6 raw-write mechanism, from when every tile's
+         ! write shared the same two FITS handles (AMP/PHA) regardless of
+         ! slot and two pthreads calling ftpsse on the same handle at once
+         ! was unsafe no matter how well-separated their byte ranges or
+         ! buffers were (see the postmortem in docs/ARCHITECTURE.md). It
+         ! remains in force unconditionally today, including under
+         ! io_write_threads_eff>1's raw-write path: each tile's own
+         ! RM-chunks already write to genuinely disjoint byte ranges via
+         ! independent stream units, so two different tiles' writes could
+         ! in principle also overlap safely by the same POSIX guarantee --
+         ! but the rule doesn't special-case that, since it costs nothing
+         ! (a tile's write almost always finishes before the next tile's
+         ! own read/mask/prep/compute pipeline does anyway). The per-slot
+         ! join above only guards buffer reuse (2 tiles apart); it does
+         ! NOT guarantee the *previous* tile's write (a different slot)
+         ! has finished, and a small/fast tile following a large/slow one
+         ! -- e.g. the leftover partial tile at the bottom of an image
+         ! whose height isn't an exact multiple of the tile size -- can
+         ! easily outrun it. This does not reduce the overlap already
+         ! achieved: tile N+1's read/mask/prep/compute/cubestat above
+         ! already ran concurrently with write(N) regardless; this only
+         ! delays *dispatch* of write(N+1) until write(N)'s handle is
+         ! free, which is required for correctness.
          if(write_pending(0))then
             call tile_write_join(write_thread_id(0))
             write_pending(0) = .false.

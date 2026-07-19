@@ -32,6 +32,7 @@ module rm_synthesis_mod
   public :: STAGE_TILE_SCATTER, STAGE_TILE_WRITE, STAGE_FINALIZE
   public :: sp, dp, int32, int64
   public :: tile_write_job_t, tile_write_dispatch_async, tile_write_join
+  public :: populate_write_job
   public :: do_tile_write
   public :: host_is_big_endian, write_rm_chunk_raw
   
@@ -3322,6 +3323,93 @@ contains
     deallocate(plane_buf)
     close(u)
   end subroutine write_rm_chunk_raw
+
+  subroutine populate_write_job(job, par_wunit_amp, par_wunit_pha, &
+  &path_amp, path_pha, datastart_amp, datastart_pha, n_write_threads, &
+  &out_mask_open, out_nvalid_open, out_peak_open, out_rmpeak_open, &
+  &out_angpeak_open, out_snr_open, group, naxes_out_in, naxes_mask, &
+  &naxes_nvalid, naxes_stat, ix_out_beg, ix_out_end, iy_out_beg, &
+  &iy_out_end, nrm_out, nx_tile, ny_tile, nz_out, ix_tile_beg, &
+  &ix_tile_end, iy_tile_beg, iy_tile_end, p_tile_arr, phi_tile_arr, &
+  &mask_tile_arr, nvalid_tile_arr, cubestat, peak_tile_arr, &
+  &rm_peak_tile_arr, ang_peak_tile_arr, snr_tile_arr)
+    !! T3b I/O orchestration ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+    !! the per-tile write_job(cur_slot)%field = local data assembly, moved
+    !! verbatim out of the tile loop into one call -- only the mechanical
+    !! assignment block, none of the surrounding synchronisation (the
+    !! join-before-reuse / join-before-dispatch statements in rm_synthesis.f90
+    !! stay completely untouched, in their exact original order, in the main
+    !! program). job is whichever ping-pong slot (write_job(cur_slot)) the
+    !! caller is about to (re)populate.
+    implicit none
+    type(tile_write_job_t), intent(inout) :: job
+    integer, intent(in) :: par_wunit_amp, par_wunit_pha
+    character(len=*), intent(in) :: path_amp, path_pha
+    integer(kind=int64), intent(in) :: datastart_amp, datastart_pha
+    integer, intent(in) :: n_write_threads
+    logical, intent(in) :: out_mask_open, out_nvalid_open, out_peak_open
+    logical, intent(in) :: out_rmpeak_open, out_angpeak_open, out_snr_open
+    integer, intent(in) :: group
+    integer, intent(in) :: naxes_out_in(3), naxes_mask(3)
+    integer, intent(in) :: naxes_nvalid(2), naxes_stat(2)
+    integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
+    integer, intent(in) :: nrm_out, nx_tile, ny_tile, nz_out
+    integer, intent(in) :: ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
+    real(sp), pointer, intent(in) :: p_tile_arr(:), phi_tile_arr(:)
+    integer(int8), pointer, intent(in) :: mask_tile_arr(:)
+    integer(int16), pointer, intent(in) :: nvalid_tile_arr(:)
+    logical, intent(in) :: cubestat
+    real(sp), pointer, intent(in) :: peak_tile_arr(:), rm_peak_tile_arr(:)
+    real(sp), pointer, intent(in) :: ang_peak_tile_arr(:), snr_tile_arr(:)
+
+    job%unit_amp = par_wunit_amp
+    job%unit_pha = par_wunit_pha
+    job%path_amp = path_amp
+    job%path_pha = path_pha
+    job%datastart_amp = datastart_amp
+    job%datastart_pha = datastart_pha
+    job%n_write_threads = n_write_threads
+    job%use_raw_write = (n_write_threads .gt. 1)
+    job%unit_mask    = 43
+    job%unit_nvalid  = 44
+    job%unit_peak    = 46
+    job%unit_rmpeak  = 47
+    job%unit_angpeak = 48
+    job%unit_snr     = 49
+    job%out_mask_open    = out_mask_open
+    job%out_nvalid_open  = out_nvalid_open
+    job%out_peak_open    = out_peak_open
+    job%out_rmpeak_open  = out_rmpeak_open
+    job%out_angpeak_open = out_angpeak_open
+    job%out_snr_open     = out_snr_open
+    job%group        = group
+    job%naxes_out    = naxes_out_in
+    job%naxes_mask   = naxes_mask
+    job%naxes_nvalid = naxes_nvalid
+    job%naxes_stat   = naxes_stat
+    job%ix_out_beg = ix_out_beg
+    job%ix_out_end = ix_out_end
+    job%iy_out_beg = iy_out_beg
+    job%iy_out_end = iy_out_end
+    job%nrm_out  = nrm_out
+    job%nx_tile  = nx_tile
+    job%ny_tile  = ny_tile
+    job%nz_out   = nz_out
+    job%ix_tile_beg = ix_tile_beg
+    job%ix_tile_end = ix_tile_end
+    job%iy_tile_beg = iy_tile_beg
+    job%iy_tile_end = iy_tile_end
+    job%p_tile_arr      => p_tile_arr
+    job%phi_tile_arr    => phi_tile_arr
+    job%mask_tile_arr   => mask_tile_arr
+    job%nvalid_tile_arr => nvalid_tile_arr
+    if(cubestat)then
+       job%peak_tile_arr     => peak_tile_arr
+       job%rm_peak_tile_arr  => rm_peak_tile_arr
+       job%ang_peak_tile_arr => ang_peak_tile_arr
+       job%snr_tile_arr      => snr_tile_arr
+    endif
+  end subroutine populate_write_job
 
   subroutine do_tile_write(job)
     !! Writes one tile's AMP/PHA (RM-chunked, parallel if n_write_threads>1)
