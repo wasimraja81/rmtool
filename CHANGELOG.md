@@ -5,25 +5,17 @@ All notable changes to this project are documented in this file.
 ## [4.0] - 2026-07-19
 
 Maintainability and documentation milestone rather than a new-capability
-one: the two files carrying almost all of rmtool's logic were
+one: the two fortran files carrying almost all of rmtool's logic were
 restructured around derived types with zero change in observable
 behaviour, a real swim-lane plotter bug was found and fixed, and the
 README gained a new "Motivation" section explaining rmtool's parallelism
-model for a research (not HPC-expert) audience. See
-`docs/RELEASE_NOTES_4.0.md` for the full writeup and
-`planning/ENCAPSULATION_REFACTOR_PLAN.md` for the ticket-by-ticket
-refactor history.
+model for a research (not HPC-expert) audience. 
 
 ### Added
 - README "Motivation" section: explains tiling for memory, the
   disk-layout-driven tile shape, the CPU-side "corner turn" (and why the
   GPU path skips it), read/write/compute overlap, parallel I/O channels,
-  and GPU offload — in plain language, fact-checked claim-by-claim
-  against the implementation during review (an earlier draft overstated
-  a 3-way read/compute/write pipeline where the real mechanism is a 2-way
-  overlap, generalised the CPU-specific "corner turn" to the GPU path
-  incorrectly, and implied a GPU-built binary is safe to run on hardware
-  with no physical device, which is untested).
+  and GPU offload — in plain language.
 
 ### Changed
 - All ~56 config values (paths, tiling/memory-planning knobs, RM sampling,
