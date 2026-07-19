@@ -1115,37 +1115,57 @@ def _layout_right_panel(
     legend_h = legend_bbox.height if legend_bbox is not None else 0.0
     info_budget_h = available_h - legend_h - (gap if legend_artist is not None and right_info_lines else 0.0)
 
-    # Info box: the largest font, in descending order, whose rendered
-    # height fits within whatever the legend left behind.
+    def build_info(fs):
+        return ax.text(
+            x_anchor,
+            y_top,
+            "\n".join(right_info_lines),
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=fs,
+            fontfamily="DejaVu Sans Mono",
+            linespacing=1.05,
+            clip_on=False,
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "#666666",
+                "alpha": 0.9,
+                "boxstyle": "round,pad=0.5",
+            },
+        )
+
+    def info_height_at(fs):
+        probe = build_info(fs)
+        h = measure(probe).height
+        probe.remove()
+        return h
+
+    # Info box: continuous (not integer-stepped) font size, binary-searched
+    # to the largest that fills info_budget_h -- whatever the legend left
+    # behind. Fixed integer candidates (9, 8, 7, ...) routinely overshoot
+    # the budget at one size and undershoot it at the next, leaving a
+    # visibly wasted gap between the boxes instead of the info panel
+    # actually using the space it was given.
     info_artist = None
     info_bbox = None
     info_fs_used = None
     if right_info_lines:
-        for info_fs in (9, 8, 7, 6, 5, 4):
-            if info_artist is not None:
-                info_artist.remove()
-            info_artist = ax.text(
-                x_anchor,
-                y_top,
-                "\n".join(right_info_lines),
-                transform=ax.transAxes,
-                va="top",
-                ha="left",
-                fontsize=info_fs,
-                fontfamily="DejaVu Sans Mono",
-                linespacing=1.05,
-                clip_on=False,
-                bbox={
-                    "facecolor": "white",
-                    "edgecolor": "#666666",
-                    "alpha": 0.9,
-                    "boxstyle": "round,pad=0.5",
-                },
-            )
-            info_bbox = measure(info_artist)
-            info_fs_used = info_fs
-            if info_bbox.height <= info_budget_h:
-                break
+        lo_fs, hi_fs = 3.5, 9.5
+        if info_height_at(hi_fs) <= info_budget_h:
+            best_fs = hi_fs
+        else:
+            best_fs = lo_fs
+            for _ in range(10):
+                mid_fs = (lo_fs + hi_fs) / 2.0
+                if info_height_at(mid_fs) <= info_budget_h:
+                    best_fs = mid_fs
+                    lo_fs = mid_fs
+                else:
+                    hi_fs = mid_fs
+        info_artist = build_info(best_fs)
+        info_bbox = measure(info_artist)
+        info_fs_used = best_fs
 
     overlap_area = _bbox_overlap_area_axes(legend_bbox, info_bbox)
     if legend_bbox is not None:
