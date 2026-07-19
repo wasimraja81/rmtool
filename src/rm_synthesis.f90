@@ -129,8 +129,6 @@ type(tile_write_job_t), target :: write_job(0:1)
 integer(c_long) :: write_thread_id(0:1)
 logical :: write_pending(0:1)
 logical :: write_dispatched_ok
-real(sp)  resiQ, resiU, slopeQ, slopeU
-logical   remove_QU_bias
 integer   bitpixQ, naxisQ, naxesQ(max_axis)
 integer   bitpixU, naxisU, naxesU(max_axis)
 integer   bitpixM, naxisM, naxesM(max_axis)
@@ -189,7 +187,7 @@ real(dp) cval,cdelt, pi
 real(sp) cpix, dRM
 
 integer   rwmode
-character(len=272) :: infileI, infileQ, infileU, message
+character(len=272) :: infileQ, infileU, message
 character(len=272) :: outfile, outfileAMP, outfileANG
 character(len=272) :: outfileMASK, outfileNVALID
 character(len=272) :: outfilePEAK, outfileRMPEAK
@@ -199,7 +197,7 @@ character(len=272) :: mask_cube_file, mask_input_cube_file,&
 character(len=272) :: subim_parfile, cfgfile, cfgfile_in
 type(rmsynth_config_t) :: cfg
 type(tile_plan_t) :: plan
-character(len=172) :: path, path_I
+character(len=172) :: path
 character(len=1) :: yorn
 
 integer   nx_1st, nx_2nd, ny_1st, ny_2nd, nz_1st, nz_2nd
@@ -345,7 +343,7 @@ integer   st_i_rm_block, st_nrm_block_now
 
  ! Variables/Parameters for RM-extraction:
 real(sp) fac, beg_rm, end_rm
-integer   ofac, rem_mean, nrm_out, nrm_out_par
+integer   ofac, nrm_out, nrm_out_par
 integer   use_auto_rm_range
 integer   output_mode
 integer   ap_angle_mode
@@ -474,14 +472,6 @@ subim_dec_inc = cfg%subim_dec_inc
 subim_chan_blc = cfg%subim_chan_blc
 subim_chan_trc = cfg%subim_chan_trc
 subim_chan_inc = cfg%subim_chan_inc
-rem_mean = cfg%rem_mean
-remove_QU_bias = cfg%remove_qu_bias
-resiQ = cfg%resiQ
-slopeQ = cfg%slopeQ
-resiU = cfg%resiU
-slopeU = cfg%slopeU
-path_I = cfg%path_I
-infileI = cfg%infileI
 ofac = cfg%ofac
 fac = cfg%fac
 beg_rm = cfg%beg_rm
@@ -573,19 +563,19 @@ if(use_gpu)then
 #endif
 endif
 
-if (rem_mean.gt.0)then
+if (cfg%rem_mean.gt.0)then
    write(*,*)"Mean will be removed from each Q and U "
    write(*,*)"spectra in the RM-extraction..."
    write(*,*)" "
 endif
 
 need_icube = .false.
-if(remove_qu_bias)need_icube = .true.
+if(cfg%remove_qu_bias)need_icube = .true.
 
-if(remove_qu_bias)then
+if(cfg%remove_qu_bias)then
    write(*,*)"Removing the bias from Q and U..."
-   write(*,*)"bias in Q specified in cfg file: ",resiQ
-   write(*,*)"bias in U specified in cfg file: ",resiU
+   write(*,*)"bias in Q specified in cfg file: ",cfg%resiQ
+   write(*,*)"bias in U specified in cfg file: ",cfg%resiU
 else
    write(*,*)"No bias removal from Q and U..."
 endif
@@ -604,9 +594,9 @@ if(nchar(mask_input_cube_file).gt.0)then
    endif
 endif
 if(need_icube)then
-   infileI(1:)=path_I(1:nchar(path_I))//&
-   &infileI(1:nchar(infileI))
-   write(*,*)"I-fitscube in: ",infileI(1:nchar(infileI))
+   cfg%infileI(1:)=cfg%path_I(1:nchar(cfg%path_I))//&
+   &cfg%infileI(1:nchar(cfg%infileI))
+   write(*,*)"I-fitscube in: ",cfg%infileI(1:nchar(cfg%infileI))
 endif
 
 outfileAMP(1:) = outfile(1:nchar(outfile))//'.AMP.RMCUBE.FITS'
@@ -1753,7 +1743,7 @@ plan%nz_out = nz_out
 plan%nrm_out = nrm_out
 plan%nx_out = nx_out
 plan%ny_out = ny_out
-plan%rem_mean = rem_mean
+plan%rem_mean = cfg%rem_mean
 plan%use_input_mask = use_input_mask
 plan%need_icube = need_icube
 plan%cubestat = cubestat
@@ -2619,7 +2609,7 @@ endif
 call FTOPEN(21,infileQ,rwmode,blocksize,status)
 call FTOPEN(22,infileU,rwmode,blocksize,status)
 if(need_icube)then
-   call FTOPEN(40,infileI,rwmode,blocksize,status)
+   call FTOPEN(40,cfg%infileI,rwmode,blocksize,status)
 endif
 if(use_input_mask)then
    status = 0
@@ -2726,7 +2716,7 @@ else
       call FTOPEN(par_unit_U(io_par_k),infileU,0,blocksize,status)
       if(need_icube)then
          par_unit_I(io_par_k) = 400 + io_par_k
-         call FTOPEN(par_unit_I(io_par_k),infileI,0,blocksize,status)
+         call FTOPEN(par_unit_I(io_par_k),cfg%infileI,0,blocksize,status)
       endif
       if(use_input_mask)then
          par_unit_mask(io_par_k) = 500 + io_par_k
@@ -3042,7 +3032,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
             &specQ, specU, mask_tile_arr,&
             &nx_tile, ny_tile, nz_out,&
             &specQ_gpu, specU_gpu, wts_gpu,&
-            &rem_mean, mean_Q, mean_U, wsum_gpu)
+            &cfg%rem_mean, mean_Q, mean_U, wsum_gpu)
 
             ! Populate nvalid_tile_arr from precomputed per-pixel weight sums.
             ! wsum_gpu(ipix) is the count of valid channels for that pixel
@@ -3073,7 +3063,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                &mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,&
                &nx_tile, ny_tile, nz_out,&
                &i_rm_block, nrm_block_now, nrm_out,&
-               &use_gpu_actual, rem_mean, output_mode,&
+               &use_gpu_actual, cfg%rem_mean, output_mode,&
                &ap_angle_mode, p_tile_arr, phi_tile_arr)
             end do
             call log_tile_note('tile_compute', 'gpu recv')
@@ -3092,14 +3082,14 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
             &specQ, specU, mask_tile_arr,&
             &nx_tile, ny_tile, nz_out,&
             &specQ_gpu, specU_gpu, wts_gpu,&
-            &rem_mean, mean_Q, mean_U, wsum_gpu)
+            &cfg%rem_mean, mean_Q, mean_U, wsum_gpu)
 #else
             ! CPU binary: (nz_out,npix) layout -> stride-1 channel loop
             call prepare_cpu_data(&
             &specQ, specU, mask_tile_arr,&
             &nx_tile, ny_tile, nz_out,&
             &specQ_gpu, specU_gpu, wts_gpu,&
-            &rem_mean, mean_Q, mean_U, wsum_gpu)
+            &cfg%rem_mean, mean_Q, mean_U, wsum_gpu)
 #endif
             do ipix_tile = 1, int(nx_tile,kind=int64)*int(ny_tile,kind=int64)
                nvalid_tile_arr(ipix_tile) =&
@@ -3121,7 +3111,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                &mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,&
                &nx_tile, ny_tile, nz_out,&
                &i_rm_block, nrm_block_now, nrm_out,&
-               &use_gpu_actual, rem_mean, output_mode,&
+               &use_gpu_actual, cfg%rem_mean, output_mode,&
                &ap_angle_mode, p_tile_arr, phi_tile_arr)
             end do
             call timer_stop(STAGE_TILE_COMPUTE,t_stage)
@@ -3261,14 +3251,14 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                   &stMask_tile_arr(1,slot_idx),&
                   &nx_tile, ny_sub_now, nz_out,&
                   &st_Q_gpu1, st_U_gpu1, st_wts_gpu1,&
-                  &rem_mean, st_mean_Q1, st_mean_U1, st_wsum_gpu1)
+                  &cfg%rem_mean, st_mean_Q1, st_mean_U1, st_wsum_gpu1)
                else
                   call prepare_gpu_data(stQ(1,slot_idx),&
                   &stU(1,slot_idx),&
                   &stMask_tile_arr(1,slot_idx),&
                   &nx_tile, ny_sub_now, nz_out,&
                   &st_Q_gpu2, st_U_gpu2, st_wts_gpu2,&
-                  &rem_mean, st_mean_Q2, st_mean_U2, st_wsum_gpu2)
+                  &cfg%rem_mean, st_mean_Q2, st_mean_U2, st_wsum_gpu2)
                endif
 
                ! Populate stNvalid from precomputed per-pixel weight sums
@@ -3331,7 +3321,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &cos_arr, sin_arr,&
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
-                        &nrm_out, use_gpu_actual, rem_mean,&
+                        &nrm_out, use_gpu_actual, cfg%rem_mean,&
                         &output_mode, ap_angle_mode,&
                         &stP(:,slot_idx_now), stPhi(:,slot_idx_now))
                      else
@@ -3341,7 +3331,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &cos_arr, sin_arr,&
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
-                        &nrm_out, use_gpu_actual, rem_mean,&
+                        &nrm_out, use_gpu_actual, cfg%rem_mean,&
                         &output_mode, ap_angle_mode,&
                         &stP(:,slot_idx_now), stPhi(:,slot_idx_now))
                      endif
@@ -3376,7 +3366,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &cos_arr, sin_arr,&
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
-                        &nrm_out, use_gpu_actual, rem_mean,&
+                        &nrm_out, use_gpu_actual, cfg%rem_mean,&
                         &output_mode, ap_angle_mode,&
                         &stP(:,slot_idx), stPhi(:,slot_idx))
                      else
@@ -3386,7 +3376,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &cos_arr, sin_arr,&
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
-                        &nrm_out, use_gpu_actual, rem_mean,&
+                        &nrm_out, use_gpu_actual, cfg%rem_mean,&
                         &output_mode, ap_angle_mode,&
                         &stP(:,slot_idx), stPhi(:,slot_idx))
                      endif
