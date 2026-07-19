@@ -192,8 +192,6 @@ character(len=272) :: outfile, outfileAMP, outfileANG
 character(len=272) :: outfileMASK, outfileNVALID
 character(len=272) :: outfilePEAK, outfileRMPEAK
 character(len=272) :: outfileANGPEAK, outfileSNR
-character(len=272) :: mask_cube_file, mask_input_cube_file,&
-&mask_trust_mode
 character(len=272) :: subim_parfile, cfgfile, cfgfile_in
 type(rmsynth_config_t) :: cfg
 type(tile_plan_t) :: plan
@@ -211,7 +209,6 @@ real(sp) x1, xn, y1, yn, z1, zn
 integer   data_precision
 real(sp) nullval
 logical   subim
-logical   write_mask_output, write_nvalid_output
 logical   cubestat
 logical   use_gpu
 logical   timing_enabled, timing_tile_enabled
@@ -343,8 +340,6 @@ integer   st_i_rm_block, st_nrm_block_now
 
  ! Variables/Parameters for RM-extraction:
 integer   nrm_out
-integer   output_mode
-integer   ap_angle_mode
 real(sp), allocatable :: RM(:)
 real(sp), allocatable :: p_ex(:)
 real(sp), allocatable :: phi_ex(:)
@@ -470,13 +465,6 @@ subim_dec_inc = cfg%subim_dec_inc
 subim_chan_blc = cfg%subim_chan_blc
 subim_chan_trc = cfg%subim_chan_trc
 subim_chan_inc = cfg%subim_chan_inc
-output_mode = cfg%output_mode
-ap_angle_mode = cfg%ap_angle_mode
-mask_cube_file = cfg%mask_cube_file
-mask_input_cube_file = cfg%mask_input_cube_file
-mask_trust_mode = cfg%mask_trust_mode
-write_mask_output = cfg%write_mask_output
-write_nvalid_output = cfg%write_nvalid_output
 cubestat = cfg%cubestat
 use_gpu = cfg%use_gpu
 log_level = cfg%log_level
@@ -575,14 +563,14 @@ endif
  ! Process file paths:
 infileQ(1:) = path(1:nchar(path))//infileQ(1:nchar(infileQ))
 infileU(1:) = path(1:nchar(path))//infileU(1:nchar(infileU))
-if(nchar(mask_input_cube_file).gt.0)then
-   inquire(file=mask_input_cube_file(&
-   &1:nchar(mask_input_cube_file)),exist=anyflg)
+if(nchar(cfg%mask_input_cube_file).gt.0)then
+   inquire(file=cfg%mask_input_cube_file(&
+   &1:nchar(cfg%mask_input_cube_file)),exist=anyflg)
    if(.not.anyflg)then
-      mask_input_cube_file(1:) =&
+      cfg%mask_input_cube_file(1:) =&
       &path(1:nchar(path))//&
-      &mask_input_cube_file(&
-      &1:nchar(mask_input_cube_file))
+      &cfg%mask_input_cube_file(&
+      &1:nchar(cfg%mask_input_cube_file))
    endif
 endif
 if(need_icube)then
@@ -592,13 +580,13 @@ if(need_icube)then
 endif
 
 outfileAMP(1:) = outfile(1:nchar(outfile))//'.AMP.RMCUBE.FITS'
-if(output_mode.eq.1)then
+if(cfg%output_mode.eq.1)then
    outfileAMP(1:) = outfile(1:nchar(outfile))//&
    &'.REAL.RMCUBE.FITS'
    outfileANG(1:) = outfile(1:nchar(outfile))//&
    &'.IMAG.RMCUBE.FITS'
 else
-   if(ap_angle_mode.eq.1)then
+   if(cfg%ap_angle_mode.eq.1)then
       outfileANG(1:) = outfile(1:nchar(outfile))//&
       &'.POLA.RMCUBE.FITS'
    else
@@ -607,8 +595,8 @@ else
    endif
 endif
 outfileMASK(1:) = outfile(1:nchar(outfile))//'.MASK.CUBE.FITS'
-if(nchar(mask_cube_file).gt.0)then
-   outfileMASK(1:) = mask_cube_file(1:nchar(mask_cube_file))
+if(nchar(cfg%mask_cube_file).gt.0)then
+   outfileMASK(1:) = cfg%mask_cube_file(1:nchar(cfg%mask_cube_file))
 endif
 outfileNVALID(1:) = outfile(1:nchar(outfile))//'.NVALID.MAP.FITS'
 outfilePEAK(1:) = outfile(1:nchar(outfile))//'.PEAK.MAP.FITS'
@@ -723,7 +711,7 @@ freq_axis = freq_axisQ
 
 if(use_input_mask)then
    status = 0
-   call myfits_info(mask_input_cube_file,&
+   call myfits_info(cfg%mask_input_cube_file,&
    &bitpixM,naxisM,naxesM,&
    &cxval_imM,cxpix_imM,xinc_imM,&
    &cyval_imM,cypix_imM,yinc_imM,&
@@ -732,8 +720,8 @@ if(use_input_mask)then
    if(status.ne.0)then
       write(*,*)"status = ",status
       write(*,*)"Mask cube info read failed"
-      write(*,*)mask_input_cube_file(&
-      &1:nchar(mask_input_cube_file))
+      write(*,*)cfg%mask_input_cube_file(&
+      &1:nchar(cfg%mask_input_cube_file))
       write(*,*)"message:",message(1:nchar(message))
       stop
    endif
@@ -1126,15 +1114,15 @@ out_snr_open = .false.
 in_mask_open = .false.
 use_input_mask = .false.
 masksrc_key = 'generated'
-if(nchar(mask_input_cube_file).gt.0)then
+if(nchar(cfg%mask_input_cube_file).gt.0)then
    use_input_mask = .true.
    masksrc_key = 'input'
 endif
 if(remove_badchan .and. use_input_mask)masksrc_key = 'combined'
 nanchk_key = 'on'
 nan_check_on = .true.
-if(index(mask_trust_mode,'strict').gt.0 .or.&
-&index(mask_trust_mode,'STRICT').gt.0)then
+if(index(cfg%mask_trust_mode,'strict').gt.0 .or.&
+&index(cfg%mask_trust_mode,'STRICT').gt.0)then
    nanchk_key = 'off'
    nan_check_on = .false.
 endif
@@ -1190,7 +1178,7 @@ if(.not.cfg%dry_run)then
       write(*,*)"Please remove/rename it and run again."
       stop
    endif
-   if(write_mask_output)then
+   if(cfg%write_mask_output)then
       inquire(file=outfileMASK(1:nchar(outfileMASK)),&
       &exist=out_exists)
       if(out_exists)then
@@ -1206,7 +1194,7 @@ if(.not.cfg%dry_run)then
          stop
       endif
    endif
-   if(write_nvalid_output)then
+   if(cfg%write_nvalid_output)then
       inquire(file=outfileNVALID(&
       &1:nchar(outfileNVALID)),exist=out_exists)
       if(out_exists)then
@@ -1300,7 +1288,7 @@ if(.not.cfg%dry_run)then
    endif
    out_ang_open = .true.
 
-   if(write_mask_output)then
+   if(cfg%write_mask_output)then
       status = 0
       call ftinit(43,outfileMASK,blocksize,status)
       if(status.ne.0)then
@@ -1314,7 +1302,7 @@ if(.not.cfg%dry_run)then
       out_mask_open = .true.
    endif
 
-   if(write_nvalid_output)then
+   if(cfg%write_nvalid_output)then
       status = 0
       call ftinit(44,outfileNVALID,blocksize,status)
       if(status.ne.0)then
@@ -1804,7 +1792,7 @@ if(cfg%dry_run)then
    close(96)
    call write_runtime_estimate('runtime_estimate.txt',&
    &image_pixels_total,&
-   &nz_totpix,ngood_chan,nbad_chan,nrm_out,output_mode,&
+   &nz_totpix,ngood_chan,nbad_chan,nrm_out,cfg%output_mode,&
    &cfg%tile_ra,cfg%tile_dec,nx_out,ny_out,tile_bytes_est,&
    &cfg%mem_frac_ram,status)
    ! Append two-level (RAM block + VRAM sub-block) summary.
@@ -2517,19 +2505,19 @@ if(out_nvalid_open)then
    &'NaN validity check on/off',status)
 endif
 call ftpkys(41,'MASKTRUS',&
-&mask_trust_mode(1:nchar(mask_trust_mode)),&
+&cfg%mask_trust_mode(1:nchar(cfg%mask_trust_mode)),&
 &'Mask trust mode: safe/strict',status)
 call ftpkys(42,'MASKTRUS',&
-&mask_trust_mode(1:nchar(mask_trust_mode)),&
+&cfg%mask_trust_mode(1:nchar(cfg%mask_trust_mode)),&
 &'Mask trust mode: safe/strict',status)
 if(out_mask_open)then
    call ftpkys(43,'MASKTRUS',&
-   &mask_trust_mode(1:nchar(mask_trust_mode)),&
+   &cfg%mask_trust_mode(1:nchar(cfg%mask_trust_mode)),&
    &'Mask trust mode: safe/strict',status)
 endif
 if(out_nvalid_open)then
    call ftpkys(44,'MASKTRUS',&
-   &mask_trust_mode(1:nchar(mask_trust_mode)),&
+   &cfg%mask_trust_mode(1:nchar(cfg%mask_trust_mode)),&
    &'Mask trust mode: safe/strict',status)
 endif
 if(out_peak_open)then
@@ -2605,12 +2593,12 @@ if(need_icube)then
 endif
 if(use_input_mask)then
    status = 0
-   call FTOPEN(45,mask_input_cube_file,&
+   call FTOPEN(45,cfg%mask_input_cube_file,&
    &rwmode,blocksize,status)
    if(status.ne.0)then
       write(*,*)"Error opening input mask cube:"
-      write(*,*)mask_input_cube_file(&
-      &1:nchar(mask_input_cube_file))
+      write(*,*)cfg%mask_input_cube_file(&
+      &1:nchar(cfg%mask_input_cube_file))
       call printerror(status)
       stop
    endif
@@ -2713,7 +2701,7 @@ else
       if(use_input_mask)then
          par_unit_mask(io_par_k) = 500 + io_par_k
          call FTOPEN(par_unit_mask(io_par_k),&
-         &mask_input_cube_file,0,blocksize,status)
+         &cfg%mask_input_cube_file,0,blocksize,status)
       endif
    enddo
    write(*,*)" Parallel FITS IO: opened ",io_read_threads_eff," handles/file"
@@ -3055,8 +3043,8 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                &mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,&
                &nx_tile, ny_tile, nz_out,&
                &i_rm_block, nrm_block_now, nrm_out,&
-               &use_gpu_actual, cfg%rem_mean, output_mode,&
-               &ap_angle_mode, p_tile_arr, phi_tile_arr)
+               &use_gpu_actual, cfg%rem_mean, cfg%output_mode,&
+               &cfg%ap_angle_mode, p_tile_arr, phi_tile_arr)
             end do
             call log_tile_note('tile_compute', 'gpu recv')
             call timer_stop(STAGE_TILE_COMPUTE,t_stage)
@@ -3103,8 +3091,8 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                &mean_Q, mean_U, wsum_gpu, cos_arr, sin_arr,&
                &nx_tile, ny_tile, nz_out,&
                &i_rm_block, nrm_block_now, nrm_out,&
-               &use_gpu_actual, cfg%rem_mean, output_mode,&
-               &ap_angle_mode, p_tile_arr, phi_tile_arr)
+               &use_gpu_actual, cfg%rem_mean, cfg%output_mode,&
+               &cfg%ap_angle_mode, p_tile_arr, phi_tile_arr)
             end do
             call timer_stop(STAGE_TILE_COMPUTE,t_stage)
             deallocate(specQ_gpu, specU_gpu, wts_gpu)
@@ -3314,7 +3302,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
                         &nrm_out, use_gpu_actual, cfg%rem_mean,&
-                        &output_mode, ap_angle_mode,&
+                        &cfg%output_mode, cfg%ap_angle_mode,&
                         &stP(:,slot_idx_now), stPhi(:,slot_idx_now))
                      else
                         call tile_extract_gpu_rm_blocked(&
@@ -3324,7 +3312,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
                         &nrm_out, use_gpu_actual, cfg%rem_mean,&
-                        &output_mode, ap_angle_mode,&
+                        &cfg%output_mode, cfg%ap_angle_mode,&
                         &stP(:,slot_idx_now), stPhi(:,slot_idx_now))
                      endif
                   enddo
@@ -3359,7 +3347,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
                         &nrm_out, use_gpu_actual, cfg%rem_mean,&
-                        &output_mode, ap_angle_mode,&
+                        &cfg%output_mode, cfg%ap_angle_mode,&
                         &stP(:,slot_idx), stPhi(:,slot_idx))
                      else
                         call tile_extract_gpu_rm_blocked(&
@@ -3369,7 +3357,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
                         &nx_tile, ny_sub_now, nz_out,&
                         &st_i_rm_block, st_nrm_block_now,&
                         &nrm_out, use_gpu_actual, cfg%rem_mean,&
-                        &output_mode, ap_angle_mode,&
+                        &cfg%output_mode, cfg%ap_angle_mode,&
                         &stP(:,slot_idx), stPhi(:,slot_idx))
                      endif
                   enddo
