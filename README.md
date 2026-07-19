@@ -2,49 +2,89 @@
 
 An HPC package for conducting Faraday Tomography (RM-Synthesis) on radio spectro-polarimetric data. The package is built for all machines - scaling from Low-RAM Desktop PCs to HPC Clusters, with GPU acceleration via OpenMP target offload.
 
-## Why rmtool? (No jargon, promise)
+## Motivation
 
-Radio telescope data cubes keep getting bigger — sometimes bigger than
-the RAM on your laptop, sometimes bigger than the RAM on an entire HPC
-node. Most tools in this space quietly force you into one of two bad
-deals: load the whole cube into memory and hope it fits (until one day
-it doesn't, and your job dies — or takes the shared machine down with
-it), or play it safe and grind through everything on a single CPU core
-while the other 63 cores on your cluster node sit there doing nothing.
+Modern spectro-polarimetric surveys routinely produce data cubes bigger
+than the memory available on any one computer — a laptop, a workstation,
+or a single machine in a larger computing cluster. That is simply the
+normal size of the data now, and rmtool was designed with this in mind
+from the outset.
 
-**rmtool doesn't make you choose.** Here's how, in plain terms:
+Many existing tools force a choice that made sense when datasets were
+smaller: try to load the whole cube into memory and hope it fits, or
+process it one piece at a time on a single processor while the rest of
+the computer's capacity goes unused. rmtool does neither. It adapts to
+whatever computer it is given — using many processors and plenty of
+memory when they are available, and working just as reliably on a
+single processor with limited memory when they are not:
 
-- **It never needs your whole cube in memory at once.** It works
-  through the image in bite-sized strips sized to whatever RAM you
-  actually have, and figures out a safe strip size for you automatically
-  — no manual tuning required. The same tool that runs on a modest
-  desktop scales straight up to a supercomputer node with the same
-  config file, unchanged.
-- **It reads, computes, and writes at the same time — not one after
-  the other.** While one strip is being read off disk, another is being
-  crunched, and a third is being saved, all at once, like a kitchen
-  running several dishes in parallel instead of one cook doing every
-  step start-to-finish before touching the next dish. Plenty of tools
-  do these strictly in sequence, leaving a fast disk and a fast CPU
-  waiting on each other for no reason.
-- **It reads and writes with many hands at once, not one.** On shared
-  cluster storage, a single reader or writer barely uses the bandwidth
-  on offer — rmtool can open several read and write channels in
-  parallel to actually use it.
-- **It'll happily use your GPU — and won't sulk if you don't have
-  one.** Flip one setting and the heavy math offloads to the graphics
-  card for a real speed-up. No GPU? Same config file, same command:
-  it just runs on the CPU instead. No separate "GPU edition" to keep
-  in sync, no rewritten scripts.
-- **Every one of the above is a switch in a plain text config file —
-  never a line of code.** More read threads, more write threads,
-  overlapping I/O with compute, GPU offload: all opt-in, all off by
-  default, all tunable without recompiling anything or knowing what a
-  thread even is.
+- **Processes the cube in memory-sized tiles, shaped to match how the
+  data actually sits on disk — and never chops it up more than it has
+  to.** rmtool is never *forced* to hold the full cube in RAM, but it
+  isn't forced to fragment it either: if the cube is small enough, or the
+  machine has enough memory, to fit the whole thing within budget, rmtool
+  processes it as a single tile and only subdivides further when the
+  image genuinely doesn't fit. That budget is a user-set fraction of the
+  machine's *total* memory — deliberately not whatever happens to be
+  free at that moment — so the tile size for a given cube and config is
+  reproducible on the same machine regardless of what else is running on
+  it at the time. (On a busy shared node, that also means the budget
+  isn't automatically reduced for other jobs' usage, so a large fraction
+  is worth setting conservatively there.) The same configuration scales
+  from a modest workstation to a large HPC node unchanged. The tile
+  shape itself is chosen for read speed too, when tiling is needed: a FITS
+  cube stores each frequency channel as one contiguous RA/Dec plane, with
+  RA varying fastest, so rmtool tiles as full-width, multi-row strips.
+  Every tile read is then one contiguous block on disk, not a scatter of
+  small fragments.
+- **Reorganizes each tile once in memory for CPU compute, not on disk —
+  and skips that step entirely on the GPU path.** The channel-by-channel
+  layout that makes reads fast is not the layout the CPU's per-pixel RM
+  synthesis wants, which needs each pixel's full frequency spectrum
+  contiguous for an efficient inner loop. rmtool performs that
+  reorganization — sometimes called a "corner turn" — once per tile, in
+  memory, in parallel, rather than paying for it as slow, scattered disk
+  access. The GPU path doesn't pay this cost at all: its preferred
+  layout already matches the order data is read in, so tile preparation
+  there is a masked copy, not a transpose. If an input cube instead
+  arrived already stored spectrum-first per pixel, the CPU path's
+  in-memory step could be skipped too; that is not how imaging pipelines
+  produce FITS cubes today, but it is a concrete, known place with
+  further speed to gain if that convention changes.
+- **Overlaps a tile's write with the next tile's read and compute,
+  instead of running every stage in strict sequence.** While one tile's
+  results are being written to disk, the next tile is already being read
+  and processed — concurrently, on a background thread, rather than
+  waiting for the write to finish first. A tile's write and the next
+  tile's read/compute have nothing to do with each other, so there's no
+  reason to make one wait on the other — keeping storage and compute
+  both busy at once instead of idling in turn.
+- **Reads and writes over multiple parallel channels.** A single I/O
+  stream rarely saturates the bandwidth available on shared HPC storage
+  (Lustre and similar filesystems); rmtool can open several read and
+  write channels concurrently to make fuller use of it.
+- **Supports GPU acceleration, with more headroom still to exploit.**
+  Enabling GPU offload moves the core computation onto the graphics
+  card. The same config file works unmodified on the CPU-only build
+  too — leave `use_gpu=n`, or leave it `y` anyway and the CPU-only build
+  prints a warning and proceeds on CPU rather than failing. (Running a
+  GPU-capable build with `use_gpu=y` on a machine with no physical GPU at
+  all is untested territory — use the CPU-only build there.) On the
+  hardware validated to date, GPU throughput is bounded by host-device
+  transfer bandwidth (PCIe) more than by the GPU's own compute capacity —
+  a faster PCIe link and a higher-end GPU than our test hardware should
+  see a larger gain than we've measured so far. This is an active area
+  for further tuning, not a finished ceiling.
+- **Most of the above is configuration, not code.** Parallel I/O and
+  I/O/compute overlap are opt-in settings in a plain-text config file,
+  no recompilation either way. GPU offload is also a config toggle — but
+  which of the four build variants to run is still a one-time, per-machine
+  build choice; the config format itself doesn't change between them.
 
-Put together: one binary, one config format, no code changes — it scales
-itself to whatever machine it's handed, from a spare laptop to a
-national HPC facility.
+The result is one configuration format that scales itself to whatever
+machine it's run on, from a single workstation to an HPC
+facility, without requiring the user to reason about memory budgets,
+concurrency, or hardware-specific tuning.
 
 ## Features
 
@@ -95,9 +135,11 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[docs/PARALLELISM.md](docs/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
 - **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
+- **[planning/ENCAPSULATION_REFACTOR_PLAN.md](planning/ENCAPSULATION_REFACTOR_PLAN.md)** — Encapsulation refactor plan: config/tile-planner/IO-orchestration derived types, ticket-by-ticket (T0-T5, all adopted)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
+- **[docs/RELEASE_NOTES_4.0.md](docs/RELEASE_NOTES_4.0.md)** — Detailed release notes for tag 4.0 (maintainability/documentation milestone)
 
 ## Configuration
 
