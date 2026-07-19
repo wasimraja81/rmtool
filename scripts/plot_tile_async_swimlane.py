@@ -996,6 +996,27 @@ def _cross_overlap_seconds(
     return total
 
 
+def _artist_window_extent(artist, renderer):
+    """Window extent of an artist's *rendered footprint*.
+
+    Text.get_window_extent() returns only the text glyphs' extent and
+    ignores the bbox= patch drawn around it (the rounded box with padding
+    the info panel uses) -- that patch reliably extends several points
+    beyond the text on every side, so using the raw text extent for
+    overlap/overflow checks systematically under-reports how much space
+    the artist actually occupies, letting it visually collide with its
+    neighbour even when the check says "no overlap". Prefer the bbox
+    patch's own extent when one is attached (Legend has no such patch
+    method and its own get_window_extent() already matches its frame).
+    """
+    get_patch = getattr(artist, "get_bbox_patch", None)
+    if get_patch is not None:
+        patch = get_patch()
+        if patch is not None:
+            return patch.get_window_extent(renderer=renderer)
+    return artist.get_window_extent(renderer=renderer)
+
+
 def _bbox_overlap_area_axes(a, b) -> float:
     if a is None or b is None:
         return 0.0
@@ -1033,132 +1054,114 @@ def _layout_right_panel(
     labels,
     right_info_lines: Optional[List[str]],
 ):
+    """Lay out the legend/info panel as two fixed, non-overlapping regions.
+
+    The right panel spans exactly the same y-range as the left (swim-lane)
+    panel, y_bottom to y_top in ax.transAxes -- so its total height always
+    matches the left panel's by construction. Within that span: the legend
+    owns a bottom region (bounded to at most max_legend_frac of the total,
+    so a many-item legend can't crowd out the info block), and the info
+    box owns whatever's left above it. Because the two regions are fixed
+    and stacked rather than independently placed and only checked for
+    overlap afterward, they cannot collide -- there is no "did it fit"
+    search over their joint placement, only a per-region font-size choice
+    to make each one's own content fit its own budget.
+    """
     x_anchor = 1.05
     y_bottom = 0.02
     y_top = 0.98
-    min_gap = 0.02
+    gap = 0.02
+    available_h = y_top - y_bottom
+    max_legend_frac = 0.45
 
     if not handles and not right_info_lines:
         return
 
-    legend_candidates = [(1, 8), (2, 8), (3, 8), (2, 7), (3, 7)]
-    info_font_candidates = [9, 8, 7, 6]
+    def measure(artist):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        return _artist_window_extent(artist, renderer).transformed(ax.transAxes.inverted())
 
-    chosen_legend = None
-    chosen_info = None
-    chosen_metrics = None
-
-    for ncol, legend_fs in legend_candidates:
-        for info_fs in info_font_candidates:
-            legend_artist = None
-            info_artist = None
-
-            if handles:
-                legend_artist = ax.legend(
-                    handles,
-                    labels,
-                    loc="lower left",
-                    bbox_to_anchor=(x_anchor, y_bottom),
-                    ncol=ncol,
-                    fontsize=legend_fs,
-                    handlelength=2.0,
-                    handleheight=1.1,
-                    columnspacing=1.0,
-                    borderaxespad=0.0,
-                    framealpha=0.9,
-                )
-
-            if right_info_lines:
-                info_artist = ax.text(
-                    x_anchor,
-                    y_top,
-                    "\n".join(right_info_lines),
-                    transform=ax.transAxes,
-                    va="top",
-                    ha="left",
-                    fontsize=info_fs,
-                    fontfamily="DejaVu Sans Mono",
-                    linespacing=1.05,
-                    clip_on=False,
-                    bbox={
-                        "facecolor": "white",
-                        "edgecolor": "#666666",
-                        "alpha": 0.9,
-                        "boxstyle": "round,pad=0.5",
-                    },
-                )
-
-            fig.canvas.draw()
-            renderer = fig.canvas.get_renderer()
-
-            legend_bbox = None
-            info_bbox = None
-            if legend_artist is not None:
-                legend_bbox = legend_artist.get_window_extent(renderer=renderer).transformed(
-                    ax.transAxes.inverted()
-                )
-            if info_artist is not None:
-                info_bbox = info_artist.get_window_extent(renderer=renderer).transformed(
-                    ax.transAxes.inverted()
-                )
-
-            legend_h = legend_bbox.height if legend_bbox is not None else 0.0
-            info_h = info_bbox.height if info_bbox is not None else 0.0
-            required_h = legend_h + info_h + (min_gap if legend_bbox is not None and info_bbox is not None else 0.0)
-            available_h = y_top - y_bottom
-            overflow = max(0.0, required_h - available_h)
-            overlap_area = _bbox_overlap_area_axes(legend_bbox, info_bbox)
-
-            fits = overflow <= 1e-6 and overlap_area <= 1e-6
-            chosen_legend = legend_artist
-            chosen_info = info_artist
-            chosen_metrics = {
-                "legend_bbox": legend_bbox,
-                "info_bbox": info_bbox,
-                "legend_area": (legend_bbox.width * legend_bbox.height) if legend_bbox is not None else 0.0,
-                "info_area": (info_bbox.width * info_bbox.height) if info_bbox is not None else 0.0,
-                "overlap_area": overlap_area,
-                "overflow": overflow,
-                "ncol": ncol,
-                "legend_fs": legend_fs,
-                "info_fs": info_fs,
-            }
-
-            if fits:
-                break
-
+    # Legend: a fixed, modest column count (kept narrow -- this is a side
+    # panel, not a place for a 6-column legend that dwarfs the info box
+    # next to it) and the largest font, in descending order, whose
+    # rendered height stays within max_legend_frac of the total.
+    legend_ncol = 1 if len(labels) <= 2 else (2 if len(labels) <= 5 else 3)
+    legend_artist = None
+    legend_bbox = None
+    legend_fs_used = None
+    if handles:
+        for legend_fs in (8, 7, 6, 5, 4):
             if legend_artist is not None:
                 legend_artist.remove()
+            legend_artist = ax.legend(
+                handles,
+                labels,
+                loc="lower left",
+                bbox_to_anchor=(x_anchor, y_bottom),
+                ncol=legend_ncol,
+                fontsize=legend_fs,
+                handlelength=2.0,
+                handleheight=1.1,
+                columnspacing=1.0,
+                borderaxespad=0.0,
+                framealpha=0.9,
+            )
+            legend_bbox = measure(legend_artist)
+            legend_fs_used = legend_fs
+            if legend_bbox.height <= max_legend_frac * available_h:
+                break
+
+    legend_h = legend_bbox.height if legend_bbox is not None else 0.0
+    info_budget_h = available_h - legend_h - (gap if legend_artist is not None and right_info_lines else 0.0)
+
+    # Info box: the largest font, in descending order, whose rendered
+    # height fits within whatever the legend left behind.
+    info_artist = None
+    info_bbox = None
+    info_fs_used = None
+    if right_info_lines:
+        for info_fs in (9, 8, 7, 6, 5, 4):
             if info_artist is not None:
                 info_artist.remove()
-            chosen_legend = None
-            chosen_info = None
-
-        if chosen_legend is not None or chosen_info is not None:
-            break
-
-    if chosen_metrics is not None:
-        lb = chosen_metrics["legend_bbox"]
-        ib = chosen_metrics["info_bbox"]
-        if lb is not None:
-            print(
-                "layout_legend_bbox_axes: "
-                f"x0={lb.x0:.3f} y0={lb.y0:.3f} x1={lb.x1:.3f} y1={lb.y1:.3f} "
-                f"area={chosen_metrics['legend_area']:.4f}"
+            info_artist = ax.text(
+                x_anchor,
+                y_top,
+                "\n".join(right_info_lines),
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=info_fs,
+                fontfamily="DejaVu Sans Mono",
+                linespacing=1.05,
+                clip_on=False,
+                bbox={
+                    "facecolor": "white",
+                    "edgecolor": "#666666",
+                    "alpha": 0.9,
+                    "boxstyle": "round,pad=0.5",
+                },
             )
-        if ib is not None:
-            print(
-                "layout_info_bbox_axes: "
-                f"x0={ib.x0:.3f} y0={ib.y0:.3f} x1={ib.x1:.3f} y1={ib.y1:.3f} "
-                f"area={chosen_metrics['info_area']:.4f}"
-            )
+            info_bbox = measure(info_artist)
+            info_fs_used = info_fs
+            if info_bbox.height <= info_budget_h:
+                break
+
+    overlap_area = _bbox_overlap_area_axes(legend_bbox, info_bbox)
+    if legend_bbox is not None:
         print(
-            "layout_overlap_axes_area: "
-            f"{chosen_metrics['overlap_area']:.6f} "
-            f"overflow={chosen_metrics['overflow']:.6f} "
-            f"legend_ncol={chosen_metrics['ncol']} "
-            f"legend_fs={chosen_metrics['legend_fs']} info_fs={chosen_metrics['info_fs']}"
+            "layout_legend_bbox_axes: "
+            f"x0={legend_bbox.x0:.3f} y0={legend_bbox.y0:.3f} "
+            f"x1={legend_bbox.x1:.3f} y1={legend_bbox.y1:.3f} "
+            f"ncol={legend_ncol} fs={legend_fs_used}"
         )
+    if info_bbox is not None:
+        print(
+            "layout_info_bbox_axes: "
+            f"x0={info_bbox.x0:.3f} y0={info_bbox.y0:.3f} "
+            f"x1={info_bbox.x1:.3f} y1={info_bbox.y1:.3f} fs={info_fs_used}"
+        )
+    print(f"layout_overlap_axes_area: {overlap_area:.6f}")
 
 
 def plot_clean_swimlane(
