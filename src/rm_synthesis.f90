@@ -222,7 +222,6 @@ logical   timing_io_enabled
 real(sp) conv_fac ! freq-to-lambda conversion factor
 real(sp) mem_frac_ram, mem_frac_vram
 integer   gpu_vram_mib
-logical   io_overlap
 character(len=16) :: log_level
 character(len=272) :: log_output_file
 character(len=272) :: timing_csv_file
@@ -294,8 +293,8 @@ real(dp)  t_thread_stage_start, t_thread_stage_elapsed
  ! Parallel IO variables (T2 read / T3 write — IO optimisation branch)
  ! io_read_threads  : cfg key; 1=serial, N>1 opens N handles per input file
  ! io_write_threads : cfg key; 1=serial, N>1 opens N handles per output cube
-integer   io_read_threads,  io_read_threads_eff
-integer   io_write_threads, io_write_threads_eff
+integer   io_read_threads_eff
+integer   io_write_threads_eff
  ! Read-side per-thread handles and scratch
 integer, allocatable :: par_unit_Q(:), par_unit_U(:)
 integer, allocatable :: par_unit_I(:), par_unit_mask(:)
@@ -506,9 +505,6 @@ write_mask_output = cfg%write_mask_output
 write_nvalid_output = cfg%write_nvalid_output
 cubestat = cfg%cubestat
 use_gpu = cfg%use_gpu
-io_overlap = cfg%io_overlap
-io_read_threads = cfg%io_read_threads
-io_write_threads = cfg%io_write_threads
 log_level = cfg%log_level
 timing_enabled = cfg%timing_enabled
 timing_tile_enabled = cfg%timing_tile_enabled
@@ -1769,7 +1765,7 @@ plan%rem_mean = rem_mean
 plan%use_input_mask = use_input_mask
 plan%need_icube = need_icube
 plan%cubestat = cubestat
-plan%io_overlap = io_overlap
+plan%io_overlap = cfg%io_overlap
 plan%use_gpu_actual = use_gpu_actual
 plan%mem_frac_ram = mem_frac_ram
 plan%mem_frac_vram = mem_frac_vram
@@ -1894,7 +1890,7 @@ allocate(specQ(int(cfg%tile_ra,kind=int64)*int(cfg%tile_dec,kind=int64)*int(nz_o
 &mask_tile_arr_s0(int(cfg%tile_ra,kind=int64)*int(cfg%tile_dec,kind=int64)*int(nz_out,kind=int64)),&
 &nvalid_tile_arr_s0(int(cfg%tile_ra,kind=int64)*int(cfg%tile_dec,kind=int64)),&
 &stat=ios_mem)
-if(ios_mem.eq.0 .and. io_overlap)then
+if(ios_mem.eq.0 .and. cfg%io_overlap)then
    allocate(&
    &p_tile_arr_s1(int(cfg%tile_ra,kind=int64)*int(cfg%tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
    &phi_tile_arr_s1(int(cfg%tile_ra,kind=int64)*int(cfg%tile_dec,kind=int64)*int(nrm_out,kind=int64)),&
@@ -1908,7 +1904,7 @@ if(ios_mem.eq.0 .and. cubestat)then
    &ang_peak_tile_arr_s0(cfg%tile_ra*cfg%tile_dec),&
    &snr_tile_arr_s0(cfg%tile_ra*cfg%tile_dec),&
    &stat=ios_mem)
-   if(ios_mem.eq.0 .and. io_overlap)then
+   if(ios_mem.eq.0 .and. cfg%io_overlap)then
       allocate(peak_tile_arr_s1(cfg%tile_ra*cfg%tile_dec),&
       &rm_peak_tile_arr_s1(cfg%tile_ra*cfg%tile_dec),&
       &ang_peak_tile_arr_s1(cfg%tile_ra*cfg%tile_dec),&
@@ -2654,25 +2650,25 @@ endif
  ! N>1 in a serial binary would open N handles and then call them sequentially,
  ! which is strictly worse than a single call.
 #if HOST_OMP == 1
-io_read_threads_eff  = max(1, min(io_read_threads,  omp_get_max_threads()))
-io_write_threads_eff = max(1, min(io_write_threads, omp_get_max_threads()))
-if(io_read_threads .gt. omp_get_max_threads())then
-   write(*,*)" WARNING: io_read_threads=",io_read_threads,&
+io_read_threads_eff  = max(1, min(cfg%io_read_threads,  omp_get_max_threads()))
+io_write_threads_eff = max(1, min(cfg%io_write_threads, omp_get_max_threads()))
+if(cfg%io_read_threads .gt. omp_get_max_threads())then
+   write(*,*)" WARNING: io_read_threads=",cfg%io_read_threads,&
    &" > OMP max threads=",omp_get_max_threads(),&
    &"; clamped to ",io_read_threads_eff
 endif
-if(io_write_threads .gt. omp_get_max_threads())then
-   write(*,*)" WARNING: io_write_threads=",io_write_threads,&
+if(cfg%io_write_threads .gt. omp_get_max_threads())then
+   write(*,*)" WARNING: io_write_threads=",cfg%io_write_threads,&
    &" > OMP max threads=",omp_get_max_threads(),&
    &"; clamped to ",io_write_threads_eff
 endif
 #else
-if(io_read_threads .gt. 1)then
-   write(*,*)" NOTE: io_read_threads=",io_read_threads,&
+if(cfg%io_read_threads .gt. 1)then
+   write(*,*)" NOTE: io_read_threads=",cfg%io_read_threads,&
    &" ignored in serial binary (HOST_OMP=0); using 1"
 endif
-if(io_write_threads .gt. 1)then
-   write(*,*)" NOTE: io_write_threads=",io_write_threads,&
+if(cfg%io_write_threads .gt. 1)then
+   write(*,*)" NOTE: io_write_threads=",cfg%io_write_threads,&
    &" ignored in serial binary (HOST_OMP=0); using 1"
 endif
 io_read_threads_eff  = 1
@@ -2808,7 +2804,7 @@ if(io_write_threads_eff.gt.1)then
    ampha_handles_closed_early = .true.
 endif
 
-if(io_overlap)then
+if(cfg%io_overlap)then
    write(*,*)" IO overlap: ON -- tile write runs on a background thread,"
    write(*,*)"   concurrent with the next tile's read/mask/prep/compute."
    call log_message('info','startup',&
@@ -2847,7 +2843,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       ! never set, so this block is a no-op and the pointers never move.
       cur_slot = mod(tile_seq, 2)
       tile_seq = tile_seq + 1
-      if(io_overlap)then
+      if(cfg%io_overlap)then
          if(write_pending(cur_slot))then
             call tile_write_join(write_thread_id(cur_slot))
             write_pending(cur_slot) = .false.
@@ -3762,7 +3758,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       &phi_tile_arr, mask_tile_arr, nvalid_tile_arr, cubestat,&
       &peak_tile_arr, rm_peak_tile_arr, ang_peak_tile_arr, snr_tile_arr)
 
-      if(io_overlap)then
+      if(cfg%io_overlap)then
          ! Handle safety: before any new write is dispatched, whichever
          ! write is currently outstanding (either slot) is joined first,
          ! unconditionally, regardless of io_write_threads_eff. This rule
@@ -3811,7 +3807,7 @@ enddo
  ! can reach here undispatched-for-join: each slot's write is only joined
  ! when that slot is reused two tiles later, so the final tile (and the
  ! one before it, in the other slot) never gets that second chance.
-if(io_overlap)then
+if(cfg%io_overlap)then
    if(write_pending(0))then
       call tile_write_join(write_thread_id(0))
       write_pending(0) = .false.
