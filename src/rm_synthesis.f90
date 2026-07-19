@@ -342,9 +342,7 @@ real(sp), allocatable :: st_sin_arr_gpu(:,:)
 integer   st_i_rm_block, st_nrm_block_now
 
  ! Variables/Parameters for RM-extraction:
-real(sp) fac, beg_rm, end_rm
-integer   ofac, nrm_out, nrm_out_par
-integer   use_auto_rm_range
+integer   nrm_out
 integer   output_mode
 integer   ap_angle_mode
 real(sp), allocatable :: RM(:)
@@ -472,12 +470,6 @@ subim_dec_inc = cfg%subim_dec_inc
 subim_chan_blc = cfg%subim_chan_blc
 subim_chan_trc = cfg%subim_chan_trc
 subim_chan_inc = cfg%subim_chan_inc
-ofac = cfg%ofac
-fac = cfg%fac
-beg_rm = cfg%beg_rm
-end_rm = cfg%end_rm
-nrm_out_par = cfg%nrm_out_par
-use_auto_rm_range = cfg%use_auto_rm_range
 output_mode = cfg%output_mode
 ap_angle_mode = cfg%ap_angle_mode
 mask_cube_file = cfg%mask_cube_file
@@ -1658,11 +1650,11 @@ enddo
  ! Use explicit flag to select RM extraction mode
  ! nrm_out based on total channels (nz_out), not good channels
  ! Bad channels are masked during DFT via flag_arr and wts=0
-if (use_auto_rm_range .eq. 1) then
-   nrm_out_par = nz_out
-   nrm_out = nrm_out_par*ofac
+if (cfg%use_auto_rm_range .eq. 1) then
+   cfg%nrm_out_par = nz_out
+   nrm_out = cfg%nrm_out_par*cfg%ofac
 else
-   nrm_out = nrm_out_par*ofac
+   nrm_out = cfg%nrm_out_par*cfg%ofac
 endif
 
  ! Allocate RM arrays: templates sized (nz_out, nrm_out) for all channels
@@ -1674,16 +1666,16 @@ allocate(sin_arr(nz_out, nrm_out))
 
  ! Pre-compute templates for ALL nz_out channels (good and bad)
  ! Bad channels have valid cos/sin but won't be used (masked by wts_tile=0 in DFT)
-call extract_general_setup(L_sq, nz_out, fac, beg_rm, end_rm,&
+call extract_general_setup(L_sq, nz_out, cfg%fac, cfg%beg_rm, cfg%end_rm,&
 &nrm_out, RM, cos_arr, sin_arr, nrm_out, nz_out,&
-&use_auto_rm_range, ofac)
+&cfg%use_auto_rm_range, cfg%ofac)
 dRM = (RM(nrm_out) - RM(1))/real(nrm_out - 1)
 open(77,file='sampled_RM.txt',status='unknown')
-write(77,*)"# ofac: ",ofac
+write(77,*)"# ofac: ",cfg%ofac
 write(77,*)"# ngood_chan: ",ngood_chan
 write(77,*)"# nrm_out: ",nrm_out
-write(77,*)"# fac: ",fac
-write(77,*)"# beg_rm: ",beg_rm
+write(77,*)"# fac: ",cfg%fac
+write(77,*)"# beg_rm: ",cfg%beg_rm
 do i = 1,nrm_out
    write(77,*)RM(i)
 enddo
@@ -3848,7 +3840,7 @@ if(in_mask_open)then
    endif
 endif
 write(*,*)" ================================"
-write(*,*)"      fac :",fac
+write(*,*)"      fac :",cfg%fac
 write(*,*)"ngood_chan: ", ngood_chan
 write(*,*)"   nRM_out: ", nRM_out
 write(*,*)"      cnt1: ", cnt1
