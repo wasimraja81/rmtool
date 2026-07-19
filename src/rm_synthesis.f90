@@ -209,8 +209,6 @@ real(sp) x1, xn, y1, yn, z1, zn
 integer   data_precision
 real(sp) nullval
 logical   subim
-logical   cubestat
-logical   use_gpu
 logical   timing_enabled, timing_tile_enabled
 logical   timing_io_enabled
 real(sp) conv_fac ! freq-to-lambda conversion factor
@@ -465,8 +463,6 @@ subim_dec_inc = cfg%subim_dec_inc
 subim_chan_blc = cfg%subim_chan_blc
 subim_chan_trc = cfg%subim_chan_trc
 subim_chan_inc = cfg%subim_chan_inc
-cubestat = cfg%cubestat
-use_gpu = cfg%use_gpu
 log_level = cfg%log_level
 timing_enabled = cfg%timing_enabled
 timing_tile_enabled = cfg%timing_tile_enabled
@@ -528,7 +524,7 @@ write(message,'(A,A)')'binary_flavor=',&
 &binary_flavor(1:nchar(binary_flavor))
 call log_message('info','startup',&
 &message(1:nchar(message)))
-if(use_gpu)then
+if(cfg%use_gpu)then
 #ifdef USE_GPU
    use_gpu_actual = .true.
    write(*,*)"GPU requested: attempting OpenMP offload."
@@ -1210,7 +1206,7 @@ if(.not.cfg%dry_run)then
          stop
       endif
    endif
-   if(cubestat)then
+   if(cfg%cubestat)then
       inquire(file=outfilePEAK(1:nchar(outfilePEAK)),&
       &exist=out_exists)
       if(out_exists)then
@@ -1316,7 +1312,7 @@ if(.not.cfg%dry_run)then
       out_nvalid_open = .true.
    endif
 
-   if(cubestat)then
+   if(cfg%cubestat)then
       status = 0
       call ftinit(46,outfilePEAK,blocksize,status)
       if(status.ne.0)then
@@ -1726,7 +1722,7 @@ plan%ny_out = ny_out
 plan%rem_mean = cfg%rem_mean
 plan%use_input_mask = use_input_mask
 plan%need_icube = need_icube
-plan%cubestat = cubestat
+plan%cubestat = cfg%cubestat
 plan%io_overlap = cfg%io_overlap
 plan%use_gpu_actual = use_gpu_actual
 plan%mem_frac_ram = cfg%mem_frac_ram
@@ -1860,7 +1856,7 @@ if(ios_mem.eq.0 .and. cfg%io_overlap)then
    &nvalid_tile_arr_s1(int(cfg%tile_ra,kind=int64)*int(cfg%tile_dec,kind=int64)),&
    &stat=ios_mem)
 endif
-if(ios_mem.eq.0 .and. cubestat)then
+if(ios_mem.eq.0 .and. cfg%cubestat)then
    allocate(peak_tile_arr_s0(cfg%tile_ra*cfg%tile_dec),&
    &rm_peak_tile_arr_s0(cfg%tile_ra*cfg%tile_dec),&
    &ang_peak_tile_arr_s0(cfg%tile_ra*cfg%tile_dec),&
@@ -1882,7 +1878,7 @@ if(ios_mem.eq.0)then
    phi_tile_arr => phi_tile_arr_s0
    mask_tile_arr => mask_tile_arr_s0
    nvalid_tile_arr => nvalid_tile_arr_s0
-   if(cubestat)then
+   if(cfg%cubestat)then
       peak_tile_arr => peak_tile_arr_s0
       rm_peak_tile_arr => rm_peak_tile_arr_s0
       ang_peak_tile_arr => ang_peak_tile_arr_s0
@@ -2815,7 +2811,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
             phi_tile_arr => phi_tile_arr_s0
             mask_tile_arr => mask_tile_arr_s0
             nvalid_tile_arr => nvalid_tile_arr_s0
-            if(cubestat)then
+            if(cfg%cubestat)then
                peak_tile_arr => peak_tile_arr_s0
                rm_peak_tile_arr => rm_peak_tile_arr_s0
                ang_peak_tile_arr => ang_peak_tile_arr_s0
@@ -2826,7 +2822,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
             phi_tile_arr => phi_tile_arr_s1
             mask_tile_arr => mask_tile_arr_s1
             nvalid_tile_arr => nvalid_tile_arr_s1
-            if(cubestat)then
+            if(cfg%cubestat)then
                peak_tile_arr => peak_tile_arr_s1
                rm_peak_tile_arr => rm_peak_tile_arr_s1
                ang_peak_tile_arr => ang_peak_tile_arr_s1
@@ -3683,7 +3679,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       call log_message('debug','tile_cubestat',&
       &message(1:nchar(message)))
       call timer_start(t_stage)
-      if(cubestat)then
+      if(cfg%cubestat)then
          call cubestat_tail_quantile_maps(&
          &p_tile_arr,phi_tile_arr,RM,&
          &nx_tile,ny_tile,nrm_out,&
@@ -3717,7 +3713,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       &naxes_mask, naxes_nvalid, naxes_stat, ix_out_beg, ix_out_end,&
       &iy_out_beg, iy_out_end, nrm_out, nx_tile, ny_tile, nz_out,&
       &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end, p_tile_arr,&
-      &phi_tile_arr, mask_tile_arr, nvalid_tile_arr, cubestat,&
+      &phi_tile_arr, mask_tile_arr, nvalid_tile_arr, cfg%cubestat,&
       &peak_tile_arr, rm_peak_tile_arr, ang_peak_tile_arr, snr_tile_arr)
 
       if(cfg%io_overlap)then
@@ -3923,7 +3919,7 @@ write(*,'(A)') ' '
 write(*,'(A)') 'Run summary:'
 write(*,'(A,A)') '  binary flavor : ',&
 &binary_flavor(1:nchar(binary_flavor))
-write(*,'(A,L1)') '  gpu requested : ',use_gpu
+write(*,'(A,L1)') '  gpu requested : ',cfg%use_gpu
 write(*,'(A,L1)') '  gpu active    : ',use_gpu_actual
 write(*,'(A)') ' '
 write(*,'(A)') 'Disk I/O summary:'
