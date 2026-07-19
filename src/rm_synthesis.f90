@@ -199,6 +199,7 @@ character(len=272) :: mask_cube_file, mask_input_cube_file,&
 &mask_trust_mode
 character(len=272) :: subim_parfile, cfgfile, cfgfile_in
 type(rmsynth_config_t) :: cfg
+type(tile_plan_t) :: plan
 character(len=172) :: path, path_I
 character(len=1) :: yorn
 
@@ -268,18 +269,13 @@ real(sp)  mask_val
 integer   in_fields
 integer   mem_unit, ios_mem
 integer(kind=int64) :: mem_avail_kb, mem_kb_tmp
-integer(kind=int64) :: mem_safe_bytes
-integer(kind=int64) :: bytes_per_tile_pixel_ram, bytes_per_vram_pixel
-integer(kind=int64) :: bytes_per_tile_pixel_ram_out
-integer(kind=int64) :: tile_pixels_max, tile_bytes_est
+integer(kind=int64) :: tile_bytes_est
 integer(kind=int64) :: image_pixels_total
 character(len=256) :: mem_line
  ! VRAM sub-block planning (Phase-1 two-level tiling):
-integer(kind=int64) :: vram_bytes_avail, vram_safe_bytes
-integer(kind=int64) :: template_bytes, sub_px_max
+integer(kind=int64) :: template_bytes
 integer   gpu_vram_mib_eff, ny_sub
 integer   inflight_slots_planned
-real(dp)  vram_budget_total_bytes, vram_budget_per_slot_bytes
 real(dp)  mem_frac_vram_per_slot
 integer   iy_sub_beg, iy_sub_end, ny_sub_now
 integer   iyl
@@ -296,8 +292,6 @@ logical   use_async_pipeline
 integer   host_omp_threads
 integer   thread_id_now
 real(dp)  t_thread_stage_start, t_thread_stage_elapsed
-integer   env_len, env_stat, ios_env
-character(len=128) :: env_vram
  ! Parallel IO variables (T2 read / T3 write — IO optimisation branch)
  ! io_read_threads  : cfg key; 1=serial, N>1 opens N handles per input file
  ! io_write_threads : cfg key; 1=serial, N>1 opens N handles per output cube
@@ -1762,219 +1756,44 @@ endif
 in_fields = 2
 if(need_icube)in_fields = 3
 
- ! RAM tile planner budget (bytes per output pixel).
- !
- ! Count arrays that are allocated at tile_ra*tile_dec scale in this run,
- ! plus non-staging full-tile prep buffers (CPU or GPU path). Do NOT charge
- ! staging-strip buffers here; they are sized by ny_sub and handled via the
- ! VRAM planner. This avoids over-shrinking tile_dec for CPU/non-staging jobs.
- !
- ! bytes_per_tile_pixel_ram_out tracks only the OUTPUT-side arrays (p/phi,
- ! mask, nvalid, cubestat maps) -- the ones io_overlap double-buffers so a
- ! tile's write can run on a background thread while the next tile's
- ! read/mask/prep/compute reuses the other buffer. Everything else (specQ/
- ! specU/specMask/specI and the non-staging prep buffers) is read/populated
- ! fresh every tile regardless of io_overlap and is never double-buffered.
-bytes_per_tile_pixel_ram = 0_int64
-bytes_per_tile_pixel_ram_out = 0_int64
+ ! T2 encapsulation ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md): the RAM
+ ! byte-budget accounting, auto-tiling policy, safety-shrink loop, and VRAM
+ ! sub-block planning that used to be inline here now live in plan_tile
+ ! (rm_synthesis_mod.f90), operating on the same arithmetic verbatim. Inputs
+ ! are loaded into plan below (mem_avail_kb is still resolved here, from
+ ! /proc/meminfo just above -- that read is genuine file I/O and stays a
+ ! caller concern); outputs are unpacked back into the same locals used
+ ! throughout the rest of this file, so nothing downstream changes.
+plan%nz_out = nz_out
+plan%nrm_out = nrm_out
+plan%nx_out = nx_out
+plan%ny_out = ny_out
+plan%rem_mean = rem_mean
+plan%use_input_mask = use_input_mask
+plan%need_icube = need_icube
+plan%cubestat = cubestat
+plan%io_overlap = io_overlap
+plan%use_gpu_actual = use_gpu_actual
+plan%mem_frac_ram = mem_frac_ram
+plan%mem_frac_vram = mem_frac_vram
+plan%gpu_vram_mib = gpu_vram_mib
+plan%tile_ra_in = tile_ra
+plan%tile_dec_in = tile_dec
+plan%tile_auto = tile_auto
+plan%mem_avail_kb = mem_avail_kb
 
- ! Always allocated full-tile arrays: specQ/specU (input) + p/phi (output).
-bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
-&int(4,kind=int64)*int(2,kind=int64)*int(nz_out,kind=int64)
-bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out +&
-&int(4,kind=int64)*int(2,kind=int64)*int(nrm_out,kind=int64)
+call plan_tile(plan)
 
- ! Optional full-tile inputs.
-if(use_input_mask)then
-   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
-   &int(4,kind=int64)*int(nz_out,kind=int64)
-endif
-if(need_icube)then
-   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
-   &int(4,kind=int64)*int(nz_out,kind=int64)
-endif
-
- ! Full-tile mask and valid-channel count outputs.
-bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out +&
-&int(1,kind=int64)*int(nz_out,kind=int64) + int(2,kind=int64)
-
- ! Optional cubestat maps (peak/rm_peak/ang_peak/snr), 4 float maps.
-if(cubestat)then
-   bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out +&
-   &int(4,kind=int64)*int(4,kind=int64)
-endif
-
- ! Non-staging prep buffers (full tile): Q/U/wts + wsum (+ means if enabled).
-bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram + int(4,kind=int64) * (&
-&int(3,kind=int64)*int(nz_out,kind=int64) + int(1,kind=int64))
-if(rem_mean.gt.0)then
-   bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram +&
-   &int(4,kind=int64)*int(2,kind=int64)
-endif
-
- ! io_overlap keeps two copies of the output-side arrays alive at once
- ! (the tile being written + the tile being computed into the other slot).
-if(io_overlap)then
-   bytes_per_tile_pixel_ram_out = bytes_per_tile_pixel_ram_out * 2_int64
-endif
-bytes_per_tile_pixel_ram = bytes_per_tile_pixel_ram + bytes_per_tile_pixel_ram_out
-
- ! VRAM sub-block budget (bytes per sub-block pixel). This is separate from
- ! RAM planning and should reflect per-offload working sets only.
-bytes_per_vram_pixel = int(4,kind=int64) * (&
-&int(3,kind=int64)*int(nz_out,kind=int64) +&
-&int(2,kind=int64)*int(nrm_out,kind=int64) +&
-&int(1,kind=int64))
-if(rem_mean.gt.0)then
-   bytes_per_vram_pixel = bytes_per_vram_pixel +&
-   &int(4,kind=int64)*int(2,kind=int64)
-endif
-
-mem_safe_bytes = int(mem_frac_ram *&
-&real(mem_avail_kb,kind=dp) * 1024.0_dp,&
-&kind=int64)
-if(mem_safe_bytes.le.bytes_per_tile_pixel_ram)then
-   mem_safe_bytes = bytes_per_tile_pixel_ram
-endif
-tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel_ram
-if(tile_pixels_max.lt.1_int64)tile_pixels_max = 1_int64
-image_pixels_total = nx_out
-image_pixels_total = image_pixels_total * ny_out
-
- ! Auto tiling policy (IO-optimal for FITS RA-fastest layout):
- ! RA (NAXIS1) is the contiguous axis on disk, so we read FULL-RA
- ! "Dec strips" -- each plane read is then one contiguous block of
- ! nx_out RA samples x a contiguous range of Dec rows. We keep
- ! tile_ra = nx_out and pack as many Dec rows as mem_frac_ram allows.
- ! Only if a single full-RA Dec row does not fit do we fall back to
- ! subdividing RA (rare; extremely wide images).
-if(tile_auto .or. tile_ra.le.0 .or. tile_dec.le.0)then
-   if(tile_pixels_max.ge.image_pixels_total)then
-      tile_ra = nx_out
-      tile_dec = ny_out
-   else if(tile_pixels_max.ge.int(nx_out,kind=int64))then
-      ! At least one full-RA Dec row fits -> Dec strips.
-      tile_ra = nx_out
-      tile_dec = int(tile_pixels_max /&
-      &int(nx_out,kind=int64))
-      if(tile_dec.lt.1)tile_dec = 1
-      if(tile_dec.gt.ny_out)tile_dec = ny_out
-   else
-      ! A single full-RA row exceeds the budget; fall back
-      ! to RA-subtiled single Dec rows.
-      tile_dec = 1
-      tile_ra = int(tile_pixels_max)
-      if(tile_ra.lt.1)tile_ra = 1
-      if(tile_ra.gt.nx_out)tile_ra = nx_out
-   endif
-else
-   tile_ra = max(1,min(tile_ra,nx_out))
-   tile_dec = max(1,min(tile_dec,ny_out))
-endif
-
- ! Safety shrink: reduce Dec rows first (keep full RA contiguous);
- ! only shrink RA once the strip is already a single Dec row.
-tile_bytes_est = int(tile_ra,kind=int64) *&
-&int(tile_dec,kind=int64) * bytes_per_tile_pixel_ram
-do while(tile_bytes_est.gt.mem_safe_bytes .and.&
-&(tile_ra.gt.1 .or. tile_dec.gt.1))
-   if(tile_dec.gt.1)then
-      tile_dec = max(1,tile_dec/2)
-   else
-      tile_ra = max(1,tile_ra/2)
-   endif
-   tile_bytes_est = int(tile_ra,kind=int64) *&
-   &int(tile_dec,kind=int64) * bytes_per_tile_pixel_ram
-enddo
-
- !----------------------------------------------------
- ! VRAM sub-block planning (Phase-1 two-level tiling).
- ! The RAM block (tile_ra x tile_dec) is the disk-read unit.
- ! Each RAM block is processed in Dec-strip sub-blocks sized to
- ! fit a fraction (mem_frac_vram) of GPU VRAM, so the per-offload
- ! device footprint is bounded independently of the read size.
- !
- ! VRAM size precedence: gpu_vram_mib (cfg) -> device query
- ! (TODO: cudaMemGetInfo, nvfortran only) -> GPU_MEM_MIB env ->
- ! default. On CPU-only runs with nothing specified, no
- ! subdivision occurs (sub-block == RAM block) so output is
- ! bit-identical to the single-level path.
-gpu_vram_mib_eff = 0
-if(gpu_vram_mib.gt.0)then
-   gpu_vram_mib_eff = gpu_vram_mib
-   write(*,*)" VRAM size from cfg gpu_vram_mib (MiB): ",&
-   &gpu_vram_mib_eff
-else
-   ! TODO(device-query): when built with nvfortran, call
-   ! cudaMemGetInfo here to auto-detect free VRAM. Not
-   ! available via gfortran/libgomp offload; fall back.
-   env_vram = ' '
-   env_len = 0
-   env_stat = 0
-   call get_environment_variable('GPU_MEM_MIB',&
-   &env_vram,env_len,env_stat)
-   if(env_stat.eq.0 .and. env_len.gt.0)then
-      read(env_vram(1:env_len),*,iostat=ios_env)&
-      &gpu_vram_mib_eff
-      if(ios_env.ne.0 .or. gpu_vram_mib_eff.le.0)then
-         gpu_vram_mib_eff = 0
-      else
-         write(*,*)" VRAM size from env "//&
-         &"GPU_MEM_MIB (MiB): ",gpu_vram_mib_eff
-      endif
-   endif
-   if(gpu_vram_mib_eff.le.0)then
-      if(use_gpu_actual)then
-         gpu_vram_mib_eff = 4096
-         write(*,*)" WARNING: VRAM size not "//&
-         &"specified; assuming (MiB): ",&
-         &gpu_vram_mib_eff
-         write(*,*)" Set gpu_vram_mib in cfg or "//&
-         &"GPU_MEM_MIB env to match your card."
-      else
-         gpu_vram_mib_eff = 0
-      endif
-   endif
-endif
-
- ! cos/sin templates stay resident on the device across sub-blocks.
- ! Templates are full-size (nz_out, nrm_out), not (ngood_chan, nrm_out)
-template_bytes = int(4,kind=int64)*int(nz_out,kind=int64)*&
-&int(nrm_out,kind=int64)*int(2,kind=int64)
-inflight_slots_planned = 1
-if(use_gpu_actual .and. tile_dec.gt.1)then
-   ! Ping-pong staging can keep two sub-blocks resident/in-flight.
-   ! Treat mem_frac_vram as TOTAL in-flight budget and split per slot.
-   inflight_slots_planned = 2
-endif
-mem_frac_vram_per_slot = mem_frac_vram /&
-&real(inflight_slots_planned,kind=dp)
-if(gpu_vram_mib_eff.gt.0)then
-   vram_bytes_avail = int(gpu_vram_mib_eff,kind=int64)*&
-   &1024_int64*1024_int64
-   vram_budget_total_bytes = mem_frac_vram *&
-   &real(vram_bytes_avail,kind=dp)
-   vram_budget_per_slot_bytes = (vram_budget_total_bytes -&
-   &real(template_bytes,kind=dp)) /&
-   &real(inflight_slots_planned,kind=dp)
-   if(vram_budget_per_slot_bytes.lt.&
-   &real(bytes_per_vram_pixel,kind=dp))then
-      vram_budget_per_slot_bytes = real(bytes_per_vram_pixel,kind=dp)
-   endif
-   vram_safe_bytes = int(vram_budget_per_slot_bytes,kind=int64)
-   if(vram_safe_bytes.lt.bytes_per_vram_pixel)then
-      vram_safe_bytes = bytes_per_vram_pixel
-   endif
-   sub_px_max = vram_safe_bytes / bytes_per_vram_pixel
-   if(sub_px_max.lt.1_int64)sub_px_max = 1_int64
-   ny_sub = int(sub_px_max / int(tile_ra,kind=int64))
-   if(ny_sub.lt.1)ny_sub = 1
-   if(ny_sub.gt.tile_dec)ny_sub = tile_dec
-else
-   ny_sub = tile_dec
-endif
- ! We should stage only on the gpu:
-use_staging = (ny_sub.lt.tile_dec) .and. use_gpu_actual
+image_pixels_total = plan%image_pixels_total
+tile_bytes_est = plan%tile_bytes_est
+template_bytes = plan%template_bytes
+tile_ra = plan%tile_ra
+tile_dec = plan%tile_dec
+gpu_vram_mib_eff = plan%gpu_vram_mib_eff
+ny_sub = plan%ny_sub
+inflight_slots_planned = plan%inflight_slots_planned
+use_staging = plan%use_staging
+mem_frac_vram_per_slot = plan%mem_frac_vram_per_slot
 
 write(*,*)" "
 write(*,*)"Tile planner (Phase-2):"
