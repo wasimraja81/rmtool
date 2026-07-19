@@ -459,6 +459,15 @@ endif
 ! separate arguments. Unpacked here, in the same place the call already
 ! was, into the same loose locals used throughout the rest of this file
 ! -- nothing downstream of this block changes.
+!
+! This unpack block is a deliberately temporary bridge (T1, shallow
+! encapsulation): every other usage site in this file still reads bare
+! locals, not cfg%, so read_cfg_keyval's caller has to re-expose them
+! here. It goes away entirely once T5 (deep cfg threading, see
+! planning/ENCAPSULATION_REFACTOR_PLAN.md) replaces every local
+! reference with cfg%field directly -- not by wrapping this block in a
+! subroutine, which would just relocate the same large-argument-list
+! problem T1 just removed from read_cfg_keyval's signature.
 path = cfg%path
 infileQ = cfg%infileQ
 infileU = cfg%infileU
