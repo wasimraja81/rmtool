@@ -101,13 +101,14 @@ Set / Correctness Gate / Rollback Criteria / Effort.
 
 ---
 
-### T3a — I/O Orchestration Cleanup (read-side + stage bookkeeping, low risk) — OPEN
+### T3a — I/O Orchestration Cleanup (read-side + stage bookkeeping, low risk) — DONE
 - **Objective:** Clean up the plumbing around the already-modular read/timer/log calls in the tile loop — reduce repeated `timer_start`/`timer_stop`/`log_tile_bounds` pairs and the read-thread-splitting arithmetic into named helper calls, without changing what CFITSIO calls happen or in what order.
 - **Scope:** `rm_synthesis.f90:2960-3180` (progress counters, tile-loop entry logging, parallel-read dispatch, mask build). Explicitly excludes the `io_overlap` ping-pong block (`2977-3014`) and everything from `write_job` assembly onward — that's T3b.
 - **Change Set:** Extract byte-count computation and read-thread-split index arithmetic into named module-level helpers called from the tile loop. The `!$omp parallel do` loop body itself is not touched (risk of silently changing firstprivate/shared semantics) — only what surrounds it.
 - **Correctness Gate:** Standard `run_tests.sh` pass (tests 5-7, 10, 13 all exercise this path every run); one bit-identical sweep against T0 as cheap insurance; manual grep-diff of a sample log's `tile_read`/`tile_write` `bytes=` field values against T0 (would otherwise silently break swim-lane plotting, a real but non-test-covered regression class).
 - **Rollback Criteria:** Any test failure; any `bytes=` field diff in logs.
 - **Effort:** 1 session.
+- **Evidence (2026-07-19):** Two new module-level helpers in `rm_synthesis_mod.f90`: `compute_tile_read_bytes` (the `nbytes_read` byte-count expression, moved verbatim into a pure function) and `split_channels_across_threads` (the `io_par_base`/`io_par_rem` division/mod, moved into a subroutine). Both are called from the tile loop exactly where the inline arithmetic used to be, immediately before the `!$omp parallel do` region -- the parallel region itself (its `shared`/`private` clauses and per-thread body) is untouched, since `io_par_base`/`io_par_rem` are still plain locals in `rm_synthesis.f90`, just now assigned via a call instead of inline. Clean 4-variant rebuild: 0 errors, 0 new warnings (same 4 pre-existing GPU linker warnings as T0). `tests/run_tests.sh`: 28/28 pass. Full bit-identical sweep of all 140 T0-archived FITS outputs: same 6-file NaN-vs-NaN `--exact` artifact as T1/T2, not a regression. `bytes=` log-field check (the gate's specific concern): every archived log's `tile_read`/`tile_write` `bytes=` sequence is identical to T0 except `ovl_y.log` (the `io_overlap=y` test), where two lines are transposed -- confirmed to be the same *set* of `bytes=` lines (order-independent diff is empty), i.e. real background-thread scheduling jitter inherent to `io_overlap`, not a content change; this ticket's edits are entirely on the synchronous read side and don't touch the write thread.
 
 ---
 

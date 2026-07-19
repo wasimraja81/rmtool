@@ -2908,18 +2908,15 @@ do ix_tile_beg = xpix_beg,xpix_end,tile_ra*incs(1)
       ! into the real*4 buffers here regardless, so this is an
       ! approximation if an input cube's on-disk BITPIX differs from
       ! that, off by the corresponding byte-width ratio).
-      nbytes_read = io_par_per_plane*io_par_nz_total*4_int64*2_int64
-      if(use_input_mask) nbytes_read = nbytes_read + &
-      &io_par_per_plane*io_par_nz_total*4_int64
-      if(need_icube) nbytes_read = nbytes_read + &
-      &io_par_per_plane*io_par_nz_total*4_int64
+      nbytes_read = compute_tile_read_bytes(io_par_per_plane,&
+      &io_par_nz_total, use_input_mask, need_icube)
 
       call log_tile_bounds('tile_read','start',&
       &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end, nbytes_read)
 
       call timer_start(t_stage)
-      io_par_base = io_par_nz_total / int(io_read_threads_eff,kind=int64)
-      io_par_rem  = mod(io_par_nz_total, int(io_read_threads_eff,kind=int64))
+      call split_channels_across_threads(io_par_nz_total,&
+      &io_read_threads_eff, io_par_base, io_par_rem)
       io_par_read_ok = .true.
 !$omp parallel do if(io_read_threads_eff.gt.1)&
 !$omp& num_threads(io_read_threads_eff)&

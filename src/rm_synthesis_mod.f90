@@ -19,6 +19,7 @@ module rm_synthesis_mod
   public :: linspace, nchar
   public :: read_cfg_keyval, rmsynth_config_t
   public :: plan_tile, tile_plan_t
+  public :: compute_tile_read_bytes, split_channels_across_threads
   public :: write_runtime_estimate
   public :: init_logging, log_message, log_tile_bounds, log_tile_note, log_subblock_progress
   public :: timer_reset, timer_start, timer_stop, timer_add
@@ -2928,6 +2929,37 @@ contains
      ! We should stage only on the gpu:
     plan%use_staging = (plan%ny_sub.lt.plan%tile_dec) .and. plan%use_gpu_actual
   end subroutine plan_tile
+
+  integer(kind=int64) function compute_tile_read_bytes(pixels_per_plane, &
+  &nz_total, use_input_mask, need_icube) result(nbytes)
+    !! T3a I/O orchestration ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+    !! estimated bytes moved by one tile's parallel FITS read (Q+U always,
+    !! plus input mask and/or I cube if enabled) -- moved verbatim from the
+    !! tile loop, used only for the tile_read log line's byte-count field,
+    !! not for any actual read logic.
+    implicit none
+    integer(kind=int64), intent(in) :: pixels_per_plane, nz_total
+    logical, intent(in) :: use_input_mask, need_icube
+
+    nbytes = pixels_per_plane*nz_total*4_int64*2_int64
+    if(use_input_mask) nbytes = nbytes + pixels_per_plane*nz_total*4_int64
+    if(need_icube) nbytes = nbytes + pixels_per_plane*nz_total*4_int64
+  end function compute_tile_read_bytes
+
+  subroutine split_channels_across_threads(nz_total, n_threads, base, rem)
+    !! T3a I/O orchestration ticket: per-thread channel-count split for the
+    !! parallel channel-chunked FITS read in the tile loop -- moved verbatim,
+    !! only var -> argument. n_threads threads each read base channels, with
+    !! the first rem threads (per the per-thread merge() below the call site)
+    !! reading one extra channel to cover the remainder.
+    implicit none
+    integer(kind=int64), intent(in) :: nz_total
+    integer, intent(in) :: n_threads
+    integer(kind=int64), intent(out) :: base, rem
+
+    base = nz_total / int(n_threads,kind=int64)
+    rem  = mod(nz_total, int(n_threads,kind=int64))
+  end subroutine split_channels_across_threads
 
   subroutine write_runtime_estimate(report_file, npix_total, nchan_total, nchan_good, &
                                     nbad_chan, nrm_out, output_mode, tile_ra, tile_dec, &
