@@ -325,8 +325,12 @@ recorded here in case a future revision needs to fall back to it.)
 
 Each phase should get its own ticket(s) in the style of
 `planning/ENCAPSULATION_REFACTOR_PLAN.md` / `IO_PARALLEL_OPTIMISATION_PLAN.md`
-(Objective/Scope/Change Set/Correctness Gate/Rollback Criteria/Effort) once
-this feasibility plan is agreed, rather than being written speculatively here.
+(Objective/Scope/Change Set/Correctness Gate/Rollback Criteria/Effort).
+**T0 and T1 (covering the start of phase 1) are now written — see §9.** Later
+tickets (phase 1's remainder, phases 2-5) are deliberately not written yet;
+each should be scoped once the ticket(s) before it have landed and their
+Evidence sections are filled in, the same incremental discipline
+`ENCAPSULATION_REFACTOR_PLAN.md` used.
 
 ## 7. Decisions recorded (confirmed with user, 2026-07-20)
 
@@ -381,6 +385,22 @@ resolved, plus one follow-up decision (0) reached after the rest:
    does **not** auto-run the full theoretical RM range for multi-band —
    `beg_rm`/`end_rm`/`nrm` remain required, explicit user choices, guided by
    (not overridden by) the logged diagnostic.
+6. **Multi-band test data: synthetic only, not real observational cubes**
+   (confirmed with user, 2026-07-20). All multi-band correctness testing —
+   geometry-validation accept/reject paths, frequency/λ² merge, the
+   `RM_res`/`RM_span` diagnostic — is validated against synthetic Q/U cubes
+   with known injected point sources at known RM, extending the existing
+   `tests/make_test_cubes.py` generator (already used by `tests/run_tests.sh`
+   for single-band tests, validated via `tests/check_rm_peak.py` recovering
+   the known-truth RM and `tests/compare_cubes.py` for bit-identical/diff
+   comparisons). **This is an explicit, narrower scope than the
+   encapsulation-refactor effort accepted for itself**: that project's T3b
+   needed a real production-scale Setonix run to validate beyond what
+   synthetic in-suite tests could show (see project memory
+   `project_jennifer_t3b_validation`); no equivalent real-data validation
+   step is planned here. A real multi-band production run remains something
+   the user can do separately once this lands, but it is not a gate any
+   ticket in this plan depends on passing.
 
 ## 8. Non-goals for this effort
 
@@ -404,3 +424,118 @@ resolved, plus one follow-up decision (0) reached after the rest:
   (`extract_general_setup`, `tile_extract_gpu_rm_blocked`) beyond how many
   channels it's handed — same guardrail this repo already applies in
   `planning/ENCAPSULATION_REFACTOR_PLAN.md`.
+
+## 9. Tickets
+
+Ticket format follows this repo's existing convention
+(`planning/ENCAPSULATION_REFACTOR_PLAN.md`, `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`):
+Objective / Scope / Change Set / Correctness Gate / Rollback Criteria /
+Effort, each getting an **Evidence (...)** section appended once done.
+
+---
+
+### T0 — Baseline Lock
+
+- **Objective:** Freeze an exact, reproducible reference of current
+  `develop` behaviour before any multi-band code changes land, so every
+  later ticket's bit-identical correctness gate (§5, §7 decision 0) has a
+  concrete baseline to diff against — the same purpose T0 served in
+  `planning/ENCAPSULATION_REFACTOR_PLAN.md`, adapted for this branch. This
+  step matters more here than it did there: that effort's baseline was a
+  safety net for a refactor with no algorithmic change intended anywhere;
+  this effort's own §7 decision 0 explicitly gave up the "bit-identical by
+  construction" guarantee, making this baseline the *primary* correctness
+  instrument, not a backstop.
+- **Scope:** Measurement only, on `multi-band-tomography` at its current
+  tip (commit `a2417f6` at the time this ticket is written — re-confirm the
+  exact commit when the ticket is actually executed, since more planning
+  commits may land first). No source changes.
+- **Change Set:** None.
+- **Correctness Gate:**
+  - Clean build via `bash scratch/make_all.sh` (or this repo's current
+    equivalent full-matrix build script) across all four variants
+    (CPU-serial, CPU-OMP, GPU-offload, GPU-offload-hostomp); record the
+    actual warning count verbatim, don't assume zero.
+  - Full `bash tests/run_tests.sh` run; record PASS/FAIL/SKIP counts
+    verbatim.
+  - Archive the complete output FITS set (AMP/PHA/MASK/NVALID/etc.) plus run
+    logs for every `tests/*.cfg` under a new
+    `scratch/baseline_multiband/` directory (gitignored, local-only,
+    mirroring `scratch/baseline_encapsulation/`'s existing pattern) — the
+    literal byte-for-byte reference every later ticket in this plan diffs
+    against via `tests/compare_cubes.py --exact`.
+  - Record the exact git commit hash this baseline was built from in a
+    `scratch/baseline_multiband/T0_MANIFEST.md`, mirroring
+    `scratch/baseline_encapsulation/T0_MANIFEST.md`'s existing format.
+- **Rollback Criteria:** N/A (measurement only).
+- **Effort:** 0.5 session.
+
+---
+
+### T1 — Unified `nbands`-Parameterized Ingestion + Geometry Validation
+
+- **Objective:** Introduce the `nbands` config key (default 1) and the
+  single, unified per-band ingestion/validation pipeline (§5, §7 decision
+  0) — proving the `nbands=1` case is bit-identical to the T0 baseline
+  before any frequency-merge logic (phase 2) exists at all. This is
+  deliberately the narrowest slice that exercises the new schema and the
+  new geometry-validation loop end-to-end without touching the RM-synthesis
+  numerics.
+- **Scope:**
+  - `src/rm_synthesis_mod.f90:106-153` (`rmsynth_config_t`): add `nbands`
+    (default 1) and `reference_band` (default 1) fields. Add a new small
+    per-band derived type (e.g. `band_cfg_t`) holding the per-band fields
+    identified in §4/§5 (`infileQ`, `infileU`, `resiQ`, `slopeQ`, `resiU`,
+    `slopeU`, `infileI`, `path_I`) and an allocatable array of it, sized to
+    `nbands`, inside `rmsynth_config_t`.
+  - `read_cfg_keyval` (`src/rm_synthesis_mod.f90:1632` onward): add
+    `nbands`/`reference_band` parsing; add the legacy-key-aliasing logic
+    (§5) that populates `band(1)` from unsuffixed `infileQ`/`infileU`/etc.
+    when `nbands` is absent or 1, and from suffixed `infileQ_1`, `infileQ_2`
+    ... when `nbands>1`; reject mixed spellings (both a legacy and a
+    suffixed key set for the same run) as a config-parse error, per §5.
+    Required-key enforcement (today at `:2585-2589` for `infileQ`/`infileU`)
+    extends to every configured band.
+  - `src/rm_synthesis.f90:572-667` (today's `myfits_info` calls + Q-vs-U
+    NAXIS/dimension check) and `:733-806` (today's Q-vs-U WCS-value exact
+    match): generalize from "Q vs U, exactly two cubes" to "every band's Q
+    and U vs `reference_band`'s geometry, N cubes" — same exact-equality
+    philosophy (§3, §7 decision 3), same loud-refuse-on-mismatch behaviour,
+    just looped over `nbands` instead of hardcoded to one pair.
+  - For `nbands>1` specifically: after geometry validation passes, stop
+    with a clear, explicit "multi-band frequency merge not yet implemented"
+    message rather than attempting synthesis — phase 2's job, out of scope
+    here. This keeps T1's blast radius to ingestion/validation plumbing
+    only.
+  - Test fixtures: extend `tests/make_test_cubes.py` to optionally emit a
+    second synthetic Q/U band (distinct frequency range from the existing
+    550-750 MHz GMRT-like band, e.g. an 800-950 MHz band, same RA/Dec
+    geometry and same injected point sources) plus a deliberately
+    geometry-mismatched variant (different `CRVAL1`/`CDELT1` or pixel
+    count) — enough to exercise both the accept and loud-refuse paths of
+    the new N-band geometry validation. Per §7 decision 6, this stays
+    synthetic-only; no real multi-band cubes are sourced for this ticket.
+- **Correctness Gate:**
+  - **Legacy/default path (`nbands` absent, and explicit `nbands=1`):**
+    every `tests/*.cfg`/`cfg/*.cfg` file, run unedited, produces
+    bit-identical output (`tests/compare_cubes.py --exact`) against the T0
+    baseline archive. This is the ticket's central gate, carrying the full
+    weight of requirements 2a/2b (§5, §7 decision 0) — there is no
+    by-construction fallback if this fails.
+  - `tests/run_tests.sh`'s existing pass/fail counts are unchanged from T0.
+  - New multi-band fixture tests (added to `tests/run_tests.sh` or a
+    parallel script): a matched-geometry two-band config passes validation
+    and reaches (and stops cleanly at) the "not yet implemented" message; a
+    mismatched-geometry two-band config is loudly refused before any
+    compute begins.
+  - A config mixing legacy and suffixed keys is rejected with a clear error
+    at parse time.
+- **Rollback Criteria:** If bit-identical output cannot be achieved for the
+  `nbands=1` case within this ticket's effort budget, roll back to before
+  this ticket rather than merging a change that silently breaks existing
+  users — re-evaluate whether the unified-pipeline decision (§7 decision 0)
+  needs revisiting in favour of the superseded two-path design kept in §5.
+- **Effort:** 1.5-2 sessions (config-parser rework + new derived type +
+  N-band validation loop + synthetic multi-band fixture generation, gated
+  by a bit-identical sweep that itself takes real wall-clock time to run
+  and diff).
