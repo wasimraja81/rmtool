@@ -167,7 +167,7 @@ The existing decomposition is:
 | Config schema (single `infileQ`/`infileU`) | **No** | Needs a list-of-bands concept (§5) — every place `cfg%infileQ` is read once needs to become "for each band." This is schema and orchestration work, not parallelism work. **Must stay backward compatible, via one unified pipeline, not two** (requirements 2a/2b, §5): `nbands` defaults to 1, legacy unsuffixed keys are parse-time aliases for band 1's keys, and there is exactly one ingestion/validation/compute pipeline for all `nbands` values — bit-identical output for existing configs is guaranteed only by the test-sweep correctness gate (§5), not by construction. |
 | Geometry validation | **No, must be extended, not reused as-is** | Today's check is Q-vs-U only; needs to become "all N cubes' RA/Dec pixel grid vs. a chosen reference" (band 1, per the §7 decision), still exact-equality, loud-warn-and-refuse on mismatch — **no** resolution/beam check is added (decided against in §2/§3: `BMAJ`/`BMIN`/`BPA` are unreliable in multi-frequency headers). |
 | Frequency/λ² grid construction | **Mixed — better news than it first looks** | The DFT template kernel itself (`extract_general_setup`, `src/rm_synthesis_mod.f90:642-728`) computes `cos_arr`/`sin_arr` from each channel's λ² **individually** (a direct sum, not an FFT), so it does not algebraically require uniform λ² spacing — a concatenated, gapped, multi-band λ² array would compute correctly through this kernel essentially as-is. The actual gap is entirely upstream, in how that array is *produced*: `myfits_info` reads one `(CRVAL,CRPIX,CDELT)` triple per cube and `linspace`s it into a uniform ramp (`src/rm_synthesis.f90:1561-1563`) — there is no per-channel frequency table anywhere. Multi-band needs that replaced by **concatenating each band's own linspace-derived channel list** (each band can keep its own internal linear grid) into one merged, sorted array, with per-channel weights/flags carried through per band. This changes `nz_out`'s meaning from "one cube's channel count" to "sum of all bands' channel counts," touching every allocation sized by it (`data_arrQ/U`, `flag_arr_out`, `L_sq`, `cos_arr`/`sin_arr`, tile-local `specQ`/`specU`) — sizing/plumbing work, not a kernel rewrite. **Overlapping-band frequency ranges (§7 decision): no deduplication.** Per-channel weighting today is a uniform 0/1 flag (`flag_arr`/`flag_arr_out`, counted into `wsum` — "count of valid channels", `src/rm_synthesis.f90:2988-2989`), not a noise/sensitivity-based weight, so flat concatenation of every band's good channels already implements "weight by both" for free: an overlap region simply ends up with more equally-weighted channel terms in the same DFT sum, exactly like non-overlapping channels elsewhere in the run. If a noise-based per-channel weight is ever added later, the same merged-list design extends to it unchanged, since the kernel already takes an arbitrary per-channel weight. Separately, **`use_auto_rm_range=1`'s default RM-range heuristic does assume uniform spacing** (`dfreq = (freq_MHz(npts)-freq_MHz(1))/(npts-1)`, `src/rm_synthesis_mod.f90:656-687`) and would silently compute a wrong range/resolution across a multi-band gap; **§7 decision: forbidden outright for `nbands>1`** — see the RM-range diagnostic row below. |
-| RM-range/resolution diagnostic for multi-band runs | **New, additive — not a parallelism concern** | With `use_auto_rm_range` forbidden for `nbands>1` (§7), the user must supply `beg_rm`/`end_rm`/`nrm` explicitly, but has no easy way to know what's actually achievable from their specific band combination — non-uniform λ² spacing across bands means the classical uniform-spacing formulas (already used for the existing single-band auto-range heuristic, `src/rm_synthesis_mod.f90:656-687`) don't directly apply. **Decision (confirmed with user, 2026-07-20):** compute and log (stdout + run log) a generalized theoretical RM resolution and un-aliased RM range/span from the merged, non-uniform λ² array — `RM_res` from the **maximum separation in λ²** across the full merged coverage, `RM_span` from the **width of the smallest (finest) individual channel in λ²** — as an informational diagnostic only, guiding the user's choice of `beg_rm`/`end_rm`/`nrm` rather than auto-selecting a range. The exact generalized (non-uniform-spacing) formulas are to be sourced from Wasim Raja's PhD thesis (RRI digital repository) at implementation time; the classical uniform-spacing case already implemented (`src/rm_synthesis_mod.f90:656-687`, Brentjens & de Bruyn-style relations) is the special case this generalizes from. |
+| RM-range/resolution diagnostic for multi-band runs | **New, additive — not a parallelism concern** | With `use_auto_rm_range` forbidden for `nbands>1` (§7), the user must supply `beg_rm`/`end_rm`/`nrm` explicitly, but has no easy way to know what's actually achievable from their specific band combination. **Decision (confirmed with user, 2026-07-20), formulas now sourced from the thesis (Raja 2014, Chapter 6 + §2.5 — see §7 decision 5 for the full citation, exact equations, and the three-quantity distinction the user flagged):** compute and log (stdout + run log) three genuinely distinct quantities — `δRM` (resolving power, for telling two nearby features apart), `max RM scale` (the largest Faraday-*thickness* an extended/thick component can have and still be detected at all), and `max un-aliased RM` (the largest Faraday *depth* at which a single thin/point-like component can still be reliably, unambiguously measured) — as an informational diagnostic only, guiding the user's choice of `beg_rm`/`end_rm`/`nrm` rather than auto-selecting a range. |
 | Tile read stage | **Partially — needs a per-band read loop, not a redesign** | `tile_read` currently issues one `FTGSVE` call (or `io_read_threads`-many) per input file. With K bands it becomes a loop of K such call-groups into disjoint slices of one enlarged `specQ`/`specU` buffer — additive complexity, not a new decomposition axis. Bad-channel/mask handling (`flag_arr`) needs to become per-band-aware so a channel flagged bad in band 2 doesn't collide with band 1's indexing. |
 | Bias correction / Q-U bias fields (`resiQ`, `slopeQ`, `resiU`, `slopeU`, `infileI`) | **Decided: per-band** | These are currently single scalars/one I-cube for the whole run. **Decision (confirmed with user, 2026-07-20):** Q-U bias correction is physically an instrumental effect and must be done **per band** — each band needs its own `resiQ`/`slopeQ`/`resiU`/`slopeU` and, when `remove_qu_bias=y`, its own Stokes-I cube (`infileI`/`path_I`). This is config-schema and per-band-loop plumbing, not a parallelism concern — the bias correction itself is applied per-channel before the DFT sum, so it composes with the merged-frequency-list design the same way bad-channel flags do. |
 
@@ -308,14 +308,19 @@ recorded here in case a future revision needs to fall back to it.)
    output on the new code before this phase is considered done — the same
    bar as this repo's existing refactor-correctness gates, but now the sole
    mechanism rather than a backstop.
-2. **Frequency/λ² merge + per-band bad-channel handling.** The structural
-   work identified as the biggest remaining gap in §4 — concatenate each
-   band's channel list (no deduplication needed in overlaps, §4/§7) into one
-   merged, sorted λ²/weight array sized by the new `nz_out` meaning.
+2. **Frequency/λ² merge + per-band bad-channel handling, validated against
+   the synthetic scenario in §10.** §10's exact numeric parameters are now
+   pinned directly from the thesis (Raja 2014, Table 6.1/6.2 — see §7
+   decision 5's citation), so this dependency is already resolved rather
+   than pending. The structural ingestion/merge work identified as the
+   biggest remaining gap in §4 — concatenate each band's channel list (no
+   deduplication needed in overlaps, §4/§7) into one merged, sorted
+   λ²/weight array sized by the new `nz_out` meaning.
 3. **RM-range/resolution diagnostic + `use_auto_rm_range` guard.** Reject
-   `use_auto_rm_range=1` whenever `nbands>1`; compute and log the
-   generalized (non-uniform-λ²-spacing) `RM_res`/`RM_span` diagnostic from
-   Wasim Raja's PhD thesis formulas, to guide the user's explicit
+   `use_auto_rm_range=1` whenever `nbands>1`; compute and log the three
+   distinct thesis-sourced quantities from §7 decision 5 (`δRM`, `max RM
+   scale`, and — pending its combined-multi-band formula, per §10's
+   implementation notes — `max un-aliased RM`) to guide the user's explicit
    `beg_rm`/`end_rm`/`nrm` choice.
 4. **Per-band bias-correction implementation** (`resiQ`/`slopeQ`/`resiU`/
    `slopeU`/`infileI` per band, §4/§7 decision).
@@ -374,21 +379,75 @@ resolved, plus one follow-up decision (0) reached after the rest:
 5. **`use_auto_rm_range` for multi-band runs**: **forbidden outright**
    whenever `nbands>1` — the existing heuristic assumes uniform channel
    spacing (§3, §4) and would silently miscompute across a multi-band gap.
-   In its place, rmtool computes and logs (stdout + run log) a **diagnostic
-   RM resolution (`RM_res`) and un-aliased RM range/span (`RM_span`)**
-   generalized to non-uniform λ² spacing: `RM_res` from the **maximum
-   separation in λ²** across the full merged band coverage, `RM_span` from
-   the **width of the smallest (finest) individual channel in λ²** — per
-   Wasim Raja's PhD thesis (RRI digital repository), generalizing the
-   uniform-spacing relations already implemented for the single-band case
-   (`src/rm_synthesis_mod.f90:656-687`). This is informational only: rmtool
-   does **not** auto-run the full theoretical RM range for multi-band —
-   `beg_rm`/`end_rm`/`nrm` remain required, explicit user choices, guided by
-   (not overridden by) the logged diagnostic.
+   In its place, rmtool computes and logs (stdout + run log) a diagnostic —
+   confirmed against the actual thesis chapter (source below), which
+   revealed the diagnostic needs **three distinct quantities, not two**
+   (correction from the user, 2026-07-20, after an earlier draft of this
+   decision conflated two of them):
+   - **`δRM` (RM resolution)** — the ability to tell two nearby features
+     apart in Faraday depth, whether two thin components or structure
+     within one thick component. `δRM ∝ 1/[λ²(Δν/ν)]` per band (thesis
+     eq 6.1, restated from eq 2.4 in §2.5.3). **For combined multi-band
+     data, this is *not* set by the total λ² separation across the full
+     gapped dataset** (an assumption an earlier draft of this document
+     made and which turned out to be wrong) — the thesis demonstrates
+     empirically (Table 6.1, P+L row: `Δλ²=0.214 m²` ≈ `Δλ²_P (0.201) +
+     Δλ²_L (0.013)`, and prose confirming it explicitly) that **the
+     effective combined resolution is set by the *sum* of the individual
+     bands' own λ² spans**, `δRM_combined ∝ 1/(Σ_band Δλ²_band)` — the gap
+     between bands does not help resolution, only each band's own internal
+     bandwidth does.
+   - **`max RM scale` (sensitivity to Faraday-*thick*/extended structure)**
+     — the largest Faraday-depth *thickness* an extended component can have
+     and still be detected without being completely washed out by
+     bandwidth depolarization. `max RM scale ~ 1/λ²_min` (thesis eq 6.4),
+     where `λ²_min` is the smallest λ² sampled anywhere across the *whole*
+     combined dataset — i.e. set by whichever band reaches the shortest
+     wavelength (highest frequency), a band-edge quantity, **not**
+     dependent on individual channel width. Table 6.1 confirms this too:
+     P+L's `max RM scale` (55.4) equals L-band's own value exactly, since L
+     is the higher-frequency band and thus supplies the dataset's
+     `λ²_min`.
+   - **`max un-aliased RM` (a third, genuinely separate quantity — this is
+     the one an earlier draft of this document wrongly conflated with `max
+     RM scale`)** — the largest Faraday *depth* (not thickness) at which a
+     single Faraday-**thin**/point-like component can still be reliably
+     measured without being confused with (aliased onto) a different RM.
+     This one *is* governed by individual channel width in λ² (thesis
+     §2.5.2-§2.5.3, illustrated via the Gauribidannaur Telescope worked
+     example: `δRM≈0.5 rad m⁻²` with `n_ch=256` channels limits reliable
+     probing to `|RM|≲60 rad m⁻²`) — matching the formula already
+     implemented for the existing single-band `use_auto_rm_range` heuristic
+     (`src/rm_synthesis_mod.f90:656-687`). **Open implementation gap,
+     flagged for whoever scopes phase 3, not resolved by this document**:
+     the thesis's own Table 6.1 does not tabulate this quantity for the
+     P/L/P+L combined case (only `δRM` and `max RM scale` are tabulated),
+     so its exact multi-band-combined formula (accounting for each band's
+     own, possibly different, channel width) needs to be worked out at
+     implementation time, not assumed from Table 6.1 by analogy to the
+     other two quantities.
+
+   **Source:** Raja, W. (2014), *"Faraday Slicing Polarized Radio
+   Sources,"* PhD thesis, Raman Research Institute / Jawaharlal Nehru
+   University — Chapter 6, *"Slicing Faraday-thick components: tomography
+   using multi-band data"* (thesis pp. 187-198), §6.1 in particular (eqs
+   6.1-6.4, Tables 6.1-6.2, Figures 6-1/6-2/6-3); and Chapter 2 §2.5,
+   *"Faraday tomography & advantages of non-uniform sampling in λ²"*
+   (thesis pp. 23-37), specifically §2.5.1 "Bandwidth depolarization"
+   (eqs 2.12-2.38) and §2.5.2-§2.5.3 "Sampling scheme for λ²s & aliasing" /
+   "Faraday tomography at very low frequencies" (thesis pp. 31-34, the
+   Gauribidannaur worked example). Read directly from the user's local copy
+   (`/home/wasim/Thesis/wasim_thesis_Final.pdf`) — not accessible via the
+   ResearchGate DOI originally supplied (403 on automated fetch).
+   This is informational only: rmtool does **not** auto-run the full
+   theoretical RM range for multi-band — `beg_rm`/`end_rm`/`nrm` remain
+   required, explicit user choices, guided by (not overridden by) the
+   logged diagnostic.
 6. **Multi-band test data: synthetic only, not real observational cubes**
    (confirmed with user, 2026-07-20). All multi-band correctness testing —
    geometry-validation accept/reject paths, frequency/λ² merge, the
-   `RM_res`/`RM_span` diagnostic — is validated against synthetic Q/U cubes
+   `δRM`/`max RM scale`/`max un-aliased RM` diagnostic — is validated
+   against synthetic Q/U cubes
    with known injected point sources at known RM, extending the existing
    `tests/make_test_cubes.py` generator (already used by `tests/run_tests.sh`
    for single-band tests, validated via `tests/check_rm_peak.py` recovering
@@ -415,8 +474,8 @@ resolved, plus one follow-up decision (0) reached after the rest:
   *frequency* coverage of the *same* sky region.
 - Auto-selecting or auto-running the full theoretical RM range for
   multi-band data (rejected, §7 point 5) — rmtool logs the achievable
-  `RM_res`/`RM_span` as a diagnostic; the user still chooses
-  `beg_rm`/`end_rm`/`nrm` explicitly.
+  `δRM`/`max RM scale`/`max un-aliased RM` as a diagnostic; the user still
+  chooses `beg_rm`/`end_rm`/`nrm` explicitly.
 - Making `use_auto_rm_range=1` itself band-gap-aware (rejected in favor of
   forbidding it outright for `nbands>1`, §7 point 5) — a band-aware version
   of the auto-range heuristic is not being pursued.
@@ -539,3 +598,130 @@ Effort, each getting an **Evidence (...)** section appended once done.
   N-band validation loop + synthetic multi-band fixture generation, gated
   by a bit-identical sweep that itself takes real wall-clock time to run
   and diff).
+
+## 10. Multi-band synthetic test scenario (informs the Phase 2 ticket)
+
+Per §7 decision 6, all multi-band correctness testing is synthetic. This
+section specifies the injected sky model that phase 2's ticket needs to
+validate the frequency/λ² merge against, now grounded directly in the
+thesis (see the citation in §7 decision 5) rather than in speculative
+placeholders. Per user decisions on 2026-07-20: this scenario **reproduces
+the thesis's own worked example (Chapter 6, §6.1, Tables 6.1-6.2, Figures
+6-1/6-2/6-3) exactly**, plus **one addition beyond it** (a close
+Faraday-thin pair, F2/F3) chosen using the thesis's own real numbers rather
+than invented ones.
+
+### Bands — reproduced exactly from Table 6.1
+
+| Band | ν_c (MHz) | Δν (MHz) | Δλ² (m²) | λ²_min (m²) | δRM (rad m⁻²) | max RM scale (rad m⁻²) |
+|---|---|---|---|---|---|---|
+| P | 300 | 30 | 0.201 | 0.907 | 15.6 | 3.6 |
+| L | 1200 | 120 | 0.013 | 0.057 | 250.1 | 55.4 |
+| P+L | — | — | 0.214 | 0.057 | 14.7 | 55.4 |
+
+This is a **new, separate synthetic fixture set** from the existing
+550-750 MHz GMRT-like single-band cube already in
+`tests/make_test_cubes.py` — that fixture (and its `src_A`/`src_B` point
+sources at RM=-5/+22) is unrelated to and untouched by this scenario; P and
+L here are their own new FITS cube pairs. Channel count/width per band
+isn't specified by Table 6.1 (only `ν_c` and `Δν` are) — pick something
+fine enough that individual-channel bandwidth depolarization (thesis
+§2.5.1, eqs 2.12-2.38) stays negligible relative to the effects under
+test, so results match Table 6.1's idealized, coverage-only numbers; this
+is an implementation-time engineering choice, not mandated by the thesis
+itself, since the thesis's own Chapter 6 demonstration doesn't appear to
+model finite-channel-width depolarization explicitly either (it isn't
+listed among Table 6.1's inputs).
+
+### Components
+
+**Two components, reproduced exactly from Table 6.2** (the thesis's own
+worked example):
+
+1. **Point source (Faraday-thin/delta).** `RM = -100 rad m⁻²`,
+   amplitude `15 Jy/(rad m⁻²)`, `PA_intrinsic = 0°`. Genuinely a single
+   Faraday depth, so it is correctly recovered as one clean, unresolved
+   peak in *every* scenario below — its role is a stable reference,
+   validating that nothing about the merge corrupts recovery of an
+   ordinary point source.
+2. **Faraday-thick component, modelled as a top-hat in Faraday depth**
+   (thesis §6.1.1: *"The extended feature is modeled as a top-hat function
+   along RM"* — **not** a `sinc`/Burn-1966-formula parameterization, which
+   an earlier draft of this document incorrectly assumed before the actual
+   thesis text was available). Spans `RM = 100` to `130 rad m⁻²` (centre
+   115, thickness 30), amplitude `5 Jy/(rad m⁻²)`, `PA_intrinsic = 0°`.
+
+**One addition beyond the thesis's own demo (confirmed with user,
+2026-07-20): a close Faraday-thin pair, F2/F3**, at `RM = +250` and
+`+290 rad m⁻²` (`Δφ_23 = 40 rad m⁻²`), amplitude `8 Jy/(rad m⁻²)` each,
+`PA_intrinsic = 0°` — placed well clear of both components above (120
+rad m⁻² from the top-hat's upper edge) so nothing overlaps. `Δφ_23=40` was
+chosen using the real Table 6.1 numbers: comfortably above `δRM_P (15.6)`
+and `δRM_P+L (14.7)` (resolved by P alone and combined) while comfortably
+below `δRM_L (250.1)` (blended at L alone).
+
+**Honesty check on what F2/F3 actually demonstrates, since it isn't from
+the thesis itself:** with these specific P/L parameters, P-band's own
+resolution (15.6) is already very close to the combined resolution (14.7)
+— per the thesis's own finding that combined `δRM` is dominated by
+whichever band contributes the larger `Δλ²` (here, P contributes ~94% of
+the combined span). So F2/F3, as specified, mainly demonstrates
+*"resolution is set by which band you choose"* (already implicit in
+comparing Figures 6-1 vs 6-2) rather than *"combining bands beyond the
+best single band helps resolution"* — a pair genuinely requiring the
+combination over P alone would need `Δφ_23` between 14.7 and 15.6, a
+sub-1-rad-m⁻² margin too fragile for a robust automated test (sensitive to
+channelisation, deconvolution loop-gain, etc.). **The genuine "why
+multi-band" demonstration is carried entirely by the top-hat component
+below**, matching the thesis's own stated message (§6.1.5): combining
+bands buys *sensitivity to extended structure* more than it buys marginal
+extra resolution beyond the best single band.
+
+### Expected results per band (mirrors thesis Figures 6-1/6-2/6-3, extended to F2/F3)
+
+- **L-band alone** (`δRM=250.1`, `max RM scale=55.4`, thesis Fig. 6-1,
+  *"poor RM resolution"*): point source and top-hat component blend into
+  one broad, unresolved hump (thesis's own finding — separation from -100
+  to ~115 is ~215, well under 250.1). F2/F3 (`Δφ=40`) also blend — new,
+  not in the thesis, but the same reasoning applies.
+- **P-band alone** (`δRM=15.6`, `max RM scale=3.6`, thesis Fig. 6-2,
+  *"poor sensitivity to extended structure"*): point source recovered
+  cleanly and accurately (thesis's own finding). Top-hat component is
+  **essentially invisible** — `max RM scale (3.6) ≪` the component's own
+  thickness (30), so it's washed out by bandwidth depolarization, not
+  merely coarsely resolved. F2/F3 (`Δφ=40 > δRM_P=15.6`) resolved into two
+  distinct peaks — new, not in the thesis.
+- **Combined P+L** (`δRM=14.7`, `max RM scale=55.4`, thesis Fig. 6-3):
+  point source still recovered cleanly; the top-hat component's **real
+  extended structure is now revealed** (thesis's own finding — a
+  significant fraction of its flux is recovered, distinguishable from a
+  point source). F2/F3 still resolved (`40 > 14.7`) — new, not in the
+  thesis, and per the honesty check above, not meaningfully better
+  resolved than at P alone.
+
+### Implementation notes for the phase-2 ticket
+
+- `tests/make_test_cubes.py` needs: (a) support for summing multiple
+  component contributions (point + top-hat, or the added F2/F3 pair) into
+  one pixel's complex polarization spectrum — currently one delta
+  component per source position; (b) a **top-hat-in-Faraday-depth** source
+  type (not a `sinc`/Burn-slab closed form) alongside the existing
+  delta-component type, matching the thesis's own model exactly; (c) a new
+  `make_header`/frequency-axis block for Band P and Band L, each emitting
+  its own Q/U FITS pair, additive to (not replacing) the existing
+  550-750 MHz single-band fixture.
+- `tests/check_rm_peak.py` (currently checks one recovered RM peak against
+  a known truth) needs a variant that checks **peak count and separation**
+  (for the F2/F3 resolved-vs-blended assertion) and one that checks
+  **recovered polarized flux fraction and approximate Faraday-depth
+  extent** (for the top-hat washed-out/blob/resolved-structure assertion)
+  rather than a single peak-position check.
+- **Not covered by this scenario, flagged as an open gap (§7 decision 5's
+  third quantity, `max un-aliased RM`):** nothing here tests the
+  high-|RM| point-source aliasing behaviour from thesis §2.5.2-§2.5.3 (the
+  Gauribidannaur worked example) — that would need a thin point source
+  placed near or beyond a band's own `max un-aliased RM`, and the thesis
+  doesn't give a combined-multi-band formula for that quantity the way
+  Table 6.1 does for `δRM`/`max RM scale`. Left for whoever scopes phase 3
+  to decide whether a dedicated test is worth adding once that formula is
+  worked out, rather than guessed here.
