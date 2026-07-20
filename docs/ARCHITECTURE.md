@@ -28,7 +28,6 @@ High-level flow:
 
 ### Build and Delivery
 - `Makefile`: primary development build matrix (OMP/GPU variants).
-- `CMakeLists.txt`: distribution-oriented build entry.
 - `docker/`: container build and release helpers.
 
 ### Configuration and Operations

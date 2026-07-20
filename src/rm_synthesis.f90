@@ -131,6 +131,7 @@ logical :: write_pending(0:1)
 logical :: write_dispatched_ok
 integer   bitpixQ, naxisQ, naxesQ(max_axis)
 integer   bitpixU, naxisU, naxesU(max_axis)
+integer(int64) :: hdrbytesQ, hdrbytesU, hdrbytesM, nbytes_write_init
 integer   bitpixM, naxisM, naxesM(max_axis)
 integer   bitpix, naxis, naxes(max_axis), naxes_out(max_axis)
 logical   simple, extend
@@ -566,12 +567,14 @@ cfg%badchan_file(1:) = cfg%badchan_file(&
 nbad_chan = 0
 
  ! Extract Some basic INFO from the FITS files:
+call timer_start(t_stage)
+call log_tile_bounds('tile_read','start',0,0,0,0)
 call myfits_info(cfg%infileQ,&
 &bitpixQ,naxisQ,naxesQ,&
 &cxval_imQ,cxpix_imQ,xinc_imQ,&
 &cyval_imQ,cypix_imQ,yinc_imQ,&
 &czval_imQ,czpix_imQ,zinc_imQ,&
-&freq_axisQ,cubeQ,message,status)
+&freq_axisQ,cubeQ,message,status,hdrbytesQ)
 
 if (status.ne.0)then
    write(*,*)"status = ",status
@@ -589,7 +592,7 @@ call myfits_info(cfg%infileU,&
 &cxval_imU,cxpix_imU,xinc_imU,&
 &cyval_imU,cypix_imU,yinc_imU,&
 &czval_imU,czpix_imU,zinc_imU,&
-&freq_axisU,cubeU,message,status)
+&freq_axisU,cubeU,message,status,hdrbytesU)
 
 if (status.ne.0)then
    write(*,*)"status = ",status
@@ -601,6 +604,8 @@ if (status.ne.0)then
    stop
    !goto 9999
 endif
+call log_tile_bounds('tile_read','done',0,0,0,0,hdrbytesQ+hdrbytesU)
+call timer_stop(STAGE_IO_READ_INIT,t_stage)
 
 if (.not.cubeQ)then
    write(*,*)'ERROR: Missing spectral axis in Q-file!'
@@ -669,7 +674,7 @@ if(use_input_mask)then
    &cxval_imM,cxpix_imM,xinc_imM,&
    &cyval_imM,cypix_imM,yinc_imM,&
    &czval_imM,czpix_imM,zinc_imM,&
-   &freq_axisM,cubeM,message,status)
+   &freq_axisM,cubeM,message,status,hdrbytesM)
    if(status.ne.0)then
       write(*,*)"status = ",status
       write(*,*)"Mask cube info read failed"
@@ -2702,6 +2707,17 @@ endif
 ! zero, with datastart/dataend unchanged -- i.e. not a header-growth
 ! shift, but exactly this stale-buffer-flush mechanism.)
 if(io_write_threads_eff.gt.1)then
+   ! This FTCLOS is where CFITSIO defines/flushes the AMP and PHA HDUs
+   ! for the first time, which is when the OS-visible file size jumps to
+   ! its full declared NAXIS extent (confirmed by real Setonix runs).
+   ! Timed and logged as an I/O-write interval (nbytes = the true declared
+   ! size of both files) so the swim-lane plotter's existing "I/O write"
+   ! bar/throughput accounting picks this up as one more interval, with
+   ! no new colour or legend entry required.
+   nbytes_write_init = 2_int64*int(nx_out,kind=int64)*&
+   &int(ny_out,kind=int64)*int(nrm_out,kind=int64)*4_int64
+   call timer_start(t_stage)
+   call log_tile_bounds('tile_write','start',0,0,0,0)
    status = 0
    call FTCLOS(par_wunit_amp,status)
    if(status.gt.0)then
@@ -2716,6 +2732,8 @@ if(io_write_threads_eff.gt.1)then
       call printerror(status)
       stop
    endif
+   call log_tile_bounds('tile_write','done',0,0,0,0,nbytes_write_init)
+   call timer_stop(STAGE_IO_WRITE_INIT,t_stage)
    ampha_handles_closed_early = .true.
 endif
 

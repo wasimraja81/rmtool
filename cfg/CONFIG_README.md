@@ -9,7 +9,7 @@ The config parser is implemented in src/rm_synthesis_mod.f90:
 - helper: split_key_value
 - helper: flag_from_value
 
-The main program src/rm_synthesis.f calls this parser.
+The main program src/rm_synthesis.f90 calls this parser.
 
 ## Strict Validation Rules
 

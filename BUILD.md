@@ -1,7 +1,5 @@
 # RM-Synthesis Build System
 
-This package supports two modern build approaches for maximum flexibility.
-
 ## Quick Start
 
 ### Release Tagging Policy
@@ -9,7 +7,7 @@ This package supports two modern build approaches for maximum flexibility.
 - Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`, `3.0`).
 - Current formal release: `3.0` (on `main`).
 
-### Option 1: Simple Makefile (Recommended for Development)
+### Building with Make
 
 ```bash
 # Build
@@ -64,26 +62,6 @@ The `HOST_OMP` macro gates preprocessor directives in the main program
 - **gpu_offload**: GPU kernel speedup with minimal host overhead
 - **gpu_offload_hostomp**: Maximum parallelization (GPU kernel + host prep)
 
-### Option 2: CMake (Recommended for Distribution)
-
-```bash
-# Build
-./cmake_build.sh
-
-# Build debug version
-./cmake_build.sh debug
-
-# Install
-cd build_cmake
-sudo cmake --install .
-```
-
-**Advantages:**
-- Cross-platform support (Windows, macOS, Linux)
-- Automatic dependency detection
-- Package configuration files
-- Industry standard for C/Fortran projects
-
 ### Quick Build Script
 
 ```bash
@@ -133,18 +111,16 @@ brew install cfitsio
 rmtool/
 ├── src/
 │   ├── rm_synthesis_mod.f90      # Modern Fortran module
-│   ├── rm_synthesis.f90          # Main program
-│   ├── myfits_info.f             # FITS utilities
-│   └── printerror.f              # Error handling
+│   ├── rm_synthesis.f90          # Main program; `include`s myfits_info.f90/
+│   │                             # printerror.f90 below at compile time
+│   ├── myfits_info.f90           # FITS utilities
+│   └── printerror.f90            # Error handling
 ├── build/                        # Build artifacts (Makefile)
 │   ├── modules/                  # Compiled .mod files
 │   └── *.o                       # Object files
-├── build_cmake/                  # Build artifacts (CMake)
 ├── bin/                          # Final executable
 ├── Makefile                      # Simple build
-├── CMakeLists.txt                # CMake configuration
 ├── build.sh                      # Quick build script
-├── cmake_build.sh                # CMake build script
 └── cfg/                          # Configuration files
 ```
 
@@ -162,14 +138,10 @@ make MODE=debug
 
 ### Intel Fortran
 
-Modify `CMakeLists.txt` or `Makefile` to use `ifort`:
+Modify `Makefile` to use `ifort`:
 
 ```bash
-# Makefile
 FC=ifort make
-
-# CMake
-cmake -DCMAKE_Fortran_COMPILER=ifort ..
 ```
 
 ## Troubleshooting
@@ -244,15 +216,12 @@ bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
 
 For distributing the package:
 
-1. Use CMake for configuration
-2. Create source tarball: `tar czf rm_synthesis-3.0.tar.gz .` (match the current release tag)
-3. Users build with: `cmake . && make && make install`
+1. Create source tarball: `tar czf rm_synthesis-3.0.tar.gz .` (match the current release tag)
+2. Users build with: `make && sudo make install`
 
 ## Support
 
 See individual file comments:
 - `src/rm_synthesis_mod.f90` - Module documentation
-- `src/rm_synthesis.f90` - Main program documentation (`src/rm_synthesis.f`,
-  the old fixed-form version, is dead code -- not referenced by the
-  Makefile at all)
-- `src/myfits_info.f` - FITS interface
+- `src/rm_synthesis.f90` - Main program documentation
+- `src/myfits_info.f90` - FITS interface

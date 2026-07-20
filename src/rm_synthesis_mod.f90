@@ -30,6 +30,7 @@ module rm_synthesis_mod
   public :: STAGE_TILE_TOTAL, STAGE_TILE_READ, STAGE_TILE_MASK
   public :: STAGE_TILE_PREP, STAGE_TILE_COMPUTE, STAGE_TILE_CUBESTAT
   public :: STAGE_TILE_SCATTER, STAGE_TILE_WRITE, STAGE_FINALIZE
+  public :: STAGE_IO_READ_INIT, STAGE_IO_WRITE_INIT
   public :: sp, dp, int32, int64
   public :: tile_write_job_t, tile_write_dispatch_async, tile_write_join
   public :: populate_write_job
@@ -67,6 +68,8 @@ module rm_synthesis_mod
   integer, parameter :: STAGE_TILE_CUBESTAT = 11
   integer, parameter :: STAGE_TILE_WRITE    = 12
   integer, parameter :: STAGE_FINALIZE      = 13
+  integer, parameter :: STAGE_IO_READ_INIT  = 14
+  integer, parameter :: STAGE_IO_WRITE_INIT = 15
   integer, parameter :: MAX_STAGES          = 32
 
   logical, save :: logger_initialized = .false.
@@ -292,6 +295,8 @@ contains
     stage_names(STAGE_TILE_CUBESTAT) = 'tile_cubestat'
     stage_names(STAGE_TILE_WRITE) = 'tile_write'
     stage_names(STAGE_FINALIZE) = 'finalize'
+    stage_names(STAGE_IO_READ_INIT) = 'io_read_init'
+    stage_names(STAGE_IO_WRITE_INIT) = 'io_write_init'
   end subroutine init_stage_names
 
   real(dp) function wall_time_seconds()
@@ -518,8 +523,8 @@ contains
     end do
 
     ! Phase-5 macro breakdown requested for performance attribution.
-    io_read_t = stage_totals(STAGE_TILE_READ)
-    io_write_t = stage_totals(STAGE_TILE_WRITE)
+    io_read_t = stage_totals(STAGE_TILE_READ) + stage_totals(STAGE_IO_READ_INIT)
+    io_write_t = stage_totals(STAGE_TILE_WRITE) + stage_totals(STAGE_IO_WRITE_INIT)
     compute_rm_t = stage_totals(STAGE_TILE_COMPUTE)
     compute_stat_t = stage_totals(STAGE_TILE_CUBESTAT)
     macro_sum = io_read_t + io_write_t + compute_rm_t + compute_stat_t
@@ -613,13 +618,14 @@ contains
         'stage_total_sec,cfg_parse_sec,io_init_sec,header_sec,tile_total_sec,' // &
         'tile_read_sec,tile_mask_sec,tile_prep_sec,tile_compute_sec,' // &
         'tile_scatter_sec,tile_cubestat_sec,tile_write_sec,finalize_sec,' // &
-        'io_read_bytes,io_write_bytes,io_read_syscalls,io_write_syscalls'
+        'io_read_bytes,io_write_bytes,io_read_syscalls,io_write_syscalls,' // &
+        'io_read_init_sec,io_write_init_sec'
     end if
 
     write(csv_unit, '(A,",",A,",",I0,",",I0,",",I0,",",I0,",",I0,",",I0,",",' // &
                     'F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",' // &
                     'F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",' // &
-                    'F0.6,",",I0,",",I0,",",I0,",",I0)') &
+                    'F0.6,",",I0,",",I0,",",I0,",",I0,",",F0.6,",",F0.6)') &
       trim(run_id), trim(mode), cube_nx, cube_ny, cube_nchan, cube_nrm, tile_ra, tile_dec, &
       total_t, timer_get_stage_seconds(STAGE_CFG_PARSE), timer_get_stage_seconds(STAGE_IO_INIT), &
       timer_get_stage_seconds(STAGE_HEADER), timer_get_stage_seconds(STAGE_TILE_TOTAL), &
@@ -627,7 +633,8 @@ contains
       timer_get_stage_seconds(STAGE_TILE_PREP), timer_get_stage_seconds(STAGE_TILE_COMPUTE), &
       timer_get_stage_seconds(STAGE_TILE_SCATTER), timer_get_stage_seconds(STAGE_TILE_CUBESTAT), &
       timer_get_stage_seconds(STAGE_TILE_WRITE), timer_get_stage_seconds(STAGE_FINALIZE), &
-      io_read_bytes, io_write_bytes, io_read_syscalls, io_write_syscalls
+      io_read_bytes, io_write_bytes, io_read_syscalls, io_write_syscalls, &
+      timer_get_stage_seconds(STAGE_IO_READ_INIT), timer_get_stage_seconds(STAGE_IO_WRITE_INIT)
 
     close(csv_unit)
   end subroutine write_timing_csv_line

@@ -1,5 +1,5 @@
 # Makefile for rm_synthesis (Fortran RM-synthesis package)
-# Quick build without CMake - targets: make, make clean, make install
+# Targets: make, make clean, make install
 
 .PHONY: all clean clean-all install uninstall help build_dir
 
@@ -110,9 +110,11 @@ LIBS := $(CFITSIO_LIB) -lpthread
 # Source files
 MODSRC := $(SRCDIR)/rm_synthesis_mod.f90
 MAINSRC := $(SRCDIR)/rm_synthesis.f90
-INCSRC := $(SRCDIR)/myfits_info.f $(SRCDIR)/printerror.f
+# Pulled into MAINSRC via Fortran `include` statements (not separately
+# compiled) -- listed as prerequisites below so editing either one triggers
+# a rebuild of rm_synthesis.o.
+INCSRC := $(SRCDIR)/myfits_info.f90 $(SRCDIR)/printerror.f90
 
-SOURCES := $(MODSRC) $(MAINSRC) $(INCSRC)
 OBJFILES := $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/rm_synthesis.o
 
 # Target executable (mode-specific plus default convenience path)
@@ -148,7 +150,7 @@ $(BUILDDIR)/rm_synthesis_mod.o: $(MODSRC) | $(BUILDDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
 
 # Main program compilation
-$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(BUILDDIR)/rm_synthesis_mod.o | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(INCSRC) $(BUILDDIR)/rm_synthesis_mod.o | $(BUILDDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -I$(MODDIR) -J$(MODDIR) -c $< -o $@
 
 # Linking

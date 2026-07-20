@@ -23,7 +23,7 @@ subroutine myfits_info(infile,&
 &cxval_im,cxpix_im,xinc_im,&
 &cyval_im,cypix_im,yinc_im,&
 &czval_im,czpix_im,zinc_im,&
-&freq_axis,cube,message,status)
+&freq_axis,cube,message,status,header_bytes)
    implicit none
    integer*4 maxdim
    parameter(maxdim = 100)
@@ -47,6 +47,14 @@ subroutine myfits_info(infile,&
    ! Some useless fitsio legacy stuff:
    integer*4 group, blocksize
 
+   ! header_bytes: true bytes read for this file's primary header, from
+   ! FTGHSP's existing-keyword count (nkeys) rounded up to the enclosing
+   ! number of 2880-byte FITS header blocks -- used by the caller's
+   ! io_read_init timing/log accounting, not by anything in this routine.
+   integer*8 header_bytes
+   integer*4 nkeys, nmore
+
+   header_bytes = 0
 
    ! Some default values:
    group = 1
@@ -59,6 +67,12 @@ subroutine myfits_info(infile,&
    if(status.ne.0)then
       message(1:) = "file-open error..."
       return
+   endif
+
+   tmp_status = 0
+   call FTGHSP(11,nkeys,nmore,tmp_status)
+   if(tmp_status.eq.0)then
+      header_bytes = ((int(nkeys,8)+1+35)/36)*2880
    endif
 
    ! Determine the data-type of the image (BITPIX value):

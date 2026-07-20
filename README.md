@@ -92,7 +92,6 @@ concurrency, or hardware-specific tuning.
 - **Subimage support** — Extract and process spatial/spectral subsets via config parameters
 - **FITS I/O** — Native support for FITS format using CFITSIO
 - **GPU offload toggle** — Enable OpenMP target offload with `use_gpu=y` in config
-- **Dual build systems** — Makefile for development, CMake for distribution
 - **Fortran 77/90** — High-performance numerical code
 
 ## Quick Start
@@ -101,7 +100,7 @@ concurrency, or hardware-specific tuning.
 
 - **gfortran** (Fortran compiler)
 - **CFITSIO** library (`libcfitsio-dev` on Debian/Ubuntu)
-- **GNU Make** or CMake
+- **GNU Make**
 
 ### Build
 
@@ -609,10 +608,11 @@ make GPU=1
 ```
 rmtool/
 ├── src/                       Source code (Fortran 77/90)
-│   ├── rm_synthesis.f90       Main program (free-form F90)
+│   ├── rm_synthesis.f90       Main program (free-form F90); `include`s
+│   │                          myfits_info.f90/printerror.f90 below at compile time
 │   ├── rm_synthesis_mod.f90   Shared module: config parser, timers/logging, helpers
-│   ├── myfits_info.f, printerror.f   Fixed-form F77 helpers (actually compiled --
-│   │                                  see Makefile's INCSRC, not the same-named .f90 files)
+│   ├── myfits_info.f90, printerror.f90   Free-form F90 helpers, pulled into
+│   │                                      rm_synthesis.f90 via `include`
 │   └── legacy/                Older standalone FITS utilities, not part of the build
 ├── cfg/                        Configuration files, examples, and ARCHIVED/ (63 historical configs)
 ├── docs/                       Architecture, parallelism, and design deep-dives; release notes
@@ -623,10 +623,9 @@ rmtool/
 ├── docker/                     Container build/release helpers
 ├── scratch/                    Ad-hoc run outputs, example logs/plots (gitignored)
 ├── bin/                        Compiled executables
-├── build/, build_cmake/        Build artifacts (Makefile / CMake respectively)
+├── build/                      Build artifacts (Makefile)
 ├── Makefile                    Primary development build (OMP/GPU variants)
-├── CMakeLists.txt              CMake build configuration
-├── build.sh, cmake_build.sh    Quick build wrapper scripts
+├── build.sh                    Quick build wrapper script
 └── BUILD.md, QUICKSTART.md     Build and quick-start documentation
 ```
 
@@ -646,14 +645,9 @@ rmtool/
 ### Building
 
 ```bash
-# Makefile (development)
 make              # Build release
 make MODE=debug   # Build with symbols
 make clean        # Clean artifacts
-
-# CMake (distribution)
-./cmake_build.sh
-cd build_cmake && sudo cmake --install .
 ```
 
 ## License
