@@ -43,6 +43,19 @@ solve the problem for a user whose bands are natively on different pixel
 grids — they must regrid first — but that tradeoff was made explicitly,
 not by default.
 
+**Follow-up decision recorded (confirmed with user, 2026-07-20), resolving
+3b:** the "matching resolution" check will **not** be implemented as a
+`BMAJ`/`BMIN`/`BPA` header comparison — those keywords are frequently absent
+or unreliable in multi-frequency FITS products, so a header-based beam check
+would be brittle in exactly the case it's meant to protect. Instead, the
+only automated geometry gate is **exact RA/Dec pixel-grid equality across
+all N cubes** (extending today's Q-vs-U check, §3), with a loud warning and
+a hard refusal to run on any mismatch — no silent tolerance, matching
+requirement 2. Actual angular-resolution matching between bands remains the
+caller's responsibility and is not verified by rmtool at all; this is a
+narrower automated guarantee than originally scoped in 3b, traded off
+explicitly rather than attempted unreliably.
+
 ## 3. Current architecture: what "ingest" and "geometry" mean today
 
 Evidence, all from `src/rm_synthesis.f90` and `src/myfits_info.f90` on
@@ -72,7 +85,13 @@ Evidence, all from `src/rm_synthesis.f90` and `src/myfits_info.f90` on
 - **No resolution (beam) information is read or checked at all.** A search
   for `BMAJ`/`BMIN`/`BPA` across `src/` returns nothing. Matching resolution
   across the whole run is an unstated, unenforced assumption today, true only
-  because there has only ever been one input band.
+  because there has only ever been one input band. Per the decision in §2,
+  this stays true by design for multi-band too — no beam check will be
+  added, since `BMAJ`/`BMIN`/`BPA` are not reliably present in multi-frequency
+  FITS headers. The sole automated gate for multi-band geometry is exact
+  RA/Dec pixel-grid equality (extending the existing NAXIS/CRVAL/CRPIX/CDELT
+  checks below from Q-vs-U to N-cubes-vs-reference), loud-warn-and-refuse on
+  mismatch.
 - **Frequency sampling is assumed to be one linear grid per cube.** The
   spectral axis is described by a single `(CRVAL, CRPIX, CDELT)` triple per
   cube (`myfits_info.f90:142-156`); `rm_synthesis.f90:1511-1562` derives the
@@ -135,10 +154,11 @@ The existing decomposition is:
 | Aspect | Fits current framework? | Why not, and what it needs |
 |---|---|---|
 | Config schema (single `infileQ`/`infileU`) | **No** | Needs a list-of-bands concept (§5) — every place `cfg%infileQ` is read once needs to become "for each band." This is schema and orchestration work, not parallelism work. |
-| Geometry validation | **No, must be extended, not reused as-is** | Today's check is Q-vs-U only; needs to become "all N cubes vs. a chosen reference," still exact-equality (per the v1 decision), but now also over resolution (new: read and compare `BMAJ`/`BMIN`/`BPA`), which nothing reads today. |
-| Frequency/λ² grid construction | **Mixed — better news than it first looks** | The DFT template kernel itself (`extract_general_setup`, `src/rm_synthesis_mod.f90:642-728`) computes `cos_arr`/`sin_arr` from each channel's λ² **individually** (a direct sum, not an FFT), so it does not algebraically require uniform λ² spacing — a concatenated, gapped, multi-band λ² array would compute correctly through this kernel essentially as-is. The actual gap is entirely upstream, in how that array is *produced*: `myfits_info` reads one `(CRVAL,CRPIX,CDELT)` triple per cube and `linspace`s it into a uniform ramp (`src/rm_synthesis.f90:1561-1563`) — there is no per-channel frequency table anywhere. Multi-band needs that replaced by **concatenating each band's own linspace-derived channel list** (each band can keep its own internal linear grid) into one merged, sorted array, with per-channel weights/flags carried through per band. This changes `nz_out`'s meaning from "one cube's channel count" to "sum of all bands' channel counts," touching every allocation sized by it (`data_arrQ/U`, `flag_arr_out`, `L_sq`, `cos_arr`/`sin_arr`, tile-local `specQ`/`specU`) — sizing/plumbing work, not a kernel rewrite. Two bands with overlapping frequency ranges would need an explicit policy (error, or de-duplicate/average) — open question, §7. Separately, **`use_auto_rm_range=1`'s default RM-range heuristic does assume uniform spacing** (`dfreq = (freq_MHz(npts)-freq_MHz(1))/(npts-1)`, `src/rm_synthesis_mod.f90:656-687`) and would silently compute a wrong range/resolution across a multi-band gap; the safe path for v1 is requiring `use_auto_rm_range=0` (explicit `beg_rm`/`end_rm`/`nrm`) whenever more than one band is supplied, until this heuristic is made band-aware.
+| Geometry validation | **No, must be extended, not reused as-is** | Today's check is Q-vs-U only; needs to become "all N cubes' RA/Dec pixel grid vs. a chosen reference" (band 1, per the §7 decision), still exact-equality, loud-warn-and-refuse on mismatch — **no** resolution/beam check is added (decided against in §2/§3: `BMAJ`/`BMIN`/`BPA` are unreliable in multi-frequency headers). |
+| Frequency/λ² grid construction | **Mixed — better news than it first looks** | The DFT template kernel itself (`extract_general_setup`, `src/rm_synthesis_mod.f90:642-728`) computes `cos_arr`/`sin_arr` from each channel's λ² **individually** (a direct sum, not an FFT), so it does not algebraically require uniform λ² spacing — a concatenated, gapped, multi-band λ² array would compute correctly through this kernel essentially as-is. The actual gap is entirely upstream, in how that array is *produced*: `myfits_info` reads one `(CRVAL,CRPIX,CDELT)` triple per cube and `linspace`s it into a uniform ramp (`src/rm_synthesis.f90:1561-1563`) — there is no per-channel frequency table anywhere. Multi-band needs that replaced by **concatenating each band's own linspace-derived channel list** (each band can keep its own internal linear grid) into one merged, sorted array, with per-channel weights/flags carried through per band. This changes `nz_out`'s meaning from "one cube's channel count" to "sum of all bands' channel counts," touching every allocation sized by it (`data_arrQ/U`, `flag_arr_out`, `L_sq`, `cos_arr`/`sin_arr`, tile-local `specQ`/`specU`) — sizing/plumbing work, not a kernel rewrite. **Overlapping-band frequency ranges (§7 decision): no deduplication.** Per-channel weighting today is a uniform 0/1 flag (`flag_arr`/`flag_arr_out`, counted into `wsum` — "count of valid channels", `src/rm_synthesis.f90:2988-2989`), not a noise/sensitivity-based weight, so flat concatenation of every band's good channels already implements "weight by both" for free: an overlap region simply ends up with more equally-weighted channel terms in the same DFT sum, exactly like non-overlapping channels elsewhere in the run. If a noise-based per-channel weight is ever added later, the same merged-list design extends to it unchanged, since the kernel already takes an arbitrary per-channel weight. Separately, **`use_auto_rm_range=1`'s default RM-range heuristic does assume uniform spacing** (`dfreq = (freq_MHz(npts)-freq_MHz(1))/(npts-1)`, `src/rm_synthesis_mod.f90:656-687`) and would silently compute a wrong range/resolution across a multi-band gap; **§7 decision: forbidden outright for `nbands>1`** — see the RM-range diagnostic row below. |
+| RM-range/resolution diagnostic for multi-band runs | **New, additive — not a parallelism concern** | With `use_auto_rm_range` forbidden for `nbands>1` (§7), the user must supply `beg_rm`/`end_rm`/`nrm` explicitly, but has no easy way to know what's actually achievable from their specific band combination — non-uniform λ² spacing across bands means the classical uniform-spacing formulas (already used for the existing single-band auto-range heuristic, `src/rm_synthesis_mod.f90:656-687`) don't directly apply. **Decision (confirmed with user, 2026-07-20):** compute and log (stdout + run log) a generalized theoretical RM resolution and un-aliased RM range/span from the merged, non-uniform λ² array — `RM_res` from the **maximum separation in λ²** across the full merged coverage, `RM_span` from the **width of the smallest (finest) individual channel in λ²** — as an informational diagnostic only, guiding the user's choice of `beg_rm`/`end_rm`/`nrm` rather than auto-selecting a range. The exact generalized (non-uniform-spacing) formulas are to be sourced from Wasim Raja's PhD thesis (RRI digital repository) at implementation time; the classical uniform-spacing case already implemented (`src/rm_synthesis_mod.f90:656-687`, Brentjens & de Bruyn-style relations) is the special case this generalizes from. |
 | Tile read stage | **Partially — needs a per-band read loop, not a redesign** | `tile_read` currently issues one `FTGSVE` call (or `io_read_threads`-many) per input file. With K bands it becomes a loop of K such call-groups into disjoint slices of one enlarged `specQ`/`specU` buffer — additive complexity, not a new decomposition axis. Bad-channel/mask handling (`flag_arr`) needs to become per-band-aware so a channel flagged bad in band 2 doesn't collide with band 1's indexing. |
-| Bias correction / Q-U bias fields (`resiQ`, `slopeQ`, `resiU`, `slopeU`, `infileI`) | **Unclear, needs scoping** | These are currently single scalars/one I-cube for the whole run. Whether Q-U bias correction is per-band (physically more correct, since it's an instrumental effect) or run-wide needs a decision before implementation — not a parallelism question, a science/config question. |
+| Bias correction / Q-U bias fields (`resiQ`, `slopeQ`, `resiU`, `slopeU`, `infileI`) | **Decided: per-band** | These are currently single scalars/one I-cube for the whole run. **Decision (confirmed with user, 2026-07-20):** Q-U bias correction is physically an instrumental effect and must be done **per band** — each band needs its own `resiQ`/`slopeQ`/`resiU`/`slopeU` and, when `remove_qu_bias=y`, its own Stokes-I cube (`infileI`/`path_I`). This is config-schema and per-band-loop plumbing, not a parallelism concern — the bias correction itself is applied per-channel before the DFT sum, so it composes with the merged-frequency-list design the same way bad-channel flags do. |
 
 ### Summary
 
@@ -169,23 +189,47 @@ A natural extension, keeping backward compatibility for existing single-band
 configs:
 ```
 nbands  = 2
+# reference_band: whose RA/Dec pixel grid every other band is validated
+# against (band 1 by default, per the §7 decision).
+reference_band = 1
+
 infileQ_1 = low_Q.fits   infileU_1 = low_U.fits
+resiQ_1 = 0.0  slopeQ_1 = 0.0  resiU_1 = 0.0  slopeU_1 = 0.0
+infileI_1 = low_I.fits  path_I_1 = /path/to/data/
+
 infileQ_2 = high_Q.fits  infileU_2 = high_U.fits
+resiQ_2 = 0.0  slopeQ_2 = 0.0  resiU_2 = 0.0  slopeU_2 = 0.0
+infileI_2 = high_I.fits  path_I_2 = /path/to/data/
 ```
 (or a comma-separated list form — either is a config-parser change only,
 independent of the feasibility questions above; picking the exact syntax is
-an implementation-time decision, not an architectural one).
+an implementation-time decision, not an architectural one). Bias-correction
+fields are now per-band (§4, §7 decision) rather than the single run-wide
+`resiQ`/`slopeQ`/`resiU`/`slopeU`/`infileI` of today's schema.
+`use_auto_rm_range` is rejected at config-validation time whenever
+`nbands>1` (§4, §7 decision) — `beg_rm`/`end_rm`/`nrm` become required keys
+in that case, informed by the logged RM-range/resolution diagnostic.
 
 ## 6. Recommended phasing
 
-1. **Geometry/resolution validation, N-file ingestion, still single
-   contiguous band each but multiple bands concatenated.** Smallest useful
-   slice: prove the "N files in, one merged frequency list out, existing
-   pipeline unchanged downstream" shape works, with the fewest moving parts.
+1. **N-file ingestion + geometry validation.** Smallest useful slice: prove
+   the "N files in (config schema, §5), RA/Dec pixel grid validated against
+   band 1, loud refusal on mismatch, existing pipeline unchanged downstream"
+   shape works, with the fewest moving parts. No frequency merge yet —
+   could initially even reject overlapping/multi-band frequency coverage to
+   isolate ingestion-plumbing risk from frequency-merge risk.
 2. **Frequency/λ² merge + per-band bad-channel handling.** The structural
-   work identified as the biggest gap in §4.
-3. **Bias-correction semantics decision + implementation**, once scoped.
-4. **Multi-band-aware diagnostics**: swim-lane/log output currently reports
+   work identified as the biggest remaining gap in §4 — concatenate each
+   band's channel list (no deduplication needed in overlaps, §4/§7) into one
+   merged, sorted λ²/weight array sized by the new `nz_out` meaning.
+3. **RM-range/resolution diagnostic + `use_auto_rm_range` guard.** Reject
+   `use_auto_rm_range=1` whenever `nbands>1`; compute and log the
+   generalized (non-uniform-λ²-spacing) `RM_res`/`RM_span` diagnostic from
+   Wasim Raja's PhD thesis formulas, to guide the user's explicit
+   `beg_rm`/`end_rm`/`nrm` choice.
+4. **Per-band bias-correction implementation** (`resiQ`/`slopeQ`/`resiU`/
+   `slopeU`/`infileI` per band, §4/§7 decision).
+5. **Multi-band-aware diagnostics**: swim-lane/log output currently reports
    one `bytes=` figure per tile read; extending it to show per-band
    breakdown is a nice-to-have, not a blocker.
 
@@ -194,30 +238,65 @@ Each phase should get its own ticket(s) in the style of
 (Objective/Scope/Change Set/Correctness Gate/Rollback Criteria/Effort) once
 this feasibility plan is agreed, rather than being written speculatively here.
 
-## 7. Open questions (not resolved by this document)
+## 7. Decisions recorded (confirmed with user, 2026-07-20)
 
-- **Overlapping frequency ranges between bands**: error out, or define a
-  merge policy (e.g. prefer one band, average, or weight by both)?
-- **Bias correction fields** (`resiQ`/`slopeQ`/`resiU`/`slopeU`/`infileI`):
-  per-band or run-wide?
-- **Resolution-mismatch tolerance**: exact equality on `BMAJ`/`BMIN`/`BPA`
-  (mirroring today's exact-equality philosophy for pixel grid), or a
-  configurable tolerance given real beam-fitting noise between independent
-  observations?
-- **What counts as "the reference geometry"** when validating N cubes: the
-  first band listed, or an explicit `reference_band` config key?
-- **`use_auto_rm_range` for multi-band runs**: forbid it outright (require
-  `use_auto_rm_range=0` whenever `nbands>1`), or invest in making the
-  Brentjens & de Bruyn default-range heuristic band-gap-aware?
+All five open questions from the original draft of this document are now
+resolved:
+
+1. **Overlapping frequency ranges between bands**: no error, no explicit
+   merge policy needed — "weight by both" falls out for free from flat
+   concatenation, since today's per-channel weighting is a uniform 0/1 flag
+   (`wsum`, `src/rm_synthesis.f90:2988-2989`), not a noise/sensitivity
+   weight. See §4's frequency/λ² grid construction row.
+2. **Bias correction fields** (`resiQ`/`slopeQ`/`resiU`/`slopeU`/`infileI`):
+   **per-band**, since Q-U bias is an instrumental effect specific to each
+   receiver/band. See §4, §5.
+3. **Resolution-mismatch tolerance**: **no `BMAJ`/`BMIN`/`BPA` check at
+   all** — those keywords are unreliable in multi-frequency FITS headers, so
+   a header-based beam-equality check would be brittle exactly where it's
+   needed most. The only automated gate is **exact RA/Dec pixel-grid
+   equality**, loud-warn-and-refuse on mismatch. Actual resolution matching
+   between bands is the caller's responsibility, unverified by rmtool. See
+   §2, §3, §4.
+4. **Reference geometry for validating N cubes**: **the first band
+   listed** (`reference_band` defaults to band 1, config-overridable — §5)
+   — the rationale being that all bands are expected to already share one
+   geometry by construction (§2's pre-matched-geometry decision), so which
+   one is nominally "the reference" is a validation-order convenience, not a
+   meaningful scientific choice.
+5. **`use_auto_rm_range` for multi-band runs**: **forbidden outright**
+   whenever `nbands>1` — the existing heuristic assumes uniform channel
+   spacing (§3, §4) and would silently miscompute across a multi-band gap.
+   In its place, rmtool computes and logs (stdout + run log) a **diagnostic
+   RM resolution (`RM_res`) and un-aliased RM range/span (`RM_span`)**
+   generalized to non-uniform λ² spacing: `RM_res` from the **maximum
+   separation in λ²** across the full merged band coverage, `RM_span` from
+   the **width of the smallest (finest) individual channel in λ²** — per
+   Wasim Raja's PhD thesis (RRI digital repository), generalizing the
+   uniform-spacing relations already implemented for the single-band case
+   (`src/rm_synthesis_mod.f90:656-687`). This is informational only: rmtool
+   does **not** auto-run the full theoretical RM range for multi-band —
+   `beg_rm`/`end_rm`/`nrm` remain required, explicit user choices, guided by
+   (not overridden by) the logged diagnostic.
 
 ## 8. Non-goals for this effort
 
 - WCS reprojection/regridding of mismatched cubes (rejected for v1, §2).
 - Convolution to a common resolution (rejected for v1, §2 — resolution
   matching is validated, not performed).
+- Any `BMAJ`/`BMIN`/`BPA`-based resolution-equality check (rejected
+  outright, §2/§7 — not merely deferred: multi-frequency FITS headers don't
+  carry these reliably enough to check).
 - Mosaicking (combining cubes covering *different* sky regions into one
   footprint) — out of scope; this effort is about combining different
   *frequency* coverage of the *same* sky region.
+- Auto-selecting or auto-running the full theoretical RM range for
+  multi-band data (rejected, §7 point 5) — rmtool logs the achievable
+  `RM_res`/`RM_span` as a diagnostic; the user still chooses
+  `beg_rm`/`end_rm`/`nrm` explicitly.
+- Making `use_auto_rm_range=1` itself band-gap-aware (rejected in favor of
+  forbidding it outright for `nbands>1`, §7 point 5) — a band-aware version
+  of the auto-range heuristic is not being pursued.
 - Any change to the numerical RM-synthesis kernel itself
   (`extract_general_setup`, `tile_extract_gpu_rm_blocked`) beyond how many
   channels it's handed — same guardrail this repo already applies in
