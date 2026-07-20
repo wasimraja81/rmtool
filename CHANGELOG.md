@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented in this file.
 
+## [4.1] - 2026-07-20
+
+Diagnostics milestone: closes a real gap in the run-timing picture found
+while looking into why a real large-cube run's swim-lane plot showed an
+oddly long first read and first write, and drops a second build path that
+had quietly stopped working.
+
+### Added
+- Two new timed stages, `io_read_init` and `io_write_init`, cover work
+  that always ran but was never counted anywhere: reading the input
+  cubes' true dimensions before anything else can happen, and (when
+  `io_write_threads>1`) staking out the output files' full size on disk
+  the first time they're closed. Both now get their own timer, their own
+  line in the run log (using the same read/write categories and colours
+  the swim-lane plot already draws, so existing plots need no changes),
+  and their own `io_read_init_sec`/`io_write_init_sec` columns in the
+  timing CSV — with real byte counts, not placeholders: true FITS header
+  bytes read (via `FTGHSP`) for the read side, and the true declared
+  AMP+PHA size for the write side.
+- The printed "Timing summary" and its "Macro timing breakdown" now fold
+  these two stages into the read/write totals, so the reported total
+  finally reconciles against the sum of its own named stages instead of
+  leaving an unexplained gap.
+
+### Removed
+- A second, CMake-based way of building the project (`CMakeLists.txt`,
+  `cmake_build.sh`) that had drifted out of sync with how the code is
+  actually built (it never learned the preprocessor switch the real
+  build now depends on) and no longer worked at all.
+- Three duplicate fixed-form source files (`src/myfits_info.f`,
+  `src/printerror.f`, `src/rm_synthesis.f`) left over from before the
+  current free-form build path existed; only their `.f90` counterparts
+  were ever actually compiled.
+
+### Validation
+- Clean 4-variant rebuild (0 new warnings), full 28/28 test suite,
+  including the two runs that specifically re-check bit-identical output
+  under `io_overlap` and `io_write_threads>1` — the exact code path the
+  new write-init timing sits next to.
+- New log markers hand-checked on a real run: they appear first, in
+  correct time order, ahead of tile 1's own read/write, with byte counts
+  that check out exactly against the cube's declared dimensions.
+
 ## [4.0] - 2026-07-19
 
 Maintainability and documentation milestone rather than a new-capability

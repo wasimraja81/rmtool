@@ -139,6 +139,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
 - **[docs/RELEASE_NOTES_4.0.md](docs/RELEASE_NOTES_4.0.md)** — Detailed release notes for tag 4.0 (maintainability/documentation milestone)
+- **[docs/RELEASE_NOTES_4.1.md](docs/RELEASE_NOTES_4.1.md)** — Detailed release notes for tag 4.1 (diagnostics milestone)
 
 ## Configuration
 

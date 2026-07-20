@@ -5,7 +5,7 @@
 ### Release Tagging Policy
 
 - Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`, `3.0`).
-- Current formal release: `3.0` (on `main`).
+- Current formal release: `4.1` (on `main`).
 
 ### Building with Make
 
@@ -216,7 +216,7 @@ bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
 
 For distributing the package:
 
-1. Create source tarball: `tar czf rm_synthesis-3.0.tar.gz .` (match the current release tag)
+1. Create source tarball: `tar czf rm_synthesis-4.1.tar.gz .` (match the current release tag)
 2. Users build with: `make && sudo make install`
 
 ## Support
