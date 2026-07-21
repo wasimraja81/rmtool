@@ -730,6 +730,49 @@ Effort, each getting an **Evidence (...)** section appended once done.
 - **Effort:** 3-4 sessions (frequency-array generalization touches a wide
   radius of `nz_out`-sized state; the §10 fixture generation and
   RM-recovery assertions are new test-infrastructure, not just cfg files).
+- **Evidence (2026-07-21):** Implemented as designed. Reference band's
+  channels always placed first (offset 0) in the merged array so the
+  pre-existing single-band `L_sq`/`flag_arr_out`-building code needed zero
+  modification; every other band's frequency/λ² construction mirrors it
+  independently (own frequency-unit inference, own `linspace`). Every new
+  code path (geometry/freq capture, `nz_out` override, append-bands
+  `L_sq`, per-band tile read, multi-tile/GPU/subimage/badchan-file/
+  `remove_qu_bias`/io-parallelism/`use_auto_rm_range` stops) is gated
+  behind `size(cfg%band).gt.1`, so it is dead code for `nbands=1` by
+  construction, not merely "expected to behave the same."
+  - Build: clean, 0 errors, 0 new warnings (same 4 pre-existing
+    GPU-offload linker warnings as T0/T1).
+  - `tests/run_tests.sh`: 35/35 pass (32 from T0/T1 + 3 new: §10 fixture
+    generation, all three P-alone/L-alone/P+L runs completing, and the
+    full `check_thesis_scenario.py` assertion set).
+  - `nbands=1` bit-identical sweep: 140/140 FITS outputs match
+    `scratch/baseline_multiband/` (same 6 pre-existing `badchan_*`
+    NaN-comparison-tool artifacts as T0/T1, re-confirmed self-referential
+    — unchanged by this ticket).
+  - §10 scenario (`tests/make_thesis_scenario_cubes.py`,
+    `tests/check_thesis_scenario.py`, P-band 300/30 MHz and L-band
+    1200/120 MHz reproduced exactly from Table 6.1): point source
+    recovered accurately at both P-alone and P+L combined; Faraday-thick
+    top-hat component's recovered peak amplitude is `~9x` larger at P+L
+    combined than at P-alone (4.76 vs 0.53 in its own RM window) —
+    directly confirming the `max RM scale` washout/reveal physics this
+    effort exists to validate, matching the thesis's own Figures 6-1/6-2/
+    6-3 qualitatively; F2/F3 resolved at P-alone, blended at L-alone, both
+    via a dip-vs-peaks comparison targeted at the known expected RM
+    positions. F2/F3 at P+L combined was **not** asserted as "resolved" —
+    see the §10 addendum above for the documented dirty-beam-ringing
+    reason (no RM-CLEAN in this codebase), confirmed as expected physics
+    rather than a merge defect, since the two claims §10 was actually
+    designed around (point-source accuracy, thick-component reveal) both
+    hold cleanly.
+  - Not yet exercised by any test in this ticket: multi-tile multi-band
+    runs, GPU multi-band, subimage/bad-channel-file/`remove_qu_bias` with
+    `nbands>1` — all correctly refuse with an explicit message (each
+    `stop` statement reviewed by inspection, matching the pattern already
+    validated for T1's mismatched-geometry refusal), but no automated test
+    exercises each refusal path individually; left for whoever picks up
+    the deferred features in a later ticket to add alongside the feature
+    itself.
 
 ## 10. Multi-band synthetic test scenario (informs the Phase 2 ticket)
 
@@ -857,3 +900,49 @@ extra resolution beyond the best single band.
   Table 6.1 does for `δRM`/`max RM scale`. Left for whoever scopes phase 3
   to decide whether a dedicated test is worth adding once that formula is
   worked out, rather than guessed here.
+
+### Addendum (found while implementing T2, 2026-07-21): dirty-beam ringing makes the F2/F3-at-P+L claim untestable by simple dip comparison
+
+Running the actual scenario surfaced a genuine, physically-expected
+limitation the original design above didn't anticipate. The point-source
+and Faraday-thick-component checks (§10's headline claims, matching the
+thesis's own Figures 6-1/6-2/6-3 exactly) came out cleanly: point source
+recovered accurately at both P-alone and P+L; the top-hat component's
+recovered peak amplitude in its own RM range is `~9x` larger at P+L
+combined than at P-alone (4.76 vs 0.53), directly confirming the
+`max RM scale` washout/reveal physics this effort exists to validate.
+
+The **F2/F3 addition specifically at P+L combined**, however, does not
+show a clean, simply-detectable dip between the two peaks the way it does
+at P-alone. This codebase has **no RM-CLEAN deconvolution** (confirmed by
+grep — `RMCLEAN`/`rm-clean` appear nowhere in `src/`), so its output is
+the raw *dirty* RM spectrum, not the Gaussian-restored profile the thesis
+itself uses (§2.5, §6.1's own `RMCLEAN` step, thesis pp. 35-37). Combining
+two widely-separated bands (P and L) creates a very large total λ² span,
+and per the thesis's own point (§2.5, "the *dirty* RM response profile...
+[depends on] the exact sampling scheme"), that large span produces
+fine-period sidelobe ringing in the dirty spectrum — confirmed directly in
+the actual output: the L-alone spectrum is smooth across the F2/F3 region
+(narrow λ² span → long ringing period), while the P+L-combined spectrum
+oscillates by several units between *adjacent* 2 rad/m⁻² bins (wide
+combined span → short ringing period) — exactly the signature the thesis
+predicts. At this sampling, that ringing's amplitude can rival the true
+F2/F3 dip even though the underlying resolution (`δRM=14.7`) is fine
+enough in principle to separate them.
+
+**Resolution adopted**: `tests/check_thesis_scenario.py` checks P-alone
+and L-alone resolved-vs-blended with a targeted dip-vs-peaks comparison at
+the known expected RM positions (robust — not blind peak-counting, which
+the same ringing defeats even at P-alone via an unrelated sidelobe just
+above a naive prominence threshold). At P+L combined, it deliberately does
+**not** assert "resolved" — only that both expected positions still carry
+real, elevated signal (the merge computed something meaningful there, not
+noise) — with an explicit code comment explaining why, rather than a
+fragile threshold tuned to pass on this one dataset. **This is a
+documented, physically-understood limitation, not a defect in the
+frequency merge itself** — the two claims §10 was actually designed to
+test (point-source accuracy, thick-component reveal) both hold cleanly.
+Adding RM-CLEAN is out of scope for this effort (§8 non-goals still
+covers "any change to the numerical RM-synthesis kernel... beyond how many
+channels it's handed") — if a clean-vs-dirty comparison ever becomes
+important, that is a new, separate effort, not a T2 fix.

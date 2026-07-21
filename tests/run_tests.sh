@@ -26,10 +26,14 @@
 #      writes; guards against the CFITSIO handle-aliasing bug and the
 #      stale-buffer-at-close bug that raw-write mode replaced it with)
 #  15. Multi-band tomography (T1) – comma-separated-list infileQ/infileU
-#      config schema: matched-geometry two-band config validates and stops
-#      cleanly at "not yet implemented"; mismatched-geometry config is
-#      loudly refused; inconsistent per-band list lengths are rejected at
-#      config-parse time (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+#      config schema: matched-geometry two-band config validates and runs
+#      to completion (T2 replaced the earlier "not yet implemented" stop);
+#      mismatched-geometry config is loudly refused; inconsistent per-band
+#      list lengths are rejected at config-parse time
+#      (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+#  16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
+#      (Raja 2014 Table 6.1/6.2): P-band alone, L-band alone, and P+L
+#      combined, for a point source + Faraday-thick top-hat + F2/F3 pair
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -878,6 +882,87 @@ CFGEOF
     fi
 else
     skip "Serial binary not available; skipping multi-band config tests"
+fi
+
+# ---------------------------------------------------------------------------
+# 16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
+#     (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md; Raja 2014 Table 6.1/6.2):
+#     P-band (300/30 MHz) alone, L-band (1200/120 MHz) alone, and the P+L
+#     combined synthesis, for a point source + Faraday-thick top-hat +
+#     the F2/F3 close-pair addition.
+# ---------------------------------------------------------------------------
+section "16. Multi-band frequency merge – Sec 10 thesis scenario (T2)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    if python3 "$TESTS_DIR/make_thesis_scenario_cubes.py"; then
+        pass "Sec 10 thesis-scenario cubes generated (P-band, L-band)"
+    else
+        fail "make_thesis_scenario_cubes.py failed"
+    fi
+
+    thesis_truth="$DATA_DIR/thesis_scenario_truth.json"
+    rm -f "$OUT_DIR"/thesis_p.*.FITS "$OUT_DIR"/thesis_l.*.FITS "$OUT_DIR"/thesis_pl.*.FITS
+
+    make_thesis_cfg() {
+        local tag="$1" infileQ="$2" infileU="$3" resi_list="$4"
+        local cfg="$OUT_DIR/${tag}.cfg"
+        cat > "$cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = ${infileQ}
+infileU             = ${infileU}
+outfile             = ${OUT_DIR}/${tag}
+remove_badchan      = n
+global_badchan_file = /dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = ${resi_list}
+slopeQ              = ${resi_list}
+resiU               = ${resi_list}
+slopeU              = ${resi_list}
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -500.0
+end_rm              = 500.0
+nrm                 = 501
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        echo "$cfg"
+    }
+
+    thesis_p_cfg=$(make_thesis_cfg thesis_p THESIS_P.Q.FITSCUBE THESIS_P.U.FITSCUBE "0.0")
+    thesis_l_cfg=$(make_thesis_cfg thesis_l THESIS_L.Q.FITSCUBE THESIS_L.U.FITSCUBE "0.0")
+    thesis_pl_cfg=$(make_thesis_cfg thesis_pl "THESIS_P.Q.FITSCUBE,THESIS_L.Q.FITSCUBE" \
+        "THESIS_P.U.FITSCUBE,THESIS_L.U.FITSCUBE" "0.0,0.0")
+
+    thesis_p_log="$OUT_DIR/thesis_p.log"
+    thesis_l_log="$OUT_DIR/thesis_l.log"
+    thesis_pl_log="$OUT_DIR/thesis_pl.log"
+
+    if run_binary "$BIN_SERIAL" "$thesis_p_cfg" "$thesis_p_log" && \
+       run_binary "$BIN_SERIAL" "$thesis_l_cfg" "$thesis_l_log" && \
+       run_binary "$BIN_SERIAL" "$thesis_pl_cfg" "$thesis_pl_log"; then
+        pass "Sec 10 scenario: P-alone/L-alone/P+L runs all completed"
+
+        thesis_p_amp="$OUT_DIR/thesis_p.AMP.RMCUBE.FITS"
+        thesis_l_amp="$OUT_DIR/thesis_l.AMP.RMCUBE.FITS"
+        thesis_pl_amp="$OUT_DIR/thesis_pl.AMP.RMCUBE.FITS"
+        if python3 "$TESTS_DIR/check_thesis_scenario.py" \
+                "$thesis_p_amp" "$thesis_l_amp" "$thesis_pl_amp" "$thesis_truth"; then
+            pass "Sec 10 scenario: point source, thick-component washout/reveal, and F2/F3 P-alone/L-alone behaviour all match thesis-grounded expectations"
+        else
+            fail "Sec 10 scenario: one or more expected behaviours not observed (see check_thesis_scenario.py output above)"
+        fi
+    else
+        fail "Sec 10 scenario: one or more runs failed (see $thesis_p_log / $thesis_l_log / $thesis_pl_log)"
+    fi
+else
+    skip "Serial binary not available; skipping Sec 10 thesis scenario"
 fi
 
 # ---------------------------------------------------------------------------
