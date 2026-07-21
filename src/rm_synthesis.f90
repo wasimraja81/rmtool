@@ -150,6 +150,34 @@ integer   freq_axisQb
 logical   cubeQb
 integer   iband, iqu
 character(len=272) :: bandfile
+ ! T2 ticket (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band frequency
+ ! axis description (channel count + CRVAL/CRPIX/CDELT on the freq axis),
+ ! captured while validating each band's header in the geometry loop
+ ! below, and this run's merged per-band FITS unit numbers/channel
+ ! offsets into the enlarged, multi-band specQ/specU tile buffers. All
+ ! sized to size(cfg%band); index cfg%reference_band holds this run's
+ ! already-open reference-band values. Untouched, unallocated for
+ ! nbands=1.
+real(sp) czval_imQb_q, zinc_imQb_q
+integer   czpix_imQb_q, naxz_imQb_q
+real(sp), allocatable :: band_czval(:), band_zinc(:)
+integer, allocatable :: band_czpix(:), band_nz(:), band_offset(:)
+integer, allocatable :: band_unit_Q(:), band_unit_U(:)
+ ! band_naxes: each band's own full NAXES array (RA/Dec match the
+ ! reference band's by construction, but the freq-axis entry is that
+ ! band's own channel count) -- FTGSVE needs the actual file's dimensions
+ ! to compute strides, so the reference band's naxes(:) cannot be reused
+ ! for other bands' reads.
+integer, allocatable :: band_naxes(:,:)
+integer   n_bands_t2, nz_out_band
+ ! T2: per-band frequency/lambda^2 array construction for every
+ ! non-reference band, mirroring the reference band's own
+ ! frequency-unit-inference + linspace logic exactly, applied
+ ! independently per band (each band's receiver may report frequency in
+ ! different units). Unused for nbands=1.
+real(sp), allocatable :: zval_band(:)
+real(sp) conv_fac_band, z1_band, zn_band
+integer   nz1_band, nz_tmp_band
 
 real(sp) cxval_im, cyval_im, czval_im
 integer   cxpix_im, cypix_im, czpix_im
@@ -845,15 +873,76 @@ else
    bitpix = -32  ! force real*4 when discrepancy exist
 endif
 
- ! Multi-band tomography (T1 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
- ! validate every additional configured band's RA/Dec pixel geometry
- ! against the reference band's (naxis/naxes/cxval_im/etc., just
- ! established above from cfg%infileQ/cfg%infileU, i.e.
- ! cfg%band(cfg%reference_band)). A no-op when only one band is
- ! configured -- the single-band validation above is untouched by this
- ! block, and this whole branch is never entered.
-if (size(cfg%band).gt.1)then
-   do iband = 1,size(cfg%band)
+ ! Multi-band tomography (T1 ticket, extended by T2, see
+ ! planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): validate every additional
+ ! configured band's RA/Dec pixel geometry against the reference band's
+ ! (naxis/naxes/cxval_im/etc., just established above from
+ ! cfg%infileQ/cfg%infileU, i.e. cfg%band(cfg%reference_band)), and
+ ! capture each band's own frequency-axis description (channel count +
+ ! CRVAL/CRPIX/CDELT on the freq axis) for the merge below. A no-op when
+ ! only one band is configured -- the single-band validation above is
+ ! untouched by this block, and this whole branch is never entered.
+n_bands_t2 = size(cfg%band)
+if (n_bands_t2.gt.1)then
+   ! T2 scope narrowing (plan Sec 9, T2 ticket): only the CPU, single-tile
+   ! combination is implemented for nbands>1 so far -- every other
+   ! existing feature stops here, explicitly, rather than silently
+   ! producing wrong output.
+   if (use_gpu_actual)then
+      write(*,*)'ERROR: multi-band GPU synthesis is not yet implemented.'
+      write(*,*)'Set use_gpu=n, or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   else if (cfg%subim)then
+      write(*,*)'ERROR: multi-band subimage extraction is not yet implemented.'
+      write(*,*)'Set subim=n, or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   else if (cfg%remove_badchan)then
+      write(*,*)'ERROR: multi-band bad-channel-file masking is not yet implemented.'
+      write(*,*)'Set remove_badchan=n, or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   else if (cfg%remove_qu_bias)then
+      write(*,*)'ERROR: multi-band Q/U bias correction is not yet implemented.'
+      write(*,*)'Set remove_qu_bias=n, or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   else if (cfg%io_read_threads.gt.1 .or. cfg%io_overlap)then
+      write(*,*)'ERROR: multi-band io_read_threads>1/io_overlap is not yet implemented.'
+      write(*,*)'Set io_read_threads=1 and io_overlap=n, or use a single band.'
+      write(*,*)'Quitting now...'
+      stop
+   else if (cfg%use_auto_rm_range.eq.1)then
+      ! Plan Sec 7 decision 5: the auto-range heuristic assumes uniform
+      ! channel spacing and would silently miscompute across a
+      ! multi-band gap -- forbidden outright for nbands>1, not merely
+      ! deferred. beg_rm/end_rm/nrm must be supplied explicitly.
+      write(*,*)'ERROR: use_auto_rm_range=1 is not supported for multi-band runs.'
+      write(*,*)'Set use_auto_rm_range=0 with explicit beg_rm/end_rm/nrm,'
+      write(*,*)'or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   endif
+
+   allocate(band_czval(n_bands_t2), band_zinc(n_bands_t2))
+   allocate(band_czpix(n_bands_t2), band_nz(n_bands_t2))
+   allocate(band_offset(n_bands_t2))
+   allocate(band_unit_Q(n_bands_t2), band_unit_U(n_bands_t2))
+   allocate(band_naxes(n_bands_t2,max_axis))
+
+   ! Reference band: already open (units 21/22) and already validated
+   ! (the pre-existing Q-vs-U block above); its freq-axis description is
+   ! already in czval_im/czpix_im/zinc_im/naxes(freq_axis).
+   band_czval(cfg%reference_band) = czval_im
+   band_czpix(cfg%reference_band) = czpix_im
+   band_zinc(cfg%reference_band) = zinc_im
+   band_nz(cfg%reference_band) = naxes(freq_axis)
+   band_naxes(cfg%reference_band,1:naxis) = naxes(1:naxis)
+   band_unit_Q(cfg%reference_band) = 21
+   band_unit_U(cfg%reference_band) = 22
+
+   do iband = 1,n_bands_t2
       if (iband.eq.cfg%reference_band) cycle
       do iqu = 1,2
          if (iqu.eq.1)then
@@ -924,16 +1013,80 @@ if (size(cfg%band).gt.1)then
             write(*,*)'Quitting now...'
             stop
          endif
+         if (iqu.eq.1)then
+            ! Stash band iband's Q freq-axis description; compared
+            ! against U's own (below) once iqu=2 has read it, mirroring
+            ! the reference band's own Q-vs-U freq-axis check above.
+            czval_imQb_q = czval_imQb
+            czpix_imQb_q = czpix_imQb
+            zinc_imQb_q = zinc_imQb
+            naxz_imQb_q = naxesQb(freq_axis)
+         else
+            if (czval_imQb.ne.czval_imQb_q .or. czpix_imQb.ne.czpix_imQb_q&
+            &.or. zinc_imQb.ne.zinc_imQb_q&
+            &.or. naxesQb(freq_axis).ne.naxz_imQb_q)then
+               write(*,*)'ERROR: Q/U freq-axis mismatch within band ',iband
+               write(*,*)'Q  CRVAL/CRPIX/CDELT/NAXIS = ',&
+               &czval_imQb_q,czpix_imQb_q,zinc_imQb_q,naxz_imQb_q
+               write(*,*)'U  CRVAL/CRPIX/CDELT/NAXIS = ',&
+               &czval_imQb,czpix_imQb,zinc_imQb,naxesQb(freq_axis)
+               write(*,*)'Quitting now...'
+               stop
+            endif
+            band_czval(iband) = czval_imQb_q
+            band_czpix(iband) = czpix_imQb_q
+            band_zinc(iband) = zinc_imQb_q
+            band_nz(iband) = naxz_imQb_q
+            ! naxesQb here reflects U's just-validated read (equal to Q's,
+            ! per the Q-vs-U freq-axis check just above; RA/Dec already
+            ! matched the reference band earlier in this same iteration).
+            band_naxes(iband,1:naxisQb) = naxesQb(1:naxisQb)
+            ! Open this band's Q/U files on fresh units for the tile-read
+            ! loop -- distinct from the 200+/300+ io_read_threads-parallel
+            ! range and the 21/22/41/42/45 fixed units used elsewhere.
+            band_unit_Q(iband) = 600 + 2*iband
+            band_unit_U(iband) = 600 + 2*iband + 1
+            status = 0
+            blocksize = 1
+            call FTOPEN(band_unit_Q(iband),&
+            &cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileQ(1:nchar(cfg%band(iband)%infileQ)),&
+            &0,blocksize,status)
+            if (status.ne.0)then
+               write(*,*)'ERROR: failed to open Q-cube for band ',iband
+               stop
+            endif
+            status = 0
+            call FTOPEN(band_unit_U(iband),&
+            &cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileU(1:nchar(cfg%band(iband)%infileU)),&
+            &0,blocksize,status)
+            if (status.ne.0)then
+               write(*,*)'ERROR: failed to open U-cube for band ',iband
+               stop
+            endif
+         endif
       enddo
    enddo
    write(*,*)' '
    write(*,*)'Multi-band geometry validated successfully across ',&
-   &size(cfg%band),' bands.'
-   write(*,*)'ERROR: multi-band frequency merge is not yet implemented.'
-   write(*,*)'This build only supports single-band synthesis for now.'
-   write(*,*)'See planning/MULTI_BAND_TOMOGRAPHY_PLAN.md for status.'
-   write(*,*)'Quitting now...'
-   stop
+   &n_bands_t2,' bands.'
+
+   ! Per-band channel offset into the merged, multi-band spectrum. The
+   ! reference band is always placed first (offset 0): its own L_sq/
+   ! flag_arr_out contribution is filled by the pre-existing single-band
+   ! code below, completely unchanged, writing into L_sq(1:nz_out) as it
+   ! always has -- putting any other band first would require that
+   ! existing loop to target a non-zero offset. Other bands follow in
+   ! their cfg%band(:) index order (skipping the reference band's own
+   ! index), appended after it.
+   band_offset(cfg%reference_band) = 0
+   nz_out_band = band_nz(cfg%reference_band)
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      band_offset(iband) = nz_out_band
+      nz_out_band = nz_out_band + band_nz(iband)
+   enddo
 endif
 
 
@@ -1577,6 +1730,13 @@ zpix_beg = fpixels(freq_axis)
 zpix_end = lpixels(freq_axis)
 nz_out = int((zpix_end - zpix_beg)/incs(freq_axis)) + 1
 
+ ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): nz_out above is still the
+ ! reference band's own channel count (unchanged from the single-band
+ ! computation). For nbands>1, redefine it as the merged multi-band total
+ ! -- every allocation below this point is sized to the corrected value.
+ ! A no-op for nbands=1 (n_bands_t2.gt.1 is false).
+if (n_bands_t2.gt.1) nz_out = nz_out_band
+
 ntot_out = nx_out*ny_out*nz_out
 
  ! Allocate per-pixel spectrum work buffers sized to actual nz_out
@@ -1693,6 +1853,50 @@ do i = zpix_beg,zpix_end,incs(freq_axis)
    flag_arr_out(cnt2) = flag_arr(i)
 enddo
 
+ ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): append every other
+ ! configured band's own channels/lambda^2 to L_sq/flag_arr_out, at the
+ ! offsets computed earlier -- the reference band's own contribution
+ ! above (indices 1:nz_out_ref, unchanged) is always first. Each band's
+ ! frequency-unit inference and z1/zn/linspace construction mirrors the
+ ! reference band's own logic above exactly, applied independently
+ ! (mirrors nz_1st's czpix_im.eq.0 edge case too). All channels from
+ ! non-reference bands are marked good (flag=1): remove_badchan is
+ ! rejected for nbands>1 above, so there is no bad-channel list to apply
+ ! to them; NaN-based per-pixel masking is separate and still applies,
+ ! downstream, regardless of which band a channel came from. A no-op for
+ ! nbands=1.
+if (n_bands_t2.gt.1) then
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
+         conv_fac_band = c_velocity
+      else if (band_czval(iband).ge.30.0e6.and.&
+      &band_czval(iband).le.10.0e9)then
+         conv_fac_band = c_velocity*1.0e6
+      else
+         write(*,*)'ERROR: Confusing frequency-unit magnitude for band ',&
+         &iband
+         write(*,*)'reference-frequency: ',band_czval(iband)
+         stop
+      endif
+      if (band_czpix(iband).eq.0)then
+         nz1_band = 0
+      else
+         nz1_band = band_czpix(iband) - 1
+      endif
+      z1_band = band_czval(iband) - real(nz1_band,kind=sp)*band_zinc(iband)
+      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*band_zinc(iband)
+      nz_tmp_band = band_nz(iband)
+      allocate(zval_band(band_nz(iband)))
+      call linspace(z1_band,zn_band,nz_tmp_band,zval_band)
+      do i = 1,band_nz(iband)
+         L_sq(band_offset(iband)+i) = (conv_fac_band/zval_band(i))**2
+         flag_arr_out(band_offset(iband)+i) = 1
+      enddo
+      deallocate(zval_band)
+   enddo
+endif
+
  ! Count good channels for book-keeping
 ngood_chan = 0
 do i = 1, nz_out
@@ -1734,9 +1938,18 @@ close(77)
 
 open(78,file='sampled_freq.txt',status='unknown')
 write(78,*)"# freq       L_sq       flag (1=good, 0=bad)"
+ ! T2: zval(:) only covers the reference band's own channels
+ ! (size nz_totpix); nz_out beyond that range belongs to other bands
+ ! (merged L_sq/flag_arr_out, no single shared zval array), so this
+ ! diagnostic prints frequency only for the reference band's own indices
+ ! -- a no-op change for nbands=1, where nz_out never exceeds nz_totpix.
 do i = 1,nz_out
-   write(78,*)zval(zpix_beg + (i-1)*incs(freq_axis)),"    ",&
-   &L_sq(i),"   ",flag_arr_out(i)
+   if (n_bands_t2.gt.1 .and. i.gt.band_nz(cfg%reference_band))then
+      write(78,*)"# (other band)    ",L_sq(i),"   ",flag_arr_out(i)
+   else
+      write(78,*)zval(zpix_beg + (i-1)*incs(freq_axis)),"    ",&
+      &L_sq(i),"   ",flag_arr_out(i)
+   endif
 enddo
 close(78)
 
@@ -1812,6 +2025,20 @@ ny_sub = plan%ny_sub
 inflight_slots_planned = plan%inflight_slots_planned
 use_staging = plan%use_staging
 mem_frac_vram_per_slot = plan%mem_frac_vram_per_slot
+
+ ! T2 scope narrowing (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): only
+ ! single-tile multi-band runs are implemented so far. A no-op for
+ ! nbands=1, where any tile count is already fully supported.
+if (n_bands_t2.gt.1 .and.&
+&(cfg%tile_ra.lt.nx_out .or. cfg%tile_dec.lt.ny_out))then
+   write(*,*)'ERROR: multi-tile multi-band runs are not yet implemented.'
+   write(*,*)'nx_out,ny_out = ',nx_out,ny_out
+   write(*,*)'planned tile_ra,tile_dec = ',cfg%tile_ra,cfg%tile_dec
+   write(*,*)'Increase mem_frac_ram / tile_ra / tile_dec so the whole'
+   write(*,*)'image fits in one tile, or use a single band (nbands=1).'
+   write(*,*)'Quitting now...'
+   stop
+endif
 
 write(*,*)" "
 write(*,*)"Tile planner (Phase-2):"
@@ -3012,6 +3239,45 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
          status = 1
       endif
 
+      ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): read every other
+      ! configured band's channels into its own offset slice of the
+      ! (now multi-band-sized) specQ/specU tile buffers -- one plain
+      ! FTGSVE call per band (io_read_threads is forced to 1 for
+      ! nbands>1 above, so there is no per-band parallel-channel
+      ! splitting to replicate here). RA/Dec fpixels/lpixels for this
+      ! tile are shared with the reference band's read above (identical
+      ! sky footprint, validated geometry); only the freq-axis
+      ! range/naxes differ per band. A no-op for nbands=1.
+      if (n_bands_t2.gt.1) then
+         do iband = 1,n_bands_t2
+            if (iband.eq.cfg%reference_band) cycle
+            io_par_buf_off = int(band_offset(iband),kind=int64) *&
+            &io_par_per_plane + 1_int64
+            io_par_fpixels = fpixels
+            io_par_lpixels = lpixels
+            io_par_fpixels(freq_axis) = 1
+            io_par_lpixels(freq_axis) = band_nz(iband)
+            io_par_status_priv = 0
+            call FTGSVE(band_unit_Q(iband),group,naxis,&
+            &band_naxes(iband,:),&
+            &io_par_fpixels,io_par_lpixels,incs,&
+            &nullval,specQ(io_par_buf_off),io_par_anyflg_priv,&
+            &io_par_status_priv)
+            if (io_par_status_priv.ne.0) io_par_read_ok = .false.
+            io_par_status_priv = 0
+            call FTGSVE(band_unit_U(iband),group,naxis,&
+            &band_naxes(iband,:),&
+            &io_par_fpixels,io_par_lpixels,incs,&
+            &nullval,specU(io_par_buf_off),io_par_anyflg_priv,&
+            &io_par_status_priv)
+            if (io_par_status_priv.ne.0) io_par_read_ok = .false.
+         enddo
+         if (.not.io_par_read_ok) then
+            write(*,*)' ERROR: one or more multi-band FITS reads failed'
+            status = 1
+         endif
+      endif
+
       call log_tile_bounds('tile_read','done',&
       &ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end, nbytes_read)
       call timer_stop(STAGE_TILE_READ,t_stage)
@@ -3885,6 +4151,16 @@ if (status .gt. 0)then
    call printerror(status)
 else
    write(*,*)"Successfully read and closed FITS Ucube..."
+endif
+ ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): close every other
+ ! configured band's Q/U handles (units 21/22 above are the reference
+ ! band's, already closed). A no-op for nbands=1.
+if (n_bands_t2.gt.1) then
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      call FTCLOS(band_unit_Q(iband),status)
+      call FTCLOS(band_unit_U(iband),status)
+   enddo
 endif
 if(need_icube)then
    call FTCLOS(40,status)

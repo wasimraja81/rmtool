@@ -176,6 +176,7 @@ mkdir -p "$OUT_DIR"
 
 # Clean previous test outputs (binary refuses to overwrite)
 rm -f "$OUT_DIR"/serial.*.FITS "$OUT_DIR"/omp.*.FITS "$OUT_DIR"/gpu.*.FITS
+rm -f "$OUT_DIR"/mb_match.*.FITS "$OUT_DIR"/mb_mismatch.*.FITS "$OUT_DIR"/mb_lenmismatch.*.FITS
 rm -f "$OUT_DIR"/*.timing.csv
 rm -f "$OUT_DIR"/*.cfg "$OUT_DIR"/*.log
 
@@ -801,7 +802,7 @@ fi
 #     uses it, matching the pattern already relied on elsewhere in this
 #     script), so these checks are log-content based, not exit-code based.
 # ---------------------------------------------------------------------------
-section "15. Multi-band config schema – geometry validation (T1)"
+section "15. Multi-band config schema – geometry validation + frequency merge (T1/T2)"
 
 if [[ -x "$BIN_SERIAL" ]]; then
     mb_match_cfg="$OUT_DIR/mb_match.cfg"
@@ -834,10 +835,21 @@ use_gpu             = n
 CFGEOF
     "$BIN_SERIAL" "$mb_match_cfg" > "$mb_match_log" 2>&1
     if grep -q "Multi-band geometry validated successfully across" "$mb_match_log" && \
-       grep -q "multi-band frequency merge is not yet implemented" "$mb_match_log"; then
-        pass "Multi-band matched-geometry config: validated 2 bands, stopped cleanly at not-yet-implemented"
+       grep -q "rm_synthesis run completed" "$mb_match_log"; then
+        pass "Multi-band matched-geometry config: validated 2 bands, ran to completion (T2)"
     else
-        fail "Multi-band matched-geometry config: expected validation/not-yet-implemented messages not found (see $mb_match_log)"
+        fail "Multi-band matched-geometry config: expected validation/completion messages not found (see $mb_match_log)"
+    fi
+
+    mb_match_amp="$OUT_DIR/mb_match.AMP.RMCUBE.FITS"
+    if [[ -f "$mb_match_amp" ]]; then
+        if python3 "$TESTS_DIR/check_rm_peak.py" "$mb_match_amp" "$TRUTH" > /dev/null 2>&1; then
+            pass "Multi-band matched-geometry config (T2): src_A/src_B recovered at correct RM from merged P+L-analogue bands"
+        else
+            fail "Multi-band matched-geometry config (T2): RM peak(s) not recovered correctly (see $mb_match_amp)"
+        fi
+    else
+        fail "Multi-band matched-geometry config (T2): expected output $mb_match_amp not found"
     fi
 
     mb_mismatch_cfg="$OUT_DIR/mb_mismatch.cfg"
