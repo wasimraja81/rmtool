@@ -178,6 +178,13 @@ integer   n_bands_t2, nz_out_band
 real(sp), allocatable :: zval_band(:)
 real(sp) conv_fac_band, z1_band, zn_band
 integer   nz1_band, nz_tmp_band
+ ! T3 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band and combined
+ ! delta_RM/max-RM-scale/Delta_RM (un-aliased span) diagnostic, informational
+ ! only -- read-only with respect to every array T1/T2 built, gated behind
+ ! nbands>1. Unused for nbands=1.
+real(sp) lam2_lo_edge, lam2_hi_edge, dlam2_band
+real(sp) drm_band, maxrmscale_band, deltarm_band
+real(sp) sum_dlam2_diag, min_lam2min_diag
 
 real(sp) cxval_im, cyval_im, czval_im
 integer   cxpix_im, cypix_im, czpix_im
@@ -1902,6 +1909,72 @@ ngood_chan = 0
 do i = 1, nz_out
    if(flag_arr_out(i).eq.1) ngood_chan = ngood_chan + 1
 enddo
+
+ ! T3 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): RM-range/resolution
+ ! diagnostic for multi-band runs, informational only -- does not gate or
+ ! auto-select beg_rm/end_rm/nrm (use_auto_rm_range=1 is already forbidden
+ ! for nbands>1, T1/T2). Read-only with respect to every array T1/T2
+ ! built; touches nothing any correctness gate covers. A no-op for
+ ! nbands=1, where the existing single-band use_auto_rm_range heuristic
+ ! already covers this ground.
+if (n_bands_t2.gt.1) then
+   write(*,*)' '
+   write(*,*)'RM-range/resolution diagnostic (informational; see'
+   write(*,*)'planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 7 decision 5):'
+   sum_dlam2_diag = 0.0_sp
+   min_lam2min_diag = huge(1.0_sp)
+   do iband = 1,n_bands_t2
+      ! Per-band edge frequencies -- same z1/zn construction as the
+      ! append-other-bands L_sq loop above, half a channel extended on
+      ! each edge (mirroring extract_general_setup's own Lsq1/Lsq2
+      ! treatment for a single band).
+      if (band_czpix(iband).eq.0)then
+         nz1_band = 0
+      else
+         nz1_band = band_czpix(iband) - 1
+      endif
+      z1_band = band_czval(iband) - real(nz1_band,kind=sp)*band_zinc(iband)
+      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*band_zinc(iband)
+      ! Independent per-band frequency-unit inference (a band's receiver
+      ! may report frequency in different units than another's).
+      if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
+         conv_fac_band = c_velocity
+      else if (band_czval(iband).ge.30.0e6.and.&
+      &band_czval(iband).le.10.0e9)then
+         conv_fac_band = c_velocity*1.0e6
+      else
+         conv_fac_band = c_velocity*1.0e6  ! already rejected above if
+         ! reached with a genuinely confusing magnitude; this branch is
+         ! unreachable in practice (see the append-bands L_sq loop, which
+         ! stops on this same condition before this diagnostic runs).
+      endif
+      lam2_lo_edge = (conv_fac_band/&
+      &(min(z1_band,zn_band)-0.5_sp*abs(band_zinc(iband))))**2
+      lam2_hi_edge = (conv_fac_band/&
+      &(max(z1_band,zn_band)+0.5_sp*abs(band_zinc(iband))))**2
+      dlam2_band = lam2_lo_edge - lam2_hi_edge
+      drm_band = cfg%fac / dlam2_band
+      maxrmscale_band = cfg%fac / lam2_hi_edge
+      deltarm_band = real(band_nz(iband),kind=sp) * drm_band
+      sum_dlam2_diag = sum_dlam2_diag + dlam2_band
+      min_lam2min_diag = min(min_lam2min_diag, lam2_hi_edge)
+      write(*,'(A,I0,A,F0.3,A,F0.3,A,F0.2,A,F0.2,A)')&
+      &'  band ',iband,': delta_RM=',drm_band,&
+      &' rad/m^2, max_RM_scale=',maxrmscale_band,&
+      &' rad/m^2, Delta_RM(un-aliased span)=',deltarm_band,&
+      &' rad/m^2 (max|RM|~',0.5_sp*deltarm_band,' rad/m^2)'
+   enddo
+   write(*,'(A,F0.3,A,F0.2,A)')&
+   &'  combined: delta_RM=',cfg%fac/sum_dlam2_diag,&
+   &' rad/m^2, max_RM_scale=',cfg%fac/min_lam2min_diag,' rad/m^2'
+   write(*,*)'  (no combined Delta_RM/un-aliased-span figure: the naive'
+   write(*,*)'  per-band sum is not the right multi-band generalization'
+   write(*,*)'  for this DFT-based (non-FFT) extraction -- open question,'
+   write(*,*)'  see planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 7 decision 5.)'
+   write(*,*)'  These figures guide, but do not auto-select, your'
+   write(*,*)'  beg_rm/end_rm/nrm choice below.'
+   write(*,*)' '
+endif
  ! Use explicit flag to select RM extraction mode
  ! nrm_out based on total channels (nz_out), not good channels
  ! Bad channels are masked during DFT via flag_arr and wts=0

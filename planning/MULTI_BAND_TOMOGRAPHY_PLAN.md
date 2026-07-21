@@ -1035,3 +1035,29 @@ important, that is a new, separate effort, not a T2 fix.
 - **Effort:** 0.5-1 session (pure diagnostic, no architecture change, no
   new test infrastructure beyond checking logged numbers against Table 6.1
   by hand or a small script).
+- **Evidence (2026-07-22):** Implemented as designed, gated behind
+  `n_bands_t2.gt.1`, inserted right after the existing `ngood_chan`
+  book-keeping loop in `rm_synthesis.f90` — reads only
+  `band_czval`/`band_czpix`/`band_zinc`/`band_nz` (already fully
+  populated by T1/T2) and `cfg%fac`; writes nothing to any array. Build
+  clean, 0 errors, 0 new warnings (same 4 pre-existing GPU-offload linker
+  warnings). `tests/run_tests.sh`: 35/35 pass, unchanged from T2. `nbands=1`
+  bit-identical sweep: 140/140 FITS match `scratch/baseline_multiband/`
+  (same 6 pre-existing NaN-artifact diffs) — expected, since this ticket's
+  code doesn't execute at all for `nbands=1`.
+
+  Ran against the §10 scenario (P: 300/30 MHz, L: 1200/120 MHz) and
+  checked the logged numbers directly against Table 6.1:
+
+  | | `δRM` (rad m⁻²) | `max RM scale` (rad m⁻²) |
+  |---|---|---|
+  | P (logged / Table 6.1) | 15.651 / 15.6 | 3.468 / 3.6 |
+  | L (logged / Table 6.1) | 250.419 / 250.1 | 55.494 / 55.4 |
+  | Combined (logged / Table 6.1) | 14.731 / **14.7** | 55.49 / 55.4 |
+
+  All within ~1% or better (the combined `δRM` essentially exact) — the
+  code's exact per-channel-edge computation tracks Table 6.1 more tightly
+  than the linear-λc hand-verification done when the formula was resolved
+  (§7 decision 5). Per-band `ΔRM` (un-aliased span) logged for both bands
+  with no combined figure, per the 2026-07-22 decision — confirmed the
+  "no combined value" note prints correctly alongside the per-band ones.
