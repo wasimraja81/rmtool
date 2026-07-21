@@ -413,19 +413,40 @@ resolved, plus one follow-up decision (0) reached after the rest:
      RM scale`)** — the largest Faraday *depth* (not thickness) at which a
      single Faraday-**thin**/point-like component can still be reliably
      measured without being confused with (aliased onto) a different RM.
-     This one *is* governed by individual channel width in λ² (thesis
-     §2.5.2-§2.5.3, illustrated via the Gauribidannaur Telescope worked
-     example: `δRM≈0.5 rad m⁻²` with `n_ch=256` channels limits reliable
-     probing to `|RM|≲60 rad m⁻²`) — matching the formula already
-     implemented for the existing single-band `use_auto_rm_range` heuristic
-     (`src/rm_synthesis_mod.f90:656-687`). **Open implementation gap,
-     flagged for whoever scopes phase 3, not resolved by this document**:
-     the thesis's own Table 6.1 does not tabulate this quantity for the
-     P/L/P+L combined case (only `δRM` and `max RM scale` are tabulated),
-     so its exact multi-band-combined formula (accounting for each band's
-     own, possibly different, channel width) needs to be worked out at
-     implementation time, not assumed from Table 6.1 by analogy to the
-     other two quantities.
+     **Resolved (confirmed with user, 2026-07-22): eq 2.4 (thesis p. 15,
+     found on a second, more targeted read — not in the pages originally
+     consulted for decision 5), the exact source formula behind the
+     Gauribidannaur illustration**:
+     ```
+     δRM  ~  π/(2λc²) · (νc/Δν)            -- per-band resolution
+     ΔRM  ~  n_ch × δRM                     -- per-band un-aliased span
+     ```
+     (`δ` = resolution, `Δ` = un-aliased span, `λc = c/νc`). Verified
+     directly against real numbers: `δRM_P=15.73`, `δRM_L=251.68` (Table
+     6.1: 15.6/250.1, within ~1%); Gauribidannaur (`νc=34.5 MHz,
+     Δν=1.5 MHz, n_ch=256`) gives `ΔRM/2=61.2`, matching the thesis's own
+     quoted *"maximum absolute RM of only about 60 rad m⁻²"* almost
+     exactly — confirming `ΔRM` is the *full* span (`−ΔRM/2` to `+ΔRM/2`),
+     not the max `|RM|` itself. Algebraically equivalent (linear-bandwidth
+     approximation) to the existing single-band `use_auto_rm_range`
+     heuristic's `d_nu = fac/t_span` (`src/rm_synthesis_mod.f90:656-687`,
+     now documented in-code, `f8a89eb`) when `fac=π` (this codebase's
+     default) — the same physics, reparameterized.
+
+     **Decision on the multi-band *combined* value (confirmed with user,
+     2026-07-22): NOT computed by this ticket.** Per-band `ΔRM` is logged
+     for each band individually. The user's own words: *"I need to think
+     what the overall max RM would be when we combine the bands. In FFT
+     where all L_sq channels are equal, this is easy. But in DFT the
+     un-aliased span should be more than the FFT case."* — i.e. the naive
+     multi-band generalization (by analogy with `δRM`/`max RM scale`'s
+     already-established combined forms) is *not* simply summing or
+     min/max-ing the per-band values, because this codebase's DFT-based
+     extraction (§4: order-independent, no FFT/uniform-sampling
+     requirement) should, in principle, tolerate a *larger* un-aliased
+     span than an equal-spacing FFT treatment would — a genuine open
+     research question, not an implementation gap to fill in by analogy.
+     Deferred to a future ticket once resolved, rather than guessed here.
 
    **Source:** Raja, W. (2014), *"Faraday Slicing Polarized Radio
    Sources,"* PhD thesis, Raman Research Institute / Jawaharlal Nehru
@@ -946,3 +967,71 @@ Adding RM-CLEAN is out of scope for this effort (§8 non-goals still
 covers "any change to the numerical RM-synthesis kernel... beyond how many
 channels it's handed") — if a clean-vs-dirty comparison ever becomes
 important, that is a new, separate effort, not a T2 fix.
+
+---
+
+### T3 — RM-Range/Resolution Diagnostic (`δRM`, `max RM scale`, per-band `ΔRM`)
+
+- **Objective:** Give multi-band users the guidance `use_auto_rm_range=1`
+  would otherwise have provided (forbidden for `nbands>1` since T1/T2) by
+  computing and logging (stdout + run log) the three §7-decision-5
+  quantities: `δRM` per band and combined, `max RM scale` per band and
+  combined, and `ΔRM` (un-aliased span) per band only — informational,
+  does not gate or auto-select `beg_rm`/`end_rm`/`nrm`, which stay
+  required, explicit user choices.
+- **Scope:**
+  - Pure diagnostic — read-only with respect to every array T2 built
+    (`band_czval`/`band_czpix`/`band_zinc`/`band_nz`, already fully
+    populated for every band, including the reference band, by the end of
+    T1/T2's geometry-validation block in `rm_synthesis.f90`). Touches
+    `nz_out`, `L_sq`, `specQ`/`specU`, and every other array T2's
+    correctness gate covers **not at all** — this ticket only adds
+    `write(*,*)`/`log_message` calls, nothing numerically consumed
+    downstream.
+  - Per band `i`: compute edge frequencies from `band_czval(i)`/
+    `band_czpix(i)`/`band_zinc(i)`/`band_nz(i)` (same `z1`/`zn`
+    construction already used for the append-other-bands `L_sq` loop, half
+    a channel extended on each edge, mirroring the existing single-band
+    `Lsq1`/`Lsq2` edge treatment in `extract_general_setup`), then:
+    - `Δλ²_i` = λ² at the low-frequency edge − λ² at the high-frequency
+      edge.
+    - `δRM_i = cfg%fac / Δλ²_i` (§7 decision 5, thesis eq 2.4 in its
+      edge-based form; `cfg%fac` defaults to `π`, matching eq 2.4's
+      literal `π/(2λc²)·(νc/Δν)` to the linear-bandwidth approximation).
+    - `max_RM_scale_i = cfg%fac / λ²_min_i` (thesis eq 6.4), `λ²_min_i` =
+      λ² at band `i`'s own high-frequency edge.
+    - `ΔRM_i = band_nz(i) × δRM_i` (thesis eq 2.4's un-aliased-span form);
+      log both the full span and `ΔRM_i/2` (max `|RM|`) — the thesis's own
+      Gauribidannaur example quotes the latter ("maximum absolute RM"), so
+      log both to avoid the ambiguity a future reader could otherwise hit.
+  - Combined (all bands together): `δRM_combined = cfg%fac /
+    (Σ_i Δλ²_i)`; `max_RM_scale_combined = cfg%fac / (min_i λ²_min_i)`
+    (both confirmed against Table 6.1's P+L row in §7 decision 5). **No
+    combined `ΔRM`** — explicitly deferred per the 2026-07-22 decision
+    recorded in §7 decision 5; log only the per-band values for this
+    quantity, with a one-line note in the output explaining why no
+    combined figure is shown.
+  - Gated behind `n_bands_t2.gt.1` — a no-op for `nbands=1`, where the
+    existing single-band `use_auto_rm_range` heuristic already covers this
+    ground and remains untouched.
+- **Correctness Gate:**
+  - `nbands=1` bit-identical sweep unaffected (trivially — this ticket's
+    code doesn't execute for `nbands=1` at all).
+  - For the §10 scenario (P: 300/30 MHz, L: 1200/120 MHz — real,
+    already-known-correct numbers to check against): logged `δRM_P`,
+    `δRM_L`, `δRM_combined`, `max_RM_scale_P`, `max_RM_scale_L`,
+    `max_RM_scale_combined` match Table 6.1 (15.6/250.1/14.7 and
+    3.6/55.4/55.4 respectively) to within the same ~1% tolerance the
+    hand-verification above already showed; per-band `ΔRM_P`/`ΔRM_L`
+    computed and logged (no combined-`ΔRM` line present).
+  - Output FITS files bit-identical to what T2 alone would have produced
+    for the same inputs (this ticket adds no new numerical computation
+    that reaches any output array).
+- **Rollback Criteria:** N/A in the usual sense (no correctness gate can
+  meaningfully fail here beyond a formula transcription error, which the
+  Table 6.1 cross-check above exists to catch) — if the logged numbers
+  don't match Table 6.1 within tolerance, fix the formula before merging
+  rather than shipping a diagnostic that misleads users.
+- **Effort:** 0.5-1 session (pure diagnostic, no architecture change, no
+  new test infrastructure beyond checking logged numbers against Table 6.1
+  by hand or a small script).
