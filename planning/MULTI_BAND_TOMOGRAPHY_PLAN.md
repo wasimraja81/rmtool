@@ -164,7 +164,7 @@ The existing decomposition is:
 
 | Aspect | Fits current framework? | Why not, and what it needs |
 |---|---|---|
-| Config schema (single `infileQ`/`infileU`) | **No** | Needs a list-of-bands concept (§5) — every place `cfg%infileQ` is read once needs to become "for each band." This is schema and orchestration work, not parallelism work. **Must stay backward compatible, via one unified pipeline, not two** (requirements 2a/2b, §5): `nbands` defaults to 1, legacy unsuffixed keys are parse-time aliases for band 1's keys, and there is exactly one ingestion/validation/compute pipeline for all `nbands` values — bit-identical output for existing configs is guaranteed only by the test-sweep correctness gate (§5), not by construction. |
+| Config schema (single `infileQ`/`infileU`) | **No** | Needs a list-of-bands concept (§5) — every place `cfg%infileQ` is read once needs to become "for each band." This is schema and orchestration work, not parallelism work. **Must stay backward compatible, via one unified pipeline, not two** (requirements 2a/2b, §5): every per-band key becomes comma-separable, band count is derived from list length (no separate `nbands` key), a comma-free value is just a length-1 list, and there is exactly one ingestion/validation/compute pipeline regardless of band count — bit-identical output for existing configs is guaranteed only by the test-sweep correctness gate (§5), not by construction. |
 | Geometry validation | **No, must be extended, not reused as-is** | Today's check is Q-vs-U only; needs to become "all N cubes' RA/Dec pixel grid vs. a chosen reference" (band 1, per the §7 decision), still exact-equality, loud-warn-and-refuse on mismatch — **no** resolution/beam check is added (decided against in §2/§3: `BMAJ`/`BMIN`/`BPA` are unreliable in multi-frequency headers). |
 | Frequency/λ² grid construction | **Mixed — better news than it first looks** | The DFT template kernel itself (`extract_general_setup`, `src/rm_synthesis_mod.f90:642-728`) computes `cos_arr`/`sin_arr` from each channel's λ² **individually** (a direct sum, not an FFT), so it does not algebraically require uniform λ² spacing — a concatenated, gapped, multi-band λ² array would compute correctly through this kernel essentially as-is. The actual gap is entirely upstream, in how that array is *produced*: `myfits_info` reads one `(CRVAL,CRPIX,CDELT)` triple per cube and `linspace`s it into a uniform ramp (`src/rm_synthesis.f90:1561-1563`) — there is no per-channel frequency table anywhere. Multi-band needs that replaced by **concatenating each band's own linspace-derived channel list** (each band can keep its own internal linear grid) into one merged, sorted array, with per-channel weights/flags carried through per band. This changes `nz_out`'s meaning from "one cube's channel count" to "sum of all bands' channel counts," touching every allocation sized by it (`data_arrQ/U`, `flag_arr_out`, `L_sq`, `cos_arr`/`sin_arr`, tile-local `specQ`/`specU`) — sizing/plumbing work, not a kernel rewrite. **Overlapping-band frequency ranges (§7 decision): no deduplication.** Per-channel weighting today is a uniform 0/1 flag (`flag_arr`/`flag_arr_out`, counted into `wsum` — "count of valid channels", `src/rm_synthesis.f90:2988-2989`), not a noise/sensitivity-based weight, so flat concatenation of every band's good channels already implements "weight by both" for free: an overlap region simply ends up with more equally-weighted channel terms in the same DFT sum, exactly like non-overlapping channels elsewhere in the run. If a noise-based per-channel weight is ever added later, the same merged-list design extends to it unchanged, since the kernel already takes an arbitrary per-channel weight. Separately, **`use_auto_rm_range=1`'s default RM-range heuristic does assume uniform spacing** (`dfreq = (freq_MHz(npts)-freq_MHz(1))/(npts-1)`, `src/rm_synthesis_mod.f90:656-687`) and would silently compute a wrong range/resolution across a multi-band gap; **§7 decision: forbidden outright for `nbands>1`** — see the RM-range diagnostic row below. |
 | RM-range/resolution diagnostic for multi-band runs | **New, additive — not a parallelism concern** | With `use_auto_rm_range` forbidden for `nbands>1` (§7), the user must supply `beg_rm`/`end_rm`/`nrm` explicitly, but has no easy way to know what's actually achievable from their specific band combination. **Decision (confirmed with user, 2026-07-20), formulas now sourced from the thesis (Raja 2014, Chapter 6 + §2.5 — see §7 decision 5 for the full citation, exact equations, and the three-quantity distinction the user flagged):** compute and log (stdout + run log) three genuinely distinct quantities — `δRM` (resolving power, for telling two nearby features apart), `max RM scale` (the largest Faraday-*thickness* an extended/thick component can have and still be detected at all), and `max un-aliased RM` (the largest Faraday *depth* at which a single thin/point-like component can still be reliably, unambiguously measured) — as an informational diagnostic only, guiding the user's choice of `beg_rm`/`end_rm`/`nrm` rather than auto-selecting a range. |
@@ -198,99 +198,99 @@ resiQ = 0.0  slopeQ = 0.0  resiU = 0.0  slopeU = 0.0
 infileI = I_cube.fits  path_I = /path/to/data/
 ```
 
-### Backward compatibility (requirements 2a/2b): one unified pipeline, `nbands` defaults to 1
+### Backward compatibility (requirements 2a/2b): one unified pipeline, comma-separated lists
 
-**Revised design (confirmed with user, 2026-07-20, superseding an earlier
-two-path draft — see the note at the end of this subsection): `nbands` is a
-new, optional key, defaulting to 1, and there is exactly one ingestion →
-geometry-validation → frequency-merge → tile/compute/write pipeline for
-every value of `nbands`, including 1.** The legacy single-band case is not a
-separately maintained branch; it *is* the `nbands=1` case of the general
-pipeline.
+**Final design (confirmed with user, 2026-07-21, superseding two earlier
+drafts — see the history note at the end of this subsection): every
+per-band key accepts a comma-separated list. `infileQ = Q_cube.fits` and
+`infileQ = Q_band1.fits,Q_band2.fits` are parsed by the *same* code —
+split on comma, get an array — so a single value isn't a special "legacy"
+case at all, it's simply a length-1 array. There is no separate `nbands`
+config key**: the number of bands is *derived* from the list length of
+`infileQ` (cross-checked against `infileU`'s list length, and against
+every other per-band key's list length when set — a config-parse error on
+mismatch, e.g. `infileQ` listing 2 files but `infileU` listing 1).
 
-- **Config-parser level (the only place backward compatibility needs
-  explicit handling):** the unsuffixed legacy keys — `infileQ`, `infileU`,
-  `resiQ`/`slopeQ`/`resiU`/`slopeU`, `infileI`/`path_I` — remain accepted
-  and are resolved, once, at parse time, as **aliases for band 1's suffixed
-  keys** (`infileQ` ≡ `infileQ_1`, etc.) into one internal per-band array
-  representation (conceptually `band(1:nbands)`, each holding the fields
-  `rmsynth_config_t` has today, just multiplied out). Downstream of parsing
-  there is only ever "an array of `nbands` bands" — no branch on whether the
-  legacy or new key spelling was used.
-  ```
-  # legacy spelling (nbands absent/1) -- parses to band(1)%infileQ = ...
-  infileQ = Q_cube.fits
-  infileU = U_cube.fits
+```
+# legacy single-band cfg, completely unedited -- still valid, still nbands=1
+infileQ = Q_cube.fits
+infileU = U_cube.fits
+resiQ = 0.0  slopeQ = 0.0  resiU = 0.0  slopeU = 0.0
+infileI = I_cube.fits  path_I = /path/to/data/
 
-  # equivalent explicit spelling, same result
-  nbands = 1
-  infileQ_1 = Q_cube.fits
-  infileU_1 = U_cube.fits
-  ```
-  Mixing the two spellings for the same band (e.g. both `infileQ` and
-  `infileQ_1` set) remains a config-parse error — that guard is about
-  avoiding ambiguous *input*, not about maintaining two downstream code
-  paths, so it doesn't conflict with unification.
-- **Multi-band configs** (`nbands > 1`) use only the suffixed form, since
-  there's no single unsuffixed name that could mean "band 2":
-  ```
-  nbands  = 2
-  # reference_band: whose RA/Dec pixel grid every other band is validated
-  # against (band 1 by default, per the §7 decision).
-  reference_band = 1
+# multi-band: same keys, comma-separated
+infileQ = low_Q.fits,high_Q.fits
+infileU = low_U.fits,high_U.fits
+resiQ = 0.0,0.0   slopeQ = 0.0,0.0   resiU = 0.0,0.0   slopeU = 0.0,0.0
+infileI = low_I.fits,high_I.fits   path_I = /path/to/data/,/path/to/data/
 
-  infileQ_1 = low_Q.fits   infileU_1 = low_U.fits
-  resiQ_1 = 0.0  slopeQ_1 = 0.0  resiU_1 = 0.0  slopeU_1 = 0.0
-  infileI_1 = low_I.fits  path_I_1 = /path/to/data/
+# reference_band: whose RA/Dec pixel grid every other band is validated
+# against (band 1, i.e. the first list entry, by default -- §7 decision 4).
+reference_band = 1
+```
 
-  infileQ_2 = high_Q.fits  infileU_2 = high_U.fits
-  resiQ_2 = 0.0  slopeQ_2 = 0.0  resiU_2 = 0.0  slopeU_2 = 0.0
-  infileI_2 = high_I.fits  path_I_2 = /path/to/data/
-  ```
-  (or a comma-separated list form — a config-parser syntax choice,
-  independent of everything else here). `use_auto_rm_range` is rejected at
-  config-validation time whenever `nbands>1` (§4, §7 decision) —
-  `beg_rm`/`end_rm`/`nrm` become required keys in that case, informed by the
-  logged RM-range/resolution diagnostic.
+This is a **simpler and more thoroughly unified realization of requirement
+2b than either earlier draft achieved** (see history below): there is
+exactly one key name per field (no suffixed `_1`/`_2` variants to keep in
+sync with a separate `nbands` count), and the parser has no
+legacy-vs-new-spelling branch to get wrong — comma-splitting a string with
+no commas and a string with one comma are the same operation. `nbands` still
+exists as an internal, derived quantity (used throughout this document as
+shorthand for "how many bands"), it just isn't something the user sets
+directly, removing an entire class of possible inconsistency (a stale
+`nbands=3` next to only 2 listed files can no longer happen — there is
+nothing to go stale). `use_auto_rm_range` is still rejected at
+config-validation time whenever the derived `nbands>1` (§4, §7 decision) —
+`beg_rm`/`end_rm`/`nrm` become required keys in that case, informed by the
+logged RM-range/resolution diagnostic.
 
-**What "unified" costs, and how the correctness gate compensates.** Under
-the earlier two-path draft, the legacy case got its bit-identical guarantee
-*for free*, by construction — it literally called the untouched existing
-subroutine. Unifying gives up that free guarantee: the general pipeline is
-new code, and floating-point non-associativity means a loop that is
-"logically equivalent" to today's for `nbands=1` (e.g. an outer per-band
-loop that happens to run once) is not automatically bit-identical to it —
-compiler vectorization/instruction-scheduling/FMA-contraction decisions can
-depend on loop shape even when the arithmetic sequence is mathematically the
-same. **This was a conscious trade the user made explicitly**, accepting the
-added verification burden in exchange for a single maintained pipeline. The
-correctness gate is therefore promoted from a backstop to the **primary and
+**What "unified" costs, and how the correctness gate compensates.** The
+verification story from the earlier drafts carries over unchanged: a
+length-1 list, however it's parsed, still runs through *new* code (the
+general list-based ingestion/merge pipeline), and floating-point
+non-associativity means "logically equivalent to today's single-band path"
+is not automatically bit-identical to it — compiler
+vectorization/instruction-scheduling/FMA-contraction decisions can depend
+on loop shape even when the arithmetic sequence is mathematically the
+same. **This was a conscious trade the user made explicitly** (§7 decision
+0), accepting the added verification burden in exchange for a single
+maintained pipeline. The correctness gate is therefore the **primary and
 only** mechanism ensuring requirement 2a: every existing `tests/*.cfg` and
 `cfg/*.cfg` file, run unedited against the new code, must produce
 **bit-identical output** to the current `develop` baseline (the same "zero
 change in observable behaviour" bar `planning/ENCAPSULATION_REFACTOR_PLAN.md`
-already applies to structural refactors in this codebase) — this is no
-longer a sanity check on top of a by-construction guarantee, it is the
-guarantee. Two implementation practices worth carrying into the ticket that
-does this work, to keep the `nbands=1` case as close to "no extra floating
+already applies to structural refactors in this codebase). Two
+implementation practices worth carrying into the ticket that does this
+work, to keep the single-entry-list case as close to "no extra floating
 point operations" as the unification allows:
 - The per-band frequency/λ² construction (`myfits_info` → `linspace`, one
-  call per band) should stay a straight per-band call with no change to its
-  internal arithmetic; only the *assembly* of per-band results into the
-  merged list is new.
-- For `nbands=1`, the merge/concatenation step (whatever form it takes for
-  `nbands>1` — sort, interleave, tag-by-band) should reduce to using band
-  1's array directly rather than passing it through generic merge logic
-  that happens to be a no-op for one input — a real short-circuit, not
-  merely an algorithm that's expected to behave like one.
+  call per list entry) should stay a straight per-entry call with no change
+  to its internal arithmetic; only the *assembly* of per-entry results into
+  the merged list is new.
+- For a length-1 list, the merge/concatenation step (whatever form it takes
+  for longer lists — sort, interleave, tag-by-band) should reduce to using
+  that one entry's array directly rather than passing it through generic
+  merge logic that happens to be a no-op for one input — a real
+  short-circuit, not merely an algorithm that's expected to behave like one.
 
-(**Earlier draft, superseded:** a prior version of this document proposed
-two explicit, mutually exclusive code paths gated on `nbands==1` vs. `>1`,
-matching the pattern this repo already uses for `io_read_threads`/
-`io_write_threads`/`io_overlap` defaulting to their serial/off behaviour via
-an unchanged code branch. That remains the lower-risk option if the
-verification cost of the unified design proves expensive in practice; it is
-recorded here in case a future revision needs to fall back to it.)
+**Design history, superseded drafts (kept for context, not current):**
+1. *Two explicit, mutually exclusive code paths* gated on band count,
+   matching the pattern this repo already uses for `io_read_threads`/
+   `io_write_threads`/`io_overlap` defaulting to their serial/off behaviour
+   via an unchanged code branch — rejected (2026-07-20) in favour of one
+   unified pipeline (§7 decision 0), on the grounds that duplicating the
+   whole ingestion/validation/compute pipeline was worse than the added
+   verification burden.
+2. *A `nbands` config key plus `infileQ_1`/`infileQ_2`-style suffixed
+   per-band keys*, with unsuffixed legacy keys treated as parse-time
+   aliases for band 1 — the unified pipeline's first concrete schema, but
+   superseded (2026-07-21) by the comma-separated-list design above, which
+   achieves the same unification with less config surface (no suffix
+   proliferation, no separate `nbands` key to keep consistent with the
+   actual list lengths).
+
+Both remain lower-risk fallbacks if the current design's verification cost
+proves expensive in practice.
 
 ## 6. Recommended phasing
 
@@ -531,41 +531,44 @@ Effort, each getting an **Evidence (...)** section appended once done.
 
 ---
 
-### T1 — Unified `nbands`-Parameterized Ingestion + Geometry Validation
+### T1 — Comma-List Config Schema + Unified Geometry Validation
 
-- **Objective:** Introduce the `nbands` config key (default 1) and the
-  single, unified per-band ingestion/validation pipeline (§5, §7 decision
-  0) — proving the `nbands=1` case is bit-identical to the T0 baseline
-  before any frequency-merge logic (phase 2) exists at all. This is
-  deliberately the narrowest slice that exercises the new schema and the
-  new geometry-validation loop end-to-end without touching the RM-synthesis
-  numerics.
+- **Objective:** Introduce comma-separated-list parsing for every per-band
+  config key (§5) — with band count derived from list length, no separate
+  `nbands` key — and the single, unified per-band ingestion/validation
+  pipeline (§7 decision 0), proving the single-entry-list case is
+  bit-identical to the T0 baseline before any frequency-merge logic (phase
+  2) exists at all. This is deliberately the narrowest slice that exercises
+  the new schema and the new geometry-validation loop end-to-end without
+  touching the RM-synthesis numerics.
 - **Scope:**
-  - `src/rm_synthesis_mod.f90:106-153` (`rmsynth_config_t`): add `nbands`
-    (default 1) and `reference_band` (default 1) fields. Add a new small
-    per-band derived type (e.g. `band_cfg_t`) holding the per-band fields
-    identified in §4/§5 (`infileQ`, `infileU`, `resiQ`, `slopeQ`, `resiU`,
-    `slopeU`, `infileI`, `path_I`) and an allocatable array of it, sized to
-    `nbands`, inside `rmsynth_config_t`.
-  - `read_cfg_keyval` (`src/rm_synthesis_mod.f90:1632` onward): add
-    `nbands`/`reference_band` parsing; add the legacy-key-aliasing logic
-    (§5) that populates `band(1)` from unsuffixed `infileQ`/`infileU`/etc.
-    when `nbands` is absent or 1, and from suffixed `infileQ_1`, `infileQ_2`
-    ... when `nbands>1`; reject mixed spellings (both a legacy and a
-    suffixed key set for the same run) as a config-parse error, per §5.
-    Required-key enforcement (today at `:2585-2589` for `infileQ`/`infileU`)
-    extends to every configured band.
+  - `src/rm_synthesis_mod.f90:106-153` (`rmsynth_config_t`): add
+    `reference_band` (default 1). Add a new small per-band derived type
+    (e.g. `band_cfg_t`) holding the per-band fields identified in §4/§5
+    (`infileQ`, `infileU`, `resiQ`, `slopeQ`, `resiU`, `slopeU`, `infileI`,
+    `path_I`) and an allocatable array of it inside `rmsynth_config_t`,
+    sized to the *derived* band count (§5) — no `nbands` field is stored
+    directly; it's the array's size.
+  - `read_cfg_keyval` (`src/rm_synthesis_mod.f90:1632` onward): change
+    `infileQ`/`infileU`/`resiQ`/`slopeQ`/`resiU`/`slopeU`/`infileI`/`path_I`
+    parsing from "read one value" to "split on comma, read N values"; the
+    band count is the resulting list length, cross-validated equal across
+    every per-band key that's set (config-parse error otherwise, per §5).
+    A config with no commas anywhere behaves exactly as today — same
+    single value, same single-entry array. Required-key enforcement (today
+    at `:2585-2589` for `infileQ`/`infileU`) extends to every list entry.
   - `src/rm_synthesis.f90:572-667` (today's `myfits_info` calls + Q-vs-U
     NAXIS/dimension check) and `:733-806` (today's Q-vs-U WCS-value exact
     match): generalize from "Q vs U, exactly two cubes" to "every band's Q
     and U vs `reference_band`'s geometry, N cubes" — same exact-equality
     philosophy (§3, §7 decision 3), same loud-refuse-on-mismatch behaviour,
-    just looped over `nbands` instead of hardcoded to one pair.
-  - For `nbands>1` specifically: after geometry validation passes, stop
-    with a clear, explicit "multi-band frequency merge not yet implemented"
-    message rather than attempting synthesis — phase 2's job, out of scope
-    here. This keeps T1's blast radius to ingestion/validation plumbing
-    only.
+    just looped over the derived band count instead of hardcoded to one
+    pair.
+  - For a derived band count `>1` specifically: after geometry validation
+    passes, stop with a clear, explicit "multi-band frequency merge not
+    yet implemented" message rather than attempting synthesis — phase 2's
+    job, out of scope here. This keeps T1's blast radius to
+    ingestion/validation plumbing only.
   - Test fixtures: extend `tests/make_test_cubes.py` to optionally emit a
     second synthetic Q/U band (distinct frequency range from the existing
     550-750 MHz GMRT-like band, e.g. an 800-950 MHz band, same RA/Dec
@@ -575,25 +578,27 @@ Effort, each getting an **Evidence (...)** section appended once done.
     the new N-band geometry validation. Per §7 decision 6, this stays
     synthetic-only; no real multi-band cubes are sourced for this ticket.
 - **Correctness Gate:**
-  - **Legacy/default path (`nbands` absent, and explicit `nbands=1`):**
-    every `tests/*.cfg`/`cfg/*.cfg` file, run unedited, produces
-    bit-identical output (`tests/compare_cubes.py --exact`) against the T0
-    baseline archive. This is the ticket's central gate, carrying the full
-    weight of requirements 2a/2b (§5, §7 decision 0) — there is no
-    by-construction fallback if this fails.
+  - **Legacy/default path (no commas in any per-band key, i.e. derived
+    band count = 1):** every `tests/*.cfg`/`cfg/*.cfg` file, run unedited,
+    produces bit-identical output (`tests/compare_cubes.py --exact`)
+    against the T0 baseline archive. This is the ticket's central gate,
+    carrying the full weight of requirements 2a/2b (§5, §7 decision 0) —
+    there is no by-construction fallback if this fails.
   - `tests/run_tests.sh`'s existing pass/fail counts are unchanged from T0.
   - New multi-band fixture tests (added to `tests/run_tests.sh` or a
-    parallel script): a matched-geometry two-band config passes validation
-    and reaches (and stops cleanly at) the "not yet implemented" message; a
-    mismatched-geometry two-band config is loudly refused before any
-    compute begins.
-  - A config mixing legacy and suffixed keys is rejected with a clear error
+    parallel script): a matched-geometry two-band config (comma-separated
+    `infileQ`/`infileU`) passes validation and reaches (and stops cleanly
+    at) the "not yet implemented" message; a mismatched-geometry two-band
+    config is loudly refused before any compute begins.
+  - A config with inconsistent list lengths across per-band keys (e.g. two
+    `infileQ` entries, one `infileU` entry) is rejected with a clear error
     at parse time.
 - **Rollback Criteria:** If bit-identical output cannot be achieved for the
-  `nbands=1` case within this ticket's effort budget, roll back to before
-  this ticket rather than merging a change that silently breaks existing
-  users — re-evaluate whether the unified-pipeline decision (§7 decision 0)
-  needs revisiting in favour of the superseded two-path design kept in §5.
+  single-entry-list case within this ticket's effort budget, roll back to
+  before this ticket rather than merging a change that silently breaks
+  existing users — re-evaluate whether the unified-pipeline decision (§7
+  decision 0) needs revisiting in favour of one of the superseded
+  lower-risk designs kept in §5.
 - **Effort:** 1.5-2 sessions (config-parser rework + new derived type +
   N-band validation loop + synthetic multi-band fixture generation, gated
   by a bit-identical sweep that itself takes real wall-clock time to run
