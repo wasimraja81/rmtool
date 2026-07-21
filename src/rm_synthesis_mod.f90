@@ -694,18 +694,48 @@ contains
     end do
     
     ! Calculate edge L_sq
+    !
+    ! NOTE (multi-band-tomography plan, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md,
+    ! Sec 7 decision 5): dfreq below is a MEAN spacing computed purely from
+    ! the two array endpoints, (freq_MHz(npts)-freq_MHz(1))/(npts-1) -- this
+    ! implicitly assumes t(1:npts) (the L_sq/lambda^2 array passed in as
+    ! `t`) is ONE globally monotonic, uniformly-spaced sequence, so that
+    ! freq_MHz(1)/freq_MHz(npts) are genuinely the dataset's true min/max
+    ! frequency. That holds for a single band (today's only caller with
+    ! use_auto_rm_range=1), but would NOT hold in general for a *merged*
+    ! multi-band L_sq array built by concatenating each band's own channel
+    ! list (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 4/Sec 9 T2): each
+    ! band's own sub-range is internally monotonic, but the endpoints of
+    ! the FULL concatenated array are just whichever band happens to be
+    ! listed last, not the true global min/max across all bands -- e.g. a
+    ! higher-frequency band listed before a lower-frequency one would make
+    ! this dfreq/d_nu/nu_span calculation silently wrong. This is exactly
+    ! why use_auto_rm_range=1 is rejected outright for nbands>1 in
+    ! rm_synthesis.f90's multi-band validation block (T1/T2) -- that
+    ! restriction is load-bearing for this reason, not just cautious. It
+    ! does NOT affect the actual DFT template build below (the cos_arr/
+    ! sin_arr loop indexes t(kk) by position only, order-independent) or
+    ! the use_auto_rm_range=0 path (beg_eff/end_eff come from cfg%beg_rm/
+    ! end_rm directly, this heuristic's output is unused). A proper
+    ! multi-band generalization of this heuristic (per-band spans summed,
+    ! true global min/max tracked explicitly rather than inferred from
+    ! array endpoints) is phase 3's job (the delta_RM/max-RM-scale
+    ! diagnostic), not implemented here.
     dfreq = (freq_MHz(npts) - freq_MHz(1)) / dble(npts - 1)
     f1 = freq_MHz(1) - 0.5_sp * dfreq
     f2 = freq_MHz(npts) + 0.5_sp * dfreq
     Lsq2 = (c_velocity / f1)**2
     Lsq1 = (c_velocity / f2)**2
-    
+
     ! Relation between RM and wavelength-squared domains
     t_span = Lsq2 - Lsq1
     d_nu = fac / t_span
     nu_span = dble(npts) * d_nu
-    
-    ! Build RM limits for the final nout samples.
+
+    ! Build RM limits for the final nout samples. use_auto_rm_range=1 is
+    ! rejected outright for multi-band runs (nbands>1) before this
+    ! subroutine is ever called with a merged L_sq array -- see the note
+    ! above on why the d_nu heuristic below is unsafe for that case.
     if (use_auto_rm_range == 1) then
       beg_eff = -0.5_sp * real(npts - 1) * d_nu
       end_eff =  0.5_sp * real(npts - 1) * d_nu
