@@ -33,7 +33,9 @@
 #      (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 #  16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
 #      (Raja 2014 Table 6.1/6.2): P-band alone, L-band alone, and P+L
-#      combined, for a point source + Faraday-thick top-hat + F2/F3 pair
+#      combined, for a point source + Faraday-thick top-hat + F2/F3 pair.
+#      Also T4: multi-tile multi-band produces bit-identical output to
+#      the single-tile P+L run above (tiling must not change the answer)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -957,6 +959,44 @@ CFGEOF
             pass "Sec 10 scenario: point source, thick-component washout/reveal, and F2/F3 P-alone/L-alone behaviour all match thesis-grounded expectations"
         else
             fail "Sec 10 scenario: one or more expected behaviours not observed (see check_thesis_scenario.py output above)"
+        fi
+
+        # T4 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): multi-tile multi-band
+        # must produce bit-identical output to the single-tile run above --
+        # tiling must not change the scientific answer.
+        thesis_plmt_cfg="$OUT_DIR/thesis_pl_multitile.cfg"
+        thesis_plmt_log="$OUT_DIR/thesis_pl_multitile.log"
+        rm -f "$OUT_DIR"/thesis_pl_multitile.*.FITS
+        { sed -e "s|outfile             = ${OUT_DIR}/thesis_pl\$|outfile             = ${OUT_DIR}/thesis_pl_multitile|" \
+              "$thesis_pl_cfg" | grep -v '^tile_'; \
+          echo "tile_ra = 16"; echo "tile_dec = 16"; echo "tile_auto = n"; \
+        } > "$thesis_plmt_cfg"
+        if run_binary "$BIN_SERIAL" "$thesis_plmt_cfg" "$thesis_plmt_log"; then
+            if grep -q "Multi-band run spanning.*4  tile(s)" "$thesis_plmt_log"; then
+                pass "Multi-tile multi-band (T4): confirmed 4-tile run (tile_ra=tile_dec=16 on a 32x32 image)"
+            else
+                fail "Multi-tile multi-band (T4): expected 4-tile message not found (see $thesis_plmt_log)"
+            fi
+            all_match=1
+            for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+                f1="$thesis_pl_amp"
+                [[ "$suffix" != "AMP.RMCUBE" ]] && f1="${thesis_pl_amp/AMP.RMCUBE/$suffix}"
+                f2="$OUT_DIR/thesis_pl_multitile.${suffix}.FITS"
+                if [[ -f "$f1" && -f "$f2" ]]; then
+                    if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact > /dev/null 2>&1; then
+                        all_match=0
+                        fail "Multi-tile multi-band (T4): ${suffix} differs from single-tile output"
+                    fi
+                else
+                    all_match=0
+                    fail "Multi-tile multi-band (T4): ${suffix} output missing (expected $f1 and $f2)"
+                fi
+            done
+            if [[ "$all_match" -eq 1 ]]; then
+                pass "Multi-tile multi-band (T4): all 4 output products bit-identical to single-tile multi-band"
+            fi
+        else
+            fail "Multi-tile multi-band (T4): run failed (see $thesis_plmt_log)"
         fi
     else
         fail "Sec 10 scenario: one or more runs failed (see $thesis_p_log / $thesis_l_log / $thesis_pl_log)"

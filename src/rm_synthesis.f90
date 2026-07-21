@@ -2099,18 +2099,20 @@ inflight_slots_planned = plan%inflight_slots_planned
 use_staging = plan%use_staging
 mem_frac_vram_per_slot = plan%mem_frac_vram_per_slot
 
- ! T2 scope narrowing (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): only
- ! single-tile multi-band runs are implemented so far. A no-op for
- ! nbands=1, where any tile count is already fully supported.
+ ! T4 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): multi-tile multi-band runs
+ ! are supported -- the per-band tile-read loop (T2, below) already sits
+ ! inside the RA/Dec tile loop and already reuses each tile's own live
+ ! fpixels/lpixels, the same mechanism the reference band's own read
+ ! already relies on across many tiles. No tile-count restriction remains
+ ! here; T2's original single-tile-only stop (this exact location) has
+ ! been removed, not merely relaxed, after direct code inspection and a
+ ! bit-identical multi-tile-vs-single-tile verification (T4 Evidence).
 if (n_bands_t2.gt.1 .and.&
 &(cfg%tile_ra.lt.nx_out .or. cfg%tile_dec.lt.ny_out))then
-   write(*,*)'ERROR: multi-tile multi-band runs are not yet implemented.'
-   write(*,*)'nx_out,ny_out = ',nx_out,ny_out
-   write(*,*)'planned tile_ra,tile_dec = ',cfg%tile_ra,cfg%tile_dec
-   write(*,*)'Increase mem_frac_ram / tile_ra / tile_dec so the whole'
-   write(*,*)'image fits in one tile, or use a single band (nbands=1).'
-   write(*,*)'Quitting now...'
-   stop
+   write(*,*)' '
+   write(*,*)'Multi-band run spanning ',&
+   &((nx_out+cfg%tile_ra-1)/cfg%tile_ra)*((ny_out+cfg%tile_dec-1)/cfg%tile_dec),&
+   &' tile(s) (tile_ra,tile_dec = ',cfg%tile_ra,cfg%tile_dec,').'
 endif
 
 write(*,*)" "

@@ -1061,3 +1061,91 @@ important, that is a new, separate effort, not a T2 fix.
   (§7 decision 5). Per-band `ΔRM` (un-aliased span) logged for both bands
   with no combined figure, per the 2026-07-22 decision — confirmed the
   "no combined value" note prints correctly alongside the per-band ones.
+
+---
+
+### T4 — Multi-Tile Multi-Band Runs
+
+- **Objective:** Remove T2's single-tile restriction, reopening the
+  thesis's own actual motivating use case (§6.2: combining Arecibo P+L
+  data over the GALFACTS survey field to study diffuse Galactic polarized
+  emission — inherently wide-field, not reachable under a single-tile
+  ceiling) rather than leaving multi-band tomography usable only on
+  images small enough to fit one RAM-budgeted tile.
+- **Why this is a small, contained change (confirmed by direct code
+  inspection before scoping, 2026-07-22):** T2's per-band tile-read code
+  already sits inside the existing RA/Dec tile loop and already reuses
+  the tile loop's own live `fpixels`/`lpixels` for its RA/Dec bounds —
+  the same mechanism the reference band's own read already relies on
+  across many tiles in existing single-band production runs. `specQ`/
+  `specU` (sized once, `tile_ra×tile_dec×nz_out`) and the merged
+  `L_sq`/`cos_arr`/`sin_arr`/`flag_arr_out` (built once, tile-invariant)
+  are already correctly tile-agnostic. Per-band FITS units are opened
+  once and reused across tiles exactly like the reference band's own
+  21/22. `io_overlap` stays separately blocked for multi-band regardless
+  (T2's own restriction, untouched here) — no double-buffering
+  interaction to introduce. The only genuinely single-tile-specific code
+  is the one blocking check itself (`rm_synthesis.f90:2105-2106`, right
+  after `plan_tile`).
+- **Scope:**
+  - Remove (or relax to a no-op) the `cfg%tile_ra.lt.nx_out .or.
+    cfg%tile_dec.lt.ny_out` stop for `nbands>1`.
+  - No other source change anticipated — this ticket's real weight is in
+    the **Correctness Gate** below, not new code, since the read-stage
+    generalization was already written tile-agnostically in T2.
+  - GPU multi-band, subimage-for-multi-band, bad-channel-file-for-
+    multi-band, `remove_qu_bias`-for-multi-band, and
+    `io_read_threads>1`/`io_overlap`-for-multi-band remain out of scope,
+    unaffected by this ticket — their own `stop` checks are untouched.
+- **Correctness Gate:**
+  - `nbands=1` bit-identical sweep unaffected (this check only ever fired
+    for `n_bands_t2.gt.1`, so removing it cannot change single-band
+    behaviour).
+  - **New invariant this ticket exists to prove**: a multi-tile multi-band
+    run produces **bit-identical output** to the single-tile run of the
+    *same* multi-band data — tiling must not change the scientific
+    answer, the same bar the original single-band tiling implementation
+    was already held to. Verify by forcing a small `tile_ra`/`tile_dec`
+    (via explicit cfg values, not `tile_auto`) on the §10 P+L scenario so
+    the run spans multiple tiles, and comparing output FITS against the
+    existing single-tile §10 run via `compare_cubes.py --exact`.
+  - §10 scenario's own scientific assertions (point-source accuracy,
+    thick-component reveal, F2/F3 behaviour) still hold under the
+    multi-tile run — re-run `check_thesis_scenario.py` against the
+    multi-tile output, not just the tile-count-invariance diff above.
+- **Rollback Criteria:** If multi-tile output is not bit-identical to
+  single-tile for the same data, do not ship this ticket — investigate
+  whether some tile-loop state actually was implicitly single-tile-only
+  despite the inspection above (e.g. a variable only initialised before
+  the tile loop that should instead be per-tile), rather than assume the
+  inspection was complete.
+- **Effort:** 0.5-1 session (the change itself is small; most of the
+  effort is the multi-tile-vs-single-tile bit-identical verification).
+- **Evidence (2026-07-22):** Confirmed by direct code inspection before
+  writing any change (user's own architectural reasoning, verified rather
+  than assumed): T2's per-band tile-read code already sits inside the
+  RA/Dec tile loop (`rm_synthesis.f90:3164` loop, per-band read at
+  `:3315`) and already reuses the tile loop's live `fpixels`/`lpixels` —
+  confirmed these are set to the *current* tile's bounds earlier in the
+  same iteration, exactly like the reference band's own read. The single
+  blocking check (`:2105-2106`) was removed outright (not relaxed),
+  replaced with an informational tile-count log line.
+
+  Verified the new invariant directly: forced `tile_ra=tile_dec=16` (4
+  tiles on the §10 scenario's 32×32 image, `tile_auto=n`) and confirmed
+  all 4 output products (AMP/PHA/MASK/NVALID) are **bit-identical** to the
+  single-tile P+L run — `tests/compare_cubes.py --exact` on all four,
+  wired into `run_tests.sh` as a permanent regression check (T4's own
+  correctness gate, not just a one-off manual check). One real bug caught
+  by the automated version that the manual check missed: the generated
+  multi-tile cfg initially reused the single-tile run's own `outfile`
+  path unchanged, colliding with its still-present output files (the
+  binary correctly refused to overwrite) — fixed by explicitly
+  substituting the `outfile` line rather than copying it verbatim.
+
+  Build clean (0 errors, 0 new warnings, same 4 pre-existing GPU-offload
+  linker warnings). `tests/run_tests.sh`: 37/37 pass (35 from T0-T3 + 2
+  new: 4-tile-run confirmation, bit-identical-to-single-tile). `nbands=1`
+  bit-identical sweep: 140/140 FITS match `scratch/baseline_multiband/`
+  (same 6 pre-existing NaN-artifact diffs) — expected, since the removed
+  check only ever fired for `nbands>1`.
