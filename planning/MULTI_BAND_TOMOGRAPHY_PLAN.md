@@ -1149,3 +1149,73 @@ important, that is a new, separate effort, not a T2 fix.
   bit-identical sweep: 140/140 FITS match `scratch/baseline_multiband/`
   (same 6 pre-existing NaN-artifact diffs) — expected, since the removed
   check only ever fired for `nbands>1`.
+
+---
+
+### T5 — Split-Band Identity Test (contiguous split == undivided cube)
+
+- **Objective:** Add the single most direct, unambiguous regression check
+  for the multi-band merge mechanism (confirmed with user, 2026-07-22, as
+  a distinct and *more fundamental* test than the §10 scientific
+  scenario): split one existing single-band test cube's channel axis into
+  two **contiguous** halves (no gap — channels 1..N/2 as "band A", N/2+1..N
+  as "band B"), feed them back through rmtool as a 2-band multi-band run,
+  and check the result against the *same* cube run undivided, single-band.
+  Unlike §10 (which validates real multi-band physics against thesis
+  numbers, but needs qualitative interpretation for some assertions —
+  e.g. the F2/F3-at-P+L ringing caveat), this test has a crisp, purely
+  mechanical pass/fail: for a contiguous split with the low-frequency half
+  as `reference_band`, the merged channel sequence reconstructs *exactly*
+  the original cube's own channel order, so the expected result is not
+  merely "close" but **bit-identical** — any future change to the
+  frequency-merge/tile-read architecture that breaks this silently would
+  be caught immediately, without needing to reason about whether an
+  observed difference is expected science or a regression.
+- **Scope:**
+  - `tests/make_test_cubes.py`: after building the existing primary-band
+    `q_cube`/`u_cube` arrays (unchanged), slice them (not regenerate) into
+    `TEST_SPLIT_LO.Q/U.FITSCUBE` (channels 1..100) and
+    `TEST_SPLIT_HI.Q/U.FITSCUBE` (channels 101..200), each with `CRVAL3`
+    adjusted to that half's own first-channel frequency and `NAXIS3=100`,
+    `CDELT3` unchanged. Slicing the already-built array (rather than
+    re-synthesizing two smaller cubes independently) guarantees
+    pixel-for-pixel correspondence to the undivided cube by construction,
+    not by re-deriving the same noise/signal separately.
+  - `tests/run_tests.sh`: new section running `infileQ =
+    TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE` (same for
+    `infileU`) with the *same* numeric parameters (`beg_rm`/`end_rm`/`nrm`/
+    `fac`/`ofac`/etc.) already used by section 5's existing single-band
+    `serial` run, so the comparison target is that run's own
+    already-produced `tests/output/serial.*.FITS` — no separate "run the
+    undivided cube again" step needed.
+- **Correctness Gate:**
+  - AMP/PHA/MASK/NVALID from the split-band run **bit-identical**
+    (`compare_cubes.py --exact`) to `tests/output/serial.*.FITS`. If this
+    turns out to be merely close rather than exact, that itself is a
+    finding worth recording precisely (which floating-point step
+    introduced the difference), not silently loosening the check to
+    `--rtol`.
+  - `nbands=1` bit-identical sweep and all prior tests unaffected (this is
+    a new, additive test; no source change anticipated unless the gate
+    above surfaces a real bug).
+- **Rollback Criteria:** N/A for the test itself. If the gate fails, that
+  is the signal to investigate — do not weaken the test to make it pass.
+- **Effort:** 0.5 session (reuses existing fixtures and an existing
+  comparison target; no new source code expected, only new test
+  fixtures/cfg/assertions).
+- **Evidence (2026-07-22):** Confirmed no source change was needed — the
+  gate passed on the first run. `tests/make_test_cubes.py` slices the
+  already-built primary-band arrays into `TEST_SPLIT_LO`/`TEST_SPLIT_HI`
+  (100 channels each, `CRVAL3` adjusted per half, `CDELT3` unchanged);
+  confirmed by direct file comparison that every existing fixture
+  (`TEST.Q/U`, `TEST_BADCHAN.*`, `TEST_BAND2.*`) is byte-identical to
+  before this addition. `run_tests.sh` section 17 runs the 2-band split
+  config and diffs AMP/PHA/MASK/NVALID against section 5's existing
+  `serial.*.FITS` — **bit-identical on the first attempt**, exactly as
+  the architectural reasoning predicted (contiguous split with the
+  low-frequency half as `reference_band` reconstructs the exact original
+  channel sequence, so the DFT sum performs the identical floating-point
+  operations in the identical order). Build unchanged (no source edited
+  this ticket; still 0 errors, 0 new warnings). `tests/run_tests.sh`:
+  38/38 pass (37 from T0-T4 + this one). `nbands=1` bit-identical sweep
+  unaffected (140/140 FITS, 6 expected pre-existing artifacts).

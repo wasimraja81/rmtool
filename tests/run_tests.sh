@@ -36,6 +36,10 @@
 #      combined, for a point source + Faraday-thick top-hat + F2/F3 pair.
 #      Also T4: multi-tile multi-band produces bit-identical output to
 #      the single-tile P+L run above (tiling must not change the answer)
+#  17. Split-band identity test (T5) – a contiguous 2-band split of the
+#      primary test cube (no gap) must reproduce the undivided cube's own
+#      output bit-for-bit; the most direct mechanical regression check
+#      for the frequency-merge architecture itself
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -1003,6 +1007,75 @@ CFGEOF
     fi
 else
     skip "Serial binary not available; skipping Sec 10 thesis scenario"
+fi
+
+# ---------------------------------------------------------------------------
+# 17. Split-band identity test (T5, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     the single most direct, mechanical regression check for the
+#     frequency-merge architecture -- splitting TEST.Q/U.FITSCUBE into two
+#     CONTIGUOUS halves (no gap) and running them as a 2-band multi-band
+#     config must reproduce the undivided cube's own output (section 5's
+#     "serial" run) bit-for-bit, not just approximately. Unlike the Sec 10
+#     scientific scenario, this has no qualitative-interpretation caveat --
+#     a mismatch here always means a real regression, never expected
+#     physics.
+# ---------------------------------------------------------------------------
+section "17. Split-band identity test – contiguous split == undivided cube (T5)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    split_cfg="$OUT_DIR/split_identity.cfg"
+    split_log="$OUT_DIR/split_identity.log"
+    rm -f "$OUT_DIR"/split_identity.*.FITS
+    cat > "$split_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/split_identity
+remove_badchan      = n
+global_badchan_file = /dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    if run_binary "$BIN_SERIAL" "$split_cfg" "$split_log"; then
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/serial.${suffix}.FITS"
+            f2="$OUT_DIR/split_identity.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "Split-band identity (T5): ${suffix} differs from undivided-cube output"
+                fi
+            else
+                all_match=0
+                fail "Split-band identity (T5): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "Split-band identity (T5): contiguous 2-band split bit-identical to undivided single-band cube"
+        fi
+    else
+        fail "Split-band identity (T5): run failed (see $split_log)"
+    fi
+else
+    skip "Serial binary not available; skipping split-band identity test"
 fi
 
 # ---------------------------------------------------------------------------

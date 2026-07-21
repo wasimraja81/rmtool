@@ -171,6 +171,33 @@ def main() -> None:
     fits.PrimaryHDU(data=q_cube, header=hdr).writeto(q_path, overwrite=True)
     fits.PrimaryHDU(data=u_cube, header=hdr).writeto(u_path, overwrite=True)
 
+    # Multi-band tomography (T5 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+    # split the primary band's own already-built arrays (not regenerated)
+    # into two CONTIGUOUS halves, channels 1..100 and 101..200 -- for the
+    # split-band identity test (contiguous multi-band split must reproduce
+    # the undivided cube's output exactly). Slicing the same array
+    # guarantees pixel-for-pixel correspondence to TEST.Q/U.FITSCUBE by
+    # construction; a re-synthesized pair of half-cubes would not give
+    # that guarantee even with the "same" RNG/signal parameters.
+    n_split = N_CHAN // 2
+    q_split_lo, u_split_lo = q_cube[:, :n_split], u_cube[:, :n_split]
+    q_split_hi, u_split_hi = q_cube[:, n_split:], u_cube[:, n_split:]
+    hdr_split_lo = make_header(NX, NY, n_split, F_START, F_STEP)
+    hdr_split_hi = make_header(NX, NY, N_CHAN - n_split,
+                                F_START + n_split * F_STEP, F_STEP)
+    q_path_split_lo = OUTDIR / "TEST_SPLIT_LO.Q.FITSCUBE"
+    u_path_split_lo = OUTDIR / "TEST_SPLIT_LO.U.FITSCUBE"
+    q_path_split_hi = OUTDIR / "TEST_SPLIT_HI.Q.FITSCUBE"
+    u_path_split_hi = OUTDIR / "TEST_SPLIT_HI.U.FITSCUBE"
+    fits.PrimaryHDU(data=q_split_lo, header=hdr_split_lo).writeto(
+        q_path_split_lo, overwrite=True)
+    fits.PrimaryHDU(data=u_split_lo, header=hdr_split_lo).writeto(
+        u_path_split_lo, overwrite=True)
+    fits.PrimaryHDU(data=q_split_hi, header=hdr_split_hi).writeto(
+        q_path_split_hi, overwrite=True)
+    fits.PrimaryHDU(data=u_split_hi, header=hdr_split_hi).writeto(
+        u_path_split_hi, overwrite=True)
+
     # Write cubes with bad channels (NaN at specific pixels)
     q_bad, u_bad = make_cubes_with_bad_channels(q_cube, u_cube,
                                                 BAD_CHANNEL_IDX,
@@ -228,6 +255,10 @@ def main() -> None:
     (OUTDIR / "truth.json").write_text(json.dumps(manifest, indent=2))
     print(f"Wrote {q_path}")
     print(f"Wrote {u_path}")
+    print(f"Wrote {q_path_split_lo}")
+    print(f"Wrote {u_path_split_lo}")
+    print(f"Wrote {q_path_split_hi}")
+    print(f"Wrote {u_path_split_hi}")
     print(f"Wrote {q_path_bad}")
     print(f"Wrote {u_path_bad}")
     print(f"Wrote {q_path2}")
