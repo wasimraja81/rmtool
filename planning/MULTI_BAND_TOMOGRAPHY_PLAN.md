@@ -528,6 +528,15 @@ Effort, each getting an **Evidence (...)** section appended once done.
     `scratch/baseline_encapsulation/T0_MANIFEST.md`'s existing format.
 - **Rollback Criteria:** N/A (measurement only).
 - **Effort:** 0.5 session.
+- **Evidence (2026-07-21, commit `baa52ce`):** Build clean via
+  `bash scratch/make_all.sh`: 0 compiler errors, 0 compiler warnings, 4
+  linker warnings (2 per GPU-offload binary — pre-existing
+  `crtoffloadtable.o`/`DT_TEXTREL` noise, matching
+  `scratch/baseline_encapsulation/T0_MANIFEST.md`'s own finding for the
+  same toolchain, GNU Fortran 13.3.0). `tests/run_tests.sh`: 28/28 pass, 0
+  fail, 0 skip. 174 output files (FITS/cfg/log/csv, 42M) archived to
+  `scratch/baseline_multiband/tests_output/` (gitignored, local-only —
+  full record in `scratch/baseline_multiband/T0_MANIFEST.md`).
 
 ---
 
