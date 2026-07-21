@@ -612,6 +612,40 @@ Effort, each getting an **Evidence (...)** section appended once done.
   N-band validation loop + synthetic multi-band fixture generation, gated
   by a bit-identical sweep that itself takes real wall-clock time to run
   and diff).
+- **Evidence (2026-07-21):** Implemented as designed: `band_cfg_t` +
+  `cfg%band(:)`/`cfg%reference_band` in `rm_synthesis_mod.f90`; comma-list
+  parsing via new `csv_count`/`csv_get_item` helpers, deferred to a
+  post-parse assembly step so every per-band key's list length can be
+  cross-validated before `cfg%band(:)` is allocated; the legacy scalar
+  fields (`cfg%infileQ` etc.) are populated from `cfg%band(reference_band)`
+  so every existing use site in `rm_synthesis.f90` is untouched. The new
+  N-band RA/Dec geometry-validation loop in `rm_synthesis.f90` is gated on
+  `size(cfg%band).gt.1` and sits entirely after the existing Q-vs-U
+  validation block — genuinely dead code for `nbands=1`, not merely
+  "expected to behave like" the old path.
+  - Build: clean, 0 errors, 0 new warnings (same 4 pre-existing
+    GPU-offload linker warnings as T0).
+  - `tests/run_tests.sh`: 31/31 pass (28 original + 3 new multi-band
+    fixture tests: matched-geometry validates and stops cleanly at
+    "not yet implemented"; mismatched-geometry loudly refused before any
+    compute; inconsistent per-band list lengths rejected at parse time).
+  - Bit-identical sweep: 140/140 FITS outputs match `scratch/baseline_multiband/`
+    (the 6 `badchan_*` files reported as "differing" by `compare_cubes.py
+    --exact` are the pre-existing NaN-vs-NaN tooling artifact from
+    `project_encapsulation_refactor` — re-confirmed self-referential here
+    by diffing the baseline archive against itself and seeing the
+    identical "201 elements differ" report). 16/16 `.cfg` outputs
+    byte-identical; `.csv`/`.log` differences are limited to expected
+    wall-clock timing values and run-id timestamps.
+  - `tests/make_test_cubes.py` extended with a `TEST_BAND2` (800 MHz,
+    150-channel) fixture sharing the primary band's RA/Dec geometry and
+    injected sources, plus a `TEST_BAND2_MISMATCH` variant (shifted
+    `CRVAL1`) — confirmed the primary band's own `TEST.Q/U.FITSCUBE` and
+    `TEST_BADCHAN.*` bytes are unchanged by this addition (verified via
+    direct file comparison against the pre-change fixtures, not just
+    "should be the same"), since the shared RNG stream for band 2's noise
+    is drawn strictly after band 1's, and band 1's own code path was only
+    refactored into a shared helper, not altered in sequence or content.
 
 ## 10. Multi-band synthetic test scenario (informs the Phase 2 ticket)
 

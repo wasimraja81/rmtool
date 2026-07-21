@@ -25,6 +25,11 @@
 #      7-tile run (T6 raw-write path bypasses CFITSIO for AMP/PHA pixel
 #      writes; guards against the CFITSIO handle-aliasing bug and the
 #      stale-buffer-at-close bug that raw-write mode replaced it with)
+#  15. Multi-band tomography (T1) – comma-separated-list infileQ/infileU
+#      config schema: matched-geometry two-band config validates and stops
+#      cleanly at "not yet implemented"; mismatched-geometry config is
+#      loudly refused; inconsistent per-band list lengths are rejected at
+#      config-parse time (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -787,6 +792,80 @@ io_write_threads=4")
     fi
 else
     skip "OMP binary not available; skipping io_write_threads test"
+fi
+
+# ---------------------------------------------------------------------------
+# 15. Multi-band tomography (T1) – comma-list config schema + geometry
+#     validation (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md). Fortran's bare
+#     `stop` always exits 0 in this codebase (every existing error path
+#     uses it, matching the pattern already relied on elsewhere in this
+#     script), so these checks are log-content based, not exit-code based.
+# ---------------------------------------------------------------------------
+section "15. Multi-band config schema – geometry validation (T1)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    mb_match_cfg="$OUT_DIR/mb_match.cfg"
+    mb_match_log="$OUT_DIR/mb_match.log"
+    cat > "$mb_match_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
+outfile             = ${OUT_DIR}/mb_match
+remove_badchan      = n
+global_badchan_file = /dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    "$BIN_SERIAL" "$mb_match_cfg" > "$mb_match_log" 2>&1
+    if grep -q "Multi-band geometry validated successfully across" "$mb_match_log" && \
+       grep -q "multi-band frequency merge is not yet implemented" "$mb_match_log"; then
+        pass "Multi-band matched-geometry config: validated 2 bands, stopped cleanly at not-yet-implemented"
+    else
+        fail "Multi-band matched-geometry config: expected validation/not-yet-implemented messages not found (see $mb_match_log)"
+    fi
+
+    mb_mismatch_cfg="$OUT_DIR/mb_mismatch.cfg"
+    mb_mismatch_log="$OUT_DIR/mb_mismatch.log"
+    sed -e "s|TEST_BAND2\.Q\.FITSCUBE|TEST_BAND2_MISMATCH.Q.FITSCUBE|" \
+        -e "s|${OUT_DIR}/mb_match|${OUT_DIR}/mb_mismatch|" \
+        "$mb_match_cfg" > "$mb_mismatch_cfg"
+    "$BIN_SERIAL" "$mb_mismatch_cfg" > "$mb_mismatch_log" 2>&1
+    if grep -q "ERROR: RA WCS mismatch for band" "$mb_mismatch_log" && \
+       ! grep -q "Multi-band geometry validated successfully" "$mb_mismatch_log"; then
+        pass "Multi-band mismatched-geometry config: loudly refused before compute"
+    else
+        fail "Multi-band mismatched-geometry config: expected loud-refuse message not found (see $mb_mismatch_log)"
+    fi
+
+    mb_lenmismatch_cfg="$OUT_DIR/mb_lenmismatch.cfg"
+    mb_lenmismatch_log="$OUT_DIR/mb_lenmismatch.log"
+    sed -e "s|infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE|infileU             = TEST.U.FITSCUBE|" \
+        -e "s|${OUT_DIR}/mb_match|${OUT_DIR}/mb_lenmismatch|" \
+        "$mb_match_cfg" > "$mb_lenmismatch_cfg"
+    "$BIN_SERIAL" "$mb_lenmismatch_cfg" > "$mb_lenmismatch_log" 2>&1
+    if grep -q "infileQ/infileU band-count mismatch" "$mb_lenmismatch_log"; then
+        pass "Multi-band inconsistent list-length config: rejected at parse time"
+    else
+        fail "Multi-band inconsistent list-length config: expected band-count-mismatch message not found (see $mb_lenmismatch_log)"
+    fi
+else
+    skip "Serial binary not available; skipping multi-band config tests"
 fi
 
 # ---------------------------------------------------------------------------

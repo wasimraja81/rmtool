@@ -17,7 +17,7 @@ module rm_synthesis_mod
   public :: prepare_gpu_data, prepare_cpu_data, tile_extract_gpu_rm_blocked
   public :: cubestat_tail_quantile_maps
   public :: linspace, nchar
-  public :: read_cfg_keyval, rmsynth_config_t
+  public :: read_cfg_keyval, rmsynth_config_t, band_cfg_t
   public :: plan_tile, tile_plan_t
   public :: compute_tile_read_bytes, split_channels_across_threads
   public :: write_runtime_estimate
@@ -103,10 +103,34 @@ module rm_synthesis_mod
   ! existing declared lengths in rm_synthesis.f90 exactly (172/16/272),
   ! not chosen fresh, so nothing about how config values are stored
   ! changes for this ticket.
+  !===========================================================================
+  ! Per-band config bundle (multi-band-tomography plan, T1 ticket,
+  ! planning/MULTI_BAND_TOMOGRAPHY_PLAN.md).
+  !===========================================================================
+  ! One element per band, populated from comma-separated per-band cfg keys
+  ! (see rmsynth_config_t%band below). A single-value (comma-free) cfg
+  ! produces a length-1 array here -- there is no separate "legacy" parsing
+  ! path (plan Sec 5, "one unified pipeline, comma-separated lists").
+  type :: band_cfg_t
+    character(len=272) :: infileQ = ' ', infileU = ' '
+    real(sp) :: resiQ = 0.0_sp, slopeQ = 0.0_sp, resiU = 0.0_sp, slopeU = 0.0_sp
+    character(len=272) :: path_I = ' ', infileI = ' '
+  end type band_cfg_t
+
   type :: rmsynth_config_t
     ! Input / output paths
     character(len=172) :: path = ' '
     character(len=272) :: infileQ = ' ', infileU = ' ', outfile = ' '
+    ! Multi-band tomography (plan Sec 5): band(:) holds the per-band
+    ! infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I values
+    ! parsed from their comma-separated cfg keys; reference_band selects
+    ! which entry's geometry every other band is validated against, and
+    ! whose values populate the legacy scalar fields above/below (infileQ,
+    ! infileU, resiQ, slopeQ, resiU, slopeU, infileI, path_I) so that every
+    ! existing single-band code path in rm_synthesis.f90 keeps reading
+    ! those scalars completely unchanged, for any band count.
+    integer(int32) :: reference_band = 1
+    type(band_cfg_t), allocatable :: band(:)
     ! Bad-channel handling
     logical :: remove_badchan = .false.
     character(len=172) :: badchan_file = ' '
@@ -1656,7 +1680,19 @@ contains
     logical :: seen_rem_mean, seen_remove_qu_bias
     logical :: seen_resiQ, seen_slopeQ, seen_resiU, seen_slopeU
     logical :: seen_path_I, seen_infileI
+    logical :: seen_reference_band
     logical :: seen_ofac, seen_fac, seen_beg_rm, seen_end_rm, seen_nrm_out
+    ! Multi-band tomography (T1 ticket): raw comma-separated text for each
+    ! per-band key, captured verbatim during the line-parse loop below and
+    ! split into cfg%band(:) only after the whole file has been read (so
+    ! every per-band key's list length can be cross-validated first). A
+    ! comma-free value is a length-1 list -- there is no separate
+    ! "single-band" parsing branch (plan Sec 5).
+    character(len=512) :: raw_infileQ, raw_infileU
+    character(len=512) :: raw_resiQ, raw_slopeQ, raw_resiU, raw_slopeU
+    character(len=512) :: raw_infileI, raw_path_I
+    character(len=512) :: csv_item
+    integer(int32) :: n_bands_local, ib
     logical :: seen_use_auto_rm_range
     logical :: seen_output_mode
     logical :: seen_ap_angle_mode
@@ -1710,6 +1746,15 @@ contains
     seen_slopeU = .false.
     seen_path_I = .false.
     seen_infileI = .false.
+    seen_reference_band = .false.
+    raw_infileQ = ' '
+    raw_infileU = ' '
+    raw_resiQ = ' '
+    raw_slopeQ = ' '
+    raw_resiU = ' '
+    raw_slopeU = ' '
+    raw_infileI = ' '
+    raw_path_I = ' '
     seen_ofac = .false.
     seen_fac = .false.
     seen_beg_rm = .false.
@@ -1739,6 +1784,7 @@ contains
     cfg%path = '../DATA/'
     cfg%infileQ = ' '
     cfg%infileU = ' '
+    cfg%reference_band = 1
     cfg%outfile = 'output'
     cfg%remove_badchan = .false.
     cfg%badchan_file = 'bad_channels.txt'
@@ -1828,7 +1874,7 @@ contains
           return
         end if
         seen_infileQ = .true.
-        cfg%infileQ = trim(val)
+        raw_infileQ = val
       case ('infileu')
         if (seen_infileU) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileU'
@@ -1837,7 +1883,22 @@ contains
           return
         end if
         seen_infileU = .true.
-        cfg%infileU = trim(val)
+        raw_infileU = val
+      case ('reference_band')
+        if (seen_reference_band) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': reference_band'
+          status = -230
+          close(unit_cfg)
+          return
+        end if
+        seen_reference_band = .true.
+        read(val, *, iostat=ios) cfg%reference_band
+        if (ios /= 0) then
+          write(*,*) 'Invalid integer for reference_band at cfg line ', line_no
+          status = -231
+          close(unit_cfg)
+          return
+        end if
       case ('outfile')
         if (seen_outfile) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': outfile'
@@ -2197,13 +2258,7 @@ contains
           return
         end if
         seen_resiQ = .true.
-        read(val, *, iostat=ios) cfg%resiQ
-        if (ios /= 0) then
-          write(*,*) 'Invalid real for resiQ at cfg line ', line_no
-          status = -112
-          close(unit_cfg)
-          return
-        end if
+        raw_resiQ = val
       case ('slopeq')
         if (seen_slopeQ) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': slopeQ'
@@ -2212,13 +2267,7 @@ contains
           return
         end if
         seen_slopeQ = .true.
-        read(val, *, iostat=ios) cfg%slopeQ
-        if (ios /= 0) then
-          write(*,*) 'Invalid real for slopeQ at cfg line ', line_no
-          status = -114
-          close(unit_cfg)
-          return
-        end if
+        raw_slopeQ = val
       case ('resiu')
         if (seen_resiU) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': resiU'
@@ -2227,13 +2276,7 @@ contains
           return
         end if
         seen_resiU = .true.
-        read(val, *, iostat=ios) cfg%resiU
-        if (ios /= 0) then
-          write(*,*) 'Invalid real for resiU at cfg line ', line_no
-          status = -116
-          close(unit_cfg)
-          return
-        end if
+        raw_resiU = val
       case ('slopeu')
         if (seen_slopeU) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': slopeU'
@@ -2242,13 +2285,7 @@ contains
           return
         end if
         seen_slopeU = .true.
-        read(val, *, iostat=ios) cfg%slopeU
-        if (ios /= 0) then
-          write(*,*) 'Invalid real for slopeU at cfg line ', line_no
-          status = -118
-          close(unit_cfg)
-          return
-        end if
+        raw_slopeU = val
       case ('path_i')
         if (seen_path_I) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': path_I'
@@ -2257,7 +2294,7 @@ contains
           return
         end if
         seen_path_I = .true.
-        cfg%path_I = trim(val)
+        raw_path_I = val
       case ('infilei')
         if (seen_infileI) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileI'
@@ -2266,7 +2303,7 @@ contains
           return
         end if
         seen_infileI = .true.
-        cfg%infileI = trim(val)
+        raw_infileI = val
       case ('ofac')
         if (seen_ofac) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': ofac'
@@ -2697,6 +2734,135 @@ contains
         write(*,*) 'Missing required cfg key: infileI (needed for remove_qu_bias=1)'
         status = -158
       end if
+    end if
+
+    ! Multi-band tomography (T1 ticket, plan Sec 5): assemble cfg%band(:)
+    ! from the raw comma-separated per-band keys captured above. Band count
+    ! is derived from infileQ's list length -- there is no separate nbands
+    ! cfg key. A comma-free infileQ (the ordinary single-band case) yields
+    ! n_bands_local=1, and the "populate legacy scalars" step below then
+    ! copies that one band's values straight back into
+    ! cfg%infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I --
+    ! bit-identical to what today's direct cfg%infileQ = trim(val)
+    ! assignment produced, just via one extra hop through cfg%band(1).
+    if (status == 0) then
+      n_bands_local = csv_count(raw_infileQ)
+      if (n_bands_local < 1) then
+        write(*,*) 'Invalid infileQ: empty value'
+        status = -200
+      end if
+    end if
+    if (status == 0 .and. csv_count(raw_infileU) /= n_bands_local) then
+      write(*,*) 'infileQ/infileU band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_infileU)
+      status = -201
+    end if
+    if (status == 0 .and. csv_count(raw_resiQ) /= n_bands_local) then
+      write(*,*) 'infileQ/resiQ band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_resiQ)
+      status = -202
+    end if
+    if (status == 0 .and. csv_count(raw_slopeQ) /= n_bands_local) then
+      write(*,*) 'infileQ/slopeQ band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_slopeQ)
+      status = -203
+    end if
+    if (status == 0 .and. csv_count(raw_resiU) /= n_bands_local) then
+      write(*,*) 'infileQ/resiU band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_resiU)
+      status = -204
+    end if
+    if (status == 0 .and. csv_count(raw_slopeU) /= n_bands_local) then
+      write(*,*) 'infileQ/slopeU band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_slopeU)
+      status = -205
+    end if
+    if (status == 0 .and. seen_infileI) then
+      if (csv_count(raw_infileI) /= n_bands_local) then
+        write(*,*) 'infileQ/infileI band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_infileI)
+        status = -206
+      end if
+    end if
+    if (status == 0 .and. seen_path_I) then
+      if (csv_count(raw_path_I) /= n_bands_local) then
+        write(*,*) 'infileQ/path_I band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_path_I)
+        status = -207
+      end if
+    end if
+    if (status == 0) then
+      if (cfg%reference_band < 1 .or. cfg%reference_band > n_bands_local) then
+        write(*,*) 'Invalid reference_band: ', cfg%reference_band, &
+        & ' (must be between 1 and ', n_bands_local, ')'
+        status = -208
+      end if
+    end if
+
+    if (status == 0) then
+      allocate(cfg%band(n_bands_local))
+      do ib = 1, n_bands_local
+        call csv_get_item(raw_infileQ, ib, cfg%band(ib)%infileQ)
+        call csv_get_item(raw_infileU, ib, cfg%band(ib)%infileU)
+
+        call csv_get_item(raw_resiQ, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%resiQ
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for resiQ, band ', ib
+          status = -210
+          exit
+        end if
+        call csv_get_item(raw_slopeQ, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%slopeQ
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for slopeQ, band ', ib
+          status = -211
+          exit
+        end if
+        call csv_get_item(raw_resiU, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%resiU
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for resiU, band ', ib
+          status = -212
+          exit
+        end if
+        call csv_get_item(raw_slopeU, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%slopeU
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for slopeU, band ', ib
+          status = -213
+          exit
+        end if
+
+        if (seen_infileI) then
+          call csv_get_item(raw_infileI, ib, cfg%band(ib)%infileI)
+        else
+          cfg%band(ib)%infileI = ' '
+        end if
+        ! path_I defaults to cfg%path (same as the pre-T1 scalar default,
+        ! rmsynth.cfg line "cfg%path_I = cfg%path" above) when not given.
+        if (seen_path_I) then
+          call csv_get_item(raw_path_I, ib, cfg%band(ib)%path_I)
+        else
+          cfg%band(ib)%path_I = trim(cfg%path)
+        end if
+      end do
+    end if
+
+    ! Populate the legacy scalar fields from the reference band, so every
+    ! existing single-band code path in rm_synthesis.f90 (which reads
+    ! cfg%infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I
+    ! directly, unchanged) keeps working exactly as before, for any band
+    ! count.
+    if (status == 0) then
+      cfg%infileQ = cfg%band(cfg%reference_band)%infileQ
+      cfg%infileU = cfg%band(cfg%reference_band)%infileU
+      cfg%resiQ = cfg%band(cfg%reference_band)%resiQ
+      cfg%slopeQ = cfg%band(cfg%reference_band)%slopeQ
+      cfg%resiU = cfg%band(cfg%reference_band)%resiU
+      cfg%slopeU = cfg%band(cfg%reference_band)%slopeU
+      cfg%infileI = cfg%band(cfg%reference_band)%infileI
+      cfg%path_I = cfg%band(cfg%reference_band)%path_I
     end if
 
     close(unit_cfg)
@@ -3162,6 +3328,58 @@ contains
       flag_from_value = .true.
     end if
   end function flag_from_value
+
+  !===========================================================================
+  ! Comma-separated-list helpers (multi-band-tomography plan, T1 ticket).
+  !===========================================================================
+  ! A comma-free string is a length-1 list -- csv_count/csv_get_item make
+  ! no distinction between "one value" and "a list of one", which is the
+  ! whole point of the unified single-value/multi-band cfg design (plan
+  ! Sec 5): every per-band key is parsed by the same code regardless of
+  ! band count.
+  function csv_count(str) result(n)
+    !! Number of comma-separated items in str (1 if no comma present,
+    !! 0 for a blank/empty string).
+    implicit none
+    character(len=*), intent(in) :: str
+    integer(int32) :: n
+    integer(int32) :: i
+
+    n = 0
+    if (len_trim(str) == 0) return
+    n = 1
+    do i = 1, len_trim(str)
+      if (str(i:i) == ',') n = n + 1
+    end do
+  end function csv_count
+
+  subroutine csv_get_item(str, idx, item)
+    !! Extract the idx-th (1-based) comma-separated item from str, trimmed
+    !! of surrounding blanks. item is blank if idx is out of range.
+    implicit none
+    character(len=*), intent(in) :: str
+    integer(int32), intent(in) :: idx
+    character(len=*), intent(out) :: item
+    integer(int32) :: i, cur, p0, n
+
+    item = ' '
+    n = len_trim(str)
+    if (n == 0) return
+
+    cur = 1
+    p0 = 1
+    do i = 1, n
+      if (str(i:i) == ',') then
+        if (cur == idx) then
+          item = adjustl(str(p0:i - 1))
+          return
+        end if
+        cur = cur + 1
+        p0 = i + 1
+      end if
+    end do
+    if (cur == idx) item = adjustl(str(p0:n))
+  end subroutine csv_get_item
 
   !===========================================================================
   ! Safe intra-write parallelism for io_write_threads>1 (T6).

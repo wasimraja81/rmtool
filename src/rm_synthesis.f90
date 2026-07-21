@@ -136,6 +136,20 @@ integer   bitpixM, naxisM, naxesM(max_axis)
 integer   bitpix, naxis, naxes(max_axis), naxes_out(max_axis)
 logical   simple, extend
 integer   decimals
+ ! Multi-band tomography (T1 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+ ! scratch header-info variables reused across every non-reference band's
+ ! Q and U file, in the new geometry-validation loop below. Only touched
+ ! when size(cfg%band).gt.1 -- a no-op, unallocated-branch-not-taken cost
+ ! for the ordinary single-band case.
+integer   bitpixQb, naxisQb, naxesQb(max_axis)
+integer(int64) :: hdrbytesQb
+real(sp) cxval_imQb, cyval_imQb, czval_imQb
+integer   cxpix_imQb, cypix_imQb, czpix_imQb
+real(sp) xinc_imQb, yinc_imQb, zinc_imQb
+integer   freq_axisQb
+logical   cubeQb
+integer   iband, iqu
+character(len=272) :: bandfile
 
 real(sp) cxval_im, cyval_im, czval_im
 integer   cxpix_im, cypix_im, czpix_im
@@ -829,6 +843,97 @@ else
    write(*,*)"Data types in the Q and U-files differ"
    write(*,*)"Forcing data type to real*4 format..."
    bitpix = -32  ! force real*4 when discrepancy exist
+endif
+
+ ! Multi-band tomography (T1 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+ ! validate every additional configured band's RA/Dec pixel geometry
+ ! against the reference band's (naxis/naxes/cxval_im/etc., just
+ ! established above from cfg%infileQ/cfg%infileU, i.e.
+ ! cfg%band(cfg%reference_band)). A no-op when only one band is
+ ! configured -- the single-band validation above is untouched by this
+ ! block, and this whole branch is never entered.
+if (size(cfg%band).gt.1)then
+   do iband = 1,size(cfg%band)
+      if (iband.eq.cfg%reference_band) cycle
+      do iqu = 1,2
+         if (iqu.eq.1)then
+            bandfile = cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileQ(1:nchar(cfg%band(iband)%infileQ))
+         else
+            bandfile = cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileU(1:nchar(cfg%band(iband)%infileU))
+         endif
+         status = 0
+         call myfits_info(bandfile,&
+         &bitpixQb,naxisQb,naxesQb,&
+         &cxval_imQb,cxpix_imQb,xinc_imQb,&
+         &cyval_imQb,cypix_imQb,yinc_imQb,&
+         &czval_imQb,czpix_imQb,zinc_imQb,&
+         &freq_axisQb,cubeQb,message,status,hdrbytesQb)
+         if (status.ne.0)then
+            write(*,*)'ERROR: failed to read header for band ',iband
+            write(*,*)'file: ',bandfile(1:nchar(bandfile))
+            write(*,*)'message:',message(1:nchar(message))
+            write(*,*)'Quitting now...'
+            stop
+         else if (.not.cubeQb)then
+            write(*,*)'ERROR: Missing spectral axis in band ',iband,' file!'
+            write(*,*)'file: ',bandfile(1:nchar(bandfile))
+            write(*,*)'Quitting now...'
+            stop
+         else if (freq_axisQb.ne.freq_axis)then
+            write(*,*)'ERROR: Frequency-axis index mis-match for band ',iband
+            write(*,*)'Reference FREQ axis = ',freq_axis
+            write(*,*)'Band ',iband,' FREQ axis = ',freq_axisQb
+            write(*,*)'Quitting now...'
+            stop
+         else if (naxisQb.ne.naxis)then
+            write(*,*)'ERROR: NAXIS mis-match for band ',iband
+            write(*,*)'Reference NAXIS = ',naxis
+            write(*,*)'Band ',iband,' NAXIS = ',naxisQb
+            write(*,*)'Quitting now...'
+            stop
+         else if (naxesQb(1).ne.naxes(1))then
+            write(*,*)'ERROR: RA pixel-grid size mismatch for band ',iband
+            write(*,*)'Reference RA length = ',naxes(1)
+            write(*,*)'Band ',iband,' RA length = ',naxesQb(1)
+            write(*,*)'Quitting now...'
+            stop
+         else if (naxesQb(2).ne.naxes(2))then
+            write(*,*)'ERROR: Dec pixel-grid size mismatch for band ',iband
+            write(*,*)'Reference Dec length = ',naxes(2)
+            write(*,*)'Band ',iband,' Dec length = ',naxesQb(2)
+            write(*,*)'Quitting now...'
+            stop
+         else if (cxval_imQb.ne.cxval_im .or. cxpix_imQb.ne.cxpix_im .or.&
+         &xinc_imQb.ne.xinc_im)then
+            write(*,*)'ERROR: RA WCS mismatch for band ',iband
+            write(*,*)'Reference CRVAL1/CRPIX1/CDELT1 = ',&
+            &cxval_im,cxpix_im,xinc_im
+            write(*,*)'Band ',iband,' CRVAL1/CRPIX1/CDELT1 = ',&
+            &cxval_imQb,cxpix_imQb,xinc_imQb
+            write(*,*)'Quitting now...'
+            stop
+         else if (cyval_imQb.ne.cyval_im .or. cypix_imQb.ne.cypix_im .or.&
+         &yinc_imQb.ne.yinc_im)then
+            write(*,*)'ERROR: Dec WCS mismatch for band ',iband
+            write(*,*)'Reference CRVAL2/CRPIX2/CDELT2 = ',&
+            &cyval_im,cypix_im,yinc_im
+            write(*,*)'Band ',iband,' CRVAL2/CRPIX2/CDELT2 = ',&
+            &cyval_imQb,cypix_imQb,yinc_imQb
+            write(*,*)'Quitting now...'
+            stop
+         endif
+      enddo
+   enddo
+   write(*,*)' '
+   write(*,*)'Multi-band geometry validated successfully across ',&
+   &size(cfg%band),' bands.'
+   write(*,*)'ERROR: multi-band frequency merge is not yet implemented.'
+   write(*,*)'This build only supports single-band synthesis for now.'
+   write(*,*)'See planning/MULTI_BAND_TOMOGRAPHY_PLAN.md for status.'
+   write(*,*)'Quitting now...'
+   stop
 endif
 
 
