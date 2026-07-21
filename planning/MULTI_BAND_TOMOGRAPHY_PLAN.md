@@ -647,6 +647,90 @@ Effort, each getting an **Evidence (...)** section appended once done.
     is drawn strictly after band 1's, and band 1's own code path was only
     refactored into a shared helper, not altered in sequence or content.
 
+---
+
+### T2 — Multi-Band Frequency/λ² Merge (CPU, Single-Tile)
+
+- **Objective:** Replace T1's "not yet implemented" stop with an actual
+  multi-band RM synthesis, for the narrowest slice that can be verified
+  against §10's thesis-grounded scenario: CPU-only (serial and OMP),
+  single-tile cubes. This deliberately narrows §6 phase 2's original
+  description — see "Scope narrowing" below for what's cut and why.
+- **Scope narrowing (confirmed direction, 2026-07-21):** attempting to
+  thread multi-band support through every existing feature (GPU
+  offload/staging, subimage extraction, the bad-channel-*file* mechanism,
+  `remove_qu_bias`, multi-tile RAM planning, `io_read_threads`/
+  `io_overlap`) in one ticket is more than one verifiable increment can
+  safely absorb, especially under the bit-identical bar this whole effort
+  already operates under. T2 covers CPU compute + single-tile only;
+  everything else loudly stops with an explicit "not yet implemented for
+  multi-band" message when requested with more than one band, exactly the
+  same graceful-stop philosophy T1 already established for the whole
+  feature. Per-pixel NaN-based masking (not the bad-channel-*file*
+  mechanism) is unaffected and continues to work per band naturally, since
+  it's a property of the read data, not a separate per-band list.
+- **Change Set:**
+  - `src/rm_synthesis.f90` header/frequency-read section (~1470-1620
+    today): for each band, read its own `CRVAL`/`CRPIX`/`CDELT` on the
+    freq axis (already partially done in T1's geometry loop for bands
+    2..N, but only for the RA/Dec axes — extend to also capture the freq
+    axis for the merge) and build that band's own per-channel frequency
+    array via the existing `linspace` logic, unchanged. Concatenate every
+    band's channel list (frequency, and hence λ², plus per-channel
+    weight/flag) into one merged array — no deduplication in overlaps
+    (§4/§7 decision 1), no sorting required (the DFT kernel is
+    order-independent, confirmed in §4). This redefines `nz_out` from "one
+    cube's channel count" to "sum of all bands' channel counts" — touches
+    every allocation sized by it (`data_arrQ/U`, `flag_arr_out`, `L_sq`,
+    `cos_arr`/`sin_arr`, tile-local `specQ`/`specU`).
+  - Tile read stage: loop over bands, one `FTGSVE` call per band per tile
+    (serial, `io_read_threads` forced to 1 for `nbands>1` — stop if the
+    user requests `io_read_threads>1` or `io_overlap=y` with `nbands>1`,
+    deferred per the scope narrowing above), each band's data landing in
+    its own disjoint slice of the enlarged `specQ`/`specU` buffers.
+  - Tile planning: if the RAM auto-tiler (or an explicit `tile_ra`/
+    `tile_dec`) would produce more than one tile for a multi-band run,
+    stop with "multi-tile multi-band not yet implemented" — deferred per
+    the scope narrowing above. `nbands=1` tiling is completely unaffected.
+  - GPU path (`use_gpu=y` with `nbands>1`), subimage (`subim=y` with
+    `nbands>1`), bad-channel-file (`remove_badchan=y` with `nbands>1`),
+    and `remove_qu_bias=y` with `nbands>1` (per §6 phase 4 — bias
+    correction is per-band and explicitly deferred to its own ticket): all
+    stop with an explicit not-yet-implemented message rather than silently
+    producing wrong output.
+  - `RM-range/resolution diagnostic`: not required for T2's own
+    correctness gate (that's phase 3), but T2's test cfgs need
+    `use_auto_rm_range=0` with explicit `beg_rm`/`end_rm`/`nrm` regardless
+    (already forbidden for `nbands>1` per §7 decision 5).
+- **Correctness Gate:**
+  - **`nbands=1` path: still bit-identical** to `scratch/baseline_multiband/`
+    (T0) — this ticket touches the frequency-array-construction and tile-read
+    code that the single-band path also runs through, so this is not a
+    given the way T1's purely-additive geometry loop was; it must be
+    re-verified explicitly, not assumed.
+  - **§10 scenario, P-band alone:** point source (RM=-100) recovered
+    accurately; the Faraday-thick top-hat component (RM 100-130) is
+    essentially invisible (`max RM scale=3.6 ≪` thickness 30).
+  - **§10 scenario, L-band alone:** both components blend into one
+    unresolved feature (`δRM=250.1` ≫ their ~215 rad m⁻² separation).
+  - **§10 scenario, P+L combined:** point source still recovered
+    accurately; the top-hat component's extended structure is now
+    recovered (a significant fraction of its flux, distinguishable in
+    shape from a point source) — the actual multi-band payoff this ticket
+    exists to deliver.
+  - **§10 scenario, F2/F3 addition:** blended at L alone, resolved at P
+    alone and combined (§10's own honesty note about what this specifically
+    demonstrates still applies).
+  - Every "not yet implemented" stop (GPU/subimage/badchan-file/
+    remove_qu_bias/multi-tile/io-parallelism × `nbands>1`) triggers
+    cleanly, before any wrong compute, with a clear message.
+- **Rollback Criteria:** If the `nbands=1` bit-identical gate cannot be
+  met, roll back to before this ticket — the frequency-merge logic is not
+  worth landing at the cost of silently changing single-band output.
+- **Effort:** 3-4 sessions (frequency-array generalization touches a wide
+  radius of `nz_out`-sized state; the §10 fixture generation and
+  RM-recovery assertions are new test-infrastructure, not just cfg files).
+
 ## 10. Multi-band synthetic test scenario (informs the Phase 2 ticket)
 
 Per §7 decision 6, all multi-band correctness testing is synthetic. This
