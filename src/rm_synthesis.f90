@@ -170,6 +170,15 @@ integer, allocatable :: band_unit_Q(:), band_unit_U(:)
  ! for other bands' reads.
 integer, allocatable :: band_naxes(:,:)
 integer   n_bands_t2, nz_out_band
+ ! T6 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): each band's own resolved
+ ! channel sub-range (subim_chan_blc/trc/inc, 0/0/1 defaults meaning "full
+ ! band", applied only when cfg%subim=.true.). band_chan_blc holds the
+ ! resolved (never-0) first selected raw pixel index; band_chan_inc the
+ ! resolved stride. band_nz(iband) is redefined by this ticket to mean
+ ! that band's own *selected* channel count, not its raw NAXIS3 -- see the
+ ! per-band geometry-validation loop below. Unused for nbands=1.
+integer, allocatable :: band_chan_blc(:), band_chan_inc(:)
+integer   chan_trc_eff_t6
  ! T2: per-band frequency/lambda^2 array construction for every
  ! non-reference band, mirroring the reference band's own
  ! frequency-unit-inference + linspace logic exactly, applied
@@ -336,6 +345,11 @@ integer(kind=int64) :: io_par_nz_k, io_par_z_off_k, io_par_buf_off
 integer   io_par_z_beg, io_par_z_end
 integer   io_par_anyflg_priv, io_par_status_priv
 integer   io_par_fpixels(max_axis), io_par_lpixels(max_axis)
+ ! T6 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band read stride for
+ ! the non-reference-band FTGSVE calls -- RA/Dec entries always match the
+ ! shared incs(:) (identical sky footprint across bands); only the
+ ! freq-axis entry differs per band (band_chan_inc(iband)).
+integer   io_par_incs_band(max_axis)
 logical   io_par_read_ok
  ! Write-side handle and scratch (RM-chunked for AMP/PHA cubes). Always a
  ! single handle now regardless of io_write_threads_eff -- see the T6
@@ -390,6 +404,20 @@ integer   nbad_chan, ngood_chan
 integer, allocatable :: flag_arr(:)
 integer, allocatable :: flag_arr_out(:)
 character(len=16) :: masksrc_key, nanchk_key
+ ! T7 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band bad-channel list,
+ ! same format/semantics as bad_chan/flag_arr above but sized to each
+ ! non-reference band's own raw NAXIS3 (band_naxes(iband,freq_axis)) --
+ ! read fresh, used, and discarded once per band inside the T2 append
+ ! loop, rather than kept as a persistent per-band array. Unused for
+ ! nbands=1.
+real(sp), allocatable :: bad_chan_band_t7(:)
+integer, allocatable :: flag_arr_band_t7(:)
+integer   nbad_chan_band_t7, ios_band_t7, i7
+ ! T7: total bad-channel count across every band (reference + others),
+ ! for the NBADGLOB output header -- equals nbad_chan (reference band's
+ ! own count, unchanged) whenever nbands=1, since the T2 loop that
+ ! accumulates the other bands' counts is then a no-op.
+integer   nbad_chan_total_t7
 
  ! processing related:
 
@@ -891,26 +919,12 @@ endif
  ! untouched by this block, and this whole branch is never entered.
 n_bands_t2 = size(cfg%band)
 if (n_bands_t2.gt.1)then
-   ! T2 scope narrowing (plan Sec 9, T2 ticket): only the CPU, single-tile
-   ! combination is implemented for nbands>1 so far -- every other
-   ! existing feature stops here, explicitly, rather than silently
-   ! producing wrong output.
-   if (use_gpu_actual)then
-      write(*,*)'ERROR: multi-band GPU synthesis is not yet implemented.'
-      write(*,*)'Set use_gpu=n, or use a single band (nbands=1).'
-      write(*,*)'Quitting now...'
-      stop
-   else if (cfg%subim)then
-      write(*,*)'ERROR: multi-band subimage extraction is not yet implemented.'
-      write(*,*)'Set subim=n, or use a single band (nbands=1).'
-      write(*,*)'Quitting now...'
-      stop
-   else if (cfg%remove_badchan)then
-      write(*,*)'ERROR: multi-band bad-channel-file masking is not yet implemented.'
-      write(*,*)'Set remove_badchan=n, or use a single band (nbands=1).'
-      write(*,*)'Quitting now...'
-      stop
-   else if (cfg%remove_qu_bias)then
+   ! T2 scope narrowing (plan Sec 9, T2 ticket), progressively relaxed by
+   ! T4 (multi-tile), T6 (channel subimaging), T7 (per-band bad-channel
+   ! files), and T8 (GPU offload, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+   ! the features listed below remain genuinely out of scope -- every one
+   ! stops here, explicitly, rather than silently producing wrong output.
+   if (cfg%remove_qu_bias)then
       write(*,*)'ERROR: multi-band Q/U bias correction is not yet implemented.'
       write(*,*)'Set remove_qu_bias=n, or use a single band (nbands=1).'
       write(*,*)'Quitting now...'
@@ -937,6 +951,7 @@ if (n_bands_t2.gt.1)then
    allocate(band_offset(n_bands_t2))
    allocate(band_unit_Q(n_bands_t2), band_unit_U(n_bands_t2))
    allocate(band_naxes(n_bands_t2,max_axis))
+   allocate(band_chan_blc(n_bands_t2), band_chan_inc(n_bands_t2))
 
    ! Reference band: already open (units 21/22) and already validated
    ! (the pre-existing Q-vs-U block above); its freq-axis description is
@@ -944,7 +959,40 @@ if (n_bands_t2.gt.1)then
    band_czval(cfg%reference_band) = czval_im
    band_czpix(cfg%reference_band) = czpix_im
    band_zinc(cfg%reference_band) = zinc_im
-   band_nz(cfg%reference_band) = naxes(freq_axis)
+   ! T6: band_nz here must be the reference band's own *selected* channel
+   ! count (subim_chan_blc/trc/inc-aware, 0 defaults meaning "full band"),
+   ! not its raw NAXIS3 -- nz_out_band/band_offset below are accumulated
+   ! from band_nz before the pre-existing single-band subim block (further
+   ! down this file) ever runs, so this must be resolved independently
+   ! here, mirroring that block's own arithmetic.
+   if (.not. cfg%subim) then
+      band_chan_blc(cfg%reference_band) = 1
+      band_chan_inc(cfg%reference_band) = 1
+      band_nz(cfg%reference_band) = naxes(freq_axis)
+   else
+      if (cfg%band(cfg%reference_band)%chan_blc .eq. 0) then
+         band_chan_blc(cfg%reference_band) = 1
+      else
+         band_chan_blc(cfg%reference_band) = cfg%band(cfg%reference_band)%chan_blc
+      endif
+      if (cfg%band(cfg%reference_band)%chan_trc .eq. 0) then
+         chan_trc_eff_t6 = naxes(freq_axis)
+      else
+         chan_trc_eff_t6 = cfg%band(cfg%reference_band)%chan_trc
+      endif
+      band_chan_inc(cfg%reference_band) = cfg%band(cfg%reference_band)%chan_inc
+      if (band_chan_blc(cfg%reference_band) .gt. naxes(freq_axis) .or.&
+      &chan_trc_eff_t6 .gt. naxes(freq_axis))then
+         write(*,*)'ERROR: subim_chan_blc/trc exceeds NAXIS for the',&
+         &' reference band'
+         write(*,*)'NAXIS(freq axis) = ',naxes(freq_axis)
+         write(*,*)'Quitting now...'
+         stop
+      endif
+      band_nz(cfg%reference_band) = int((chan_trc_eff_t6 -&
+      &band_chan_blc(cfg%reference_band))/&
+      &band_chan_inc(cfg%reference_band)) + 1
+   endif
    band_naxes(cfg%reference_band,1:naxis) = naxes(1:naxis)
    band_unit_Q(cfg%reference_band) = 21
    band_unit_U(cfg%reference_band) = 22
@@ -1043,7 +1091,36 @@ if (n_bands_t2.gt.1)then
             band_czval(iband) = czval_imQb_q
             band_czpix(iband) = czpix_imQb_q
             band_zinc(iband) = zinc_imQb_q
-            band_nz(iband) = naxz_imQb_q
+            ! T6: band_nz here must be this band's own *selected* channel
+            ! count (subim_chan_blc/trc/inc-aware), not its raw NAXIS3 --
+            ! mirrors the reference band's own resolution just above.
+            if (.not. cfg%subim) then
+               band_chan_blc(iband) = 1
+               band_chan_inc(iband) = 1
+               band_nz(iband) = naxz_imQb_q
+            else
+               if (cfg%band(iband)%chan_blc .eq. 0) then
+                  band_chan_blc(iband) = 1
+               else
+                  band_chan_blc(iband) = cfg%band(iband)%chan_blc
+               endif
+               if (cfg%band(iband)%chan_trc .eq. 0) then
+                  chan_trc_eff_t6 = naxz_imQb_q
+               else
+                  chan_trc_eff_t6 = cfg%band(iband)%chan_trc
+               endif
+               band_chan_inc(iband) = cfg%band(iband)%chan_inc
+               if (band_chan_blc(iband) .gt. naxz_imQb_q .or.&
+               &chan_trc_eff_t6 .gt. naxz_imQb_q)then
+                  write(*,*)'ERROR: subim_chan_blc/trc exceeds NAXIS for',&
+                  &' band ',iband
+                  write(*,*)'NAXIS(freq axis) = ',naxz_imQb_q
+                  write(*,*)'Quitting now...'
+                  stop
+               endif
+               band_nz(iband) = int((chan_trc_eff_t6 -&
+               &band_chan_blc(iband))/band_chan_inc(iband)) + 1
+            endif
             ! naxesQb here reflects U's just-validated read (equal to Q's,
             ! per the Q-vs-U freq-axis check just above; RA/Dec already
             ! matched the reference band earlier in this same iteration).
@@ -1866,15 +1943,57 @@ enddo
  ! above (indices 1:nz_out_ref, unchanged) is always first. Each band's
  ! frequency-unit inference and z1/zn/linspace construction mirrors the
  ! reference band's own logic above exactly, applied independently
- ! (mirrors nz_1st's czpix_im.eq.0 edge case too). All channels from
- ! non-reference bands are marked good (flag=1): remove_badchan is
- ! rejected for nbands>1 above, so there is no bad-channel list to apply
- ! to them; NaN-based per-pixel masking is separate and still applies,
- ! downstream, regardless of which band a channel came from. A no-op for
- ! nbands=1.
+ ! (mirrors nz_1st's czpix_im.eq.0 edge case too). T7
+ ! (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): each non-reference band's own
+ ! bad-channel file (cfg%band(iband)%badchan_file, always required, same
+ ! format as the reference band's own -- raw pixel indices into that
+ ! band's own file) is read fresh here and applied via flag_arr_band_t7,
+ ! same as the reference band's flag_arr above; NaN-based per-pixel
+ ! masking is separate and still applies, downstream, regardless of which
+ ! band a channel came from. A no-op for nbands=1.
+nbad_chan_total_t7 = nbad_chan
 if (n_bands_t2.gt.1) then
    do iband = 1,n_bands_t2
       if (iband.eq.cfg%reference_band) cycle
+      allocate(flag_arr_band_t7(band_naxes(iband,freq_axis)))
+      flag_arr_band_t7 = 1
+      nbad_chan_band_t7 = 0
+      if (cfg%remove_badchan) then
+         allocate(bad_chan_band_t7(band_naxes(iband,freq_axis)))
+         open(71,file=cfg%band(iband)%badchan_file(&
+         &1:nchar(cfg%band(iband)%badchan_file)),&
+         &status='old',iostat=ios_band_t7)
+         if (ios_band_t7 .ne. 0)then
+            write(*,*)'ERROR: failed to open bad-channel file for band ',&
+            &iband
+            write(*,*)cfg%band(iband)%badchan_file(&
+            &1:nchar(cfg%band(iband)%badchan_file))
+            write(*,*)'Quitting now...'
+            stop
+         else
+            do while(.true.)
+               nbad_chan_band_t7 = nbad_chan_band_t7 + 1
+               if (nbad_chan_band_t7 .gt. band_naxes(iband,freq_axis))then
+                  write(*,*)'Too many bad channels for band ',iband
+                  write(*,*)'Max by cube:'
+                  write(*,*)band_naxes(iband,freq_axis)
+                  close(71)
+                  stop
+               endif
+               read(71,*,end=712)bad_chan_band_t7(nbad_chan_band_t7)
+            enddo
+712         continue
+            nbad_chan_band_t7 = nbad_chan_band_t7 - 1
+            write(*,*)'Number of Bad Channels (band ',iband,'): ',&
+            &nbad_chan_band_t7
+            close(71)
+            do i7 = 1,nbad_chan_band_t7
+               flag_arr_band_t7(int(bad_chan_band_t7(i7))) = 0
+            enddo
+         endif
+         deallocate(bad_chan_band_t7)
+         nbad_chan_total_t7 = nbad_chan_total_t7 + nbad_chan_band_t7
+      endif
       if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
          conv_fac_band = c_velocity
       else if (band_czval(iband).ge.30.0e6.and.&
@@ -1891,16 +2010,29 @@ if (n_bands_t2.gt.1) then
       else
          nz1_band = band_czpix(iband) - 1
       endif
+      ! T6: z1_band is the frequency at this band's own first *selected*
+      ! channel (raw pixel band_chan_blc(iband), 1 by default), not always
+      ! raw pixel 1; zn_band's step accounts for the selection stride
+      ! band_chan_inc(iband) (1 by default) between selected channels.
       z1_band = band_czval(iband) - real(nz1_band,kind=sp)*band_zinc(iband)
-      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*band_zinc(iband)
+      z1_band = z1_band +&
+      &real(band_chan_blc(iband)-1,kind=sp)*band_zinc(iband)
+      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*&
+      &band_zinc(iband)*real(band_chan_inc(iband),kind=sp)
       nz_tmp_band = band_nz(iband)
       allocate(zval_band(band_nz(iband)))
       call linspace(z1_band,zn_band,nz_tmp_band,zval_band)
       do i = 1,band_nz(iband)
          L_sq(band_offset(iband)+i) = (conv_fac_band/zval_band(i))**2
-         flag_arr_out(band_offset(iband)+i) = 1
+         ! T7: raw pixel index of this band's i-th selected channel,
+         ! mirroring band_chan_blc/band_chan_inc's use in the tile-read
+         ! loop -- looks up that band's own flag_arr_band_t7 rather than
+         ! always marking the channel good.
+         flag_arr_out(band_offset(iband)+i) =&
+         &flag_arr_band_t7(band_chan_blc(iband)+(i-1)*band_chan_inc(iband))
       enddo
       deallocate(zval_band)
+      deallocate(flag_arr_band_t7)
    enddo
 endif
 
@@ -1933,8 +2065,13 @@ if (n_bands_t2.gt.1) then
       else
          nz1_band = band_czpix(iband) - 1
       endif
+      ! T6: shift to this band's own first *selected* channel (mirrors the
+      ! append-other-bands L_sq loop above).
       z1_band = band_czval(iband) - real(nz1_band,kind=sp)*band_zinc(iband)
-      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*band_zinc(iband)
+      z1_band = z1_band +&
+      &real(band_chan_blc(iband)-1,kind=sp)*band_zinc(iband)
+      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*&
+      &band_zinc(iband)*real(band_chan_inc(iband),kind=sp)
       ! Independent per-band frequency-unit inference (a band's receiver
       ! may report frequency in different units than another's).
       if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
@@ -2843,16 +2980,16 @@ if(out_nvalid_open)then
    &1:nchar(masksrc_key)),&
    &'Mask source: generated/input/combined',status)
 endif
-call ftpkyj(41,'NBADGLOB',nbad_chan,&
+call ftpkyj(41,'NBADGLOB',nbad_chan_total_t7,&
 &'No. of globally bad channels',status)
-call ftpkyj(42,'NBADGLOB',nbad_chan,&
+call ftpkyj(42,'NBADGLOB',nbad_chan_total_t7,&
 &'No. of globally bad channels',status)
 if(out_mask_open)then
-   call ftpkyj(43,'NBADGLOB',nbad_chan,&
+   call ftpkyj(43,'NBADGLOB',nbad_chan_total_t7,&
    &'No. of globally bad channels',status)
 endif
 if(out_nvalid_open)then
-   call ftpkyj(44,'NBADGLOB',nbad_chan,&
+   call ftpkyj(44,'NBADGLOB',nbad_chan_total_t7,&
    &'No. of globally bad channels',status)
 endif
 call ftpkys(41,'NANCHK',nanchk_key(1:nchar(nanchk_key)),&
@@ -3323,6 +3460,9 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       ! tile are shared with the reference band's read above (identical
       ! sky footprint, validated geometry); only the freq-axis
       ! range/naxes differ per band. A no-op for nbands=1.
+      ! T6: freq-axis fpixels/lpixels/incs now come from this band's own
+      ! resolved chan sub-range (band_chan_blc/band_chan_inc, 1/1 defaults
+      ! meaning "full band from pixel 1") instead of always "1..band_nz".
       if (n_bands_t2.gt.1) then
          do iband = 1,n_bands_t2
             if (iband.eq.cfg%reference_band) cycle
@@ -3330,19 +3470,22 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
             &io_par_per_plane + 1_int64
             io_par_fpixels = fpixels
             io_par_lpixels = lpixels
-            io_par_fpixels(freq_axis) = 1
-            io_par_lpixels(freq_axis) = band_nz(iband)
+            io_par_incs_band = incs
+            io_par_fpixels(freq_axis) = band_chan_blc(iband)
+            io_par_lpixels(freq_axis) = band_chan_blc(iband) +&
+            &(band_nz(iband)-1)*band_chan_inc(iband)
+            io_par_incs_band(freq_axis) = band_chan_inc(iband)
             io_par_status_priv = 0
             call FTGSVE(band_unit_Q(iband),group,naxis,&
             &band_naxes(iband,:),&
-            &io_par_fpixels,io_par_lpixels,incs,&
+            &io_par_fpixels,io_par_lpixels,io_par_incs_band,&
             &nullval,specQ(io_par_buf_off),io_par_anyflg_priv,&
             &io_par_status_priv)
             if (io_par_status_priv.ne.0) io_par_read_ok = .false.
             io_par_status_priv = 0
             call FTGSVE(band_unit_U(iband),group,naxis,&
             &band_naxes(iband,:),&
-            &io_par_fpixels,io_par_lpixels,incs,&
+            &io_par_fpixels,io_par_lpixels,io_par_incs_band,&
             &nullval,specU(io_par_buf_off),io_par_anyflg_priv,&
             &io_par_status_priv)
             if (io_par_status_priv.ne.0) io_par_read_ok = .false.

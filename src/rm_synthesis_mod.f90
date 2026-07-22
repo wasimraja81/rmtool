@@ -115,6 +115,15 @@ module rm_synthesis_mod
     character(len=272) :: infileQ = ' ', infileU = ' '
     real(sp) :: resiQ = 0.0_sp, slopeQ = 0.0_sp, resiU = 0.0_sp, slopeU = 0.0_sp
     character(len=272) :: path_I = ' ', infileI = ' '
+    ! T6 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band channel
+    ! sub-range selection, same semantics/defaults as the legacy scalar
+    ! subim_chan_blc/trc/inc (0/0/1 = "full band"), applied only when
+    ! cfg%subim=.true. (that switch itself stays global, not per-band).
+    integer(int32) :: chan_blc = 0, chan_trc = 0, chan_inc = 1
+    ! T7 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band bad-channel
+    ! file, same format/semantics as the legacy scalar badchan_file --
+    ! list entries are raw pixel indices into this band's own file.
+    character(len=172) :: badchan_file = ' '
   end type band_cfg_t
 
   type :: rmsynth_config_t
@@ -1721,6 +1730,14 @@ contains
     character(len=512) :: raw_infileQ, raw_infileU
     character(len=512) :: raw_resiQ, raw_slopeQ, raw_resiU, raw_slopeU
     character(len=512) :: raw_infileI, raw_path_I
+    ! T6: raw comma-separated text for the per-band channel sub-range keys,
+    ! same deferred-assembly pattern as raw_resiQ etc above.
+    character(len=512) :: raw_subim_chan_blc, raw_subim_chan_trc
+    character(len=512) :: raw_subim_chan_inc
+    ! T7: raw comma-separated text for the per-band badchan_file key --
+    ! required (like raw_infileQ), not optional (like the T6 keys above),
+    ! matching the legacy scalar's own "always required" behaviour.
+    character(len=512) :: raw_badchan_file
     character(len=512) :: csv_item
     integer(int32) :: n_bands_local, ib
     logical :: seen_use_auto_rm_range
@@ -1785,6 +1802,10 @@ contains
     raw_slopeU = ' '
     raw_infileI = ' '
     raw_path_I = ' '
+    raw_subim_chan_blc = ' '
+    raw_subim_chan_trc = ' '
+    raw_subim_chan_inc = ' '
+    raw_badchan_file = ' '
     seen_ofac = .false.
     seen_fac = .false.
     seen_beg_rm = .false.
@@ -1955,7 +1976,7 @@ contains
           return
         end if
         seen_badchan_file = .true.
-        cfg%badchan_file = trim(val)
+        raw_badchan_file = val
       case ('subim')
         if (seen_subim) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim'
@@ -2108,19 +2129,7 @@ contains
           return
         end if
         seen_subim_chan_blc = .true.
-        read(val, *, iostat=io_stat) cfg%subim_chan_blc
-        if (io_stat /= 0) then
-          write(*,*) 'Error reading subim_chan_blc at line ', line_no
-          status = -177
-          close(unit_cfg)
-          return
-        end if
-        if (cfg%subim_chan_blc < 0) then
-          write(*,*) 'Error: subim_chan_blc must be >= 0 at line ', line_no
-          status = -177
-          close(unit_cfg)
-          return
-        end if
+        raw_subim_chan_blc = val
       case ('subim_chan_trc')
         if (seen_subim_chan_trc) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_chan_trc'
@@ -2129,19 +2138,7 @@ contains
           return
         end if
         seen_subim_chan_trc = .true.
-        read(val, *, iostat=io_stat) cfg%subim_chan_trc
-        if (io_stat /= 0) then
-          write(*,*) 'Error reading subim_chan_trc at line ', line_no
-          status = -178
-          close(unit_cfg)
-          return
-        end if
-        if (cfg%subim_chan_trc > 0 .and. cfg%subim_chan_trc < cfg%subim_chan_blc) then
-          write(*,*) 'Error: subim_chan_trc must be >= subim_chan_blc at line ', line_no
-          status = -178
-          close(unit_cfg)
-          return
-        end if
+        raw_subim_chan_trc = val
       case ('subim_chan_inc')
         if (seen_subim_chan_inc) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_chan_inc'
@@ -2150,19 +2147,7 @@ contains
           return
         end if
         seen_subim_chan_inc = .true.
-        read(val, *, iostat=io_stat) cfg%subim_chan_inc
-        if (io_stat /= 0) then
-          write(*,*) 'Error reading subim_chan_inc at line ', line_no
-          status = -179
-          close(unit_cfg)
-          return
-        end if
-        if (cfg%subim_chan_inc < 1) then
-          write(*,*) 'Error: subim_chan_inc must be >= 1 at line ', line_no
-          status = -179
-          close(unit_cfg)
-          return
-        end if
+        raw_subim_chan_inc = val
       case ('tile_ra')
         if (seen_tile_ra) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_ra'
@@ -2787,6 +2772,14 @@ contains
       & n_bands_local, ' vs ', csv_count(raw_infileU)
       status = -201
     end if
+    ! T7: badchan_file/global_badchan_file is always required (like
+    ! infileQ/infileU), regardless of remove_badchan -- same behaviour as
+    ! the pre-T7 legacy scalar, just band-count-validated for nbands>1.
+    if (status == 0 .and. csv_count(raw_badchan_file) /= n_bands_local) then
+      write(*,*) 'infileQ/badchan_file band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_badchan_file)
+      status = -238
+    end if
     if (status == 0 .and. csv_count(raw_resiQ) /= n_bands_local) then
       write(*,*) 'infileQ/resiQ band-count mismatch: ', &
       & n_bands_local, ' vs ', csv_count(raw_resiQ)
@@ -2819,6 +2812,30 @@ contains
         write(*,*) 'infileQ/path_I band-count mismatch: ', &
         & n_bands_local, ' vs ', csv_count(raw_path_I)
         status = -207
+      end if
+    end if
+    ! T6: subim_chan_blc/trc/inc are optional per-band keys -- only
+    ! band-count-validated if the key was given at all (absent means every
+    ! band defaults to 0/0/1, matching today's "key absent" behaviour).
+    if (status == 0 .and. seen_subim_chan_blc) then
+      if (csv_count(raw_subim_chan_blc) /= n_bands_local) then
+        write(*,*) 'infileQ/subim_chan_blc band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_subim_chan_blc)
+        status = -232
+      end if
+    end if
+    if (status == 0 .and. seen_subim_chan_trc) then
+      if (csv_count(raw_subim_chan_trc) /= n_bands_local) then
+        write(*,*) 'infileQ/subim_chan_trc band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_subim_chan_trc)
+        status = -233
+      end if
+    end if
+    if (status == 0 .and. seen_subim_chan_inc) then
+      if (csv_count(raw_subim_chan_inc) /= n_bands_local) then
+        write(*,*) 'infileQ/subim_chan_inc band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_subim_chan_inc)
+        status = -234
       end if
     end if
     if (status == 0) then
@@ -2876,6 +2893,61 @@ contains
         else
           cfg%band(ib)%path_I = trim(cfg%path)
         end if
+
+        ! T6: per-band channel sub-range, defaults 0/0/1 ("full band") when
+        ! the key was not given at all -- same as the legacy scalar default.
+        if (seen_subim_chan_blc) then
+          call csv_get_item(raw_subim_chan_blc, ib, csv_item)
+          read(csv_item, *, iostat=ios) cfg%band(ib)%chan_blc
+          if (ios /= 0) then
+            write(*,*) 'Invalid integer for subim_chan_blc, band ', ib
+            status = -235
+            exit
+          end if
+          if (cfg%band(ib)%chan_blc < 0) then
+            write(*,*) 'Error: subim_chan_blc must be >= 0, band ', ib
+            status = -235
+            exit
+          end if
+        else
+          cfg%band(ib)%chan_blc = 0
+        end if
+        if (seen_subim_chan_trc) then
+          call csv_get_item(raw_subim_chan_trc, ib, csv_item)
+          read(csv_item, *, iostat=ios) cfg%band(ib)%chan_trc
+          if (ios /= 0) then
+            write(*,*) 'Invalid integer for subim_chan_trc, band ', ib
+            status = -236
+            exit
+          end if
+          if (cfg%band(ib)%chan_trc > 0 .and. &
+          & cfg%band(ib)%chan_trc < cfg%band(ib)%chan_blc) then
+            write(*,*) 'Error: subim_chan_trc must be >= subim_chan_blc, band ', ib
+            status = -236
+            exit
+          end if
+        else
+          cfg%band(ib)%chan_trc = 0
+        end if
+        if (seen_subim_chan_inc) then
+          call csv_get_item(raw_subim_chan_inc, ib, csv_item)
+          read(csv_item, *, iostat=ios) cfg%band(ib)%chan_inc
+          if (ios /= 0) then
+            write(*,*) 'Invalid integer for subim_chan_inc, band ', ib
+            status = -237
+            exit
+          end if
+          if (cfg%band(ib)%chan_inc < 1) then
+            write(*,*) 'Error: subim_chan_inc must be >= 1, band ', ib
+            status = -237
+            exit
+          end if
+        else
+          cfg%band(ib)%chan_inc = 1
+        end if
+
+        ! T7: per-band bad-channel file, always required.
+        call csv_get_item(raw_badchan_file, ib, cfg%band(ib)%badchan_file)
       end do
     end if
 
@@ -2893,6 +2965,10 @@ contains
       cfg%slopeU = cfg%band(cfg%reference_band)%slopeU
       cfg%infileI = cfg%band(cfg%reference_band)%infileI
       cfg%path_I = cfg%band(cfg%reference_band)%path_I
+      cfg%subim_chan_blc = cfg%band(cfg%reference_band)%chan_blc
+      cfg%subim_chan_trc = cfg%band(cfg%reference_band)%chan_trc
+      cfg%subim_chan_inc = cfg%band(cfg%reference_band)%chan_inc
+      cfg%badchan_file = cfg%band(cfg%reference_band)%badchan_file
     end if
 
     close(unit_cfg)

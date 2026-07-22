@@ -40,6 +40,21 @@
 #      primary test cube (no gap) must reproduce the undivided cube's own
 #      output bit-for-bit; the most direct mechanical regression check
 #      for the frequency-merge architecture itself
+#  18. Per-band channel sub-range selection (T6) – a 2-band run where band 2
+#      is the full undivided primary test cube restricted via per-band
+#      subim_chan_blc/trc down to exactly the T5 split's high-channel range
+#      must reproduce T5's own bit-identical result; exercises the T6
+#      per-band offset/count/z1-shift arithmetic specifically
+#  19. Per-band bad-channel files (T7) – flagging raw channel 150 via a
+#      single-band badchan_file on the undivided primary test cube must
+#      reproduce, bit-identically, a 2-band split run that flags the same
+#      raw channel via band 2's own badchan_file (channel 50 in band 2's
+#      own numbering, since band 2 starts at original channel 101)
+#  20. GPU offload for multi-band (T8) – the T5 split-band config run
+#      through the GPU binary: non-staged within rtol=2e-3 of the CPU
+#      reference (matching every existing GPU test's own tolerance) plus
+#      RM-peak validation; staged (VRAM sub-block path, gpu_vram_mib=1)
+#      bit-identical to the non-staged GPU run
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -823,7 +838,7 @@ infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
 infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
 outfile             = ${OUT_DIR}/mb_match
 remove_badchan      = n
-global_badchan_file = /dev/null
+global_badchan_file = /dev/null,/dev/null
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -912,13 +927,17 @@ if [[ -x "$BIN_SERIAL" ]]; then
     make_thesis_cfg() {
         local tag="$1" infileQ="$2" infileU="$3" resi_list="$4"
         local cfg="$OUT_DIR/${tag}.cfg"
+        # T7: badchan_file is a required per-band list, same cardinality as
+        # resi_list -- reuse its comma count rather than hard-coding it.
+        local badchan_list
+        badchan_list=$(echo "$resi_list" | sed 's/[^,]*/\/dev\/null/g')
         cat > "$cfg" <<CFGEOF
 path                = ${DATA_DIR}/
 infileQ             = ${infileQ}
 infileU             = ${infileU}
 outfile             = ${OUT_DIR}/${tag}
 remove_badchan      = n
-global_badchan_file = /dev/null
+global_badchan_file = ${badchan_list}
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -1032,7 +1051,7 @@ infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
 infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
 outfile             = ${OUT_DIR}/split_identity
 remove_badchan      = n
-global_badchan_file = /dev/null
+global_badchan_file = /dev/null,/dev/null
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -1076,6 +1095,299 @@ CFGEOF
     fi
 else
     skip "Serial binary not available; skipping split-band identity test"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. Per-band channel sub-range selection (T6, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     band 1 = TEST_SPLIT_LO (unrestricted, its own full 100-channel range),
+#     band 2 = the FULL undivided TEST.Q/U.FITSCUBE (200 channels) with
+#     subim_chan_blc/trc restricting it, per-band, down to exactly channels
+#     101-200 -- the same channels T5's TEST_SPLIT_HI file contains. Output
+#     must be bit-identical to T5's own already-passing result (itself
+#     bit-identical to the undivided single-band run). Only passes if the
+#     per-band offset/count/z1-shift arithmetic T6 adds is exactly right.
+# ---------------------------------------------------------------------------
+section "18. Per-band channel sub-range selection – restricted full cube == T5 split (T6)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    chan_cfg="$OUT_DIR/split_identity_chan.cfg"
+    chan_log="$OUT_DIR/split_identity_chan.log"
+    rm -f "$OUT_DIR"/split_identity_chan.*.FITS
+    cat > "$chan_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST.U.FITSCUBE
+outfile             = ${OUT_DIR}/split_identity_chan
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = y
+subim_chan_blc      = 0,101
+subim_chan_trc      = 0,200
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    if run_binary "$BIN_SERIAL" "$chan_cfg" "$chan_log"; then
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/serial.${suffix}.FITS"
+            f2="$OUT_DIR/split_identity_chan.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "Per-band chan sub-range (T6): ${suffix} differs from undivided-cube output"
+                fi
+            else
+                all_match=0
+                fail "Per-band chan sub-range (T6): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "Per-band chan sub-range (T6): restricted full cube bit-identical to undivided single-band cube"
+        fi
+    else
+        fail "Per-band chan sub-range (T6): run failed (see $chan_log)"
+    fi
+else
+    skip "Serial binary not available; skipping per-band channel sub-range test"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. Per-band bad-channel files (T7, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     raw channel 150 (1-indexed, into the undivided 200-channel TEST cube)
+#     flagged via a plain single-band badchan_file must reproduce,
+#     bit-identically, a 2-band split run (TEST_SPLIT_LO + TEST_SPLIT_HI)
+#     that flags the *same* raw channel via band 2's own badchan_file --
+#     channel 50 in band 2's own numbering, since band 2 (TEST_SPLIT_HI)
+#     starts at original channel 101 (150 - 100 = 50). Exercises the T7
+#     per-band bad-channel read/apply code specifically, composed with the
+#     existing frequency-merge architecture.
+# ---------------------------------------------------------------------------
+section "19. Per-band bad-channel files – flagged split-band run == flagged undivided cube (T7)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    badchan7_ref_list="$OUT_DIR/badchan7_ref_list.txt"
+    badchan7_band2_list="$OUT_DIR/badchan7_band2_list.txt"
+    badchan7_none_list="$OUT_DIR/badchan7_none_list.txt"
+    printf '150\n' > "$badchan7_ref_list"
+    printf '50\n' > "$badchan7_band2_list"
+    : > "$badchan7_none_list"
+
+    badchan7_ref_cfg="$OUT_DIR/badchan7_ref.cfg"
+    badchan7_ref_log="$OUT_DIR/badchan7_ref.log"
+    rm -f "$OUT_DIR"/badchan7_ref.*.FITS
+    cat > "$badchan7_ref_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE
+outfile             = ${OUT_DIR}/badchan7_ref
+remove_badchan      = y
+global_badchan_file = ${badchan7_ref_list}
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0
+slopeQ              = 0.0
+resiU               = 0.0
+slopeU              = 0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+
+    badchan7_split_cfg="$OUT_DIR/badchan7_split.cfg"
+    badchan7_split_log="$OUT_DIR/badchan7_split.log"
+    rm -f "$OUT_DIR"/badchan7_split.*.FITS
+    cat > "$badchan7_split_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/badchan7_split
+remove_badchan      = y
+global_badchan_file = ${badchan7_none_list},${badchan7_band2_list}
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+
+    if run_binary "$BIN_SERIAL" "$badchan7_ref_cfg" "$badchan7_ref_log" && \
+       run_binary "$BIN_SERIAL" "$badchan7_split_cfg" "$badchan7_split_log"; then
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/badchan7_ref.${suffix}.FITS"
+            f2="$OUT_DIR/badchan7_split.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "Per-band bad-channel files (T7): ${suffix} differs between flagged-undivided and flagged-split runs"
+                fi
+            else
+                all_match=0
+                fail "Per-band bad-channel files (T7): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if grep -q "Number of Bad Channels (band" "$badchan7_split_log"; then
+            pass "Per-band bad-channel files (T7): per-band badchan_file read path confirmed taken"
+        else
+            all_match=0
+            fail "Per-band bad-channel files (T7): expected per-band bad-channel log line not found (see $badchan7_split_log)"
+        fi
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "Per-band bad-channel files (T7): flagged split-band run bit-identical to flagged undivided cube"
+        fi
+    else
+        fail "Per-band bad-channel files (T7): one or more runs failed (see $badchan7_ref_log / $badchan7_split_log)"
+    fi
+else
+    skip "Serial binary not available; skipping per-band bad-channel files test"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. GPU offload for multi-band (T8, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     the same split-band 2-band config as T5/section 17, run through the
+#     GPU binary instead of serial. Mirrors the existing single-band GPU
+#     tests exactly: non-staged run checked via rtol=2e-3 against the CPU
+#     reference (test 7's own "ffast-math vs IEEE" tolerance, not a
+#     multi-band-specific relaxation) plus RM-peak-position validation;
+#     staged run (gpu_vram_mib=1 forces VRAM sub-block staging, the one
+#     path never previously exercised with a multi-band tile) checked
+#     bit-identical against the non-staged GPU run (test 9's own pattern).
+#     PHA.RMCUBE is deliberately not rtol-checked here, matching every
+#     existing GPU test -- phase angle near low-amplitude bins is known to
+#     amplify small ffast-math differences well past 2e-3, in the
+#     single-band case too (confirmed by direct comparison during this
+#     ticket's investigation), so it was never part of the GPU tolerance
+#     gate to begin with.
+# ---------------------------------------------------------------------------
+section "20. GPU offload for multi-band – split-band run via GPU (T8)"
+
+if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
+    mbgpu_cfg="$OUT_DIR/mb_gpu.cfg"
+    mbgpu_log="$OUT_DIR/mb_gpu.log"
+    rm -f "$OUT_DIR"/mb_gpu.*.FITS
+    cat > "$mbgpu_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/mb_gpu
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = y
+CFGEOF
+    if run_binary "$BIN_GPU" "$mbgpu_cfg" "$mbgpu_log"; then
+        mbgpu_amp="$OUT_DIR/mb_gpu.AMP.RMCUBE.FITS"
+        if [[ -f "$mbgpu_amp" ]]; then
+            if python3 "$TESTS_DIR/check_rm_peak.py" "$mbgpu_amp" "$TRUTH" > /dev/null 2>&1; then
+                pass "Multi-band GPU (T8): RM peaks at correct positions"
+            else
+                fail "Multi-band GPU (T8): RM peak check failed (see check_rm_peak.py output)"
+            fi
+            if python3 "$TESTS_DIR/compare_cubes.py" \
+                    "$OUT_DIR/split_identity.AMP.RMCUBE.FITS" "$mbgpu_amp" \
+                    --rtol 2e-3 > /dev/null 2>&1; then
+                pass "Multi-band GPU AMP (T8): matches CPU reference within rtol=2e-3 (ffast-math vs IEEE)"
+            else
+                fail "Multi-band GPU AMP (T8): differs from CPU reference beyond rtol=2e-3"
+            fi
+        else
+            fail "Multi-band GPU (T8): AMP output cube not found: $mbgpu_amp"
+        fi
+    else
+        fail "Multi-band GPU (T8): run failed (see $mbgpu_log)"
+    fi
+
+    # Staging: force VRAM sub-block subdivision (gpu_vram_mib=1), same
+    # pattern as test 9. OMP_TARGET_OFFLOAD=DISABLED for determinism when
+    # comparing bit-for-bit against the non-staged run above -- both are
+    # the same -ffast-math-compiled kernel, so host-fallback vs real-device
+    # dispatch of that same compiled code is expected to be bit-identical
+    # (no cross-thread reduction in this kernel), exactly as test 9 already
+    # relies on for the single-band case.
+    export OMP_TARGET_OFFLOAD="${OMP_TARGET_OFFLOAD:-DISABLED}"
+    mbgpu_stg_cfg="$OUT_DIR/mb_gpu_stage.cfg"
+    mbgpu_stg_log="$OUT_DIR/mb_gpu_stage.log"
+    rm -f "$OUT_DIR"/mb_gpu_stage.*.FITS
+    { cat "$mbgpu_cfg"; echo "gpu_vram_mib=1"; echo "mem_frac_vram=0.10"; } | \
+        sed "s|outfile             = ${OUT_DIR}/mb_gpu\$|outfile             = ${OUT_DIR}/mb_gpu_stage|" \
+        > "$mbgpu_stg_cfg"
+    if run_binary "$BIN_GPU" "$mbgpu_stg_cfg" "$mbgpu_stg_log"; then
+        if grep -q "Staging sub-blocks:  T" "$mbgpu_stg_log"; then
+            mbgpu_stg_amp="$OUT_DIR/mb_gpu_stage.AMP.RMCUBE.FITS"
+            if [[ -f "$mbgpu_stg_amp" ]]; then
+                if python3 "$TESTS_DIR/compare_cubes.py" \
+                        "$OUT_DIR/mb_gpu.AMP.RMCUBE.FITS" "$mbgpu_stg_amp" \
+                        --exact > /dev/null 2>&1; then
+                    pass "Multi-band GPU staging AMP (T8): bit-identical to non-staged multi-band GPU"
+                else
+                    fail "Multi-band GPU staging AMP (T8): differs from non-staged multi-band GPU (gather/scatter bug?)"
+                fi
+            else
+                fail "Multi-band GPU staging (T8): AMP output cube not found: $mbgpu_stg_amp"
+            fi
+        else
+            fail "Multi-band GPU staging (T8): staging path was NOT activated (check planner logic)"
+        fi
+    else
+        fail "Multi-band GPU staging (T8): run failed (see $mbgpu_stg_log)"
+    fi
+else
+    skip "GPU binary or multi-band CPU reference not available; skipping multi-band GPU test"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1219,3 +1219,296 @@ important, that is a new, separate effort, not a T2 fix.
   this ticket; still 0 errors, 0 new warnings). `tests/run_tests.sh`:
   38/38 pass (37 from T0-T4 + this one). `nbands=1` bit-identical sweep
   unaffected (140/140 FITS, 6 expected pre-existing artifacts).
+
+### T6 — Per-Band Channel Sub-Range Selection (`subim` channel axis only)
+
+- **Objective:** Investigation of the four remaining "not yet implemented"
+  T2 restrictions (`rem_mean`, `subim`, `remove_badchan`,
+  `remove_qu_bias`/`resiQ`/`slopeQ`/`resiU`/`slopeU`, confirmed with user
+  2026-07-22) found: `rem_mean` needs no change (pure per-pixel,
+  all-channels-loaded computation, confirmed correct as-is);
+  `remove_qu_bias`/`resiQ`/`slopeQ`/`resiU`/`slopeU` are dead code even in
+  the pre-existing single-band tool -- `cfg%resiQ` etc. are parsed, stored,
+  and printed, but never applied to `specQ`/`specU` anywhere in the
+  compute pipeline, and the I-cube read into `stI` is never passed to
+  `tile_extract_gpu_rm_blocked`. Confirmed with user this is intentional:
+  the I-cube read path is being kept alive deliberately as a placeholder
+  for future Q/U-vs-I calibration (normalising by the I-spectrum where
+  Q/U show non-smooth behaviour across band boundaries), not a bug to fix
+  under this project. `remove_badchan` is a genuine gap needing new
+  per-band plumbing (own ticket, not in scope here). `subim` splits into
+  two cases: RA/Dec-only sub-windowing already works with zero changes
+  (shared `fpixels(1)/(2)` apply identically to every band's read, since
+  bands are geometry-matched by policy); channel-range sub-windowing
+  (`subim_chan_blc/trc/inc`) does not -- confirmed by user as a wanted
+  feature in its own right (reject bad edge channels or hand-pick a good
+  sub-range independently per band), not merely a restriction to lift.
+- **Scope:**
+  - `rm_synthesis_mod.f90`: `band_cfg_t` gains `chan_blc`, `chan_trc`,
+    `chan_inc` (integers, defaults 0/0/1, same semantics as today's
+    `subim_chan_blc/trc/inc`), parsed via the same raw-comma-buffer +
+    deferred-assembly pattern as `resiQ`/`slopeQ`/`resiU`/`slopeU`
+    (optional keys: only band-count-validated/parsed if the key was seen
+    at all, else every band defaults to 0/0/1 -- matching today's
+    "key absent" behaviour exactly). Legacy scalars
+    `cfg%subim_chan_blc/trc/inc` populate from `cfg%band(reference_band)`,
+    so every existing single-band cfg file is unaffected.
+  - `rm_synthesis.f90`: new per-band scratch arrays `band_chan_blc(:)`,
+    `band_chan_inc(:)` (parallel to `band_czval`/`band_nz`/etc). At the
+    point each band's raw NAXIS3 becomes known (reference band ~line 947,
+    each other band ~line 1046), resolve that band's own
+    `chan_blc/trc/inc` (0 defaults to "full band", mirroring the existing
+    single-band `subim` resolution at lines 1645-1679) into
+    `band_chan_blc(iband)`/`band_chan_inc(iband)` and a **corrected**
+    `band_nz(iband)` = that band's own *selected* channel count (not its
+    raw NAXIS3) -- with an explicit bounds check that
+    `chan_blc`/`chan_trc` don't exceed that band's actual NAXIS3, stopping
+    with a per-band error if they do (mirroring the existing single-band
+    bounds check at lines 1705-1718). This also fixes a latent bug the
+    investigation surfaced: `band_nz(cfg%reference_band)` was being set
+    to the *raw* `naxes(freq_axis)` before `fpixels`/`lpixels` even get
+    built from `subim_chan_blc/trc`, so `nz_out_band`/`band_offset`
+    (computed from `band_nz` before the existing `subim` block runs) would
+    have silently used the wrong, oversized count for the reference band
+    the moment channel-range subimaging was allowed for multi-band --
+    unreachable today only because `subim` is currently blocked outright
+    for `nbands>1`.
+  - The T2 "append other bands' L_sq/flag_arr_out" loop (~1875-1905) and
+    the T3 diagnostic loop (~1920+): both currently assume a band's first
+    contributing channel is raw pixel 1 (`z1_band` derived straight from
+    that band's `CRVAL`/`CRPIX`/`CDELT`). Both need `z1_band` shifted by
+    `(band_chan_blc(iband)-1)*band_zinc(iband)` and the `zn_band` step
+    multiplied by `band_chan_inc(iband)`, so frequency/lambda^2 values are
+    computed for the *selected* channels, not always starting at channel 1.
+  - The per-band tile-read `FTGSVE` calls (~3326-3354): currently hardcode
+    `io_par_fpixels(freq_axis)=1, io_par_lpixels(freq_axis)=band_nz(iband)`
+    (always the band's full range) with the shared `incs` array. Needs a
+    per-band `fpixels(freq_axis)=band_chan_blc(iband)`,
+    `lpixels(freq_axis)=band_chan_blc(iband)+(band_nz(iband)-1)*band_chan_inc(iband)`,
+    and a per-band copy of `incs` with `incs(freq_axis)=band_chan_inc(iband)`
+    (RA/Dec entries unchanged, shared across all bands as today).
+  - Remove the blanket `cfg%subim` stop-check for `nbands>1` (lines
+    903-907) entirely -- no replacement guard needed, since channel-range
+    subimaging is now band-aware and RA/Dec-only subimaging already worked.
+- **Correctness Gate:**
+  - `nbands=1` bit-identical sweep, unaffected.
+  - New test reusing T5's fixtures with zero new cube generation: 2-band
+    run with band 1 = `TEST_SPLIT_LO` (unrestricted) and band 2 = the
+    *full* undivided `TEST.Q/U` cube (200 ch) with `chan_blc,chan_inc =
+    <blc>,1` restricting it, per-band, down to exactly channels 101-200 --
+    i.e. `TEST_SPLIT_HI`'s own range. Must be bit-identical to T5's
+    already-passing split-band result (`tests/output/serial.*.FITS`).
+    Only passes if the per-band offset/count/z1-shift arithmetic above is
+    exactly right, not merely "doesn't crash" -- this is a real exercise
+    of the new code, not a restatement of T5.
+- **Rollback Criteria:** revert to the blanket `subim` block for `nbands>1`
+  if the identity test doesn't come out bit-identical (investigate and
+  fix, don't loosen to a tolerance).
+- **Effort:** ~1 session (schema + two arithmetic-correction sites + a
+  per-band read-loop parameterization + one new test).
+- **Evidence (2026-07-22):** Implemented as scoped. `band_cfg_t` gained
+  `chan_blc`/`chan_trc`/`chan_inc`; legacy scalars
+  `cfg%subim_chan_blc/trc/inc` now populate from
+  `cfg%band(reference_band)`, so single-band cfg files are unaffected.
+  Fixed the latent bug the investigation surfaced: `band_nz` for both the
+  reference band and every other band is now resolved from that band's own
+  `chan_blc/trc/inc` (with an explicit per-band NAXIS bounds check) at the
+  point each band's header is read, instead of the raw NAXIS3 -- this also
+  corrects `nz_out_band`/`band_offset`, which are accumulated from
+  `band_nz` before the reference band's own (pre-existing) `subim` block
+  runs. `z1_band`/`zn_band` in both the T2 L_sq-append loop and the T3
+  diagnostic loop now shift by `(band_chan_blc(iband)-1)*band_zinc(iband)`
+  and step by `band_chan_inc(iband)`, so per-band frequency/lambda^2 values
+  reflect the *selected* channels, not always channel 1. The per-band
+  tile-read `FTGSVE` calls now use `band_chan_blc(iband)` as
+  `fpixels(freq_axis)`, `band_chan_blc(iband)+(band_nz(iband)-1)*band_chan_inc(iband)`
+  as `lpixels(freq_axis)`, and a per-band incs copy with
+  `band_chan_inc(iband)` in the freq slot. The blanket `cfg%subim`
+  stop-check for `nbands>1` is removed with no replacement guard.
+  Build: 0 errors, 0 new warnings across all 4 variants (still exactly 4
+  pre-existing GPU-offload linker warnings). `tests/run_tests.sh`: 39/39
+  pass (38 from T0-T5 + new section 18) -- the new test (band 1 =
+  `TEST_SPLIT_LO` unrestricted, band 2 = the full undivided 200-channel
+  `TEST` cube with `subim_chan_blc,subim_chan_trc = 0,101` / `0,200`
+  restricting it down to exactly `TEST_SPLIT_HI`'s own channel range)
+  came out **bit-identical on the first attempt** to both T5's split-band
+  result and the original undivided single-band run -- confirming the
+  per-band offset/count/z1-shift arithmetic is correct, not merely
+  non-crashing. `nbands=1` bit-identical sweep unaffected (140/140 FITS
+  compared, 134 exact + the same 6 pre-existing NaN-artifact diffs seen in
+  every prior sweep).
+
+### T7 — Per-Band Bad-Channel Files
+
+- **Objective:** The one remaining genuine gap identified in the T2
+  restriction investigation (see T6): let each band flag its own bad
+  channels via its own file, rather than blocking `remove_badchan`
+  outright for `nbands>1`. Confirmed with user (2026-07-22): a per-band
+  file is wanted, required (exact per-band list, same rule as `infileQ`)
+  rather than optional/shared, even though this means a `remove_badchan=n`
+  multi-band cfg must still supply one placeholder path per band (a minor
+  typing cost inherited from the pre-existing single-band key already
+  being unconditionally required regardless of the flag's value).
+- **Scope:**
+  - `band_cfg_t` gains `badchan_file` (comma-list, always required like
+    `infileQ` -- not optional like the T6 keys). Legacy scalar
+    `cfg%badchan_file` populates from `cfg%band(reference_band)`, so
+    single-band cfg files are unaffected.
+  - `rm_synthesis.f90`: each non-reference band's own bad-channel file is
+    read fresh inside the existing T2 append loop (not kept as a
+    persistent per-band array) -- same open/read-list/close pattern as the
+    reference band's own `bad_chan`/`flag_arr`, but sized to *that band's
+    own* raw NAXIS3 (`band_naxes(iband,freq_axis)`, already stored, T6).
+    List entries are raw pixel indices into that band's own file, same
+    semantics as the reference band today -- this is what lets bad-channel
+    flagging and T6 channel-subimaging compose correctly (a flagged raw
+    channel outside the T6-selected range is simply never sampled).
+  - The T2 `flag_arr_out` write for each band changes from unconditionally
+    marking every channel good to looking up that band's own resolved
+    flag array at the raw index `band_chan_blc(iband)+(i-1)*band_chan_inc(iband)`.
+  - `NBADGLOB` output header: extended to the sum of bad-channel counts
+    across every band (equals the reference band's own count, unchanged,
+    whenever `nbands=1`) -- metadata-only, not part of the correctness
+    gate (headers aren't compared by `compare_cubes.py`), fixed anyway
+    since leaving it silently reference-band-only would misdocument
+    multi-band output. `MASKSRC` needed no change -- inspection found its
+    final value already derives from `cfg%remove_badchan` directly (a
+    single global flag), not from any per-band count, so it was already
+    band-agnostic.
+  - Remove the blanket `remove_badchan` stop-check for `nbands>1`.
+- **Correctness Gate:**
+  - `nbands=1` bit-identical sweep, unaffected.
+  - New test: flagging raw channel 150 (of the undivided 200-channel
+    `TEST` cube) via a plain single-band `badchan_file` must reproduce,
+    bit-identically, a 2-band split run (`TEST_SPLIT_LO`+`TEST_SPLIT_HI`)
+    that flags the *same* raw channel via band 2's own `badchan_file`
+    (channel 50 in band 2's own numbering, since band 2 starts at original
+    channel 101). Exercises the new per-band read/apply code specifically,
+    composed with the existing frequency-merge architecture -- not merely
+    "doesn't crash".
+- **Rollback Criteria:** revert to the blanket `remove_badchan` block for
+  `nbands>1` if the identity test doesn't come out bit-identical
+  (investigate and fix, don't loosen to a tolerance).
+- **Effort:** ~0.5-1 session (schema + one read/apply site inside an
+  existing loop + one new test; no new arithmetic-correction sites, unlike
+  T6, since bad-channel indices are raw pixel indices independent of any
+  subim selection).
+- **Evidence (2026-07-22):** Implemented as scoped. `band_cfg_t` gained
+  `badchan_file` (required per-band list); legacy scalar
+  `cfg%badchan_file` populates from `cfg%band(reference_band)`. Existing
+  multi-band test cfgs in `run_tests.sh` (sections 15-18, plus the shared
+  `make_thesis_cfg` helper in section 16) updated to supply a per-band
+  `global_badchan_file` list (`/dev/null` repeated to match band count)
+  since the key is now band-count-validated like `infileQ`. Each
+  non-reference band's bad-channel file is read fresh inside the T2 append
+  loop, sized to that band's own raw NAXIS3, and applied via a per-band
+  flag lookup at the T6-aware raw index. `NBADGLOB` now sums bad-channel
+  counts across all bands (unchanged for `nbands=1`); confirmed by
+  inspection that `MASKSRC` needed no change since its final value already
+  derives from `cfg%remove_badchan` directly, not any per-band count.
+  Build: 0 errors, 0 new warnings across all 4 variants (still exactly 4
+  pre-existing GPU-offload linker warnings). `tests/run_tests.sh`: 41/41
+  pass (39 from T0-T6 + new section 19) -- the new test (raw channel 150
+  flagged via a single-band `badchan_file` on the undivided `TEST` cube
+  vs. the same raw channel flagged via band 2's own `badchan_file`,
+  channel 50 in its own numbering, in a 2-band split run) came out
+  **bit-identical on the first attempt**, confirming the per-band
+  read/apply code is correct, not merely non-crashing. `nbands=1`
+  bit-identical sweep unaffected (140/140 FITS compared, 134 exact + the
+  same 6 pre-existing NaN-artifact diffs seen in every prior sweep --
+  re-verified directly this ticket, by inspecting the actual data at the
+  differing positions, that these are the single deliberately
+  fully-masked test pixel (25,25) outputting the identical `NaN` in both
+  the baseline and current output at every RM bin; `NaN != NaN` under
+  IEEE 754 is why `compare_cubes.py --exact`'s `numpy.array_equal` flags
+  them, not a behavioural difference).
+
+With T6 and T7 complete, all four T2 restrictions from the investigation
+that opened T6 are now resolved: `rem_mean` needed no change (confirmed
+correct as-is), RA/Dec-only `subim` needed no change, channel-range
+`subim` is now band-aware (T6), and `remove_badchan` is now band-aware
+(T7). `remove_qu_bias`/`resiQ`/`slopeQ`/`resiU`/`slopeU` remain
+deliberately unimplemented (dead code, pre-existing even for single-band,
+kept as a placeholder for future Q/U-vs-I calibration -- not a multi-band
+gap). Next planned topic (per user, 2026-07-22): GPU offload for
+multi-band.
+
+### T8 — GPU Offload for Multi-Band
+
+- **Objective:** User's assessment (2026-07-22, confirmed by code
+  inspection before agreeing, mirroring the T4 discipline): GPU offload
+  should already work for multi-band with no compute-path changes, since
+  `tile_extract_gpu_rm_blocked` is the same kernel used by both CPU and
+  GPU paths, and `prepare_gpu_data`/`prepare_cpu_data` are parameterized
+  purely by `nz_out` (already the correct merged total by the time either
+  is called -- the multi-band override runs well before). Also checked the
+  user's suggestion that auto-tile logic might need updating for
+  multi-band cube sizes/mem-fractions: found this is *already* correct,
+  not something to change -- `plan_tile`'s RAM/VRAM byte-budget arithmetic
+  is entirely `plan%nz_out`-driven, and `plan%nz_out` is assigned after
+  the multi-band override, so it already auto-shrinks tiles for a wider
+  merged spectrum with zero changes. The one thing genuinely never
+  exercised: the two-level VRAM sub-block *staging* path
+  (`plan%use_staging = (ny_sub<tile_dec) .and. use_gpu_actual`), unreached
+  while `use_gpu_actual` was forced false for `nbands>1` -- needed a real
+  GPU-hardware check, not just inspection.
+- **Scope:** Remove the blanket `use_gpu_actual` stop-check for `nbands>1`
+  (the one line at the top of the T2 scope-narrowing block). No other
+  source change.
+- **Correctness Gate:**
+  - `nbands=1` bit-identical sweep, unaffected.
+  - New test (real GPU hardware, RTX 3050 present in this environment):
+    the T5 split-band 2-band config run through the GPU binary.
+    Non-staged: `AMP.RMCUBE` within `rtol=2e-3` of the CPU reference
+    (`tests/output/split_identity.AMP.RMCUBE.FITS`, itself already proven
+    bit-identical to the undivided single-band run by T5) plus RM-peak
+    validation via `check_rm_peak.py` -- mirrors test 7's own tolerance
+    exactly, not a multi-band-specific relaxation. Staged
+    (`gpu_vram_mib=1` forcing VRAM sub-block subdivision, confirmed via
+    the `Staging sub-blocks:  T` log line): `AMP.RMCUBE` bit-identical to
+    the non-staged multi-band GPU run, mirroring test 9's own pattern
+    (`OMP_TARGET_OFFLOAD=DISABLED` for determinism, relying on the same
+    already-established fact that this kernel has no cross-thread
+    reduction, so host-fallback and real-device dispatch of the same
+    `-ffast-math`-compiled code are bit-identical).
+  - `PHA.RMCUBE` deliberately excluded from the GPU rtol check, matching
+    every existing GPU test in this suite -- confirmed by direct
+    comparison during this ticket that single-band `serial.PHA.RMCUBE`
+    vs `gpu.PHA.RMCUBE` already exceeds `rtol=2e-3` (1.971e-02), so this
+    is pre-existing phase-near-low-amplitude sensitivity to `ffast-math`
+    reassociation, not a multi-band regression.
+- **Rollback Criteria:** revert to the blanket GPU block for `nbands>1` if
+  either GPU test fails to meet its tolerance/bit-identical bar
+  (investigate and fix, don't loosen the bar).
+- **Effort:** ~0.5 session (one line removed; the correctness case rests
+  on code already proven generic by T2/T4/T6/T7, verified here on real
+  hardware rather than re-derived).
+- **Evidence (2026-07-22):** Implemented as scoped -- the blanket
+  `use_gpu_actual` stop-check for `nbands>1` removed, no other source
+  change. Build: 0 errors, 0 new warnings across all 4 variants (still
+  exactly 4 pre-existing GPU-offload linker warnings). `tests/run_tests.sh`:
+  44/44 pass (41 from T0-T7 + new section 20, run against a real NVIDIA
+  RTX 3050 present in this environment) -- multi-band GPU non-staged run:
+  RM peaks correct, `AMP.RMCUBE` within `rtol=2e-3` of the CPU reference
+  (max relative diff 9.376e-05, well inside tolerance); staged run
+  (confirmed via the `Staging sub-blocks:  T` log line, 32 VRAM
+  sub-blocks processed): bit-identical to the non-staged multi-band GPU
+  run. Confirmed by direct comparison that excluding `PHA.RMCUBE` from
+  the GPU rtol gate is correct practice, not a multi-band-specific
+  loosening: single-band `serial.PHA.RMCUBE` vs `gpu.PHA.RMCUBE` already
+  exceeds `rtol=2e-3` (1.971e-02) with zero multi-band involvement, worse
+  than the multi-band case's own PHA gap (7.652e-03) -- this is why the
+  pre-existing single-band GPU tests (7, 7b, 9) never check `PHA.RMCUBE`
+  either. `nbands=1` bit-identical sweep unaffected (140/140 FITS
+  compared, 134 exact + the same 6 pre-existing NaN-artifact diffs seen
+  in every prior sweep). Both the user's core claim (compute path needs
+  no changes) and the one correction to it (auto-tile logic needs no
+  update either, since it is already `nz_out`-driven) held up under
+  direct verification.
+
+All four tickets opened by the "what else would be zero-effort" line of
+investigation (T6 channel subimaging, T7 per-band bad channels, T8 GPU
+offload) are now complete, alongside the earlier T0-T5 foundation. The
+only remaining known gap in this codebase is `remove_qu_bias` (dead code,
+pre-existing even for single-band, deliberately left as a placeholder for
+future Q/U-vs-I calibration -- not a multi-band-specific item).
