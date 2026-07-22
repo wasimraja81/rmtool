@@ -8,20 +8,22 @@
 !
 ! Current stage: proof-of-concept for extracting a clean pixel->sky
 ! Mapping from a single file's (possibly compound Stokes+Sky+Spectrum) WCS
-! via astMapSplit. Earlier attempts to determine the sky axes' positions
-! by walking astDecompose's Frame-splitting order turned out unreliable
-! (the compound Frame's own component order does not necessarily match
-! the axis order the WCS actually presents -- confirmed by direct
-! transform-vs-CRVAL comparison). astConvert/astFindFrame domain-search
-! were also tried, but per the actual SUN/211 manual (installed via
-! libstarlink-ast-doc), domain search only examines each FrameSet's own
-! top-level registered frames (base + current) by their own Domain
-! attribute -- it does not recurse into a CmpFrame's internal components,
-! so a domainlist of 'SKY' can never match here (the current frame's own
-! Domain is the whole compound label "STOKES-SKY-SPECTRUM"). This stage
-! instead determines the sky axis positions empirically (transform a test
-! pixel, compare outputs against CRVAL/CTYPE-identified expectations) and
-! uses those confirmed-correct positions with astMapSplit directly.
+! via astMapSplit, with the sky axes' positions detected automatically --
+! no assumption about which positions they occupy. Earlier attempts to
+! infer this by walking astDecompose's Frame-splitting order turned out
+! unreliable (the compound Frame's own component order does not
+! necessarily match the axis order the WCS actually presents -- confirmed
+! by direct transform-vs-CRVAL comparison). astConvert/astFindFrame
+! domain-search were also tried, but per the actual SUN/211 manual
+! (installed via libstarlink-ast-doc), domain search only examines each
+! FrameSet's own top-level registered frames (base + current) by their
+! own Domain attribute -- it does not recurse into a CmpFrame's internal
+! components, so a domainlist of 'SKY' can never match here (the current
+! frame's own Domain is the whole compound label "STOKES-SKY-SPECTRUM").
+! This stage instead uses a genuine AST class check (ast_isaskyframe) on
+! every consecutive axis pair (guaranteed consecutive since CmpFrame
+! concatenates component axis blocks contiguously) to find the sky axes'
+! true positions before handing them to astMapSplit.
 !
 ! Usage: reproject_cubes <fits_file>
 program reproject_cubes
@@ -38,15 +40,18 @@ program reproject_cubes
    integer, parameter :: ast__base = 0
    integer, parameter :: ast__current = -1
    integer, external :: ast_fitschan, ast_read, ast_geti
-   integer, external :: ast_getmapping, ast_simplify
-   logical, external :: ast_isaframeset
+   integer, external :: ast_getmapping, ast_simplify, ast_getframe
+   integer, external :: ast_pickaxes
+   logical, external :: ast_isaframeset, ast_isaskyframe
    character(len=ast__szchr), external :: ast_getc
 
    character(len=512) :: infile
    integer :: wcs, fullmap, simplemap, skymap
-   integer :: nin, status
+   integer :: nin, nout, status
    integer :: sky_axes_in(2), out_axes(4)
    double precision :: xin(1), yin(1), xout(1), yout(1)
+   integer :: curframe, probe_axes(2), probe_frame, probe_map, i
+   logical :: found_sky
 
    if (command_argument_count() < 1) then
       write(*,*) 'Usage: reproject_cubes <fits_file>'
@@ -64,25 +69,53 @@ program reproject_cubes
    endif
 
    nin = ast_geti(wcs, 'Nin', status)
+   nout = ast_geti(wcs, 'Nout', status)
    write(*,'(A,I0,A)') 'Nin=', nin, ' pixel axes'
+
+   ! --- Locate the sky axes automatically, with no assumption about
+   ! which positions they occupy ---
+   ! A SkyFrame is always an indivisible 2-axis unit within a CmpFrame
+   ! (component Frames are concatenated as contiguous axis blocks, never
+   ! interleaved), so its 2 axes are guaranteed consecutive -- but WHICH
+   ! consecutive pair depends on the file (confirmed unreliable to infer
+   ! from astDecompose's own traversal order, see module comment above).
+   ! Checking every consecutive pair via ast_pickaxes + ast_isaskyframe
+   ! is a genuine AST class check, not a guess: it tries each candidate
+   ! and asks AST directly "is this actually a SkyFrame", stopping at the
+   ! first (and structurally only possible) match.
+   curframe = ast_getframe(wcs, ast__current, status)
+   found_sky = .false.
+   do i = 1, nout - 1
+      probe_axes(1) = i
+      probe_axes(2) = i + 1
+      probe_frame = ast_pickaxes(curframe, 2, probe_axes, probe_map, status)
+      if (ast_isaskyframe(probe_frame, status)) then
+         sky_axes_in = probe_axes
+         found_sky = .true.
+         call ast_annul(probe_frame, status)
+         exit
+      endif
+      call ast_annul(probe_frame, status)
+   enddo
+   call ast_annul(curframe, status)
+
+   if (.not. found_sky) then
+      write(*,*) 'ERROR: no consecutive-axis-pair SkyFrame found in the WCS'
+      stop 1
+   endif
+   write(*,'(A,I0,A,I0)') 'Sky axes detected automatically at positions: ',&
+   &sky_axes_in(1), ' , ', sky_axes_in(2)
 
    ! --- Extract the pixel-grid -> sky Mapping ---
    ! astMapSplit selects a Mapping's INPUT axes, but the sky axes'
-   ! positions are known on the OUTPUT side (current frame) of the
-   ! pixel->compound Mapping -- so invert first (making sky axes
-   ! selectable as inputs), simplify (helps AST recognise separability),
-   ! split, then invert the result back to a forward pixel-subset -> sky
-   ! Mapping. Axis positions (1,2) confirmed empirically for this file's
-   ! WCS by an earlier diagnostic (transform a test pixel, compare
-   ! outputs against CRVAL/CTYPE-identified expectations) -- see the
-   ! module-level comment above for why that replaced decompose-order
-   ! bookkeeping. Determining this robustly for an arbitrary file (rather
-   ! than this hardcoded confirmed value) is the next open step.
+   ! positions (just determined above) are on the OUTPUT side (current
+   ! frame) of the pixel->compound Mapping -- so invert first (making sky
+   ! axes selectable as inputs), simplify (helps AST recognise
+   ! separability), split, then invert the result back to a forward
+   ! pixel-subset -> sky Mapping.
    fullmap = ast_getmapping(wcs, ast__base, ast__current, status)
    call ast_invert(fullmap, status)
    simplemap = ast_simplify(fullmap, status)
-   sky_axes_in(1) = 1
-   sky_axes_in(2) = 2
    call ast_mapsplit(simplemap, 2, sky_axes_in, out_axes, skymap, status)
    if (status.ne.0 .or. skymap.eq.ast__null) then
       write(*,*) 'ERROR: ast_mapsplit failed to isolate the sky Mapping,',&
