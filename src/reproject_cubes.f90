@@ -131,30 +131,34 @@ contains
       !! Extract the pixel-grid -> sky (RA/Dec) Mapping from a WCS
       !! FrameSet, with the sky axes' positions in the (possibly compound
       !! Stokes+Sky+Spectrum) current frame detected automatically -- no
-      !! assumption about which positions they occupy. A SkyFrame is
-      !! always an indivisible 2-axis unit within a CmpFrame (component
-      !! Frames are concatenated as contiguous axis blocks, never
-      !! interleaved), so its 2 axes are guaranteed consecutive; every
-      !! consecutive pair is probed with ast_pickaxes + ast_isaskyframe (a
-      !! genuine AST class check, not a guess) to find which one. Once
-      !! known, astMapSplit selects a Mapping's INPUT axes, but the sky
-      !! axes are on the OUTPUT side (current frame) of the pixel->
-      !! compound Mapping -- so invert first (making sky axes selectable
-      !! as inputs), simplify (helps AST recognise separability), split,
-      !! then invert the result back to a forward pixel-subset -> sky
-      !! Mapping. Also returns the isolated SkyFrame object itself (not
-      !! just the Mapping) -- a SkyFrame's own axis order is NOT a fixed
-      !! RA-then-Dec convention (it reflects whichever axis the header
-      !! declared as longitude vs latitude first, confirmed by direct
-      !! comparison: a file with CTYPE1=DEC presents (Dec,RA), not
-      !! (RA,Dec)), so the caller needs the actual Frame object to align
-      !! two files' sky axes correctly via astConvert rather than assuming
-      !! a shared order.
+      !! assumption about which positions they occupy. Every axis PAIR
+      !! (not just consecutive ones -- an earlier version assumed a
+      !! SkyFrame's 2 axes must be consecutive within a CmpFrame, since
+      !! decompose splits a CmpFrame into two axis-contiguous components;
+      !! that assumption turned out to be wrong, confirmed by direct
+      !! test: a file with RA/Dec on non-adjacent pixel axes 2 and 4 still
+      !! has a genuine SkyFrame recoverable via ast_pickaxes(2,4), so
+      !! whatever internal structure connects them is not simply "the two
+      !! components of one decompose split") is probed with ast_pickaxes
+      !! + ast_isaskyframe -- a genuine AST class check, not a guess -- to
+      !! find which pair it is. Once known, astMapSplit selects a
+      !! Mapping's INPUT axes, but the sky axes are on the OUTPUT side
+      !! (current frame) of the pixel->compound Mapping -- so invert first
+      !! (making sky axes selectable as inputs), simplify (helps AST
+      !! recognise separability), split, then invert the result back to a
+      !! forward pixel-subset -> sky Mapping. Also returns the isolated
+      !! SkyFrame object itself (not just the Mapping) -- a SkyFrame's own
+      !! axis order is NOT a fixed RA-then-Dec convention (it reflects
+      !! whichever axis the header declared as longitude vs latitude
+      !! first, confirmed by direct comparison: a file with CTYPE1=DEC
+      !! presents (Dec,RA), not (RA,Dec)), so the caller needs the actual
+      !! Frame object to align two files' sky axes correctly via
+      !! astConvert rather than assuming a shared order.
       integer, intent(in) :: wcs
       integer, intent(out) :: skymap, skyframe
       integer, intent(inout) :: status
 
-      integer :: curframe, nout, i
+      integer :: curframe, nout, i, j
       integer :: probe_axes(2), probe_frame, probe_map
       integer :: sky_axes_in(2), out_axes(4)
       integer :: fullmap, simplemap
@@ -167,24 +171,26 @@ contains
       nout = ast_geti(wcs, 'Nout', status)
       curframe = ast_getframe(wcs, ast__current, status)
       found_sky = .false.
-      do i = 1, nout - 1
-         probe_axes(1) = i
-         probe_axes(2) = i + 1
-         probe_frame = ast_pickaxes(curframe, 2, probe_axes, probe_map, status)
-         if (ast_isaskyframe(probe_frame, status)) then
-            sky_axes_in = probe_axes
-            found_sky = .true.
-            skyframe = probe_frame
+      outer: do i = 1, nout - 1
+         do j = i + 1, nout
+            probe_axes(1) = i
+            probe_axes(2) = j
+            probe_frame = ast_pickaxes(curframe, 2, probe_axes, probe_map, status)
+            if (ast_isaskyframe(probe_frame, status)) then
+               sky_axes_in = probe_axes
+               found_sky = .true.
+               skyframe = probe_frame
+               call ast_annul(probe_map, status)
+               exit outer
+            endif
+            call ast_annul(probe_frame, status)
             call ast_annul(probe_map, status)
-            exit
-         endif
-         call ast_annul(probe_frame, status)
-         call ast_annul(probe_map, status)
-      enddo
+         enddo
+      enddo outer
       call ast_annul(curframe, status)
 
       if (.not. found_sky) then
-         write(*,*) 'ERROR: no consecutive-axis-pair SkyFrame found in the WCS'
+         write(*,*) 'ERROR: no axis-pair SkyFrame found in the WCS'
          status = -1
          return
       endif
