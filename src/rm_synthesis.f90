@@ -921,17 +921,13 @@ n_bands_t2 = size(cfg%band)
 if (n_bands_t2.gt.1)then
    ! T2 scope narrowing (plan Sec 9, T2 ticket), progressively relaxed by
    ! T4 (multi-tile), T6 (channel subimaging), T7 (per-band bad-channel
-   ! files), and T8 (GPU offload, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
-   ! the features listed below remain genuinely out of scope -- every one
-   ! stops here, explicitly, rather than silently producing wrong output.
+   ! files), T8 (GPU offload), and T9 (io_read_threads>1/io_overlap,
+   ! planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): the features listed below
+   ! remain genuinely out of scope -- every one stops here, explicitly,
+   ! rather than silently producing wrong output.
    if (cfg%remove_qu_bias)then
       write(*,*)'ERROR: multi-band Q/U bias correction is not yet implemented.'
       write(*,*)'Set remove_qu_bias=n, or use a single band (nbands=1).'
-      write(*,*)'Quitting now...'
-      stop
-   else if (cfg%io_read_threads.gt.1 .or. cfg%io_overlap)then
-      write(*,*)'ERROR: multi-band io_read_threads>1/io_overlap is not yet implemented.'
-      write(*,*)'Set io_read_threads=1 and io_overlap=n, or use a single band.'
       write(*,*)'Quitting now...'
       stop
    else if (cfg%use_auto_rm_range.eq.1)then

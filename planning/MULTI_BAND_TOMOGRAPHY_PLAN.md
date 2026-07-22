@@ -1508,7 +1508,58 @@ multi-band.
 
 All four tickets opened by the "what else would be zero-effort" line of
 investigation (T6 channel subimaging, T7 per-band bad channels, T8 GPU
-offload) are now complete, alongside the earlier T0-T5 foundation. The
-only remaining known gap in this codebase is `remove_qu_bias` (dead code,
-pre-existing even for single-band, deliberately left as a placeholder for
-future Q/U-vs-I calibration -- not a multi-band-specific item).
+offload) are now complete, alongside the earlier T0-T5 foundation.
+`remove_qu_bias` remains a deliberate, known non-gap (dead code,
+pre-existing even for single-band, kept as a placeholder for future
+Q/U-vs-I calibration). `io_read_threads>1`/`io_overlap` is a genuine,
+still-open gap -- see T9 below.
+
+### T9 — Enable `io_read_threads>1`/`io_overlap` for Multi-Band (MUST DO)
+
+- **Status:** not yet scoped or started. Tracked explicitly here per user
+  instruction (2026-07-22) after a miscommunication: the user never
+  intended this restriction and was questioning why it existed at all,
+  not asking for it to be added -- this is a required fix, not an
+  optional enhancement, and matters for large multi-band cubes.
+- **Objective:** remove the blanket
+  `cfg%io_read_threads.gt.1 .or. cfg%io_overlap` stop-check for
+  `nbands>1` ([rm_synthesis.f90:932-936](../src/rm_synthesis.f90#L932-L936)),
+  following the same discipline as T6/T7/T8: investigate by code
+  inspection first (is the restriction genuinely necessary, or was it
+  over-cautious like channel subimaging/GPU turned out to be?), scope
+  concretely, implement, verify via a bit-identical/tolerance test plus
+  the standing `nbands=1` sweep, record Evidence.
+- **Not yet investigated**: whether the per-band tile-read loop (T2)
+  already reuses the parallel-channel-read/async-write infrastructure
+  safely for multi-band, or whether genuine new work is needed (e.g. the
+  per-band FTGSVE calls added in T2/T6 currently run as plain sequential
+  calls, forced by `io_read_threads` being blocked at 1 for `nbands>1` --
+  worth checking whether that per-band loop can be parallelized the same
+  way the reference band's own channel-chunked read already is).
+- **Evidence (2026-07-22):** Investigated by code inspection before
+  touching anything, per the user's direct challenge to justify the
+  restriction. Found: the `io_read_threads` parallel channel-split read
+  ([rm_synthesis.f90:3391-3404](../src/rm_synthesis.f90#L3391-L3404))
+  only ever touches the *reference* band's own channel range and buffer
+  offset -- the other bands' reads happen afterward, sequentially,
+  entirely outside that parallel region, so there is no data race to
+  introduce. The `io_overlap` ping-pong double-buffering
+  ([rm_synthesis.f90:2350-2364](../src/rm_synthesis.f90#L2350-L2364)) is
+  sized from `nz_out`, already the correct post-merge multi-band total at
+  that point in the program, and the write-dispatch logic
+  (`populate_write_job`) operates purely on already-merged output tile
+  arrays with no notion of band count at all. Same over-cautious-blanket-
+  restriction pattern as T6/T7/T8. Implemented: removed the stop-check,
+  no other source change. Build: 0 errors, 0 new warnings across all 4
+  variants (still exactly 4 pre-existing GPU-offload linker warnings).
+  `tests/run_tests.sh`: 49/49 pass (44 from T0-T8 + two new sections) --
+  the T5 split-band config, forced into 7 tiles (uneven remainder, same
+  shape as the existing single-band io_overlap/io_read_threads tests):
+  with `io_overlap=y`, confirmed 7 tiles ran, no overlapping tile writes,
+  and all 4 output products bit-identical to the existing single-tile
+  split-band reference; with `io_read_threads=4`, confirmed the 4-handle
+  parallel-read path was taken and all 4 output products bit-identical to
+  the same reference. `nbands=1` bit-identical sweep unaffected (140/140
+  FITS compared, 134 exact + the same 6 pre-existing NaN-artifact diffs
+  seen in every prior sweep). Both code-inspection predictions confirmed
+  empirically on the first attempt.

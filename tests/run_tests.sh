@@ -55,6 +55,12 @@
 #      reference (matching every existing GPU test's own tolerance) plus
 #      RM-peak validation; staged (VRAM sub-block path, gpu_vram_mib=1)
 #      bit-identical to the non-staged GPU run
+#  21. io_overlap for multi-band (T9) – the T5 split-band config forced
+#      into 7 tiles with io_overlap=y, bit-identical to the existing
+#      single-tile split-band reference; confirms no overlapping tile
+#      writes
+#  22. io_read_threads>1 for multi-band (T9) – same config, 7 tiles,
+#      io_read_threads=4, bit-identical to the same single-tile reference
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -1388,6 +1394,139 @@ CFGEOF
     fi
 else
     skip "GPU binary or multi-band CPU reference not available; skipping multi-band GPU test"
+fi
+
+# ---------------------------------------------------------------------------
+# 21. io_overlap for multi-band (T9, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     the T5 split-band 2-band config, forced into 7 tiles (32 Dec rows / 5
+#     per tile, uneven remainder -- same shape as test 13's single-band
+#     case) with io_overlap=y. Must be bit-identical to the existing
+#     single-tile split_identity reference (test 17/T5) -- the ping-pong
+#     output buffers io_overlap double-buffers are sized from the already-
+#     merged nz_out and never touch how many bands contributed to it, so
+#     this exercises exactly the "genuinely does not care about band
+#     count" claim from the T9 investigation, not a new code path.
+# ---------------------------------------------------------------------------
+section "21. io_overlap for multi-band – multi-tile async write == single-tile reference (T9)"
+
+if [[ -x "$BIN_OMP" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
+    mbovl_cfg="$OUT_DIR/mb_io_overlap.cfg"
+    mbovl_log="$OUT_DIR/mb_io_overlap.log"
+    rm -f "$OUT_DIR"/mb_io_overlap.*.FITS
+    cat > "$mbovl_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/mb_io_overlap
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+tile_auto           = n
+tile_ra             = 32
+tile_dec            = 5
+io_overlap          = y
+log_level           = debug
+CFGEOF
+    if run_binary "$BIN_OMP" "$mbovl_cfg" "$mbovl_log"; then
+        n_tiles_mb=$(grep -c "Doing tile" "$mbovl_log" || true)
+        if [[ "$n_tiles_mb" -gt 1 ]]; then
+            pass "io_overlap multi-band (T9): multi-tile run confirmed (${n_tiles_mb} tiles)"
+        else
+            fail "io_overlap multi-band (T9): expected >1 tile, got $n_tiles_mb"
+        fi
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/split_identity.${suffix}.FITS"
+            f2="$OUT_DIR/mb_io_overlap.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "io_overlap multi-band (T9): ${suffix} differs from single-tile reference"
+                fi
+            else
+                all_match=0
+                fail "io_overlap multi-band (T9): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "io_overlap multi-band (T9): bit-identical to single-tile split-band reference"
+        fi
+        if require_no_overlapping_tile_writes "$mbovl_log" > /dev/null 2>&1; then
+            pass "io_overlap multi-band (T9): tile writes never overlap (single-handle serialization holds)"
+        else
+            fail "io_overlap multi-band (T9): two tile writes overlapped in time (see $mbovl_log)"
+        fi
+    else
+        fail "io_overlap multi-band (T9): run failed (see $mbovl_log)"
+    fi
+else
+    skip "OMP binary or multi-band CPU reference not available; skipping io_overlap multi-band test"
+fi
+
+# ---------------------------------------------------------------------------
+# 22. io_read_threads>1 for multi-band (T9): same split-band 2-band config,
+#     forced into 7 tiles, with io_read_threads=4. Must be bit-identical to
+#     the same single-tile split_identity reference -- the parallel
+#     channel-split read only ever touches the reference band's own
+#     channel range/buffer offset; the other bands' reads happen
+#     afterward, sequentially, outside that parallel region entirely.
+# ---------------------------------------------------------------------------
+section "22. io_read_threads>1 for multi-band – parallel read == single-tile reference (T9)"
+
+if [[ -x "$BIN_OMP" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
+    mbrt_cfg="$OUT_DIR/mb_io_read_threads.cfg"
+    mbrt_log="$OUT_DIR/mb_io_read_threads.log"
+    rm -f "$OUT_DIR"/mb_io_read_threads.*.FITS
+    sed -e "s|outfile             = ${OUT_DIR}/mb_io_overlap\$|outfile             = ${OUT_DIR}/mb_io_read_threads|" \
+        -e "s|io_overlap          = y|io_overlap          = n\nio_read_threads     = 4|" \
+        "$mbovl_cfg" > "$mbrt_cfg"
+    if run_binary "$BIN_OMP" "$mbrt_cfg" "$mbrt_log"; then
+        if grep -qE "Parallel FITS IO: opened +4 +handles/file" "$mbrt_log"; then
+            pass "io_read_threads>1 multi-band (T9): parallel-read path confirmed taken (4 handles)"
+        else
+            fail "io_read_threads>1 multi-band (T9): expected 4-handle parallel-read log line not found (see $mbrt_log)"
+        fi
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/split_identity.${suffix}.FITS"
+            f2="$OUT_DIR/mb_io_read_threads.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "io_read_threads>1 multi-band (T9): ${suffix} differs from single-tile reference"
+                fi
+            else
+                all_match=0
+                fail "io_read_threads>1 multi-band (T9): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "io_read_threads>1 multi-band (T9): bit-identical to single-tile split-band reference"
+        fi
+    else
+        fail "io_read_threads>1 multi-band (T9): run failed (see $mbrt_log)"
+    fi
+else
+    skip "OMP binary or multi-band CPU reference not available; skipping io_read_threads>1 multi-band test"
 fi
 
 # ---------------------------------------------------------------------------
