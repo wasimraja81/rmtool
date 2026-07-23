@@ -25,6 +25,22 @@
 ! different from *partial* overlap, which is the normal, expected case
 ! for combining bands with different sky coverage and is not rejected.
 !
+! Also demonstrates the actual regridding step: resample_first_plane
+! reads one input's first plane and resamples it onto the final output
+! grid via astResampleR. Caught a real bug on the first attempt: the
+! documented 20-argument signature (this, ndim_in, lbnd_in, ubnd_in, in,
+! in_var, interp, finterp, params, flags, tol, maxpix, badval, ndim_out,
+! lbnd_out, ubnd_out, lbnd, ubnd, out, out_var) was missing "params"
+! entirely, silently shifting every later argument by one position (a
+! REAL array landing where an INTEGER "flags" scalar was expected, etc)
+! -- segfaulted rather than erroring cleanly, so this needed bisecting
+! with diagnostic prints rather than reading a status code. Verified
+! after the fix: resampling the axis-swapped fixture onto the reference
+! grid reproduces the exact known ground-truth value at a known pixel
+! (read independently via Python beforehand), and the union-mode test's
+! NaN count for uncovered output pixels matches the expected uncovered
+! area exactly (16x32 = 512).
+!
 ! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
 program reproject_cubes
    implicit none
@@ -42,6 +58,8 @@ program reproject_cubes
    integer, external :: ast_fitschan, ast_read, ast_geti
    integer, external :: ast_getmapping, ast_simplify, ast_getframe
    integer, external :: ast_pickaxes, ast_cmpmap, ast_convert
+   integer, external :: ast_resampler
+   integer, parameter :: ast__linear = 5
    logical, external :: ast_isaframeset, ast_isaskyframe
    character(len=ast__szchr), external :: ast_getc
 
@@ -177,6 +195,31 @@ program reproject_cubes
       stop 1
    endif
 
+   ! --- Resample the first input's first plane onto the final output
+   ! grid, via astResampleR ---
+   ! Proof-of-concept for the actual regridding step: re-derives the
+   ! first input's own pixel->reference Mapping (cheap relative to the
+   ! resample itself; the per-channel production loop will keep Mappings
+   ! alive across a single pass instead of recomputing, once this
+   ! correctness case is established). Only the first non-sky-axis plane
+   ! (e.g. channel 1) is handled here -- looping over every plane is the
+   ! next increment, not this one.
+   call load_wcs(infiles(1), wcs_in, naxes_in, status)
+   call extract_sky_mapping(wcs_in, skymap_in, skyframe_in, pixaxes_in, status)
+   call compose_pix2pix(skymap_in, skyframe_in, skymap_ref, skyframe_ref,&
+   &map_in2ref, status)
+   if (status.ne.0) then
+      write(*,*) 'ERROR: failed to re-derive the first input''s Mapping',&
+      &' for resampling'
+      stop 1
+   endif
+   call resample_first_plane(infiles(1), map_in2ref, naxes_in, pixaxes_in,&
+   &lbnd_out, ubnd_out, status)
+   call ast_annul(map_in2ref, status)
+   call ast_annul(skymap_in, status)
+   call ast_annul(skyframe_in, status)
+   call ast_annul(wcs_in, status)
+
    write(*,'(A,A,A,F0.0,A,F0.0,A,F0.0,A,F0.0,A)') 'Final output grid (',&
    &trim(mode), ' mode): [', lbnd_out(1), ',', ubnd_out(1), '] x [',&
    &lbnd_out(2), ',', ubnd_out(2), ']'
@@ -194,6 +237,119 @@ program reproject_cubes
    write(*,*) 'OK: footprint-mode output grid computed successfully.'
 
 contains
+
+   subroutine resample_first_plane(filename, map_in2ref, naxes_in,&
+   &pixaxes_in, lbnd_out_d, ubnd_out_d, status)
+      !! Read filename's first plane (every non-sky axis fixed at index 1)
+      !! and resample it onto the output grid [lbnd_out_d,ubnd_out_d]
+      !! (reference pixel space) via astResampleR, using map_in2ref (the
+      !! forward input->reference pixel Mapping -- astResampleR uses its
+      !! INVERSE internally to look up each output pixel's input value,
+      !! per its own documented convention). Bad/uncovered output pixels
+      !! are flagged with IEEE NaN, matching this codebase's existing
+      !! NaN-based masking convention throughout rm_synthesis.
+      !!
+      !! Reading fpixels(k)=lpixels(k)=1 for every axis except the 2 sky
+      !! ones (set to that axis's own full 1..NAXIS extent) naturally
+      !! produces a flat array with the sky axes as its only two
+      !! non-degenerate dimensions, in pixaxes_in's own order (first
+      !! fastest) -- exactly the "Fortran array indexing" astResampleR
+      !! expects -- regardless of which raw file-axis numbers they are,
+      !! since a degenerate (extent-1) axis contributes no stride.
+      use, intrinsic :: ieee_arithmetic
+      character(len=*), intent(in) :: filename
+      integer, intent(in) :: map_in2ref
+      integer, intent(in) :: naxes_in(:), pixaxes_in(2)
+      double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
+      integer, intent(inout) :: status
+
+      integer :: unit, blocksize, fitsstat, group, naxis, k
+      integer :: fpixels(max_axes), lpixels(max_axes), incs(max_axes)
+      integer :: nx_in, ny_in, nx_out, ny_out
+      real, allocatable :: data_in(:,:), data_out(:,:)
+      logical :: anyflg
+      integer :: lbnd_in(2), ubnd_in(2), lbnd_o(2), ubnd_o(2)
+      integer :: nbad
+      real :: badval
+      double precision :: params_dummy(1)
+
+      if (status.ne.0) return
+
+      nx_in = naxes_in(pixaxes_in(1))
+      ny_in = naxes_in(pixaxes_in(2))
+      allocate(data_in(nx_in, ny_in))
+
+      naxis = 0
+      do k = 1, max_axes
+         if (naxes_in(k).gt.0) naxis = k
+      enddo
+      fpixels(1:naxis) = 1
+      lpixels(1:naxis) = 1
+      incs(1:naxis) = 1
+      lpixels(pixaxes_in(1)) = nx_in
+      lpixels(pixaxes_in(2)) = ny_in
+
+      fitsstat = 0
+      blocksize = 1
+      unit = 31
+      group = 1
+      badval = ieee_value(badval, ieee_quiet_nan)
+      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
+      call FTGSVE(unit, group, naxis, naxes_in(1:naxis),&
+      &fpixels(1:naxis), lpixels(1:naxis), incs(1:naxis),&
+      &badval, data_in, anyflg, fitsstat)
+      call FTCLOS(unit, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to read data plane from ', trim(filename)
+         call printerror(fitsstat)
+         status = -1
+         return
+      endif
+
+      nx_out = nint(ubnd_out_d(1) - lbnd_out_d(1)) + 1
+      ny_out = nint(ubnd_out_d(2) - lbnd_out_d(2)) + 1
+      allocate(data_out(nx_out, ny_out))
+
+      lbnd_in(1) = 1
+      lbnd_in(2) = 1
+      ubnd_in(1) = nx_in
+      ubnd_in(2) = ny_in
+      lbnd_o(1) = nint(lbnd_out_d(1))
+      lbnd_o(2) = nint(lbnd_out_d(2))
+      ubnd_o(1) = nint(ubnd_out_d(1))
+      ubnd_o(2) = nint(ubnd_out_d(2))
+      params_dummy(1) = 0.0d0
+
+      ! Full 20-argument signature (this, ndim_in, lbnd_in, ubnd_in, in,
+      ! in_var, interp, finterp, params, flags, tol, maxpix, badval,
+      ! ndim_out, lbnd_out, ubnd_out, lbnd, ubnd, out, out_var) -- an
+      ! earlier attempt omitted "params" entirely, silently shifting every
+      ! later argument by one position (a REAL array landing where an
+      ! INTEGER "flags" scalar was expected, etc), which segfaulted.
+      ! in_var/out_var are unused here (no variance requested) but AST's
+      ! Fortran binding needs a validly-typed/sized array regardless of a
+      ! true C NULL, so data_in/data_out are reused as harmless
+      ! placeholders rather than risk an invalid "null" convention guess.
+      nbad = ast_resampler(map_in2ref, 2, lbnd_in, ubnd_in, data_in, data_in,&
+      &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval,&
+      &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o, data_out, data_out, status)
+
+      write(*,'(A,A,A,I0,A,I0,A)') 'Resampled ', trim(filename), ': ',&
+      &nx_out, ' x ', ny_out, ' output plane'
+      write(*,'(A,I0,A)') '  bad (uncovered) output pixels: ', nbad
+
+      ! Diagnostic: print the resampled value at reference pixel (5,9),
+      ! for comparison against a known ground-truth value read directly
+      ! from the original data with a Python script beforehand.
+      if (5.ge.lbnd_o(1) .and. 5.le.ubnd_o(1) .and.&
+      &9.ge.lbnd_o(2) .and. 9.le.ubnd_o(2)) then
+         write(*,'(A,F0.9)') '  value at reference pixel (5,9): ',&
+         &data_out(5-lbnd_o(1)+1, 9-lbnd_o(2)+1)
+      endif
+
+      deallocate(data_in)
+      deallocate(data_out)
+   end subroutine resample_first_plane
 
    subroutine compose_pix2pix(skymap_from, skyframe_from, skymap_to,&
    &skyframe_to, map_out, status)
