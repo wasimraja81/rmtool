@@ -6,28 +6,26 @@
 ! rm_synthesis exact-match ingestion (T1) can consume genuinely misaligned
 ! bands unchanged.
 !
-! Current stage: cross-file pixel(A)->pixel(B) Mapping, composed from each
-! file's own pixel->sky Mapping (extract_sky_mapping: automatic axis
-! detection via ast_isaskyframe + a clean astMapSplit extraction, correct
-! for any axis order/adjacency -- see extract_sky_mapping's own comment)
-! rather than via astConvert. astConvert was tried first (the textbook
-! cross-WCS-alignment primitive) but, per the actual SUN/211 manual
-! (installed via libstarlink-ast-doc), its domain search only examines
-! each FrameSet's own top-level registered frames (base + current) by
-! their own Domain attribute -- it does not recurse into a CmpFrame's
-! internal components, so a domainlist of 'SKY' can never match a
-! compound "STOKES-SKY-SPECTRUM" current frame. Composing pixel_A->sky
-! (this file's own Mapping) with sky->pixel_B (the other file's own
-! Mapping, inverted) sidesteps that limitation entirely.
+! Current stage: N-input footprint-mode computation (intersection/union/
+! reference), built on top of two previously-verified building blocks:
+! extract_sky_mapping (automatic sky-axis detection, correct for any axis
+! order/adjacency -- see its own comment for why the earlier consecutive-
+! axis-only search was wrong) and astMapBox-based footprint bounds
+! (verified against a genuine partial-overlap case, not just full
+! overlap). Cross-file alignment composes each file's own pixel->sky
+! Mapping with an astConvert between the two SkyFrame *objects* (not
+! whole FrameSets -- astConvert's domain search does not recurse into a
+! CmpFrame's internal components, confirmed against the actual SUN/211
+! manual, so it cannot align two compound "STOKES-SKY-SPECTRUM" current
+! frames directly).
 !
-! Also demonstrates footprint computation via astMapBox: one file's full
-! pixel extent expressed in the other's pixel space, the building block
-! for the intersection/union/reference footprint modes -- verified
-! against a genuine partial-overlap case (not just full-overlap, which
-! could hide a bug), by hand-shifting one fixture's CRPIX and confirming
-! the reported footprint matches the expected shift exactly.
+! Footprint policy: zero overlap between any input and the running output
+! grid is always a hard failure, regardless of mode (loudly refuse before
+! compute, matching the rest of this project's philosophy) -- this is
+! different from *partial* overlap, which is the normal, expected case
+! for combining bands with different sky coverage and is not rejected.
 !
-! Usage: reproject_cubes <fits_file_a> <fits_file_b>
+! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
 program reproject_cubes
    implicit none
    ! AST_PAR (the vendor Fortran constants file, /usr/include/AST_PAR) is
@@ -48,114 +46,144 @@ program reproject_cubes
    character(len=ast__szchr), external :: ast_getc
 
    integer, parameter :: max_axes = 10
-   character(len=512) :: infile_a, infile_b
-   integer :: wcs_a, wcs_b, skymap_a, skymap_b, pix2pix
-   integer :: skyframe_a, skyframe_b, sky2sky
-   integer :: naxes_a(max_axes), naxes_b(max_axes)
-   integer :: pixaxes_a(2), pixaxes_b(2)
-   integer :: status
-   double precision :: xin(1), yin(1), xout(1), yout(1)
-   double precision :: lbnd_in(2), ubnd_in(2)
-   double precision :: lbnd_out, ubnd_out, xl(2), xu(2)
+   integer, parameter :: max_inputs = 50
 
-   if (command_argument_count() < 2) then
-      write(*,*) 'Usage: reproject_cubes <fits_file_a> <fits_file_b>'
+   character(len=16) :: mode
+   character(len=512) :: reffile
+   character(len=512) :: infiles(max_inputs)
+   integer :: n_inputs, iarg, i
+
+   integer :: wcs_ref, skymap_ref, skyframe_ref
+   integer :: naxes_ref(max_axes), pixaxes_ref(2)
+   integer :: wcs_in, skymap_in, skyframe_in
+   integer :: naxes_in(max_axes), pixaxes_in(2)
+   integer :: map_in2ref
+   double precision :: lbnd_out(2), ubnd_out(2)
+   double precision :: this_lbnd(2), this_ubnd(2)
+   integer :: status
+
+   if (command_argument_count() < 3) then
+      write(*,*) 'Usage: reproject_cubes <intersection|union|reference>',&
+      &' <reference_file> <input_file> [input_file ...]'
       stop 1
    endif
-   call get_command_argument(1, infile_a)
-   call get_command_argument(2, infile_b)
+   call get_command_argument(1, mode)
+   call get_command_argument(2, reffile)
+   n_inputs = command_argument_count() - 2
+   if (n_inputs.gt.max_inputs) then
+      write(*,*) 'ERROR: too many input files (max ', max_inputs, ')'
+      stop 1
+   endif
+   do i = 1, n_inputs
+      call get_command_argument(2+i, infiles(i))
+   enddo
+
+   if (trim(mode).ne.'intersection' .and. trim(mode).ne.'union' .and.&
+   &trim(mode).ne.'reference') then
+      write(*,*) 'ERROR: mode must be intersection, union, or reference'
+      stop 1
+   endif
 
    status = 0
    call ast_begin(status)
 
-   call load_wcs(infile_a, wcs_a, naxes_a, status)
-   call load_wcs(infile_b, wcs_b, naxes_b, status)
+   call load_wcs(reffile, wcs_ref, naxes_ref, status)
+   call extract_sky_mapping(wcs_ref, skymap_ref, skyframe_ref, pixaxes_ref, status)
    if (status.ne.0) then
-      write(*,*) 'ERROR: failed to load one or both WCS FrameSets'
+      write(*,*) 'ERROR: failed to load the reference file''s WCS'
       stop 1
    endif
 
-   call extract_sky_mapping(wcs_a, skymap_a, skyframe_a, pixaxes_a, status)
-   call extract_sky_mapping(wcs_b, skymap_b, skyframe_b, pixaxes_b, status)
-   if (status.ne.0) then
-      write(*,*) 'ERROR: failed to extract one or both pixel->sky Mappings'
+   ! Output grid starts as the reference's own full extent; intersection
+   ! shrinks it, union grows it, reference mode leaves it untouched (the
+   ! loop below is skipped entirely for reference mode).
+   lbnd_out(1) = 1.0d0
+   lbnd_out(2) = 1.0d0
+   ubnd_out(1) = real(naxes_ref(pixaxes_ref(1)), kind=8)
+   ubnd_out(2) = real(naxes_ref(pixaxes_ref(2)), kind=8)
+   write(*,'(A,A,A,F0.0,A,F0.0,A,F0.0,A,F0.0,A)') 'Reference (', trim(reffile),&
+   &') own extent: [', lbnd_out(1), ',', ubnd_out(1), '] x [',&
+   &lbnd_out(2), ',', ubnd_out(2), ']'
+
+   if (trim(mode).ne.'reference') then
+      do i = 1, n_inputs
+         call load_wcs(infiles(i), wcs_in, naxes_in, status)
+         call extract_sky_mapping(wcs_in, skymap_in, skyframe_in, pixaxes_in, status)
+         if (status.ne.0) then
+            write(*,*) 'ERROR: failed to load input file: ', trim(infiles(i))
+            stop 1
+         endif
+
+         call compose_pix2pix(skymap_in, skyframe_in, skymap_ref, skyframe_ref,&
+         &map_in2ref, status)
+         if (status.ne.0) then
+            write(*,*) 'ERROR: failed to align input file to the reference: ',&
+            &trim(infiles(i))
+            stop 1
+         endif
+
+         call footprint_bounds(map_in2ref, naxes_in, pixaxes_in,&
+         &this_lbnd, this_ubnd, status)
+         write(*,'(A,A,A,F0.2,A,F0.2,A,F0.2,A,F0.2,A)') '  ', trim(infiles(i)),&
+         &' footprint in reference space: [', this_lbnd(1), ',', this_ubnd(1),&
+         &'] x [', this_lbnd(2), ',', this_ubnd(2), ']'
+
+         ! Zero overlap with the running output grid is always a hard
+         ! failure, regardless of mode -- a band sharing no sky at all
+         ! with the rest is not legitimate partial coverage (that implies
+         ! at least some shared sky), it is almost certainly the wrong
+         ! file. Checked here, per-input, before folding it into the
+         ! running bound, so the diagnostic names the specific offending
+         ! file rather than a generic "empty result" at the end.
+         if (this_ubnd(1).lt.lbnd_out(1) .or. this_lbnd(1).gt.ubnd_out(1) .or.&
+         &this_ubnd(2).lt.lbnd_out(2) .or. this_lbnd(2).gt.ubnd_out(2)) then
+            write(*,*) 'ERROR: zero sky overlap between the reference and: ',&
+            &trim(infiles(i))
+            write(*,*) 'Quitting now...'
+            stop 1
+         endif
+
+         if (trim(mode).eq.'intersection') then
+            lbnd_out = max(lbnd_out, this_lbnd)
+            ubnd_out = min(ubnd_out, this_ubnd)
+         else ! union
+            lbnd_out = min(lbnd_out, this_lbnd)
+            ubnd_out = max(ubnd_out, this_ubnd)
+         endif
+
+         call ast_annul(map_in2ref, status)
+         call ast_annul(skymap_in, status)
+         call ast_annul(skyframe_in, status)
+         call ast_annul(wcs_in, status)
+      enddo
+   endif
+
+   ! Round to the integer pixel grid: intersection wants the largest
+   ! integer range fully CONTAINED within the real-valued bound (ceiling
+   ! the lower edge, floor the upper edge); union wants the smallest
+   ! integer range that fully CONTAINS it (floor/ceiling the other way).
+   ! Reference mode's bound is already exactly integer (a file's own
+   ! NAXIS), so this is a no-op for it either way.
+   if (trim(mode).eq.'intersection') then
+      lbnd_out = ceiling(lbnd_out)
+      ubnd_out = floor(ubnd_out)
+   else
+      lbnd_out = floor(lbnd_out)
+      ubnd_out = ceiling(ubnd_out)
+   endif
+
+   if (lbnd_out(1).gt.ubnd_out(1) .or. lbnd_out(2).gt.ubnd_out(2)) then
+      write(*,*) 'ERROR: computed output grid is empty (', trim(mode), ' mode)'
       stop 1
    endif
-   write(*,*) 'Both files'' pixel -> sky Mappings extracted successfully.'
 
-   ! --- Align the two SkyFrames themselves ---
-   ! A SkyFrame's own axis order is NOT a fixed RA-then-Dec convention --
-   ! it reflects whichever axis the header declared as longitude vs
-   ! latitude first (confirmed by direct comparison: file B's CTYPE1=DEC
-   ! makes its SkyFrame present (Dec,RA), not (RA,Dec) like file A's).
-   ! astConvert between two whole FrameSets failed earlier because domain
-   ! search only checks each FrameSet's own top-level registered frames --
-   ! but skyframe_a/skyframe_b are genuine Frame objects (not FrameSets),
-   ! so Frame-to-Frame astConvert applies here directly and correctly
-   ! resolves any axis-order/equinox/system difference via AST's own
-   ! SkyFrame alignment logic, rather than this code assuming an order.
-   sky2sky = ast_convert(skyframe_a, skyframe_b, ' ', status)
-   if (status.ne.0 .or. sky2sky.eq.ast__null) then
-      write(*,*) 'ERROR: failed to align the two SkyFrames, status=', status
-      stop 1
-   endif
+   write(*,'(A,A,A,F0.0,A,F0.0,A,F0.0,A,F0.0,A)') 'Final output grid (',&
+   &trim(mode), ' mode): [', lbnd_out(1), ',', ubnd_out(1), '] x [',&
+   &lbnd_out(2), ',', ubnd_out(2), ']'
 
-   ! --- Compose pixel_A -> sky_A -> sky_B -> pixel_B ---
-   call ast_invert(skymap_b, status)
-   pix2pix = ast_cmpmap(skymap_a, sky2sky, .true., ' ', status)
-   pix2pix = ast_cmpmap(pix2pix, skymap_b, .true., ' ', status)
-   call ast_invert(skymap_b, status)
-   if (status.ne.0 .or. pix2pix.eq.ast__null) then
-      write(*,*) 'ERROR: failed to compose the pixel(A)->pixel(B) Mapping,',&
-      &' status=', status
-      stop 1
-   endif
-
-   write(*,*) 'pixel(A) -> pixel(B) Mapping composed:'
-   write(*,'(A,I0)') '  Nin  (pixel axes in A): ', ast_geti(pix2pix, 'Nin', status)
-   write(*,'(A,I0)') '  Nout (pixel axes in B): ', ast_geti(pix2pix, 'Nout', status)
-
-   xin(1) = 5.0d0
-   yin(1) = 9.0d0
-   call ast_tran2(pix2pix, 1, xin, yin, .true., xout, yout, status)
-   write(*,'(A,F0.3,A,F0.3,A)') '  A pixel (5.0,9.0) -> B pixel (',&
-   &xout(1), ' , ', yout(1), ')'
-
-   ! --- Footprint: file B's full pixel extent, expressed in A's own
-   ! pixel space, via astMapBox ---
-   ! astMapBox computes the true enclosing bound of ONE output coordinate
-   ! over a given input box -- properly handling any rotation/distortion
-   ! in the Mapping (not just a naive 4-corner check, which can
-   ! underestimate the true extent for a non-axis-aligned Mapping). Two
-   ! calls are needed, one per output (A-pixel) axis. Input box is B's
-   ! own full pixel-axis extent on the 2 axes its sky Mapping depends on
-   ! (pixaxes_b), read from its own NAXIS values.
-   lbnd_in(1) = 1.0d0
-   lbnd_in(2) = 1.0d0
-   ubnd_in(1) = real(naxes_b(pixaxes_b(1)), kind=8)
-   ubnd_in(2) = real(naxes_b(pixaxes_b(2)), kind=8)
-
-   ! pix2pix is A->B; astMapBox needs the B->A direction here (forward
-   ! transform of B's box into A's space), so invert for this call.
-   call ast_invert(pix2pix, status)
-   call ast_mapbox(pix2pix, lbnd_in, ubnd_in, .true., 1, lbnd_out, ubnd_out, xl, xu, status)
-   write(*,'(A,F0.3,A,F0.3,A)') '  B''s footprint in A pixel space, axis 1: [',&
-   &lbnd_out, ' , ', ubnd_out, ']'
-   call ast_mapbox(pix2pix, lbnd_in, ubnd_in, .true., 2, lbnd_out, ubnd_out, xl, xu, status)
-   write(*,'(A,F0.3,A,F0.3,A)') '  B''s footprint in A pixel space, axis 2: [',&
-   &lbnd_out, ' , ', ubnd_out, ']'
-   write(*,'(A,I0,A,I0,A)') '  (A''s own full extent is [1,', naxes_a(pixaxes_a(1)),&
-   &'] x [1,', naxes_a(pixaxes_a(2)), '])'
-   call ast_invert(pix2pix, status)
-
-   call ast_annul(pix2pix, status)
-   call ast_annul(sky2sky, status)
-   call ast_annul(skymap_a, status)
-   call ast_annul(skymap_b, status)
-   call ast_annul(skyframe_a, status)
-   call ast_annul(skyframe_b, status)
-   call ast_annul(wcs_a, status)
-   call ast_annul(wcs_b, status)
+   call ast_annul(skymap_ref, status)
+   call ast_annul(skyframe_ref, status)
+   call ast_annul(wcs_ref, status)
    call ast_end(status)
 
    if (status.ne.0) then
@@ -163,9 +191,81 @@ program reproject_cubes
       stop 1
    endif
 
-   write(*,*) 'OK: cross-file pixel(A)->pixel(B) Mapping verified.'
+   write(*,*) 'OK: footprint-mode output grid computed successfully.'
 
 contains
+
+   subroutine compose_pix2pix(skymap_from, skyframe_from, skymap_to,&
+   &skyframe_to, map_out, status)
+      !! Compose pixel_from -> sky_from -> sky_to -> pixel_to, aligning
+      !! sky_from/sky_to via a Frame-to-Frame astConvert between the two
+      !! SkyFrame objects (handles any axis-order/equinox/system
+      !! difference between them; see extract_sky_mapping's own comment
+      !! for why this cannot be skipped -- composing the two pixel->sky
+      !! Mappings directly, without this alignment step, silently
+      !! produces wrong results whenever the two files' SkyFrames present
+      !! their axes in a different order).
+      integer, intent(in) :: skymap_from, skyframe_from
+      integer, intent(in) :: skymap_to, skyframe_to
+      integer, intent(out) :: map_out
+      integer, intent(inout) :: status
+
+      integer :: sky2sky
+
+      map_out = ast__null
+      if (status.ne.0) return
+
+      sky2sky = ast_convert(skyframe_from, skyframe_to, ' ', status)
+      if (status.ne.0 .or. sky2sky.eq.ast__null) then
+         write(*,*) 'ERROR: failed to align two SkyFrames, status=', status
+         status = -1
+         return
+      endif
+
+      call ast_invert(skymap_to, status)
+      map_out = ast_cmpmap(skymap_from, sky2sky, .true., ' ', status)
+      map_out = ast_cmpmap(map_out, skymap_to, .true., ' ', status)
+      call ast_invert(skymap_to, status)
+      if (status.ne.0 .or. map_out.eq.ast__null) then
+         write(*,*) 'ERROR: failed to compose the pixel->pixel Mapping,',&
+         &' status=', status
+         status = -1
+      endif
+
+      call ast_annul(sky2sky, status)
+   end subroutine compose_pix2pix
+
+   subroutine footprint_bounds(map_from_to, naxes_from, pixaxes_from,&
+   &lbnd, ubnd, status)
+      !! "from" file's full pixel extent (its own NAXIS on the 2 axes its
+      !! sky Mapping depends on), expressed in "to" pixel space, via
+      !! astMapBox (the true enclosing bound of each output coordinate --
+      !! not a naive 4-corner check, which can underestimate the true
+      !! extent for a non-axis-aligned Mapping). map_from_to must be the
+      !! forward "from"->"to" pixel Mapping (as returned by
+      !! compose_pix2pix with "from" as its first, "to" as its second
+      !! argument pair).
+      integer, intent(in) :: map_from_to
+      integer, intent(in) :: naxes_from(:), pixaxes_from(2)
+      double precision, intent(out) :: lbnd(2), ubnd(2)
+      integer, intent(inout) :: status
+
+      double precision :: lbnd_in(2), ubnd_in(2), xl(2), xu(2)
+
+      lbnd = 0.0d0
+      ubnd = 0.0d0
+      if (status.ne.0) return
+
+      lbnd_in(1) = 1.0d0
+      lbnd_in(2) = 1.0d0
+      ubnd_in(1) = real(naxes_from(pixaxes_from(1)), kind=8)
+      ubnd_in(2) = real(naxes_from(pixaxes_from(2)), kind=8)
+
+      call ast_mapbox(map_from_to, lbnd_in, ubnd_in, .true., 1,&
+      &lbnd(1), ubnd(1), xl, xu, status)
+      call ast_mapbox(map_from_to, lbnd_in, ubnd_in, .true., 2,&
+      &lbnd(2), ubnd(2), xl, xu, status)
+   end subroutine footprint_bounds
 
    subroutine extract_sky_mapping(wcs, skymap, skyframe, pixel_axes, status)
       !! Extract the pixel-grid -> sky (RA/Dec) Mapping from a WCS
