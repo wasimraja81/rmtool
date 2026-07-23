@@ -565,6 +565,13 @@ contains
       &lbnd_out_d(1)-1.0d0, status)
       call copy_axis_keywords(ref_unit, pixaxes_ref(2), out_unit, 2,&
       &lbnd_out_d(2)-1.0d0, status)
+      ! PCi_j/CDi_j (the 2x2-matrix alternative to CROTA, which
+      ! copy_axis_keywords just above already handles per-axis): also
+      ! from the reference, same reasoning as CROTA -- the output grid's
+      ! orientation is the reference's own, unaffected by cropping/
+      ! growing its extent.
+      call copy_sky_rotation_matrix(ref_unit, pixaxes_ref(1),&
+      &pixaxes_ref(2), out_unit, status)
       ! EQUINOX/RADESYS describe the coordinate SYSTEM, not a specific
       ! axis or the data -- the output is expressed in the REFERENCE's
       ! sky frame (compose_pix2pix converts every input's sky coordinates
@@ -782,15 +789,21 @@ contains
 
    subroutine copy_axis_keywords(src_unit, src_axis, dst_unit, dst_axis,&
    &crpix_shift, status)
-      !! Copy CTYPE/CRVAL/CRPIX/CDELT/CUNIT for src_axis (in src_unit's
-      !! own header) to dst_axis (in dst_unit's header, already created
-      !! via FTPHPR). CRPIX is additionally shifted by -crpix_shift (0 for
-      !! a straight passthrough; the output grid's own pixel-1 offset,
-      !! reference-pixel-numbered, for a cropped/grown sky axis) --
-      !! matches rm_synthesis.f90's own existing subimage CRPIX-shift
-      !! formula exactly, generalised to any axis number via a
-      !! constructed keyword string ("CRVAL"//axis, etc.) rather than a
-      !! literal "1"/"2" suffix.
+      !! Copy CTYPE/CRVAL/CRPIX/CDELT/CUNIT/CROTA for src_axis (in
+      !! src_unit's own header) to dst_axis (in dst_unit's header,
+      !! already created via FTPHPR). CRPIX is additionally shifted by
+      !! -crpix_shift (0 for a straight passthrough; the output grid's
+      !! own pixel-1 offset, reference-pixel-numbered, for a cropped/
+      !! grown sky axis) -- matches rm_synthesis.f90's own existing
+      !! subimage CRPIX-shift formula exactly, generalised to any axis
+      !! number via a constructed keyword string ("CRVAL"//axis, etc.)
+      !! rather than a literal "1"/"2" suffix. CROTA needs no shift --
+      !! cropping/growing the same grid changes CRPIX (a position within
+      !! it), never its rotation. (PCi_j/CDi_j, the 2x2-matrix
+      !! alternative to CROTA, are handled separately by
+      !! copy_sky_rotation_matrix below -- they're indexed by an axis
+      !! *pair*, not a single axis, so they don't fit this per-axis
+      !! copy loop.)
       integer, intent(in) :: src_unit, src_axis, dst_unit, dst_axis
       double precision, intent(in) :: crpix_shift
       integer, intent(inout) :: status
@@ -843,7 +856,86 @@ contains
          write(axstr,'(I0)') dst_axis
          call FTPKYS(dst_unit, 'CUNIT'//trim(axstr), trim(sval), ' ', fitsstat)
       endif
+
+      write(axstr,'(I0)') src_axis
+      fitsstat = 0
+      call FTGKYD(src_unit, 'CROTA'//trim(axstr), dval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         write(axstr,'(I0)') dst_axis
+         call FTPKYD(dst_unit, 'CROTA'//trim(axstr), dval, 13, ' ', fitsstat)
+      endif
    end subroutine copy_axis_keywords
+
+   subroutine copy_sky_rotation_matrix(src_unit, src_axis1, src_axis2,&
+   &dst_unit, status)
+      !! PCi_j/CDi_j: the 2x2-matrix alternative to CROTA (a file uses
+      !! one convention or the other, essentially never both -- copying
+      !! whichever is actually present, doing nothing if neither is, is
+      !! the correct behaviour either way). Indexed by an axis PAIR
+      !! (e.g. PC2_4), so this reads the 4 entries for the sky axis pair
+      !! specifically (src_axis1,src_axis2 -- in the REFERENCE file's own
+      !! numbering) and writes them at the output's fixed sky positions
+      !! (1,2), the same axis-renumbering copy_axis_keywords already does
+      !! for CTYPE/CRVAL/etc, just for a 2-axis-indexed keyword instead
+      !! of a 1-axis-indexed one. This is intentionally NOT attempted for
+      !! the generic (infile, non-sky-axis) header copy elsewhere
+      !! (copy_generic_header skips PC/CD entirely there) -- a rotation
+      !! entry for a channel or Stokes axis would be highly unusual, and
+      !! blindly relocating it under the input's own arbitrary axis
+      !! numbers, unlike this deliberate sky-axis-pair copy, risks
+      !! landing it on the wrong axis.
+      integer, intent(in) :: src_unit, src_axis1, src_axis2, dst_unit
+      integer, intent(inout) :: status
+
+      if (status.ne.0) return
+
+      call copy_one_matrix_entry(src_unit, 'PC', src_axis1, src_axis1,&
+      &dst_unit, 1, 1)
+      call copy_one_matrix_entry(src_unit, 'PC', src_axis1, src_axis2,&
+      &dst_unit, 1, 2)
+      call copy_one_matrix_entry(src_unit, 'PC', src_axis2, src_axis1,&
+      &dst_unit, 2, 1)
+      call copy_one_matrix_entry(src_unit, 'PC', src_axis2, src_axis2,&
+      &dst_unit, 2, 2)
+      call copy_one_matrix_entry(src_unit, 'CD', src_axis1, src_axis1,&
+      &dst_unit, 1, 1)
+      call copy_one_matrix_entry(src_unit, 'CD', src_axis1, src_axis2,&
+      &dst_unit, 1, 2)
+      call copy_one_matrix_entry(src_unit, 'CD', src_axis2, src_axis1,&
+      &dst_unit, 2, 1)
+      call copy_one_matrix_entry(src_unit, 'CD', src_axis2, src_axis2,&
+      &dst_unit, 2, 2)
+   end subroutine copy_sky_rotation_matrix
+
+   subroutine copy_one_matrix_entry(su, prefix, sa, sb, du, da, db)
+      !! Single-entry helper for copy_sky_rotation_matrix (a sibling
+      !! internal subroutine, not nested inside it -- Fortran doesn't
+      !! allow a second level of CONTAINS). Copies keyword
+      !! "<prefix><sa>_<sb>" from unit su to "<prefix><da>_<db>" on unit
+      !! du, only if present on su (absent is not an error -- most files
+      !! use CROTA or nothing, not PC/CD, so 0-of-8 entries found here is
+      !! the common case).
+      integer, intent(in) :: su, sa, sb, du, da, db
+      character(len=*), intent(in) :: prefix
+
+      character(len=16) :: srckey, dstkey
+      character(len=68) :: comment
+      double precision :: dval
+      integer :: fitsstat
+      character(len=4) :: si, sj
+
+      write(si,'(I0)') sa
+      write(sj,'(I0)') sb
+      srckey = trim(prefix)//trim(si)//'_'//trim(sj)
+      fitsstat = 0
+      call FTGKYD(su, trim(srckey), dval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         write(si,'(I0)') da
+         write(sj,'(I0)') db
+         dstkey = trim(prefix)//trim(si)//'_'//trim(sj)
+         call FTPKYD(du, trim(dstkey), dval, 13, ' ', fitsstat)
+      endif
+   end subroutine copy_one_matrix_entry
 
    subroutine copy_wcs_system_keywords(src_unit, dst_unit, status)
       !! EQUINOX/RADESYS describe the sky coordinate SYSTEM (not a
@@ -869,22 +961,31 @@ contains
    end subroutine copy_wcs_system_keywords
 
    subroutine copy_generic_header(src_unit, dst_unit, status)
-      !! Copy every header card from src_unit to dst_unit EXCEPT:
-      !! structural keywords FTPHPR already wrote (SIMPLE/BITPIX/NAXIS/
-      !! EXTEND/PCOUNT/GCOUNT/END), any axis-indexed keyword
-      !! (NAXISn/CTYPEn/CRVALn/CRPIXn/CDELTn/CUNITn/CROTAn/PCn_m/CDn_m,
-      !! for ANY n/m) -- CTYPE/CRVAL/CRPIX/CDELT/CUNIT are handled
-      !! per-axis elsewhere (copy_axis_keywords), and PC/CD/CROTA
-      !! (rotation-matrix terms) are deliberately skipped rather than
-      !! copied under the wrong output axis numbering, which would be
-      !! worse than absent -- and EQUINOX/RADESYS (copy_wcs_system_keywords
-      !! handles those, from the reference, not this file). Everything
-      !! else -- BUNIT, BMAJ/BMIN/BPA, OBJECT, TELESCOP, INSTRUME,
-      !! DATE-OBS, RESTFRQ, HISTORY, COMMENT, and anything this project
-      !! has never heard of -- is copied verbatim via a raw 80-column
-      !! header record (FTGREC/FTPREC), not decoded/re-encoded through a
-      !! type-specific FTGKYx/FTPKYx pair, so formatting/precision/
-      !! comments survive exactly. This is what actually fixes losing
+      !! Copy every header card from src_unit (always called with this
+      !! opened on INFILE, for the "other" -- non-sky -- axes) to
+      !! dst_unit EXCEPT: structural keywords FTPHPR already wrote
+      !! (SIMPLE/BITPIX/NAXIS/EXTEND/PCOUNT/GCOUNT/END), and any
+      !! axis-indexed keyword (NAXISn/CTYPEn/CRVALn/CRPIXn/CDELTn/
+      !! CUNITn/CROTAn/PCn_m/CDn_m, for ANY n/m). CTYPE/CRVAL/CRPIX/
+      !! CDELT/CUNIT/CROTA are handled per-axis elsewhere
+      !! (copy_axis_keywords), PCi_j/CDi_j elsewhere too
+      !! (copy_sky_rotation_matrix), and EQUINOX/RADESYS elsewhere too
+      !! (copy_wcs_system_keywords) -- but ALL THREE of those, unlike
+      !! this generic copy, are only ever called against the REFERENCE
+      !! file for the 2 sky axes specifically, with correct axis
+      !! renumbering built in. A rotation/WCS-system keyword found here,
+      !! on one of INFILE's own non-sky axes, is skipped rather than
+      !! blindly relocated under this file's own arbitrary axis
+      !! numbering (which the output does not share) -- landing it on
+      !! the wrong axis would be worse than leaving it absent, and a
+      !! genuine rotation entry on a channel/Stokes axis would be
+      !! extremely unusual in practice anyway. Everything else -- BUNIT,
+      !! BMAJ/BMIN/BPA, OBJECT, TELESCOP, INSTRUME, DATE-OBS, RESTFRQ,
+      !! HISTORY, COMMENT, and anything this project has never heard of
+      !! -- is copied verbatim via a raw 80-column header record
+      !! (FTGREC/FTPREC), not decoded/re-encoded through a type-specific
+      !! FTGKYx/FTPKYx pair, so formatting/precision/comments survive
+      !! exactly. This is what actually fixes losing
       !! units/beam/provenance from the output (previously ONLY the
       !! axis-indexed WCS keywords were ever copied at all).
       integer, intent(in) :: src_unit, dst_unit
