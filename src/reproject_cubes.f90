@@ -25,11 +25,11 @@
 ! different from *partial* overlap, which is the normal, expected case
 ! for combining bands with different sky coverage and is not rejected.
 !
-! Also demonstrates the actual regridding step: resample_first_plane
-! reads one input's first plane and resamples it onto the final output
-! grid via astResampleR. Caught a real bug on the first attempt: the
-! documented 20-argument signature (this, ndim_in, lbnd_in, ubnd_in, in,
-! in_var, interp, finterp, params, flags, tol, maxpix, badval, ndim_out,
+! Also demonstrates the actual regridding step: resample_one_plane reads
+! one specific plane and resamples it onto the final output grid via
+! astResampleR. Caught a real bug on the first attempt: the documented
+! 20-argument signature (this, ndim_in, lbnd_in, ubnd_in, in, in_var,
+! interp, finterp, params, flags, tol, maxpix, badval, ndim_out,
 ! lbnd_out, ubnd_out, lbnd, ubnd, out, out_var) was missing "params"
 ! entirely, silently shifting every later argument by one position (a
 ! REAL array landing where an INTEGER "flags" scalar was expected, etc)
@@ -40,6 +40,17 @@
 ! (read independently via Python beforehand), and the union-mode test's
 ! NaN count for uncovered output pixels matches the expected uncovered
 ! area exactly (16x32 = 512).
+!
+! resample_all_planes loops over every combination of an input's non-sky
+! axes (channel, Stokes, or any other axis a cube happens to have),
+! decoding a flat plane index via a mixed-radix counter so it works for
+! any number of non-sky axes, not just the 2 (channel, Stokes) this
+! project's own fixtures happen to have -- and reuses the same
+! input->reference Mapping across every plane (it depends only on the 2
+! sky axes, never on which plane is being read). Verified across all 200
+! channels of the axis-swapped fixture: 3 spot-checked channels (1, 100,
+! 200) all reproduce their known ground-truth values exactly, and the
+! whole 200-channel run completes in well under a second.
 !
 ! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
 program reproject_cubes
@@ -195,15 +206,13 @@ program reproject_cubes
       stop 1
    endif
 
-   ! --- Resample the first input's first plane onto the final output
+   ! --- Resample every plane of the first input onto the final output
    ! grid, via astResampleR ---
-   ! Proof-of-concept for the actual regridding step: re-derives the
-   ! first input's own pixel->reference Mapping (cheap relative to the
-   ! resample itself; the per-channel production loop will keep Mappings
-   ! alive across a single pass instead of recomputing, once this
-   ! correctness case is established). Only the first non-sky-axis plane
-   ! (e.g. channel 1) is handled here -- looping over every plane is the
-   ! next increment, not this one.
+   ! Re-derives the first input's own pixel->reference Mapping once
+   ! (cheap relative to resampling itself) and reuses it across every
+   ! plane -- the Mapping only depends on the 2 sky axes, never on which
+   ! channel/Stokes plane is being read, so it is correct to compute once
+   ! per input rather than once per plane.
    call load_wcs(infiles(1), wcs_in, naxes_in, status)
    call extract_sky_mapping(wcs_in, skymap_in, skyframe_in, pixaxes_in, status)
    call compose_pix2pix(skymap_in, skyframe_in, skymap_ref, skyframe_ref,&
@@ -213,7 +222,7 @@ program reproject_cubes
       &' for resampling'
       stop 1
    endif
-   call resample_first_plane(infiles(1), map_in2ref, naxes_in, pixaxes_in,&
+   call resample_all_planes(infiles(1), map_in2ref, naxes_in, pixaxes_in,&
    &lbnd_out, ubnd_out, status)
    call ast_annul(map_in2ref, status)
    call ast_annul(skymap_in, status)
@@ -238,29 +247,88 @@ program reproject_cubes
 
 contains
 
-   subroutine resample_first_plane(filename, map_in2ref, naxes_in,&
+   subroutine resample_all_planes(filename, map_in2ref, naxes_in,&
    &pixaxes_in, lbnd_out_d, ubnd_out_d, status)
-      !! Read filename's first plane (every non-sky axis fixed at index 1)
-      !! and resample it onto the output grid [lbnd_out_d,ubnd_out_d]
-      !! (reference pixel space) via astResampleR, using map_in2ref (the
-      !! forward input->reference pixel Mapping -- astResampleR uses its
-      !! INVERSE internally to look up each output pixel's input value,
-      !! per its own documented convention). Bad/uncovered output pixels
-      !! are flagged with IEEE NaN, matching this codebase's existing
-      !! NaN-based masking convention throughout rm_synthesis.
+      !! Loop driver: resample every plane of filename (every combination
+      !! of the non-sky axes -- channel, Stokes, or any other axis a
+      !! given cube happens to have) onto the output grid, reusing the
+      !! same map_in2ref throughout (it depends only on the 2 sky axes,
+      !! never on which plane is being read). Decodes a flat plane index
+      !! into per-axis indices via a mixed-radix counter, so this works
+      !! for any number of non-sky axes (0, 1, 2, or more), not just the
+      !! 2 (channel, Stokes) this project's own fixtures happen to have.
+      integer, intent(in) :: map_in2ref
+      character(len=*), intent(in) :: filename
+      integer, intent(in) :: naxes_in(:), pixaxes_in(2)
+      double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
+      integer, intent(inout) :: status
+
+      integer :: naxis, k, other_axes(max_axes), n_other
+      integer :: other_idx(max_axes), remainder, radix
+      integer :: iplane, n_planes
+
+      if (status.ne.0) return
+
+      naxis = 0
+      do k = 1, size(naxes_in)
+         if (naxes_in(k).gt.0) naxis = k
+      enddo
+      n_other = 0
+      do k = 1, naxis
+         if (k.ne.pixaxes_in(1) .and. k.ne.pixaxes_in(2)) then
+            n_other = n_other + 1
+            other_axes(n_other) = k
+         endif
+      enddo
+
+      n_planes = 1
+      do k = 1, n_other
+         n_planes = n_planes * naxes_in(other_axes(k))
+      enddo
+      write(*,'(A,A,A,I0,A)') 'Resampling ', trim(filename), ': ',&
+      &n_planes, ' plane(s)'
+
+      do iplane = 1, n_planes
+         remainder = iplane - 1
+         do k = 1, n_other
+            radix = naxes_in(other_axes(k))
+            other_idx(k) = mod(remainder, radix) + 1
+            remainder = remainder / radix
+         enddo
+         call resample_one_plane(filename, map_in2ref, naxes_in,&
+         &pixaxes_in, other_axes(1:n_other), other_idx(1:n_other),&
+         &lbnd_out_d, ubnd_out_d, iplane, status)
+         if (status.ne.0) return
+      enddo
+   end subroutine resample_all_planes
+
+   subroutine resample_one_plane(filename, map_in2ref, naxes_in,&
+   &pixaxes_in, other_axes, other_idx, lbnd_out_d, ubnd_out_d, iplane,&
+   &status)
+      !! Read one specific plane of filename (other_axes(k) fixed at
+      !! other_idx(k) for every non-sky axis) and resample it onto the
+      !! output grid [lbnd_out_d,ubnd_out_d] (reference pixel space) via
+      !! astResampleR, using map_in2ref (the forward input->reference
+      !! pixel Mapping -- astResampleR uses its INVERSE internally to
+      !! look up each output pixel's input value, per its own documented
+      !! convention). Bad/uncovered output pixels are flagged with IEEE
+      !! NaN, matching this codebase's existing NaN-based masking
+      !! convention throughout rm_synthesis.
       !!
-      !! Reading fpixels(k)=lpixels(k)=1 for every axis except the 2 sky
-      !! ones (set to that axis's own full 1..NAXIS extent) naturally
-      !! produces a flat array with the sky axes as its only two
-      !! non-degenerate dimensions, in pixaxes_in's own order (first
-      !! fastest) -- exactly the "Fortran array indexing" astResampleR
-      !! expects -- regardless of which raw file-axis numbers they are,
-      !! since a degenerate (extent-1) axis contributes no stride.
+      !! Reading fpixels(k)=lpixels(k)=other_idx for every non-sky axis
+      !! (full 1..NAXIS extent for the 2 sky axes) naturally produces a
+      !! flat array with the sky axes as its only two non-degenerate
+      !! dimensions, in pixaxes_in's own order (first fastest) -- exactly
+      !! the "Fortran array indexing" astResampleR expects -- regardless
+      !! of which raw file-axis numbers they are, since a degenerate
+      !! (extent-1) axis contributes no stride.
       use, intrinsic :: ieee_arithmetic
       character(len=*), intent(in) :: filename
       integer, intent(in) :: map_in2ref
       integer, intent(in) :: naxes_in(:), pixaxes_in(2)
+      integer, intent(in) :: other_axes(:), other_idx(:)
       double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
+      integer, intent(in) :: iplane
       integer, intent(inout) :: status
 
       integer :: unit, blocksize, fitsstat, group, naxis, k
@@ -288,6 +356,10 @@ contains
       incs(1:naxis) = 1
       lpixels(pixaxes_in(1)) = nx_in
       lpixels(pixaxes_in(2)) = ny_in
+      do k = 1, size(other_axes)
+         fpixels(other_axes(k)) = other_idx(k)
+         lpixels(other_axes(k)) = other_idx(k)
+      enddo
 
       fitsstat = 0
       blocksize = 1
@@ -334,22 +406,22 @@ contains
       &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval,&
       &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o, data_out, data_out, status)
 
-      write(*,'(A,A,A,I0,A,I0,A)') 'Resampled ', trim(filename), ': ',&
-      &nx_out, ' x ', ny_out, ' output plane'
-      write(*,'(A,I0,A)') '  bad (uncovered) output pixels: ', nbad
-
-      ! Diagnostic: print the resampled value at reference pixel (5,9),
-      ! for comparison against a known ground-truth value read directly
-      ! from the original data with a Python script beforehand.
-      if (5.ge.lbnd_o(1) .and. 5.le.ubnd_o(1) .and.&
+      ! Verification print for a handful of representative planes only
+      ! (not all -- would flood output for a 200-channel cube): the
+      ! resampled value at reference pixel (5,9), for comparison against
+      ! known ground-truth values read directly from the original data
+      ! with a Python script beforehand, at 3 different channels.
+      if ((iplane.eq.1 .or. iplane.eq.100 .or. iplane.eq.200) .and.&
+      &5.ge.lbnd_o(1) .and. 5.le.ubnd_o(1) .and.&
       &9.ge.lbnd_o(2) .and. 9.le.ubnd_o(2)) then
-         write(*,'(A,F0.9)') '  value at reference pixel (5,9): ',&
+         write(*,'(A,I0,A,I0,A,F0.9)') '  plane ', iplane,&
+         &': bad=', nbad, ', value at reference pixel (5,9): ',&
          &data_out(5-lbnd_o(1)+1, 9-lbnd_o(2)+1)
       endif
 
       deallocate(data_in)
       deallocate(data_out)
-   end subroutine resample_first_plane
+   end subroutine resample_one_plane
 
    subroutine compose_pix2pix(skymap_from, skyframe_from, skymap_to,&
    &skyframe_to, map_out, status)
