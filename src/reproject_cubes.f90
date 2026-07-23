@@ -71,16 +71,21 @@
 ! the pixel value at the shifted position matches independently-computed
 ! ground truth exactly.
 !
-! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
+! Usage: reproject_cubes mode=<intersection|union|reference> reffile=<reference_file> infiles=<input_file>[,<input_file>...]
 !    or: reproject_cubes --config <cfgfile>
-!    or: reproject_cubes --config <cfgfile> <intersection|union|reference> <reference_file> <input_file> [input_file ...]
+!    or: reproject_cubes --config <cfgfile> mode=<...> [reffile=<...>] [infiles=<...>]
 !    or: reproject_cubes --help | -h
-! (positional args, if given, take precedence over --config, atomically
-! replacing the whole mode/reffile/infiles group -- see read_reproject_cfg).
-! Config file is a key=value text file: mode=..., reffile=..., and
-! infiles=file1,file2,file3 (comma-separated, same csv-list convention
-! rm_synthesis's own multi-band config keys use). Full usage text is in
-! print_usage below (shared by --help and the argument-error path).
+! No positional args: mode/reffile/infiles are always named key=value
+! (no spaces around '='), on the command line or via --config, never
+! inferred from argument order -- deliberate, to leave no room for a
+! user mistake on which bare word means what. Each CLI key=value token
+! overrides only that same key from --config (per-key precedence, not
+! an atomic-group replacement -- unambiguous now that every CLI value
+! names its own field). Config file is the same key=value style:
+! mode=..., reffile=..., and infiles=file1,file2,file3 (comma-
+! separated, same csv-list convention rm_synthesis's own multi-band
+! config keys use). Full usage text is in print_usage below (shared by
+! --help and the argument-error path).
 program reproject_cubes
    implicit none
    ! AST_PAR (the vendor Fortran constants file, /usr/include/AST_PAR) is
@@ -108,13 +113,17 @@ program reproject_cubes
    character(len=16) :: mode
    character(len=512) :: reffile
    character(len=512) :: infiles(max_inputs)
-   integer :: n_inputs, iarg, i
+   integer :: n_inputs, i
 
    character(len=512) :: cfgfile
-   character(len=512) :: this_arg
-   character(len=512) :: cli_positional(2+max_inputs)
-   integer :: n_cli_positional, argc
+   character(len=512) :: this_arg, cli_key, cli_val
+   character(len=16) :: cli_mode
+   character(len=512) :: cli_reffile, raw_cli_infiles
+   integer :: argc, iarg
+   logical :: has_kv
    logical :: have_cfgfile
+   logical :: seen_mode, seen_reffile, seen_infiles
+   logical :: cli_seen_mode, cli_seen_reffile, cli_seen_infiles
 
    integer :: wcs_ref, skymap_ref, skyframe_ref
    integer :: naxes_ref(max_axes), pixaxes_ref(2)
@@ -125,18 +134,20 @@ program reproject_cubes
    double precision :: this_lbnd(2), this_ubnd(2)
    integer :: status
 
-   ! Two ways to supply mode/reffile/infiles: positional CLI args (the
-   ! original "snap run" usage -- this tool's own parameter list is short
-   ! enough that a config file is a convenience, not a requirement, unlike
-   ! rm_synthesis's much larger key set which mandates one) or a
-   ! --config key=value file (read_reproject_cfg below, same key=value
-   ! style as rm_synthesis's own config). Both may be given together;
-   ! positional CLI args then win outright, atomically replacing the
-   ! whole mode/reffile/infiles group from the config rather than
-   ! merging field-by-field (avoids ambiguity about which fields a
-   ! partial positional list was meant to override).
+   ! Two ways to supply mode/reffile/infiles: explicit key=value CLI
+   ! tokens (mode=..., reffile=..., infiles=...) or a --config key=value
+   ! file (read_reproject_cfg below, same csv-list convention). No
+   ! positional args -- deliberately: a bare "reproject_cubes
+   ! intersection ref.fits a.fits b.fits" leaves the user to remember
+   ! argument order from memory, which is exactly the kind of mistake
+   ! named key=value args rule out. Both sources may be given together;
+   ! each CLI key=value token overrides only its own field from --config
+   ! (per-key, not atomic-group, precedence -- unambiguous now that every
+   ! CLI value names the field it sets).
    have_cfgfile = .false.
-   n_cli_positional = 0
+   cli_seen_mode = .false.
+   cli_seen_reffile = .false.
+   cli_seen_infiles = .false.
    argc = command_argument_count()
    iarg = 1
    do while (iarg.le.argc)
@@ -153,27 +164,76 @@ program reproject_cubes
          have_cfgfile = .true.
          iarg = iarg + 2
       else
-         n_cli_positional = n_cli_positional + 1
-         if (n_cli_positional.gt.2+max_inputs) then
-            write(*,*) 'ERROR: too many input files (max ', max_inputs, ')'
+         call split_cli_kv(this_arg, cli_key, cli_val, has_kv)
+         if (.not. has_kv) then
+            write(*,*) 'ERROR: unrecognised argument "', trim(this_arg),&
+            &'" -- expected key=value (mode=..., reffile=..., infiles=...),',&
+            &' --config <file>, or --help'
             stop 1
          endif
-         cli_positional(n_cli_positional) = this_arg
+         select case (trim(cli_key))
+         case ('mode')
+            if (cli_seen_mode) then
+               write(*,*) 'ERROR: mode given more than once on the command line'
+               stop 1
+            endif
+            cli_mode = trim(cli_val)
+            cli_seen_mode = .true.
+         case ('reffile')
+            if (cli_seen_reffile) then
+               write(*,*) 'ERROR: reffile given more than once on the command line'
+               stop 1
+            endif
+            cli_reffile = trim(cli_val)
+            cli_seen_reffile = .true.
+         case ('infiles')
+            if (cli_seen_infiles) then
+               write(*,*) 'ERROR: infiles given more than once on the command line'
+               stop 1
+            endif
+            raw_cli_infiles = trim(cli_val)
+            cli_seen_infiles = .true.
+         case default
+            write(*,*) 'ERROR: unrecognised key "', trim(cli_key), '" -- expected',&
+            &' mode, reffile, or infiles'
+            stop 1
+         end select
          iarg = iarg + 1
       endif
    enddo
 
-   if (n_cli_positional.ge.3) then
-      mode = cli_positional(1)
-      reffile = cli_positional(2)
-      n_inputs = n_cli_positional - 2
-      do i = 1, n_inputs
-         infiles(i) = cli_positional(2+i)
-      enddo
-   else if (n_cli_positional.eq.0 .and. have_cfgfile) then
+   seen_mode = .false.
+   seen_reffile = .false.
+   seen_infiles = .false.
+   if (have_cfgfile) then
       call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
       if (status.ne.0) stop 1
-   else
+      seen_mode = .true.
+      seen_reffile = .true.
+      seen_infiles = .true.
+   endif
+
+   if (cli_seen_mode) then
+      mode = cli_mode
+      seen_mode = .true.
+   endif
+   if (cli_seen_reffile) then
+      reffile = cli_reffile
+      seen_reffile = .true.
+   endif
+   if (cli_seen_infiles) then
+      n_inputs = cfg_csv_count(raw_cli_infiles)
+      if (n_inputs.lt.1 .or. n_inputs.gt.max_inputs) then
+         write(*,*) 'ERROR: infiles must list between 1 and ', max_inputs, ' files'
+         stop 1
+      endif
+      do i = 1, n_inputs
+         call cfg_csv_get_item(raw_cli_infiles, i, infiles(i))
+      enddo
+      seen_infiles = .true.
+   endif
+
+   if (.not. seen_mode .or. .not. seen_reffile .or. .not. seen_infiles) then
       call print_usage()
       stop 1
    endif
@@ -915,15 +975,17 @@ contains
       write(*,'(A)') 'reproject_cubes -- reproject FITS cubes onto a common grid'
       write(*,'(A)') ''
       write(*,'(A)') 'Usage:'
-      write(*,'(A)') '  reproject_cubes <intersection|union|reference> <reference_file>'//&
-      &' <input_file> [input_file ...]'
+      write(*,'(A)') '  reproject_cubes mode=<intersection|union|reference>'//&
+      &' reffile=<reference_file> infiles=<input_file>[,<input_file>...]'
       write(*,'(A)') '  reproject_cubes --config <cfgfile>'
-      write(*,'(A)') '  reproject_cubes --config <cfgfile> <intersection|union|reference>'//&
-      &' <reference_file> <input_file> [input_file ...]'
+      write(*,'(A)') '  reproject_cubes --config <cfgfile> mode=<...>'//&
+      &' [reffile=<...>] [infiles=<...>]'
       write(*,'(A)') '  reproject_cubes --help | -h'
       write(*,'(A)') ''
-      write(*,'(A)') 'If both --config and positional args are given, the positional args'//&
-      &' win outright, replacing the whole mode/reffile/infiles group from the config.'
+      write(*,'(A)') 'No positional args -- mode/reffile/infiles must each be given as'//&
+      &' key=value (no spaces around ''='', e.g. mode=union), either directly on the'
+      write(*,'(A)') 'command line or via --config. If both are given, each CLI key=value'//&
+      &' overrides only that same key from --config; unset keys still come from --config.'
       write(*,'(A)') ''
       write(*,'(A)') 'Modes:'
       write(*,'(A)') '  reference    output grid is the reference file''s own extent'
@@ -1060,6 +1122,32 @@ contains
       val = trim(val)
       has_kv = .true.
    end subroutine cfg_split_key_value
+
+   subroutine split_cli_kv(token, key, val, has_kv)
+      !! Split a single CLI argument of the form key=value. Deliberately
+      !! no '#'/';' comment-stripping (unlike cfg_split_key_value) --
+      !! this is one shell-split argv token, not a config-file line, and
+      !! a file path could legitimately contain either character.
+      character(len=*), intent(in) :: token
+      character(len=*), intent(out) :: key, val
+      logical, intent(out) :: has_kv
+      integer :: peq
+
+      key = ' '
+      val = ' '
+      has_kv = .false.
+
+      peq = index(token, '=')
+      if (peq <= 1) return
+
+      key = adjustl(token(1:peq - 1))
+      val = adjustl(token(peq + 1:))
+      if (len_trim(key) == 0 .or. len_trim(val) == 0) return
+
+      key = trim(key)
+      val = trim(val)
+      has_kv = .true.
+   end subroutine split_cli_kv
 
    function cfg_csv_count(str) result(n)
       !! Number of comma-separated items in str (1 if no comma present,
