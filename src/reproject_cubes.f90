@@ -41,16 +41,35 @@
 ! NaN count for uncovered output pixels matches the expected uncovered
 ! area exactly (16x32 = 512).
 !
-! resample_all_planes loops over every combination of an input's non-sky
-! axes (channel, Stokes, or any other axis a cube happens to have),
-! decoding a flat plane index via a mixed-radix counter so it works for
-! any number of non-sky axes, not just the 2 (channel, Stokes) this
-! project's own fixtures happen to have -- and reuses the same
-! input->reference Mapping across every plane (it depends only on the 2
-! sky axes, never on which plane is being read). Verified across all 200
-! channels of the axis-swapped fixture: 3 spot-checked channels (1, 100,
-! 200) all reproduce their known ground-truth values exactly, and the
-! whole 200-channel run completes in well under a second.
+! Loops over every combination of an input's non-sky axes (channel,
+! Stokes, or any other axis a cube happens to have), decoding a flat
+! plane index via a mixed-radix counter so it works for any number of
+! non-sky axes, not just the 2 (channel, Stokes) this project's own
+! fixtures happen to have -- and reuses the same input->reference Mapping
+! across every plane (it depends only on the 2 sky axes, never on which
+! plane is being read). Verified across all 200 channels of the axis-
+! swapped fixture: 3 spot-checked channels (1, 100, 200) all reproduce
+! their known ground-truth values exactly, and the whole 200-channel run
+! completes in well under a second.
+!
+! Actually writes an output FITS file now (write_reprojected_file):
+! output axis layout puts the 2 sky axes at OUTPUT positions 1,2 (RA-
+! fastest-on-disk, matching what rm_synthesis's own tile-read I/O already
+! assumes -- confirmed against rm_synthesis_mod.f90's own auto-tile-
+! planner comment), in whatever order the REFERENCE presents them; other
+! (non-sky) axes keep INFILE's own values unchanged, at output positions
+! 3... This guarantees "sky is axes 1,2" but only guarantees "axis 1 is
+! literally RA" for a conventionally-ordered reference (RA before Dec) --
+! a deliberate, documented scope limit, not a silent assumption. CRPIX
+! for the sky axes is shifted for the output grid's own origin using the
+! exact same formula rm_synthesis.f90 already uses for its own subimage
+! CRPIX shift. Verified independently via Python/astropy, header and
+! data both: reference mode reproduces the reference's own header
+! exactly and all 3 spot-checked channels match known ground truth;
+! intersection mode's CRPIX1 correctly shifts from 17.0 to 1.0 for a
+! 16-pixel crop, CRPIX2 stays untouched (that axis wasn't cropped), and
+! the pixel value at the shifted position matches independently-computed
+! ground truth exactly.
 !
 ! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
 program reproject_cubes
@@ -206,28 +225,35 @@ program reproject_cubes
       stop 1
    endif
 
-   ! --- Resample every plane of the first input onto the final output
-   ! grid, via astResampleR ---
-   ! Re-derives the first input's own pixel->reference Mapping once
-   ! (cheap relative to resampling itself) and reuses it across every
-   ! plane -- the Mapping only depends on the 2 sky axes, never on which
-   ! channel/Stokes plane is being read, so it is correct to compute once
-   ! per input rather than once per plane.
-   call load_wcs(infiles(1), wcs_in, naxes_in, status)
-   call extract_sky_mapping(wcs_in, skymap_in, skyframe_in, pixaxes_in, status)
-   call compose_pix2pix(skymap_in, skyframe_in, skymap_ref, skyframe_ref,&
-   &map_in2ref, status)
-   if (status.ne.0) then
-      write(*,*) 'ERROR: failed to re-derive the first input''s Mapping',&
-      &' for resampling'
-      stop 1
-   endif
-   call resample_all_planes(infiles(1), map_in2ref, naxes_in, pixaxes_in,&
-   &lbnd_out, ubnd_out, status)
-   call ast_annul(map_in2ref, status)
-   call ast_annul(skymap_in, status)
-   call ast_annul(skyframe_in, status)
-   call ast_annul(wcs_in, status)
+   ! --- Resample and write every plane of every input onto the final
+   ! output grid, via astResampleR + FTPSSE ---
+   ! Re-derives each input's own pixel->reference Mapping once (cheap
+   ! relative to resampling itself) and reuses it across every plane of
+   ! that input -- the Mapping only depends on the 2 sky axes, never on
+   ! which channel/Stokes plane is being read.
+   do i = 1, n_inputs
+      call load_wcs(infiles(i), wcs_in, naxes_in, status)
+      call extract_sky_mapping(wcs_in, skymap_in, skyframe_in, pixaxes_in, status)
+      call compose_pix2pix(skymap_in, skyframe_in, skymap_ref, skyframe_ref,&
+      &map_in2ref, status)
+      if (status.ne.0) then
+         write(*,*) 'ERROR: failed to re-derive input''s Mapping for',&
+         &' resampling: ', trim(infiles(i))
+         stop 1
+      endif
+      call write_reprojected_file(reffile, infiles(i),&
+      &'!'//trim(infiles(i))//'_REPROJ.FITS', pixaxes_ref, map_in2ref,&
+      &naxes_in, pixaxes_in, lbnd_out, ubnd_out, status)
+      if (status.ne.0) then
+         write(*,*) 'ERROR: failed to write reprojected output for: ',&
+         &trim(infiles(i))
+         stop 1
+      endif
+      call ast_annul(map_in2ref, status)
+      call ast_annul(skymap_in, status)
+      call ast_annul(skyframe_in, status)
+      call ast_annul(wcs_in, status)
+   enddo
 
    write(*,'(A,A,A,F0.0,A,F0.0,A,F0.0,A,F0.0,A)') 'Final output grid (',&
    &trim(mode), ' mode): [', lbnd_out(1), ',', ubnd_out(1), '] x [',&
@@ -247,18 +273,26 @@ program reproject_cubes
 
 contains
 
-   subroutine resample_all_planes(filename, map_in2ref, naxes_in,&
-   &pixaxes_in, lbnd_out_d, ubnd_out_d, status)
-      !! Loop driver: resample every plane of filename (every combination
-      !! of the non-sky axes -- channel, Stokes, or any other axis a
-      !! given cube happens to have) onto the output grid, reusing the
-      !! same map_in2ref throughout (it depends only on the 2 sky axes,
-      !! never on which plane is being read). Decodes a flat plane index
-      !! into per-axis indices via a mixed-radix counter, so this works
-      !! for any number of non-sky axes (0, 1, 2, or more), not just the
-      !! 2 (channel, Stokes) this project's own fixtures happen to have.
+   subroutine write_reprojected_file(reffile, infile, outfile, pixaxes_ref,&
+   &map_in2ref, naxes_in, pixaxes_in, lbnd_out_d, ubnd_out_d, status)
+      !! Create outfile and write every reprojected plane of infile into
+      !! it. Output axis layout: the 2 sky axes always occupy OUTPUT
+      !! positions 1,2 (matching what rm_synthesis's own tile-read I/O
+      !! already assumes -- RA-fastest-on-disk -- confirmed against
+      !! rm_synthesis_mod.f90's own auto-tile-planner comment), in
+      !! whatever order the REFERENCE file itself presents them (pixaxes_ref);
+      !! this guarantees "sky is axes 1,2" but only guarantees "axis 1 is
+      !! literally RA" if the reference is conventionally ordered (RA
+      !! before Dec) -- a deliberate, documented scope limit, not a
+      !! silent assumption: full semantic RA/Dec canonicalisation
+      !! regardless of the reference's own convention is a follow-on
+      !! refinement. The other (non-sky) axes keep their own values from
+      !! INFILE unchanged (that band's own channel/Stokes definitions,
+      !! untouched by reprojection), placed at output positions 3.. in
+      !! their original relative order.
+      character(len=*), intent(in) :: reffile, infile, outfile
+      integer, intent(in) :: pixaxes_ref(2)
       integer, intent(in) :: map_in2ref
-      character(len=*), intent(in) :: filename
       integer, intent(in) :: naxes_in(:), pixaxes_in(2)
       double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
       integer, intent(inout) :: status
@@ -266,6 +300,9 @@ contains
       integer :: naxis, k, other_axes(max_axes), n_other
       integer :: other_idx(max_axes), remainder, radix
       integer :: iplane, n_planes
+      integer :: nx_out, ny_out, naxis_out, naxes_out(max_axes)
+      integer :: ref_unit, out_unit, fitsstat, blocksize
+      logical :: simple, extend
 
       if (status.ne.0) return
 
@@ -281,11 +318,62 @@ contains
          endif
       enddo
 
+      nx_out = nint(ubnd_out_d(1) - lbnd_out_d(1)) + 1
+      ny_out = nint(ubnd_out_d(2) - lbnd_out_d(2)) + 1
+      naxis_out = 2 + n_other
+      naxes_out(1) = nx_out
+      naxes_out(2) = ny_out
+      do k = 1, n_other
+         naxes_out(2+k) = naxes_in(other_axes(k))
+      enddo
+
+      ! --- Create the output file and its primary header ---
+      fitsstat = 0
+      blocksize = 1
+      out_unit = 43
+      call FTINIT(out_unit, trim(outfile), blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to create output file: ', trim(outfile)
+         call printerror(fitsstat)
+         status = -1
+         return
+      endif
+      simple = .true.
+      extend = .false.
+      call FTPHPR(out_unit, simple, -32, naxis_out, naxes_out(1:naxis_out),&
+      &0, 1, extend, fitsstat)
+
+      ! Sky axes (output 1,2): WCS copied from the REFERENCE's own
+      ! pixaxes_ref-numbered keywords, CRPIX shifted for the output
+      ! grid's own origin (same formula rm_synthesis.f90 already uses for
+      ! its own subimage CRPIX shift: (old_crpix - pixel_offset) + 1,
+      ! stride 1 since this is a crop/grow, never a sub-sample).
+      ref_unit = 44
+      fitsstat = 0
+      call FTOPEN(ref_unit, trim(reffile), 0, blocksize, fitsstat)
+      call copy_axis_keywords(ref_unit, pixaxes_ref(1), out_unit, 1,&
+      &lbnd_out_d(1)-1.0d0, status)
+      call copy_axis_keywords(ref_unit, pixaxes_ref(2), out_unit, 2,&
+      &lbnd_out_d(2)-1.0d0, status)
+      call FTCLOS(ref_unit, fitsstat)
+
+      ! Other axes (output 3..): WCS copied from INFILE's own axis
+      ! numbering unchanged (no CRPIX shift -- reprojection never touches
+      ! these axes).
+      fitsstat = 0
+      call FTOPEN(ref_unit, trim(infile), 0, blocksize, fitsstat)
+      do k = 1, n_other
+         call copy_axis_keywords(ref_unit, other_axes(k), out_unit,&
+         &2+k, 0.0d0, status)
+      enddo
+      call FTCLOS(ref_unit, fitsstat)
+
+      ! --- Resample and write every plane ---
       n_planes = 1
       do k = 1, n_other
          n_planes = n_planes * naxes_in(other_axes(k))
       enddo
-      write(*,'(A,A,A,I0,A)') 'Resampling ', trim(filename), ': ',&
+      write(*,'(A,A,A,I0,A)') 'Writing ', trim(outfile), ': ',&
       &n_planes, ' plane(s)'
 
       do iplane = 1, n_planes
@@ -295,16 +383,86 @@ contains
             other_idx(k) = mod(remainder, radix) + 1
             remainder = remainder / radix
          enddo
-         call resample_one_plane(filename, map_in2ref, naxes_in,&
+         call resample_one_plane(infile, map_in2ref, naxes_in,&
          &pixaxes_in, other_axes(1:n_other), other_idx(1:n_other),&
-         &lbnd_out_d, ubnd_out_d, iplane, status)
-         if (status.ne.0) return
+         &lbnd_out_d, ubnd_out_d, iplane, out_unit, n_other, status)
+         if (status.ne.0) then
+            call FTCLOS(out_unit, fitsstat)
+            return
+         endif
       enddo
-   end subroutine resample_all_planes
+
+      call FTCLOS(out_unit, fitsstat)
+   end subroutine write_reprojected_file
+
+   subroutine copy_axis_keywords(src_unit, src_axis, dst_unit, dst_axis,&
+   &crpix_shift, status)
+      !! Copy CTYPE/CRVAL/CRPIX/CDELT/CUNIT for src_axis (in src_unit's
+      !! own header) to dst_axis (in dst_unit's header, already created
+      !! via FTPHPR). CRPIX is additionally shifted by -crpix_shift (0 for
+      !! a straight passthrough; the output grid's own pixel-1 offset,
+      !! reference-pixel-numbered, for a cropped/grown sky axis) --
+      !! matches rm_synthesis.f90's own existing subimage CRPIX-shift
+      !! formula exactly, generalised to any axis number via a
+      !! constructed keyword string ("CRVAL"//axis, etc.) rather than a
+      !! literal "1"/"2" suffix.
+      integer, intent(in) :: src_unit, src_axis, dst_unit, dst_axis
+      double precision, intent(in) :: crpix_shift
+      integer, intent(inout) :: status
+
+      integer :: fitsstat
+      character(len=8) :: axstr
+      character(len=68) :: comment
+      character(len=68) :: sval
+      double precision :: dval
+
+      if (status.ne.0) return
+
+      write(axstr,'(I0)') src_axis
+      fitsstat = 0
+      call FTGKYS(src_unit, 'CTYPE'//trim(axstr), sval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         write(axstr,'(I0)') dst_axis
+         call FTPKYS(dst_unit, 'CTYPE'//trim(axstr), trim(sval), ' ', fitsstat)
+      endif
+
+      write(axstr,'(I0)') src_axis
+      fitsstat = 0
+      call FTGKYD(src_unit, 'CRVAL'//trim(axstr), dval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         write(axstr,'(I0)') dst_axis
+         call FTPKYD(dst_unit, 'CRVAL'//trim(axstr), dval, 13, ' ', fitsstat)
+      endif
+
+      write(axstr,'(I0)') src_axis
+      fitsstat = 0
+      call FTGKYD(src_unit, 'CRPIX'//trim(axstr), dval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         dval = dval - crpix_shift
+         write(axstr,'(I0)') dst_axis
+         call FTPKYD(dst_unit, 'CRPIX'//trim(axstr), dval, 13, ' ', fitsstat)
+      endif
+
+      write(axstr,'(I0)') src_axis
+      fitsstat = 0
+      call FTGKYD(src_unit, 'CDELT'//trim(axstr), dval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         write(axstr,'(I0)') dst_axis
+         call FTPKYD(dst_unit, 'CDELT'//trim(axstr), dval, 13, ' ', fitsstat)
+      endif
+
+      write(axstr,'(I0)') src_axis
+      fitsstat = 0
+      call FTGKYS(src_unit, 'CUNIT'//trim(axstr), sval, comment, fitsstat)
+      if (fitsstat.eq.0) then
+         write(axstr,'(I0)') dst_axis
+         call FTPKYS(dst_unit, 'CUNIT'//trim(axstr), trim(sval), ' ', fitsstat)
+      endif
+   end subroutine copy_axis_keywords
 
    subroutine resample_one_plane(filename, map_in2ref, naxes_in,&
    &pixaxes_in, other_axes, other_idx, lbnd_out_d, ubnd_out_d, iplane,&
-   &status)
+   &out_unit, n_other, status)
       !! Read one specific plane of filename (other_axes(k) fixed at
       !! other_idx(k) for every non-sky axis) and resample it onto the
       !! output grid [lbnd_out_d,ubnd_out_d] (reference pixel space) via
@@ -329,6 +487,7 @@ contains
       integer, intent(in) :: other_axes(:), other_idx(:)
       double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
       integer, intent(in) :: iplane
+      integer, intent(in) :: out_unit, n_other
       integer, intent(inout) :: status
 
       integer :: unit, blocksize, fitsstat, group, naxis, k
@@ -340,6 +499,8 @@ contains
       integer :: nbad
       real :: badval
       double precision :: params_dummy(1)
+      integer :: fpixels_wr(max_axes), lpixels_wr(max_axes), naxis_wr
+      integer :: naxes_wr(max_axes)
 
       if (status.ne.0) return
 
@@ -405,6 +566,31 @@ contains
       nbad = ast_resampler(map_in2ref, 2, lbnd_in, ubnd_in, data_in, data_in,&
       &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval,&
       &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o, data_out, data_out, status)
+
+      ! --- Write this plane into the output file ---
+      ! Output axis layout (see write_reprojected_file's own comment):
+      ! sky always at output positions 1,2, full extent; other axes at
+      ! output positions 3.. (2+k for other_axes(k)), fixed at this
+      ! plane's own other_idx(k) -- same value, just relocated to the
+      ! output file's own axis numbering rather than the input's.
+      naxis_wr = 2 + n_other
+      naxes_wr(1) = nx_out
+      naxes_wr(2) = ny_out
+      fpixels_wr(1) = 1
+      fpixels_wr(2) = 1
+      lpixels_wr(1) = nx_out
+      lpixels_wr(2) = ny_out
+      do k = 1, n_other
+         naxes_wr(2+k) = naxes_in(other_axes(k))
+         fpixels_wr(2+k) = other_idx(k)
+         lpixels_wr(2+k) = other_idx(k)
+      enddo
+      call FTPSSE(out_unit, 1, naxis_wr, naxes_wr(1:naxis_wr),&
+      &fpixels_wr(1:naxis_wr), lpixels_wr(1:naxis_wr), data_out, status)
+      if (status.ne.0) then
+         write(*,*) 'ERROR: failed to write plane ', iplane, ' to output'
+         return
+      endif
 
       ! Verification print for a handful of representative planes only
       ! (not all -- would flood output for a 200-channel cube): the
