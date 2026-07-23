@@ -565,6 +565,12 @@ contains
       &lbnd_out_d(1)-1.0d0, status)
       call copy_axis_keywords(ref_unit, pixaxes_ref(2), out_unit, 2,&
       &lbnd_out_d(2)-1.0d0, status)
+      ! EQUINOX/RADESYS describe the coordinate SYSTEM, not a specific
+      ! axis or the data -- the output is expressed in the REFERENCE's
+      ! sky frame (compose_pix2pix converts every input's sky coordinates
+      ! into it), so these follow reffile, not infile, same reasoning as
+      ! the sky axes themselves just above.
+      call copy_wcs_system_keywords(ref_unit, out_unit, status)
       call FTCLOS(ref_unit, fitsstat)
 
       ! Other axes (output 3..): WCS copied from INFILE's own axis
@@ -576,6 +582,15 @@ contains
          call copy_axis_keywords(ref_unit, other_axes(k), out_unit,&
          &2+k, 0.0d0, status)
       enddo
+      ! Everything else non-structural and non-axis-indexed (BUNIT,
+      ! BMAJ/BMIN/BPA, OBJECT, TELESCOP, DATE-OBS, RESTFRQ, HISTORY,
+      ! COMMENT, ...) describes the DATA, unchanged by reprojection --
+      ! follows infile, matching the other axes just above. Previously
+      ! dropped entirely (only per-axis WCS keywords were ever copied),
+      ! silently losing units/beam/provenance from the output.
+      call copy_generic_header(ref_unit, out_unit, status)
+      call FTPHIS(out_unit, 'reproject_cubes: reprojected from '//&
+      &trim(infile)//' onto the grid of '//trim(reffile), fitsstat)
       call FTCLOS(ref_unit, fitsstat)
 
       ! --- Block size: mem_frac_ram fraction of total system RAM,
@@ -829,6 +844,128 @@ contains
          call FTPKYS(dst_unit, 'CUNIT'//trim(axstr), trim(sval), ' ', fitsstat)
       endif
    end subroutine copy_axis_keywords
+
+   subroutine copy_wcs_system_keywords(src_unit, dst_unit, status)
+      !! EQUINOX/RADESYS describe the sky coordinate SYSTEM (not a
+      !! specific axis), copied verbatim if present -- absent from
+      !! src_unit is not an error (many FITS files simply omit them,
+      !! relying on standard defaults; nothing to propagate then).
+      integer, intent(in) :: src_unit, dst_unit
+      integer, intent(inout) :: status
+
+      integer :: fitsstat
+      character(len=68) :: comment, sval
+      double precision :: dval
+
+      if (status.ne.0) return
+
+      fitsstat = 0
+      call FTGKYD(src_unit, 'EQUINOX', dval, comment, fitsstat)
+      if (fitsstat.eq.0) call FTPKYD(dst_unit, 'EQUINOX', dval, 13, ' ', fitsstat)
+
+      fitsstat = 0
+      call FTGKYS(src_unit, 'RADESYS', sval, comment, fitsstat)
+      if (fitsstat.eq.0) call FTPKYS(dst_unit, 'RADESYS', trim(sval), ' ', fitsstat)
+   end subroutine copy_wcs_system_keywords
+
+   subroutine copy_generic_header(src_unit, dst_unit, status)
+      !! Copy every header card from src_unit to dst_unit EXCEPT:
+      !! structural keywords FTPHPR already wrote (SIMPLE/BITPIX/NAXIS/
+      !! EXTEND/PCOUNT/GCOUNT/END), any axis-indexed keyword
+      !! (NAXISn/CTYPEn/CRVALn/CRPIXn/CDELTn/CUNITn/CROTAn/PCn_m/CDn_m,
+      !! for ANY n/m) -- CTYPE/CRVAL/CRPIX/CDELT/CUNIT are handled
+      !! per-axis elsewhere (copy_axis_keywords), and PC/CD/CROTA
+      !! (rotation-matrix terms) are deliberately skipped rather than
+      !! copied under the wrong output axis numbering, which would be
+      !! worse than absent -- and EQUINOX/RADESYS (copy_wcs_system_keywords
+      !! handles those, from the reference, not this file). Everything
+      !! else -- BUNIT, BMAJ/BMIN/BPA, OBJECT, TELESCOP, INSTRUME,
+      !! DATE-OBS, RESTFRQ, HISTORY, COMMENT, and anything this project
+      !! has never heard of -- is copied verbatim via a raw 80-column
+      !! header record (FTGREC/FTPREC), not decoded/re-encoded through a
+      !! type-specific FTGKYx/FTPKYx pair, so formatting/precision/
+      !! comments survive exactly. This is what actually fixes losing
+      !! units/beam/provenance from the output (previously ONLY the
+      !! axis-indexed WCS keywords were ever copied at all).
+      integer, intent(in) :: src_unit, dst_unit
+      integer, intent(inout) :: status
+
+      integer :: nkeys, nmore, i, fitsstat
+      character(len=80) :: card
+      character(len=8) :: key
+
+      if (status.ne.0) return
+
+      fitsstat = 0
+      call FTGHSP(src_unit, nkeys, nmore, fitsstat)
+      do i = 1, nkeys
+         fitsstat = 0
+         call FTGREC(src_unit, i, card, fitsstat)
+         if (fitsstat.ne.0) cycle
+         key = adjustl(card(1:8))
+         if (skip_generic_header_key(key)) cycle
+         fitsstat = 0
+         call FTPREC(dst_unit, card, fitsstat)
+      enddo
+   end subroutine copy_generic_header
+
+   logical function skip_generic_header_key(key)
+      !! True for any keyword copy_generic_header must NOT copy verbatim
+      !! -- see that subroutine's own comment for why each category is
+      !! excluded.
+      character(len=8), intent(in) :: key
+
+      skip_generic_header_key = .true.
+      select case (trim(key))
+      case ('SIMPLE', 'BITPIX', 'NAXIS', 'EXTEND', 'PCOUNT', 'GCOUNT',&
+      &'END', 'EQUINOX', 'RADESYS', 'WCSAXES', 'LONPOLE', 'LATPOLE')
+         return
+      end select
+      if (is_indexed_keyword(key, 'NAXIS')) return
+      if (is_indexed_keyword(key, 'CTYPE')) return
+      if (is_indexed_keyword(key, 'CRVAL')) return
+      if (is_indexed_keyword(key, 'CRPIX')) return
+      if (is_indexed_keyword(key, 'CDELT')) return
+      if (is_indexed_keyword(key, 'CUNIT')) return
+      if (is_indexed_keyword(key, 'CROTA')) return
+      if (is_indexed_keyword(key, 'PC')) return
+      if (is_indexed_keyword(key, 'CD')) return
+      skip_generic_header_key = .false.
+   end function skip_generic_header_key
+
+   logical function is_indexed_keyword(key, prefix)
+      !! True if key is exactly prefix followed by one or two groups of
+      !! digits separated by at most one underscore (e.g. prefix='CD':
+      !! matches "CD1_2", "CD10_2"; prefix='NAXIS': matches "NAXIS1",
+      !! "NAXIS12"; does not match "CDELT1" -- the "ELT1" tail after
+      !! stripping "CD" is not all-digits-and-at-most-one-underscore).
+      character(len=8), intent(in) :: key
+      character(len=*), intent(in) :: prefix
+
+      character(len=8) :: rest
+      integer :: plen, klen, i
+      logical :: seen_underscore
+
+      is_indexed_keyword = .false.
+      plen = len_trim(prefix)
+      klen = len_trim(key)
+      if (klen.le.plen) return
+      if (key(1:plen).ne.prefix(1:plen)) return
+
+      rest = key(plen+1:klen)
+      seen_underscore = .false.
+      do i = 1, len_trim(rest)
+         if (rest(i:i).eq.'_') then
+            if (seen_underscore) return
+            seen_underscore = .true.
+         else if (rest(i:i).lt.'0' .or. rest(i:i).gt.'9') then
+            return
+         endif
+      enddo
+      if (len_trim(rest).eq.0) return
+      if (rest(1:1).eq.'_' .or. rest(len_trim(rest):len_trim(rest)).eq.'_') return
+      is_indexed_keyword = .true.
+   end function is_indexed_keyword
 
    subroutine read_one_block(filename, naxes_in, pixaxes_in, other_axes,&
    &other_idx, n_other, chan_start, chan_len, nx_in, ny_in, block_data_in,&
