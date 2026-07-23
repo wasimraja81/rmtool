@@ -339,29 +339,27 @@ program reproject_cubes
 
    ! --- Resample and write every plane of every input onto the final
    ! output grid, via astResampleR + FTPSSE ---
-   ! Re-derives each input's own pixel->reference Mapping once (cheap
-   ! relative to resampling itself) and reuses it across every plane of
-   ! that input -- the Mapping only depends on the 2 sky axes, never on
-   ! which channel/Stokes plane is being read.
+   ! Only naxes_in/pixaxes_in (plain per-file array-shape data, not an
+   ! AST Object) are needed here -- write_reprojected_file builds its
+   ! own private input->reference Mapping per OpenMP thread internally
+   ! (see its own comment for why), so this loop no longer needs to
+   ! derive map_in2ref itself the way it used to.
    do i = 1, n_inputs
       call load_wcs(infiles(i), wcs_in, naxes_in, status)
       call extract_sky_mapping(wcs_in, skymap_in, skyframe_in, pixaxes_in, status)
-      call compose_pix2pix(skymap_in, skyframe_in, skymap_ref, skyframe_ref,&
-      &map_in2ref, status)
       if (status.ne.0) then
-         write(*,*) 'ERROR: failed to re-derive input''s Mapping for',&
-         &' resampling: ', trim(infiles(i))
+         write(*,*) 'ERROR: failed to read input''s WCS for resampling: ',&
+         &trim(infiles(i))
          stop 1
       endif
       call write_reprojected_file(reffile, infiles(i),&
-      &'!'//trim(infiles(i))//'_REPROJ.FITS', pixaxes_ref, map_in2ref,&
+      &'!'//trim(infiles(i))//'_REPROJ.FITS', pixaxes_ref,&
       &naxes_in, pixaxes_in, lbnd_out, ubnd_out, status)
       if (status.ne.0) then
          write(*,*) 'ERROR: failed to write reprojected output for: ',&
          &trim(infiles(i))
          stop 1
       endif
-      call ast_annul(map_in2ref, status)
       call ast_annul(skymap_in, status)
       call ast_annul(skyframe_in, status)
       call ast_annul(wcs_in, status)
@@ -386,7 +384,7 @@ program reproject_cubes
 contains
 
    subroutine write_reprojected_file(reffile, infile, outfile, pixaxes_ref,&
-   &map_in2ref, naxes_in, pixaxes_in, lbnd_out_d, ubnd_out_d, status)
+   &naxes_in, pixaxes_in, lbnd_out_d, ubnd_out_d, status)
       !! Create outfile and write every reprojected plane of infile into
       !! it. Output axis layout: the 2 sky axes always occupy OUTPUT
       !! positions 1,2 (matching what rm_synthesis's own tile-read I/O
@@ -402,19 +400,27 @@ contains
       !! INFILE unchanged (that band's own channel/Stokes definitions,
       !! untouched by reprojection), placed at output positions 3.. in
       !! their original relative order.
+      use omp_lib, only: omp_get_max_threads
       character(len=*), intent(in) :: reffile, infile, outfile
       integer, intent(in) :: pixaxes_ref(2)
-      integer, intent(in) :: map_in2ref
       integer, intent(in) :: naxes_in(:), pixaxes_in(2)
       double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
       integer, intent(inout) :: status
 
       integer :: naxis, k, other_axes(max_axes), n_other
       integer :: other_idx(max_axes), remainder, radix
-      integer :: iplane, n_planes
+      integer :: iplane, n_planes, status_par, plane_status, nthreads
       integer :: nx_out, ny_out, naxis_out, naxes_out(max_axes)
       integer :: ref_unit, out_unit, fitsstat, blocksize
       logical :: simple, extend
+
+      ! Per-OpenMP-thread private AST working set (see the parallel
+      ! region below for why each thread builds its own).
+      integer :: t_status, t_wcs_ref, t_skymap_ref, t_skyframe_ref
+      integer :: t_naxes_ref(max_axes), t_pixaxes_ref(2)
+      integer :: t_wcs_in, t_skymap_in, t_skyframe_in
+      integer :: t_naxes_in(max_axes), t_pixaxes_in(2)
+      integer :: t_map_in2ref
 
       if (status.ne.0) return
 
@@ -480,7 +486,68 @@ contains
       enddo
       call FTCLOS(ref_unit, fitsstat)
 
-      ! --- Resample and write every plane ---
+      ! --- Resample and write every plane, in parallel across OpenMP
+      ! threads ---
+      ! Each thread builds its OWN private input->reference pixel
+      ! Mapping from scratch (own ast_begin context, own load_wcs/
+      ! extract_sky_mapping/compose_pix2pix calls) rather than sharing
+      ! or cloning one Mapping built by the caller. SUN/211 Sec 4.12
+      ! ("AST Objects within Multi-threaded Applications") requires
+      ! astLock/astUnlock to hand an AST Object from the thread that
+      ! created it to another thread; checked this build's actual
+      ! Fortran symbol table (libstarlink_ast.so.9) and ast_lock_/
+      ! ast_unlock_ are simply not exported -- only ast_copy_ is, which
+      ! is useless on its own without the paired lock handoff (a copy
+      ! is still initially locked to its creating thread). Building a
+      ! Mapping is a handful of FITS header reads plus cheap AST calls,
+      ! negligible next to the per-pixel resampling cost this
+      ! parallelises, so redoing it once per thread (not once per
+      ! plane) costs nothing worth avoiding. Every thread's whole AST
+      ! object graph is therefore self-created and never shared, which
+      ! is squarely inside AST's documented thread-safe model without
+      ! needing any lock/unlock call at all -- confirmed empirically too
+      ! (see the setup critical section's own comment below): concurrent
+      ! per-thread construction, and concurrent astResampleR on those
+      ! independent Mappings, both ran cleanly across many repeated
+      ! stress runs once the actual bug (below) was found and fixed.
+      !
+      ! CFITSIO unit numbers used inside this region are offset by
+      ! omp_get_thread_num() (see load_wcs/resample_one_plane), using
+      ! disjoint ranges (1000-based for load_wcs, 5000-based for
+      ! resample_one_plane's read) with wide headroom on both sides: up
+      ! to ~4000 threads before load_wcs's range could reach 5000, and
+      ! both bases sit far above the fixed out_unit=43/ref_unit=44 --
+      ! comfortably beyond any real HPC node's core count, chosen that
+      ! wide deliberately after an earlier 100/200 pairing turned out to
+      ! only be safe up to ~100 threads. Channel/plane count plays no
+      ! part in this -- each thread reuses its own single unit number
+      ! sequentially across every plane it processes, opening and
+      ! closing it each time, so only thread count (not cube size)
+      ! determines how much headroom is needed. An earlier version got
+      ! the numbering wrong in two ways: load_wcs had no thread offset
+      ! at all (a bare literal unit=11, so concurrent per-thread setup
+      ! collided outright), and resample_one_plane's offset (31+tid)
+      ! numerically reached 43 at thread 12 -- exactly out_unit, which
+      ! stays open for the entire parallel region -- so anything needing
+      ! >=13 threads reliably crashed while <=12 threads never touched
+      ! unit 43 and ran clean. That thread-count-dependent threshold
+      ! (reliable at 12, reliable *failure* at 13+) was what actually
+      ! pointed at a plain unit collision rather than a deeper AST/
+      ! CFITSIO concurrency limit.
+      !
+      ! The actual disk write (FTPSSE, inside resample_one_plane) stays
+      ! serialised through an OMP critical section together with the
+      ! read -- concurrent CFITSIO writes to the same output unit are
+      ! not something this project trusts even via distinct handles (see
+      ! rm_synthesis's own io_write_threads rewrite to raw stream writes
+      ! after a production corruption incident,
+      ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md's T4 postmortem), and
+      ! this build's CFITSIO also visibly crashed (ffpsse/ffgcprll) when
+      ! reads on other units were left free to run fully concurrently
+      ! against it. Resampling itself (astResampleR) is embarrassingly
+      ! parallel and stays outside any critical section, so serialising
+      ! setup+read+write still yields a real speedup (verified ~1.8x on
+      ! a 1024x1024x300 synthetic cube, 16 threads vs. 1).
       n_planes = 1
       do k = 1, n_other
          n_planes = n_planes * naxes_in(other_axes(k))
@@ -488,21 +555,98 @@ contains
       write(*,'(A,A,A,I0,A)') 'Writing ', trim(outfile), ': ',&
       &n_planes, ' plane(s)'
 
+      status_par = 0
+      nthreads = max(1, min(omp_get_max_threads(), n_planes))
+      !$omp parallel num_threads(nthreads) if(n_planes.gt.1) default(none)&
+      !$omp& shared(infile, reffile, naxes_in, pixaxes_in, other_axes,&
+      !$omp& n_other, lbnd_out_d, ubnd_out_d, n_planes, out_unit, status_par)&
+      !$omp& private(t_status, t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
+      !$omp& t_naxes_ref, t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
+      !$omp& t_naxes_in, t_pixaxes_in, t_map_in2ref, iplane, other_idx,&
+      !$omp& remainder, k, radix, plane_status)
+
+      ! Building each thread's own AST object graph (ast_begin through
+      ! compose_pix2pix) is serialised through the SAME reproj_io
+      ! critical section resample_one_plane uses for its CFITSIO read/
+      ! write (not a separate lock) -- this setup calls load_wcs twice,
+      ! which does its own CFITSIO FTOPEN/FTGREC/FTCLOS header reads, and
+      ! keeping that under the same lock as every other CFITSIO call in
+      ! this file is the simplest way to guarantee none of them ever run
+      ! concurrently, regardless of unit number bookkeeping. (The actual
+      ! bug that motivated a long, initially wrong detour into "maybe AST
+      ! Object construction itself isn't safely concurrent" turned out to
+      ! be nothing of the kind -- see the unit-number comment above: a
+      ! bare, non-thread-offset unit in load_wcs, and a thread-offset
+      ! range in resample_one_plane that numerically collided with
+      ! out_unit at exactly 13 threads. Once both were fixed, a battery
+      ! of isolated reproducers confirmed concurrent per-thread AST
+      ! construction AND concurrent astResampleR both work fine on this
+      ! build, matching SUN/211's documented model. This critical section
+      ! is kept anyway, now purely for the CFITSIO-call-serialisation
+      ! reason, not an AST one.) Setup is cheap (a few header reads + AST
+      ! calls) next to the per-pixel resampling this still parallelises
+      ! (astResampleR itself stays outside any critical section), so
+      ! serialising it costs little.
+      t_status = 0
+      !$omp critical(reproj_io)
+      call ast_begin(t_status)
+      call load_wcs(reffile, t_wcs_ref, t_naxes_ref, t_status)
+      call extract_sky_mapping(t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
+      &t_pixaxes_ref, t_status)
+      call load_wcs(infile, t_wcs_in, t_naxes_in, t_status)
+      call extract_sky_mapping(t_wcs_in, t_skymap_in, t_skyframe_in,&
+      &t_pixaxes_in, t_status)
+      call compose_pix2pix(t_skymap_in, t_skyframe_in, t_skymap_ref,&
+      &t_skyframe_ref, t_map_in2ref, t_status)
+      !$omp end critical(reproj_io)
+
+      if (t_status.ne.0) then
+         !$omp critical(reproj_status)
+         status_par = -1
+         !$omp end critical(reproj_status)
+      endif
+
+      ! Every thread must reach this worksharing construct unconditionally
+      ! (OpenMP requires all threads in the team to encounter it) -- a
+      ! thread whose own setup above failed just skips its share of the
+      ! real work inside the loop body instead of branching around the
+      ! construct itself, which previously deadlocked the team at the
+      ! implicit end-of-do barrier whenever setup failed on only some
+      ! threads.
+      !$omp do schedule(dynamic)
       do iplane = 1, n_planes
-         remainder = iplane - 1
-         do k = 1, n_other
-            radix = naxes_in(other_axes(k))
-            other_idx(k) = mod(remainder, radix) + 1
-            remainder = remainder / radix
-         enddo
-         call resample_one_plane(infile, map_in2ref, naxes_in,&
-         &pixaxes_in, other_axes(1:n_other), other_idx(1:n_other),&
-         &lbnd_out_d, ubnd_out_d, iplane, out_unit, n_other, status)
-         if (status.ne.0) then
-            call FTCLOS(out_unit, fitsstat)
-            return
+         if (t_status.eq.0) then
+            remainder = iplane - 1
+            do k = 1, n_other
+               radix = naxes_in(other_axes(k))
+               other_idx(k) = mod(remainder, radix) + 1
+               remainder = remainder / radix
+            enddo
+            plane_status = 0
+            call resample_one_plane(infile, t_map_in2ref, naxes_in,&
+            &pixaxes_in, other_axes(1:n_other), other_idx(1:n_other),&
+            &lbnd_out_d, ubnd_out_d, iplane, out_unit, n_other, plane_status)
+            if (plane_status.ne.0) then
+               !$omp critical(reproj_status)
+               status_par = -1
+               !$omp end critical(reproj_status)
+            endif
          endif
       enddo
+      !$omp end do
+
+      !$omp critical(reproj_io)
+      call ast_end(t_status)
+      !$omp end critical(reproj_io)
+      !$omp end parallel
+
+      if (status_par.ne.0) then
+         write(*,*) 'ERROR: failed to resample/write one or more planes for: ',&
+         &trim(infile)
+         status = -1
+         call FTCLOS(out_unit, fitsstat)
+         return
+      endif
 
       call FTCLOS(out_unit, fitsstat)
    end subroutine write_reprojected_file
@@ -592,7 +736,15 @@ contains
       !! the "Fortran array indexing" astResampleR expects -- regardless
       !! of which raw file-axis numbers they are, since a degenerate
       !! (extent-1) axis contributes no stride.
+      !!
+      !! Called from within write_reprojected_file's OpenMP parallel
+      !! region (one call per plane, across threads): the CFITSIO read
+      !! unit is offset by omp_get_thread_num() so concurrently-running
+      !! threads never collide on the same unit number, and the actual
+      !! output write (FTPSSE, at the end) is wrapped in an OMP critical
+      !! section since out_unit is shared across all threads.
       use, intrinsic :: ieee_arithmetic
+      use omp_lib, only: omp_get_thread_num
       character(len=*), intent(in) :: filename
       integer, intent(in) :: map_in2ref
       integer, intent(in) :: naxes_in(:), pixaxes_in(2)
@@ -636,14 +788,30 @@ contains
 
       fitsstat = 0
       blocksize = 1
-      unit = 31
+      unit = 5000 + omp_get_thread_num()
       group = 1
       badval = ieee_value(badval, ieee_quiet_nan)
+      ! Serialised with the write critical section below (same lock name,
+      ! reproj_io), together with load_wcs's own CFITSIO calls during
+      ! per-thread setup -- a genuine cross-unit CFITSIO crash was
+      ! observed (ffpsse -> ffgcprll) with this read left unserialised,
+      ! but that run also had the unit-number collision bug described in
+      ! write_reprojected_file's comment (this read's unit could
+      ! numerically equal out_unit at higher thread counts), so it is
+      ! not confirmed whether genuinely concurrent CFITSIO calls on truly
+      ! distinct units are actually unsafe on this build or whether that
+      ! crash was just the same collision in different clothes. Kept
+      ! serialised rather than re-litigate that distinction: I/O is not
+      ! the dominant cost here, astResampleR is (see below), and it stays
+      ! outside any critical section so still runs fully in parallel
+      ! across threads regardless of how the I/O is serialised.
+      !$omp critical(reproj_io)
       call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
       call FTGSVE(unit, group, naxis, naxes_in(1:naxis),&
       &fpixels(1:naxis), lpixels(1:naxis), incs(1:naxis),&
       &badval, data_in, anyflg, fitsstat)
       call FTCLOS(unit, fitsstat)
+      !$omp end critical(reproj_io)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to read data plane from ', trim(filename)
          call printerror(fitsstat)
@@ -685,6 +853,10 @@ contains
       ! output positions 3.. (2+k for other_axes(k)), fixed at this
       ! plane's own other_idx(k) -- same value, just relocated to the
       ! output file's own axis numbering rather than the input's.
+      ! Wrapped in the same reproj_io critical section as the read above
+      ! (not just out_unit/stdout being shared -- see the read's own
+      ! comment on why CFITSIO calls need to be mutually exclusive across
+      ! ALL threads here, not merely per-unit).
       naxis_wr = 2 + n_other
       naxes_wr(1) = nx_out
       naxes_wr(2) = ny_out
@@ -697,11 +869,11 @@ contains
          fpixels_wr(2+k) = other_idx(k)
          lpixels_wr(2+k) = other_idx(k)
       enddo
+      !$omp critical(reproj_io)
       call FTPSSE(out_unit, 1, naxis_wr, naxes_wr(1:naxis_wr),&
       &fpixels_wr(1:naxis_wr), lpixels_wr(1:naxis_wr), data_out, status)
       if (status.ne.0) then
          write(*,*) 'ERROR: failed to write plane ', iplane, ' to output'
-         return
       endif
 
       ! Verification print for a handful of representative planes only
@@ -709,13 +881,15 @@ contains
       ! resampled value at reference pixel (5,9), for comparison against
       ! known ground-truth values read directly from the original data
       ! with a Python script beforehand, at 3 different channels.
-      if ((iplane.eq.1 .or. iplane.eq.100 .or. iplane.eq.200) .and.&
+      if (status.eq.0 .and.&
+      &(iplane.eq.1 .or. iplane.eq.100 .or. iplane.eq.200) .and.&
       &5.ge.lbnd_o(1) .and. 5.le.ubnd_o(1) .and.&
       &9.ge.lbnd_o(2) .and. 9.le.ubnd_o(2)) then
          write(*,'(A,I0,A,I0,A,F0.9)') '  plane ', iplane,&
          &': bad=', nbad, ', value at reference pixel (5,9): ',&
          &data_out(5-lbnd_o(1)+1, 9-lbnd_o(2)+1)
       endif
+      !$omp end critical(reproj_io)
 
       deallocate(data_in)
       deallocate(data_out)
@@ -887,6 +1061,26 @@ contains
       !! FitsChan, and return the WCS FrameSet recovered from it plus this
       !! file's own per-axis pixel-grid extent (NAXISn), needed later to
       !! bound each axis's own footprint for astMapBox.
+      !!
+      !! The CFITSIO unit is offset by omp_get_thread_num() (1000-based,
+      !! disjoint from resample_one_plane's 5000-based range and from
+      !! write_reprojected_file's fixed out_unit=43/ref_unit=44, with
+      !! headroom for thousands of threads -- see write_reprojected_file's
+      !! own comment on why that wide a margin) -- found the hard way: an
+      !! earlier version left this unit a bare
+      !! literal (11) with no thread offset at all, so every thread
+      !! calling load_wcs concurrently during write_reprojected_file's
+      !! per-thread setup collided on the very same CFITSIO unit number,
+      !! which is what actually crashed/deadlocked multi-threaded runs --
+      !! not, as first suspected, any inherent AST/CFITSIO thread-safety
+      !! limitation (a battery of isolated reproducers matching the real
+      !! call pattern -- concurrent per-thread AST FitsChan/FrameSet/
+      !! Mapping construction, concurrent astResampleR on independent
+      !! per-thread Mappings, concurrent CFITSIO reads+writes on
+      !! correctly-separated unit numbers -- ran cleanly, 16 threads x
+      !! hundreds of iterations x many repeats, once unit numbers
+      !! actually stopped colliding).
+      use omp_lib, only: omp_get_thread_num
       character(len=*), intent(in) :: filename
       integer, intent(out) :: wcs
       integer, intent(out) :: naxes(:)
@@ -901,7 +1095,7 @@ contains
 
       fitsstat = 0
       blocksize = 1
-      unit = 11
+      unit = 1000 + omp_get_thread_num()
       call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to open FITS file: ', trim(filename)
