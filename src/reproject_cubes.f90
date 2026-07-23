@@ -7,17 +7,25 @@
 ! bands unchanged.
 !
 ! Current stage: cross-file pixel(A)->pixel(B) Mapping, composed from each
-! file's own pixel->sky Mapping (extract_sky_mapping, proven in the
-! previous commit: automatic axis detection via ast_isaskyframe + a clean
-! astMapSplit extraction) rather than via astConvert. astConvert was tried
-! first (the textbook cross-WCS-alignment primitive) but, per the actual
-! SUN/211 manual (installed via libstarlink-ast-doc), its domain search
-! only examines each FrameSet's own top-level registered frames (base +
-! current) by their own Domain attribute -- it does not recurse into a
-! CmpFrame's internal components, so a domainlist of 'SKY' can never match
-! a compound "STOKES-SKY-SPECTRUM" current frame. Composing pixel_A->sky
+! file's own pixel->sky Mapping (extract_sky_mapping: automatic axis
+! detection via ast_isaskyframe + a clean astMapSplit extraction, correct
+! for any axis order/adjacency -- see extract_sky_mapping's own comment)
+! rather than via astConvert. astConvert was tried first (the textbook
+! cross-WCS-alignment primitive) but, per the actual SUN/211 manual
+! (installed via libstarlink-ast-doc), its domain search only examines
+! each FrameSet's own top-level registered frames (base + current) by
+! their own Domain attribute -- it does not recurse into a CmpFrame's
+! internal components, so a domainlist of 'SKY' can never match a
+! compound "STOKES-SKY-SPECTRUM" current frame. Composing pixel_A->sky
 ! (this file's own Mapping) with sky->pixel_B (the other file's own
 ! Mapping, inverted) sidesteps that limitation entirely.
+!
+! Also demonstrates footprint computation via astMapBox: one file's full
+! pixel extent expressed in the other's pixel space, the building block
+! for the intersection/union/reference footprint modes -- verified
+! against a genuine partial-overlap case (not just full-overlap, which
+! could hide a bug), by hand-shifting one fixture's CRPIX and confirming
+! the reported footprint matches the expected shift exactly.
 !
 ! Usage: reproject_cubes <fits_file_a> <fits_file_b>
 program reproject_cubes
@@ -39,11 +47,16 @@ program reproject_cubes
    logical, external :: ast_isaframeset, ast_isaskyframe
    character(len=ast__szchr), external :: ast_getc
 
+   integer, parameter :: max_axes = 10
    character(len=512) :: infile_a, infile_b
    integer :: wcs_a, wcs_b, skymap_a, skymap_b, pix2pix
    integer :: skyframe_a, skyframe_b, sky2sky
+   integer :: naxes_a(max_axes), naxes_b(max_axes)
+   integer :: pixaxes_a(2), pixaxes_b(2)
    integer :: status
    double precision :: xin(1), yin(1), xout(1), yout(1)
+   double precision :: lbnd_in(2), ubnd_in(2)
+   double precision :: lbnd_out, ubnd_out, xl(2), xu(2)
 
    if (command_argument_count() < 2) then
       write(*,*) 'Usage: reproject_cubes <fits_file_a> <fits_file_b>'
@@ -55,15 +68,15 @@ program reproject_cubes
    status = 0
    call ast_begin(status)
 
-   call load_wcs(infile_a, wcs_a, status)
-   call load_wcs(infile_b, wcs_b, status)
+   call load_wcs(infile_a, wcs_a, naxes_a, status)
+   call load_wcs(infile_b, wcs_b, naxes_b, status)
    if (status.ne.0) then
       write(*,*) 'ERROR: failed to load one or both WCS FrameSets'
       stop 1
    endif
 
-   call extract_sky_mapping(wcs_a, skymap_a, skyframe_a, status)
-   call extract_sky_mapping(wcs_b, skymap_b, skyframe_b, status)
+   call extract_sky_mapping(wcs_a, skymap_a, skyframe_a, pixaxes_a, status)
+   call extract_sky_mapping(wcs_b, skymap_b, skyframe_b, pixaxes_b, status)
    if (status.ne.0) then
       write(*,*) 'ERROR: failed to extract one or both pixel->sky Mappings'
       stop 1
@@ -108,6 +121,33 @@ program reproject_cubes
    write(*,'(A,F0.3,A,F0.3,A)') '  A pixel (5.0,9.0) -> B pixel (',&
    &xout(1), ' , ', yout(1), ')'
 
+   ! --- Footprint: file B's full pixel extent, expressed in A's own
+   ! pixel space, via astMapBox ---
+   ! astMapBox computes the true enclosing bound of ONE output coordinate
+   ! over a given input box -- properly handling any rotation/distortion
+   ! in the Mapping (not just a naive 4-corner check, which can
+   ! underestimate the true extent for a non-axis-aligned Mapping). Two
+   ! calls are needed, one per output (A-pixel) axis. Input box is B's
+   ! own full pixel-axis extent on the 2 axes its sky Mapping depends on
+   ! (pixaxes_b), read from its own NAXIS values.
+   lbnd_in(1) = 1.0d0
+   lbnd_in(2) = 1.0d0
+   ubnd_in(1) = real(naxes_b(pixaxes_b(1)), kind=8)
+   ubnd_in(2) = real(naxes_b(pixaxes_b(2)), kind=8)
+
+   ! pix2pix is A->B; astMapBox needs the B->A direction here (forward
+   ! transform of B's box into A's space), so invert for this call.
+   call ast_invert(pix2pix, status)
+   call ast_mapbox(pix2pix, lbnd_in, ubnd_in, .true., 1, lbnd_out, ubnd_out, xl, xu, status)
+   write(*,'(A,F0.3,A,F0.3,A)') '  B''s footprint in A pixel space, axis 1: [',&
+   &lbnd_out, ' , ', ubnd_out, ']'
+   call ast_mapbox(pix2pix, lbnd_in, ubnd_in, .true., 2, lbnd_out, ubnd_out, xl, xu, status)
+   write(*,'(A,F0.3,A,F0.3,A)') '  B''s footprint in A pixel space, axis 2: [',&
+   &lbnd_out, ' , ', ubnd_out, ']'
+   write(*,'(A,I0,A,I0,A)') '  (A''s own full extent is [1,', naxes_a(pixaxes_a(1)),&
+   &'] x [1,', naxes_a(pixaxes_a(2)), '])'
+   call ast_invert(pix2pix, status)
+
    call ast_annul(pix2pix, status)
    call ast_annul(sky2sky, status)
    call ast_annul(skymap_a, status)
@@ -127,7 +167,7 @@ program reproject_cubes
 
 contains
 
-   subroutine extract_sky_mapping(wcs, skymap, skyframe, status)
+   subroutine extract_sky_mapping(wcs, skymap, skyframe, pixel_axes, status)
       !! Extract the pixel-grid -> sky (RA/Dec) Mapping from a WCS
       !! FrameSet, with the sky axes' positions in the (possibly compound
       !! Stokes+Sky+Spectrum) current frame detected automatically -- no
@@ -156,6 +196,7 @@ contains
       !! astConvert rather than assuming a shared order.
       integer, intent(in) :: wcs
       integer, intent(out) :: skymap, skyframe
+      integer, intent(out) :: pixel_axes(2)
       integer, intent(inout) :: status
 
       integer :: curframe, nout, i, j
@@ -166,6 +207,7 @@ contains
 
       skymap = ast__null
       skyframe = ast__null
+      pixel_axes = 0
       if (status.ne.0) return
 
       nout = ast_geti(wcs, 'Nout', status)
@@ -208,22 +250,27 @@ contains
          return
       endif
       call ast_invert(skymap, status)
+      pixel_axes = out_axes(1:2)
 
       call ast_annul(fullmap, status)
       call ast_annul(simplemap, status)
    end subroutine extract_sky_mapping
 
-   subroutine load_wcs(filename, wcs, status)
+   subroutine load_wcs(filename, wcs, naxes, status)
       !! Read filename's FITS header via CFITSIO, load it into an AST
-      !! FitsChan, and return the WCS FrameSet recovered from it.
+      !! FitsChan, and return the WCS FrameSet recovered from it plus this
+      !! file's own per-axis pixel-grid extent (NAXISn), needed later to
+      !! bound each axis's own footprint for astMapBox.
       character(len=*), intent(in) :: filename
       integer, intent(out) :: wcs
+      integer, intent(out) :: naxes(:)
       integer, intent(inout) :: status
 
       integer :: unit, blocksize, fitsstat, nkeys, nmore, i, fitschan
       character(len=80) :: card
 
       wcs = ast__null
+      naxes = 0
       if (status.ne.0) return
 
       fitsstat = 0
@@ -240,6 +287,15 @@ contains
       call FTGHSP(unit, nkeys, nmore, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: FTGHSP failed for ', trim(filename)
+         call printerror(fitsstat)
+         call FTCLOS(unit, fitsstat)
+         status = -1
+         return
+      endif
+
+      call FTGISZ(unit, size(naxes), naxes, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: FTGISZ failed for ', trim(filename)
          call printerror(fitsstat)
          call FTCLOS(unit, fitsstat)
          status = -1
