@@ -72,6 +72,13 @@
 ! ground truth exactly.
 !
 ! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
+!    or: reproject_cubes --config <cfgfile>
+!    or: reproject_cubes --config <cfgfile> <intersection|union|reference> <reference_file> <input_file> [input_file ...]
+! (positional args, if given, take precedence over --config, atomically
+! replacing the whole mode/reffile/infiles group -- see read_reproject_cfg).
+! Config file is a key=value text file: mode=..., reffile=..., and
+! infiles=file1,file2,file3 (comma-separated, same csv-list convention
+! rm_synthesis's own multi-band config keys use).
 program reproject_cubes
    implicit none
    ! AST_PAR (the vendor Fortran constants file, /usr/include/AST_PAR) is
@@ -101,6 +108,12 @@ program reproject_cubes
    character(len=512) :: infiles(max_inputs)
    integer :: n_inputs, iarg, i
 
+   character(len=512) :: cfgfile
+   character(len=512) :: this_arg
+   character(len=512) :: cli_positional(2+max_inputs)
+   integer :: n_cli_positional, argc
+   logical :: have_cfgfile
+
    integer :: wcs_ref, skymap_ref, skyframe_ref
    integer :: naxes_ref(max_axes), pixaxes_ref(2)
    integer :: wcs_in, skymap_in, skyframe_in
@@ -110,21 +123,60 @@ program reproject_cubes
    double precision :: this_lbnd(2), this_ubnd(2)
    integer :: status
 
-   if (command_argument_count() < 3) then
+   ! Two ways to supply mode/reffile/infiles: positional CLI args (the
+   ! original "snap run" usage -- this tool's own parameter list is short
+   ! enough that a config file is a convenience, not a requirement, unlike
+   ! rm_synthesis's much larger key set which mandates one) or a
+   ! --config key=value file (read_reproject_cfg below, same key=value
+   ! style as rm_synthesis's own config). Both may be given together;
+   ! positional CLI args then win outright, atomically replacing the
+   ! whole mode/reffile/infiles group from the config rather than
+   ! merging field-by-field (avoids ambiguity about which fields a
+   ! partial positional list was meant to override).
+   have_cfgfile = .false.
+   n_cli_positional = 0
+   argc = command_argument_count()
+   iarg = 1
+   do while (iarg.le.argc)
+      call get_command_argument(iarg, this_arg)
+      if (trim(this_arg).eq.'--config') then
+         if (iarg.eq.argc) then
+            write(*,*) 'ERROR: --config requires a file path argument'
+            stop 1
+         endif
+         call get_command_argument(iarg+1, cfgfile)
+         have_cfgfile = .true.
+         iarg = iarg + 2
+      else
+         n_cli_positional = n_cli_positional + 1
+         if (n_cli_positional.gt.2+max_inputs) then
+            write(*,*) 'ERROR: too many input files (max ', max_inputs, ')'
+            stop 1
+         endif
+         cli_positional(n_cli_positional) = this_arg
+         iarg = iarg + 1
+      endif
+   enddo
+
+   if (n_cli_positional.ge.3) then
+      mode = cli_positional(1)
+      reffile = cli_positional(2)
+      n_inputs = n_cli_positional - 2
+      do i = 1, n_inputs
+         infiles(i) = cli_positional(2+i)
+      enddo
+   else if (n_cli_positional.eq.0 .and. have_cfgfile) then
+      call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
+      if (status.ne.0) stop 1
+   else
       write(*,*) 'Usage: reproject_cubes <intersection|union|reference>',&
       &' <reference_file> <input_file> [input_file ...]'
+      write(*,*) '   or: reproject_cubes --config <cfgfile>'
+      write(*,*) '   or: reproject_cubes --config <cfgfile>',&
+      &' <intersection|union|reference> <reference_file> <input_file> [input_file ...]',&
+      &'  (CLI args override the config file)'
       stop 1
    endif
-   call get_command_argument(1, mode)
-   call get_command_argument(2, reffile)
-   n_inputs = command_argument_count() - 2
-   if (n_inputs.gt.max_inputs) then
-      write(*,*) 'ERROR: too many input files (max ', max_inputs, ')'
-      stop 1
-   endif
-   do i = 1, n_inputs
-      call get_command_argument(2+i, infiles(i))
-   enddo
 
    if (trim(mode).ne.'intersection' .and. trim(mode).ne.'union' .and.&
    &trim(mode).ne.'reference') then
@@ -856,5 +908,169 @@ contains
       endif
       call ast_annul(fitschan, status)
    end subroutine load_wcs
+
+   subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
+      !! Parse a --config key=value file: three required keys, mode,
+      !! reffile, and infiles (comma-separated, same csv-list convention
+      !! rm_synthesis's own multi-band keys use). Standalone re-
+      !! implementation of rm_synthesis_mod's split_key_value/csv_count/
+      !! csv_get_item (below) rather than a `use` dependency -- this tool
+      !! is deliberately kept off the main rm_synthesis build graph (own
+      !! binary, own dependency set, see the Makefile comment), and these
+      !! are a handful of generic string-parsing lines each, unlikely to
+      !! drift.
+      character(len=*), intent(in) :: cfgfile
+      character(len=*), intent(out) :: mode, reffile
+      character(len=*), intent(out) :: infiles(:)
+      integer, intent(out) :: n_inputs
+      integer, intent(out) :: status
+
+      character(len=512) :: line, key, val, raw_infiles
+      integer :: unit_cfg, ios, line_no, j
+      logical :: has_kv, seen_mode, seen_reffile, seen_infiles
+
+      status = 0
+      n_inputs = 0
+      seen_mode = .false.
+      seen_reffile = .false.
+      seen_infiles = .false.
+      raw_infiles = ' '
+
+      open(newunit=unit_cfg, file=trim(cfgfile), status='old', action='read', iostat=ios)
+      if (ios.ne.0) then
+         write(*,*) 'ERROR: cannot open config file: ', trim(cfgfile)
+         status = -1
+         return
+      endif
+
+      line_no = 0
+      do
+         read(unit_cfg, '(A)', iostat=ios) line
+         if (ios.ne.0) exit
+         line_no = line_no + 1
+         call cfg_split_key_value(line, key, val, has_kv)
+         if (.not. has_kv) cycle
+         select case (trim(key))
+         case ('mode')
+            mode = trim(val)
+            seen_mode = .true.
+         case ('reffile')
+            reffile = trim(val)
+            seen_reffile = .true.
+         case ('infiles')
+            raw_infiles = trim(val)
+            seen_infiles = .true.
+         case default
+            write(*,*) 'ERROR: unrecognised config key "', trim(key), '" at line ',&
+            &line_no, ' in ', trim(cfgfile)
+            status = -1
+            close(unit_cfg)
+            return
+         end select
+      enddo
+      close(unit_cfg)
+
+      if (.not. seen_mode .or. .not. seen_reffile .or. .not. seen_infiles) then
+         write(*,*) 'ERROR: config file ', trim(cfgfile),&
+         &' must set mode, reffile, and infiles'
+         status = -1
+         return
+      endif
+
+      n_inputs = cfg_csv_count(raw_infiles)
+      if (n_inputs.lt.1 .or. n_inputs.gt.size(infiles)) then
+         write(*,*) 'ERROR: infiles in config must list between 1 and ',&
+         &size(infiles), ' files'
+         status = -1
+         n_inputs = 0
+         return
+      endif
+      do j = 1, n_inputs
+         call cfg_csv_get_item(raw_infiles, j, infiles(j))
+      enddo
+   end subroutine read_reproject_cfg
+
+   subroutine cfg_split_key_value(raw_line, key, val, has_kv)
+      !! Same convention as rm_synthesis_mod's split_key_value: strips
+      !! ';'/'#' comments, splits on the first '=', blank/comment-only
+      !! lines and lines missing either side of '=' yield has_kv=.false.
+      character(len=*), intent(in) :: raw_line
+      character(len=*), intent(out) :: key, val
+      logical, intent(out) :: has_kv
+      character(len=len(raw_line)) :: line
+      integer :: p1, p2, peq, pcut
+
+      key = ' '
+      val = ' '
+      has_kv = .false.
+
+      line = raw_line
+      p1 = index(line, ';')
+      p2 = index(line, '#')
+      if (p1 > 0 .and. p2 > 0) then
+         pcut = min(p1, p2)
+      else if (p1 > 0) then
+         pcut = p1
+      else
+         pcut = p2
+      endif
+      if (pcut > 0) line = line(1:pcut - 1)
+
+      line = adjustl(line)
+      if (len_trim(line) == 0) return
+
+      peq = index(line, '=')
+      if (peq <= 1) return
+
+      key = adjustl(line(1:peq - 1))
+      val = adjustl(line(peq + 1:))
+      if (len_trim(key) == 0 .or. len_trim(val) == 0) return
+
+      key = trim(key)
+      val = trim(val)
+      has_kv = .true.
+   end subroutine cfg_split_key_value
+
+   function cfg_csv_count(str) result(n)
+      !! Number of comma-separated items in str (1 if no comma present,
+      !! 0 for a blank/empty string).
+      character(len=*), intent(in) :: str
+      integer :: n
+      integer :: i
+
+      n = 0
+      if (len_trim(str) == 0) return
+      n = 1
+      do i = 1, len_trim(str)
+         if (str(i:i) == ',') n = n + 1
+      enddo
+   end function cfg_csv_count
+
+   subroutine cfg_csv_get_item(str, idx, item)
+      !! Extract the idx-th (1-based) comma-separated item from str,
+      !! trimmed of surrounding blanks.
+      character(len=*), intent(in) :: str
+      integer, intent(in) :: idx
+      character(len=*), intent(out) :: item
+      integer :: i, cur, p0, n
+
+      item = ' '
+      n = len_trim(str)
+      if (n == 0) return
+
+      cur = 1
+      p0 = 1
+      do i = 1, n
+         if (str(i:i) == ',') then
+            if (cur == idx) then
+               item = adjustl(str(p0:i - 1))
+               return
+            endif
+            cur = cur + 1
+            p0 = i + 1
+         endif
+      enddo
+      if (cur == idx) item = adjustl(str(p0:n))
+   end subroutine cfg_csv_get_item
 
 end program reproject_cubes
