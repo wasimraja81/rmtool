@@ -74,11 +74,13 @@
 ! Usage: reproject_cubes <intersection|union|reference> <reference_file> <input_file> [input_file ...]
 !    or: reproject_cubes --config <cfgfile>
 !    or: reproject_cubes --config <cfgfile> <intersection|union|reference> <reference_file> <input_file> [input_file ...]
+!    or: reproject_cubes --help | -h
 ! (positional args, if given, take precedence over --config, atomically
 ! replacing the whole mode/reffile/infiles group -- see read_reproject_cfg).
 ! Config file is a key=value text file: mode=..., reffile=..., and
 ! infiles=file1,file2,file3 (comma-separated, same csv-list convention
-! rm_synthesis's own multi-band config keys use).
+! rm_synthesis's own multi-band config keys use). Full usage text is in
+! print_usage below (shared by --help and the argument-error path).
 program reproject_cubes
    implicit none
    ! AST_PAR (the vendor Fortran constants file, /usr/include/AST_PAR) is
@@ -139,7 +141,10 @@ program reproject_cubes
    iarg = 1
    do while (iarg.le.argc)
       call get_command_argument(iarg, this_arg)
-      if (trim(this_arg).eq.'--config') then
+      if (trim(this_arg).eq.'--help' .or. trim(this_arg).eq.'-h') then
+         call print_usage()
+         stop
+      else if (trim(this_arg).eq.'--config') then
          if (iarg.eq.argc) then
             write(*,*) 'ERROR: --config requires a file path argument'
             stop 1
@@ -169,12 +174,7 @@ program reproject_cubes
       call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
       if (status.ne.0) stop 1
    else
-      write(*,*) 'Usage: reproject_cubes <intersection|union|reference>',&
-      &' <reference_file> <input_file> [input_file ...]'
-      write(*,*) '   or: reproject_cubes --config <cfgfile>'
-      write(*,*) '   or: reproject_cubes --config <cfgfile>',&
-      &' <intersection|union|reference> <reference_file> <input_file> [input_file ...]',&
-      &'  (CLI args override the config file)'
+      call print_usage()
       stop 1
    endif
 
@@ -908,6 +908,36 @@ contains
       endif
       call ast_annul(fitschan, status)
    end subroutine load_wcs
+
+   subroutine print_usage()
+      !! Shared by --help/-h and the argument-error path, so the two
+      !! can't drift out of sync with each other.
+      write(*,'(A)') 'reproject_cubes -- reproject FITS cubes onto a common grid'
+      write(*,'(A)') ''
+      write(*,'(A)') 'Usage:'
+      write(*,'(A)') '  reproject_cubes <intersection|union|reference> <reference_file>'//&
+      &' <input_file> [input_file ...]'
+      write(*,'(A)') '  reproject_cubes --config <cfgfile>'
+      write(*,'(A)') '  reproject_cubes --config <cfgfile> <intersection|union|reference>'//&
+      &' <reference_file> <input_file> [input_file ...]'
+      write(*,'(A)') '  reproject_cubes --help | -h'
+      write(*,'(A)') ''
+      write(*,'(A)') 'If both --config and positional args are given, the positional args'//&
+      &' win outright, replacing the whole mode/reffile/infiles group from the config.'
+      write(*,'(A)') ''
+      write(*,'(A)') 'Modes:'
+      write(*,'(A)') '  reference    output grid is the reference file''s own extent'
+      write(*,'(A)') '  intersection output grid shrinks to the overlap of all inputs'//&
+      &' with the reference'
+      write(*,'(A)') '  union        output grid grows to cover all inputs and the reference'
+      write(*,'(A)') ''
+      write(*,'(A)') 'Config file: key=value text file with three required keys:'
+      write(*,'(A)') '  mode    = intersection | union | reference'
+      write(*,'(A)') '  reffile = /path/to/reference.fits'
+      write(*,'(A)') '  infiles = /path/band1.fits,/path/band2.fits,/path/band3.fits'
+      write(*,'(A)') '(infiles is comma-separated, no spaces required; ''#'' or '';'''//&
+      &' starts a comment.)'
+   end subroutine print_usage
 
    subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
       !! Parse a --config key=value file: three required keys, mode,
