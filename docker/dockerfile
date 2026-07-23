@@ -25,6 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcfitsio-dev \
     libcurl4-openssl-dev \
     libnghttp2-dev \
+    libstarlink-ast-dev \
+    libstarlink-ast-err9 \
+    libstarlink-ast-grf3d9 \
+    libstarlink-pal-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,7 +55,28 @@ RUN set -eux; \
     make -j2 OMP=1 GPU=1; \
     cp -f bin/rm_synthesis_release_gpu_offload_hostomp bin/rm_synthesis_OMP1_GPU1
 
-# Expose all four compiled targets to the container's system PATH
+# reproject_cubes: independent of the rm_synthesis build graph above (own
+# binary, own AST dependency -- see the Makefile's own comment), so it
+# isn't touched by any of the `make clean OMP=... GPU=...` calls above
+# (those only remove rm_synthesis-specific build artifacts). Built once,
+# ends up at bin/reproject_cubes.
+RUN make reproject_cubes
+
+# plot_tile_async_swimlane.py: symlinked into bin/ (not copied) so there's
+# one source of truth -- editing scripts/plot_tile_async_swimlane.py in a
+# later image layer or a bind-mounted dev checkout is still what actually
+# runs. Its own shebang (#!/usr/bin/env python3) already resolves to
+# whichever python3 is first on PATH; inside this image that's the
+# apt-get python3 installed above (with matplotlib/numpy/astropy already
+# on it, not some other interpreter), so it needs no rewriting -- only
+# needs to be executable (already is, tracked in git) and reachable from
+# PATH like every other tool here.
+RUN chmod +x scripts/plot_tile_async_swimlane.py \
+    && ln -sf /app/rmtool/scripts/plot_tile_async_swimlane.py \
+       bin/plot_tile_async_swimlane.py
+
+# Expose all four compiled rm_synthesis targets plus reproject_cubes and
+# plot_tile_async_swimlane.py to the container's system PATH
 ENV PATH="/app/rmtool/bin:${PATH}"
 
 CMD ["/bin/bash"]
