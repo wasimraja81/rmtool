@@ -25,9 +25,11 @@
 ! different from *partial* overlap, which is the normal, expected case
 ! for combining bands with different sky coverage and is not rejected.
 !
-! Also demonstrates the actual regridding step: resample_one_plane reads
-! one specific plane and resamples it onto the final output grid via
-! astResampleR. Caught a real bug on the first attempt: the documented
+! Also demonstrates the actual regridding step: reads planes and
+! resamples them onto the final output grid via astResampleR (originally
+! one plane at a time, via a since-removed resample_one_plane -- see the
+! OpenMP/block paragraph below for its replacement). Caught a real bug on
+! the first attempt: the documented
 ! 20-argument signature (this, ndim_in, lbnd_in, ubnd_in, in, in_var,
 ! interp, finterp, params, flags, tol, maxpix, badval, ndim_out,
 ! lbnd_out, ubnd_out, lbnd, ubnd, out, out_var) was missing "params"
@@ -70,6 +72,32 @@
 ! 16-pixel crop, CRPIX2 stays untouched (that axis wasn't cropped), and
 ! the pixel value at the shifted position matches independently-computed
 ! ground truth exactly.
+!
+! OpenMP-parallelised across planes, and reads/resamples/writes in
+! memory-budgeted BLOCKS of planes (mem_frac_ram, same concept as
+! rm_synthesis's own tile planner -- see get_mem_total_kb) rather than
+! one plane at a time. Each block goes through three strictly separated
+! phases: read (one thread, OMP `single`), resample (every thread, in
+! parallel -- each thread builds its own private AST Mapping, since this
+! Fortran AST binding has no astLock_/astUnlock_ to hand one Mapping
+! between threads), write (one thread, `single`). Blocks mean a whole
+! block's CFITSIO I/O happens on a single thread BY CONSTRUCTION, so
+! there is nothing to lock -- an earlier plane-at-a-time version
+! serialised every CFITSIO call behind an OMP critical section instead,
+! which this replaced (see write_reprojected_file's own comment). A real
+! bug surfaced getting here: FTGSVE fills its output array in ascending-
+! axis-number order among the axes actually being read, and reading a
+! whole block (not a single degenerate plane) exposed a case the old
+! per-plane code never hit -- TEST_NONADJACENT.Q.FITSCUBE has FREQ on
+! axis 1, *before* RA/DEC on axes 2 and 4, so a block read's fastest
+! dimension is the block axis, not the sky axes; read_one_block now
+! ranks the 3 relevant axes and only pays for a permute copy on
+! non-conventional orderings like that one, not the common case.
+! Verified byte-identical (header and data) against the pre-blocking,
+! pre-OpenMP committed output across all fixtures, multiple block sizes
+! (including a 3-plane block against 200 channels, exercising a
+! non-exact remainder), and 25 repeated stress runs at default thread
+! count with no failures.
 !
 ! Usage: reproject_cubes mode=<intersection|union|reference> reffile=<reference_file> infiles=<input_file>[,<input_file>...]
 !    or: reproject_cubes --config <cfgfile>
@@ -125,6 +153,15 @@ program reproject_cubes
    logical :: seen_mode, seen_reffile, seen_infiles
    logical :: cli_seen_mode, cli_seen_reffile, cli_seen_infiles
 
+   ! mem_frac_ram: optional (unlike mode/reffile/infiles, has a default
+   ! and is never required) -- fraction of total system RAM (see
+   ! get_mem_total_kb) budgeted for one read/resample/write block of
+   ! planes at a time, same concept and default as rm_synthesis's own
+   ! cfg%mem_frac_ram (rm_synthesis_mod.f90's plan_tile).
+   real :: mem_frac_ram, cli_mem_frac_ram
+   logical :: cli_seen_mem_frac_ram
+   integer :: ios_mfr
+
    integer :: wcs_ref, skymap_ref, skyframe_ref
    integer :: naxes_ref(max_axes), pixaxes_ref(2)
    integer :: wcs_in, skymap_in, skyframe_in
@@ -148,6 +185,8 @@ program reproject_cubes
    cli_seen_mode = .false.
    cli_seen_reffile = .false.
    cli_seen_infiles = .false.
+   cli_seen_mem_frac_ram = .false.
+   mem_frac_ram = 0.25
    argc = command_argument_count()
    iarg = 1
    do while (iarg.le.argc)
@@ -193,9 +232,21 @@ program reproject_cubes
             endif
             raw_cli_infiles = trim(cli_val)
             cli_seen_infiles = .true.
+         case ('mem_frac_ram')
+            if (cli_seen_mem_frac_ram) then
+               write(*,*) 'ERROR: mem_frac_ram given more than once on the command line'
+               stop 1
+            endif
+            read(cli_val, *, iostat=ios_mfr) cli_mem_frac_ram
+            if (ios_mfr.ne.0) then
+               write(*,*) 'ERROR: mem_frac_ram must be a number, got "',&
+               &trim(cli_val), '"'
+               stop 1
+            endif
+            cli_seen_mem_frac_ram = .true.
          case default
             write(*,*) 'ERROR: unrecognised key "', trim(cli_key), '" -- expected',&
-            &' mode, reffile, or infiles'
+            &' mode, reffile, infiles, or mem_frac_ram'
             stop 1
          end select
          iarg = iarg + 1
@@ -206,7 +257,8 @@ program reproject_cubes
    seen_reffile = .false.
    seen_infiles = .false.
    if (have_cfgfile) then
-      call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
+      call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&
+      &mem_frac_ram, status)
       if (status.ne.0) stop 1
       seen_mode = .true.
       seen_reffile = .true.
@@ -232,9 +284,15 @@ program reproject_cubes
       enddo
       seen_infiles = .true.
    endif
+   if (cli_seen_mem_frac_ram) mem_frac_ram = cli_mem_frac_ram
 
    if (.not. seen_mode .or. .not. seen_reffile .or. .not. seen_infiles) then
       call print_usage()
+      stop 1
+   endif
+
+   if (mem_frac_ram.le.0.0 .or. mem_frac_ram.gt.0.95) then
+      write(*,*) 'ERROR: mem_frac_ram must be > 0 and <= 0.95, got ', mem_frac_ram
       stop 1
    endif
 
@@ -354,7 +412,7 @@ program reproject_cubes
       endif
       call write_reprojected_file(reffile, infiles(i),&
       &'!'//trim(infiles(i))//'_REPROJ.FITS', pixaxes_ref,&
-      &naxes_in, pixaxes_in, lbnd_out, ubnd_out, status)
+      &naxes_in, pixaxes_in, lbnd_out, ubnd_out, mem_frac_ram, status)
       if (status.ne.0) then
          write(*,*) 'ERROR: failed to write reprojected output for: ',&
          &trim(infiles(i))
@@ -384,7 +442,7 @@ program reproject_cubes
 contains
 
    subroutine write_reprojected_file(reffile, infile, outfile, pixaxes_ref,&
-   &naxes_in, pixaxes_in, lbnd_out_d, ubnd_out_d, status)
+   &naxes_in, pixaxes_in, lbnd_out_d, ubnd_out_d, mem_frac_ram, status)
       !! Create outfile and write every reprojected plane of infile into
       !! it. Output axis layout: the 2 sky axes always occupy OUTPUT
       !! positions 1,2 (matching what rm_synthesis's own tile-read I/O
@@ -400,19 +458,45 @@ contains
       !! INFILE unchanged (that band's own channel/Stokes definitions,
       !! untouched by reprojection), placed at output positions 3.. in
       !! their original relative order.
+      !! Planes are read, resampled, and written in BLOCKS, not one at a
+      !! time: block size comes from mem_frac_ram (get_mem_total_kb
+      !! below mirrors rm_synthesis's own /proc/meminfo MemTotal read
+      !! exactly, same concept as its plan_tile). Each block goes through
+      !! three strictly separated phases -- read (one thread, via OMP
+      !! `single`), resample (every thread, in parallel, one
+      !! astResampleR call per plane in the block), write (one thread,
+      !! via `single`) -- relying on the implicit barrier every `single`/
+      !! `do` construct has by default. This replaced an earlier
+      !! plane-at-a-time version that serialised every CFITSIO call
+      !! behind an OMP critical section: with blocks, a whole block's I/O
+      !! happens on a single thread BY CONSTRUCTION, so there is no
+      !! concurrent CFITSIO access to guard against in the first place --
+      !! nothing to lock, rather than a lock relied on to make concurrent
+      !! access safe. Batching also amortises CFITSIO's per-call
+      !! (FTOPEN/FTGSVE/FTPSSE) overhead across many planes instead of
+      !! paying it every single one.
+      use, intrinsic :: ieee_arithmetic
       use omp_lib, only: omp_get_max_threads
       character(len=*), intent(in) :: reffile, infile, outfile
       integer, intent(in) :: pixaxes_ref(2)
       integer, intent(in) :: naxes_in(:), pixaxes_in(2)
       double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
+      real, intent(in) :: mem_frac_ram
       integer, intent(inout) :: status
 
       integer :: naxis, k, other_axes(max_axes), n_other
       integer :: other_idx(max_axes), remainder, radix
-      integer :: iplane, n_planes, status_par, plane_status, nthreads
+      integer :: n_planes, status_par, nthreads
       integer :: nx_out, ny_out, naxis_out, naxes_out(max_axes)
+      integer :: nx_in, ny_in
       integer :: ref_unit, out_unit, fitsstat, blocksize
       logical :: simple, extend
+
+      integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes
+      integer(kind=8) :: block_planes64
+      integer :: block_planes, n_groups, igroup, axis1_extent
+      integer :: chan_start, chan_len, local_iplane
+      real, allocatable :: block_data_in(:,:,:), block_data_out(:,:,:)
 
       ! Per-OpenMP-thread private AST working set (see the parallel
       ! region below for why each thread builds its own).
@@ -421,6 +505,12 @@ contains
       integer :: t_wcs_in, t_skymap_in, t_skyframe_in
       integer :: t_naxes_in(max_axes), t_pixaxes_in(2)
       integer :: t_map_in2ref
+
+      ! Per-plane resample working set (private, one astResampleR call
+      ! per plane inside a block's parallel do).
+      integer :: lbnd_in(2), ubnd_in(2), lbnd_o(2), ubnd_o(2), nbad
+      real :: badval
+      double precision :: params_dummy(1)
 
       if (status.ne.0) return
 
@@ -436,6 +526,8 @@ contains
          endif
       enddo
 
+      nx_in = naxes_in(pixaxes_in(1))
+      ny_in = naxes_in(pixaxes_in(2))
       nx_out = nint(ubnd_out_d(1) - lbnd_out_d(1)) + 1
       ny_out = nint(ubnd_out_d(2) - lbnd_out_d(2)) + 1
       naxis_out = 2 + n_other
@@ -486,109 +578,95 @@ contains
       enddo
       call FTCLOS(ref_unit, fitsstat)
 
-      ! --- Resample and write every plane, in parallel across OpenMP
-      ! threads ---
-      ! Each thread builds its OWN private input->reference pixel
-      ! Mapping from scratch (own ast_begin context, own load_wcs/
-      ! extract_sky_mapping/compose_pix2pix calls) rather than sharing
-      ! or cloning one Mapping built by the caller. SUN/211 Sec 4.12
-      ! ("AST Objects within Multi-threaded Applications") requires
-      ! astLock/astUnlock to hand an AST Object from the thread that
-      ! created it to another thread; checked this build's actual
-      ! Fortran symbol table (libstarlink_ast.so.9) and ast_lock_/
-      ! ast_unlock_ are simply not exported -- only ast_copy_ is, which
-      ! is useless on its own without the paired lock handoff (a copy
-      ! is still initially locked to its creating thread). Building a
-      ! Mapping is a handful of FITS header reads plus cheap AST calls,
-      ! negligible next to the per-pixel resampling cost this
-      ! parallelises, so redoing it once per thread (not once per
-      ! plane) costs nothing worth avoiding. Every thread's whole AST
-      ! object graph is therefore self-created and never shared, which
-      ! is squarely inside AST's documented thread-safe model without
-      ! needing any lock/unlock call at all -- confirmed empirically too
-      ! (see the setup critical section's own comment below): concurrent
-      ! per-thread construction, and concurrent astResampleR on those
-      ! independent Mappings, both ran cleanly across many repeated
-      ! stress runs once the actual bug (below) was found and fixed.
-      !
-      ! CFITSIO unit numbers used inside this region are offset by
-      ! omp_get_thread_num() (see load_wcs/resample_one_plane), using
-      ! disjoint ranges (1000-based for load_wcs, 5000-based for
-      ! resample_one_plane's read) with wide headroom on both sides: up
-      ! to ~4000 threads before load_wcs's range could reach 5000, and
-      ! both bases sit far above the fixed out_unit=43/ref_unit=44 --
-      ! comfortably beyond any real HPC node's core count, chosen that
-      ! wide deliberately after an earlier 100/200 pairing turned out to
-      ! only be safe up to ~100 threads. Channel/plane count plays no
-      ! part in this -- each thread reuses its own single unit number
-      ! sequentially across every plane it processes, opening and
-      ! closing it each time, so only thread count (not cube size)
-      ! determines how much headroom is needed. An earlier version got
-      ! the numbering wrong in two ways: load_wcs had no thread offset
-      ! at all (a bare literal unit=11, so concurrent per-thread setup
-      ! collided outright), and resample_one_plane's offset (31+tid)
-      ! numerically reached 43 at thread 12 -- exactly out_unit, which
-      ! stays open for the entire parallel region -- so anything needing
-      ! >=13 threads reliably crashed while <=12 threads never touched
-      ! unit 43 and ran clean. That thread-count-dependent threshold
-      ! (reliable at 12, reliable *failure* at 13+) was what actually
-      ! pointed at a plain unit collision rather than a deeper AST/
-      ! CFITSIO concurrency limit.
-      !
-      ! The actual disk write (FTPSSE, inside resample_one_plane) stays
-      ! serialised through an OMP critical section together with the
-      ! read -- concurrent CFITSIO writes to the same output unit are
-      ! not something this project trusts even via distinct handles (see
-      ! rm_synthesis's own io_write_threads rewrite to raw stream writes
-      ! after a production corruption incident,
-      ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md's T4 postmortem), and
-      ! this build's CFITSIO also visibly crashed (ffpsse/ffgcprll) when
-      ! reads on other units were left free to run fully concurrently
-      ! against it. Resampling itself (astResampleR) is embarrassingly
-      ! parallel and stays outside any critical section, so serialising
-      ! setup+read+write still yields a real speedup (verified ~1.8x on
-      ! a 1024x1024x300 synthetic cube, 16 threads vs. 1).
+      ! --- Block size: mem_frac_ram fraction of total system RAM,
+      ! divided by the bytes one plane's worth of input+output costs
+      ! (same budgeting concept as rm_synthesis's plan_tile, applied to
+      ! "planes in a block" instead of "output pixels in a tile"). Never
+      ! larger than a single cycle of other_axes(1) (the fastest-varying
+      ! non-sky axis) -- a block always covers one CONTIGUOUS range of
+      ! that axis with every slower other axis held fixed (see the
+      ! group/block loop below), so it can never usefully span past
+      ! where that axis wraps.
       n_planes = 1
       do k = 1, n_other
          n_planes = n_planes * naxes_in(other_axes(k))
       enddo
-      write(*,'(A,A,A,I0,A)') 'Writing ', trim(outfile), ': ',&
-      &n_planes, ' plane(s)'
+      call get_mem_total_kb(mem_total_kb)
+      bytes_per_plane = int(4,8) * (int(nx_in,8)*int(ny_in,8) +&
+      &int(nx_out,8)*int(ny_out,8))
+      mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) *&
+      &1024.0d0, 8)
+      block_planes64 = max(1_8, mem_safe_bytes / bytes_per_plane)
+      block_planes = int(min(block_planes64, int(n_planes,8)))
+      axis1_extent = 1
+      if (n_other.ge.1) then
+         axis1_extent = naxes_in(other_axes(1))
+         block_planes = min(block_planes, axis1_extent)
+      endif
+      if (block_planes.lt.1) block_planes = 1
+
+      write(*,'(A,A,A,I0,A,I0,A)') 'Writing ', trim(outfile), ': ',&
+      &n_planes, ' plane(s), in blocks of up to ', block_planes, ' plane(s)'
+
+      ! Parallelism only happens WITHIN a block (its plane range, via the
+      ! `!$omp do` below) -- blocks themselves are strictly sequential,
+      ! never overlapped/pipelined, so block_planes is a hard ceiling on
+      ! how many threads can ever do useful work at once, not just a
+      ! memory knob. A too-small mem_frac_ram therefore doesn't just add
+      ! CFITSIO call overhead -- it can silently throw away most of the
+      ! OpenMP speedup: measured 12.0s (block_planes=1, forced to 1
+      ! thread) vs. 5.2s (one block covering the whole cube, 16 threads)
+      ! on the same 1024x1024x300 synthetic cube, over 2x slower from
+      ! losing parallelism, not from smaller reads/writes. Warn rather
+      ! than silently eat that cost or override the user's own budget.
+      if (block_planes.lt.omp_get_max_threads()) then
+         write(*,'(A,I0,A,I0,A)') 'WARNING: mem_frac_ram limits blocks to ',&
+         &block_planes, ' plane(s), below the ', omp_get_max_threads(),&
+         &' threads available -- parallelism (not just I/O) is reduced;'//&
+         &' raise mem_frac_ram for full speedup if memory allows.'
+      endif
+
+      allocate(block_data_in(nx_in, ny_in, block_planes))
+      allocate(block_data_out(nx_out, ny_out, block_planes))
+
+      n_groups = 1
+      do k = 2, n_other
+         n_groups = n_groups * naxes_in(other_axes(k))
+      enddo
 
       status_par = 0
-      nthreads = max(1, min(omp_get_max_threads(), n_planes))
-      !$omp parallel num_threads(nthreads) if(n_planes.gt.1) default(none)&
+      nthreads = max(1, min(omp_get_max_threads(), block_planes))
+      !$omp parallel num_threads(nthreads) default(none)&
       !$omp& shared(infile, reffile, naxes_in, pixaxes_in, other_axes,&
-      !$omp& n_other, lbnd_out_d, ubnd_out_d, n_planes, out_unit, status_par)&
+      !$omp& n_other, lbnd_out_d, ubnd_out_d, out_unit, status_par,&
+      !$omp& nx_in, ny_in, nx_out, ny_out, block_planes, block_data_in,&
+      !$omp& block_data_out, n_groups, axis1_extent)&
       !$omp& private(t_status, t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
       !$omp& t_naxes_ref, t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
-      !$omp& t_naxes_in, t_pixaxes_in, t_map_in2ref, iplane, other_idx,&
-      !$omp& remainder, k, radix, plane_status)
+      !$omp& t_naxes_in, t_pixaxes_in, t_map_in2ref, other_idx, remainder,&
+      !$omp& radix, k, igroup, chan_start, chan_len, local_iplane, nbad,&
+      !$omp& lbnd_in, ubnd_in, lbnd_o, ubnd_o, badval, params_dummy)
 
-      ! Building each thread's own AST object graph (ast_begin through
-      ! compose_pix2pix) is serialised through the SAME reproj_io
-      ! critical section resample_one_plane uses for its CFITSIO read/
-      ! write (not a separate lock) -- this setup calls load_wcs twice,
-      ! which does its own CFITSIO FTOPEN/FTGREC/FTCLOS header reads, and
-      ! keeping that under the same lock as every other CFITSIO call in
-      ! this file is the simplest way to guarantee none of them ever run
-      ! concurrently, regardless of unit number bookkeeping. (The actual
-      ! bug that motivated a long, initially wrong detour into "maybe AST
-      ! Object construction itself isn't safely concurrent" turned out to
-      ! be nothing of the kind -- see the unit-number comment above: a
-      ! bare, non-thread-offset unit in load_wcs, and a thread-offset
-      ! range in resample_one_plane that numerically collided with
-      ! out_unit at exactly 13 threads. Once both were fixed, a battery
-      ! of isolated reproducers confirmed concurrent per-thread AST
-      ! construction AND concurrent astResampleR both work fine on this
-      ! build, matching SUN/211's documented model. This critical section
-      ! is kept anyway, now purely for the CFITSIO-call-serialisation
-      ! reason, not an AST one.) Setup is cheap (a few header reads + AST
-      ! calls) next to the per-pixel resampling this still parallelises
-      ! (astResampleR itself stays outside any critical section), so
-      ! serialising it costs little.
+      ! Each thread builds its OWN private input->reference pixel
+      ! Mapping from scratch (own ast_begin context, own load_wcs/
+      ! extract_sky_mapping/compose_pix2pix calls) rather than sharing or
+      ! cloning one Mapping built by the caller. SUN/211 Sec 4.12 ("AST
+      ! Objects within Multi-threaded Applications") requires astLock/
+      ! astUnlock to hand an AST Object from the thread that created it
+      ! to another thread; this Fortran binding doesn't export
+      ! ast_lock_/ast_unlock_ (checked libstarlink_ast.so.9's actual
+      ! symbol table) -- only ast_copy_ is present, useless on its own
+      ! without the paired lock handoff. Every thread's whole AST object
+      ! graph is therefore self-created and never shared, squarely
+      ! inside AST's documented thread-safe model without needing
+      ! lock/unlock at all. CFITSIO unit numbers used for this (in
+      ! load_wcs) are offset by omp_get_thread_num(), 1000-based --
+      ! disjoint from read_one_block's fixed unit and the fixed
+      ! out_unit=43/ref_unit=44, with headroom for thousands of threads
+      ! (see load_wcs's own comment for the earlier version that got
+      ! this numbering wrong, and what it actually broke: a plain unit
+      ! collision, not an AST/CFITSIO concurrency limit).
       t_status = 0
-      !$omp critical(reproj_io)
       call ast_begin(t_status)
       call load_wcs(reffile, t_wcs_ref, t_naxes_ref, t_status)
       call extract_sky_mapping(t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
@@ -598,47 +676,83 @@ contains
       &t_pixaxes_in, t_status)
       call compose_pix2pix(t_skymap_in, t_skyframe_in, t_skymap_ref,&
       &t_skyframe_ref, t_map_in2ref, t_status)
-      !$omp end critical(reproj_io)
-
       if (t_status.ne.0) then
-         !$omp critical(reproj_status)
+         !$omp atomic write
          status_par = -1
-         !$omp end critical(reproj_status)
       endif
 
-      ! Every thread must reach this worksharing construct unconditionally
-      ! (OpenMP requires all threads in the team to encounter it) -- a
-      ! thread whose own setup above failed just skips its share of the
-      ! real work inside the loop body instead of branching around the
-      ! construct itself, which previously deadlocked the team at the
-      ! implicit end-of-do barrier whenever setup failed on only some
-      ! threads.
-      !$omp do schedule(dynamic)
-      do iplane = 1, n_planes
-         if (t_status.eq.0) then
-            remainder = iplane - 1
-            do k = 1, n_other
-               radix = naxes_in(other_axes(k))
-               other_idx(k) = mod(remainder, radix) + 1
-               remainder = remainder / radix
-            enddo
-            plane_status = 0
-            call resample_one_plane(infile, t_map_in2ref, naxes_in,&
-            &pixaxes_in, other_axes(1:n_other), other_idx(1:n_other),&
-            &lbnd_out_d, ubnd_out_d, iplane, out_unit, n_other, plane_status)
-            if (plane_status.ne.0) then
-               !$omp critical(reproj_status)
-               status_par = -1
-               !$omp end critical(reproj_status)
-            endif
-         endif
-      enddo
-      !$omp end do
+      ! Outer "group" loop: one iteration per combination of the SLOWER
+      ! non-sky axes (other_axes(2:n_other)), decoded from igroup via the
+      ! same mixed-radix scheme used elsewhere in this file. Every thread
+      ! computes the same igroup/other_idx/chan_start/chan_len values
+      ! redundantly (cheap, deterministic from shared inputs) so they all
+      ! hit the same single/do/single sequence together, as OpenMP
+      ! worksharing constructs require.
+      do igroup = 1, n_groups
+         remainder = igroup - 1
+         do k = 2, n_other
+            radix = naxes_in(other_axes(k))
+            other_idx(k) = mod(remainder, radix) + 1
+            remainder = remainder / radix
+         enddo
 
-      !$omp critical(reproj_io)
+         chan_start = 1
+         do while (chan_start.le.axis1_extent)
+            chan_len = min(block_planes, axis1_extent - chan_start + 1)
+
+            !$omp single
+            call read_one_block(infile, naxes_in, pixaxes_in, other_axes,&
+            &other_idx, n_other, chan_start, chan_len, nx_in, ny_in,&
+            &block_data_in(:,:,1:chan_len), status_par)
+            !$omp end single
+
+            !$omp do schedule(static)
+            do local_iplane = 1, chan_len
+               if (t_status.eq.0 .and. status_par.eq.0) then
+                  lbnd_in(1) = 1
+                  lbnd_in(2) = 1
+                  ubnd_in(1) = nx_in
+                  ubnd_in(2) = ny_in
+                  lbnd_o(1) = nint(lbnd_out_d(1))
+                  lbnd_o(2) = nint(lbnd_out_d(2))
+                  ubnd_o(1) = nint(ubnd_out_d(1))
+                  ubnd_o(2) = nint(ubnd_out_d(2))
+                  badval = ieee_value(badval, ieee_quiet_nan)
+                  params_dummy(1) = 0.0d0
+                  ! Same 20-argument astResampleR signature/pitfall as
+                  ! before (see git history for the "missing params"
+                  ! segfault this avoids); in_var/out_var unused, block
+                  ! arrays reused as harmless placeholders.
+                  nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
+                  &block_data_in(:,:,local_iplane),&
+                  &block_data_in(:,:,local_iplane),&
+                  &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval,&
+                  &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
+                  &block_data_out(:,:,local_iplane),&
+                  &block_data_out(:,:,local_iplane), t_status)
+                  if (t_status.ne.0) then
+                     !$omp atomic write
+                     status_par = -1
+                  endif
+               endif
+            enddo
+            !$omp end do
+
+            !$omp single
+            call write_one_block(out_unit, naxes_in, other_axes, other_idx,&
+            &n_other, chan_start, chan_len, nx_out, ny_out,&
+            &block_data_out(:,:,1:chan_len), status_par)
+            !$omp end single
+
+            chan_start = chan_start + chan_len
+         enddo
+      enddo
+
       call ast_end(t_status)
-      !$omp end critical(reproj_io)
       !$omp end parallel
+
+      deallocate(block_data_in)
+      deallocate(block_data_out)
 
       if (status_par.ne.0) then
          write(*,*) 'ERROR: failed to resample/write one or more planes for: ',&
@@ -716,61 +830,68 @@ contains
       endif
    end subroutine copy_axis_keywords
 
-   subroutine resample_one_plane(filename, map_in2ref, naxes_in,&
-   &pixaxes_in, other_axes, other_idx, lbnd_out_d, ubnd_out_d, iplane,&
-   &out_unit, n_other, status)
-      !! Read one specific plane of filename (other_axes(k) fixed at
-      !! other_idx(k) for every non-sky axis) and resample it onto the
-      !! output grid [lbnd_out_d,ubnd_out_d] (reference pixel space) via
-      !! astResampleR, using map_in2ref (the forward input->reference
-      !! pixel Mapping -- astResampleR uses its INVERSE internally to
-      !! look up each output pixel's input value, per its own documented
-      !! convention). Bad/uncovered output pixels are flagged with IEEE
-      !! NaN, matching this codebase's existing NaN-based masking
-      !! convention throughout rm_synthesis.
+   subroutine read_one_block(filename, naxes_in, pixaxes_in, other_axes,&
+   &other_idx, n_other, chan_start, chan_len, nx_in, ny_in, block_data_in,&
+   &status)
+      !! Read chan_len consecutive planes of filename in one CFITSIO
+      !! call: sky axes full extent, other_axes(1) spanning
+      !! [chan_start, chan_start+chan_len-1], every slower other axis
+      !! (other_axes(2:n_other)) fixed at other_idx(2:n_other) -- the
+      !! write-side mirror of write_one_block below, same fpixels/lpixels
+      !! construction as the old per-plane resample_one_plane just with a
+      !! range instead of a single index on other_axes(1). Always called
+      !! from a single OpenMP thread (write_reprojected_file's `!$omp
+      !! single` region), so a fixed CFITSIO unit number is safe here --
+      !! no other thread can be touching CFITSIO at the same moment, by
+      !! construction, not by locking convention.
       !!
-      !! Reading fpixels(k)=lpixels(k)=other_idx for every non-sky axis
-      !! (full 1..NAXIS extent for the 2 sky axes) naturally produces a
-      !! flat array with the sky axes as its only two non-degenerate
-      !! dimensions, in pixaxes_in's own order (first fastest) -- exactly
-      !! the "Fortran array indexing" astResampleR expects -- regardless
-      !! of which raw file-axis numbers they are, since a degenerate
-      !! (extent-1) axis contributes no stride.
+      !! FTGSVE fills its output array in ascending-axis-number order
+      !! among the non-degenerate (extent>1) axes of THIS read: the 2 sky
+      !! axes (always non-degenerate) and other_axes(1) (non-degenerate
+      !! whenever chan_len>1). The single-plane version this replaced
+      !! never had to care which of the 3 was numerically smallest --
+      !! every non-sky axis was degenerate then (extent exactly 1), and a
+      !! degenerate axis contributes no stride regardless of where it
+      !! sits in the axis order. That stopped being true here: whenever
+      !! other_axes(1) itself is numerically BEFORE one or both sky axes
+      !! (e.g. TEST_NONADJACENT.Q.FITSCUBE: FREQ on axis 1, RA/DEC on
+      !! axes 2 and 4 -- FREQ reads fastest, not slowest), the natural
+      !! read order stops matching the caller's fixed
+      !! (nx_in,ny_in,chan_len) block_data_in layout, and reading
+      !! straight into it silently scrambles the data (caught by
+      !! comparing block output against the pre-batching serial output
+      !! byte-for-byte -- TEST_NONADJACENT differed in 102397 of 102400
+      !! elements). The output side never has this problem -- its axis
+      !! layout is always canonicalised to sky-first (see
+      !! write_one_block) regardless of the input's own numbering.
       !!
-      !! Called from within write_reprojected_file's OpenMP parallel
-      !! region (one call per plane, across threads): the CFITSIO read
-      !! unit is offset by omp_get_thread_num() so concurrently-running
-      !! threads never collide on the same unit number, and the actual
-      !! output write (FTPSSE, at the end) is wrapped in an OMP critical
-      !! section since out_unit is shared across all threads.
+      !! Fixed generally: read into a buffer shaped in the ACTUAL natural
+      !! order (via pairwise-comparison ranking of the 3 axis numbers),
+      !! then copy into the caller's fixed layout explicitly. Common case
+      !! (other_axes(1) numerically after both sky axes, i.e. a
+      !! conventionally-ordered cube with channels/Stokes after RA/Dec)
+      !! reads directly into block_data_in with no extra buffer or copy
+      !! -- the permute path only costs anything on the non-conventional
+      !! axis orderings that actually need it.
       use, intrinsic :: ieee_arithmetic
-      use omp_lib, only: omp_get_thread_num
       character(len=*), intent(in) :: filename
-      integer, intent(in) :: map_in2ref
       integer, intent(in) :: naxes_in(:), pixaxes_in(2)
-      integer, intent(in) :: other_axes(:), other_idx(:)
-      double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
-      integer, intent(in) :: iplane
-      integer, intent(in) :: out_unit, n_other
+      integer, intent(in) :: other_axes(:), other_idx(:), n_other
+      integer, intent(in) :: chan_start, chan_len, nx_in, ny_in
+      real, intent(out) :: block_data_in(:,:,:)
       integer, intent(inout) :: status
 
       integer :: unit, blocksize, fitsstat, group, naxis, k
       integer :: fpixels(max_axes), lpixels(max_axes), incs(max_axes)
-      integer :: nx_in, ny_in, nx_out, ny_out
-      real, allocatable :: data_in(:,:), data_out(:,:)
       logical :: anyflg
-      integer :: lbnd_in(2), ubnd_in(2), lbnd_o(2), ubnd_o(2)
-      integer :: nbad
       real :: badval
-      double precision :: params_dummy(1)
-      integer :: fpixels_wr(max_axes), lpixels_wr(max_axes), naxis_wr
-      integer :: naxes_wr(max_axes)
+      integer :: ax_sky1, ax_sky2, ax_block
+      integer :: rank_sky1, rank_sky2, rank_block
+      integer :: dims(3), idxvec(3), i, j, c
+      logical :: natural_order
+      real, allocatable :: natural_buf(:,:,:)
 
       if (status.ne.0) return
-
-      nx_in = naxes_in(pixaxes_in(1))
-      ny_in = naxes_in(pixaxes_in(2))
-      allocate(data_in(nx_in, ny_in))
 
       naxis = 0
       do k = 1, max_axes
@@ -781,82 +902,101 @@ contains
       incs(1:naxis) = 1
       lpixels(pixaxes_in(1)) = nx_in
       lpixels(pixaxes_in(2)) = ny_in
-      do k = 1, size(other_axes)
+      if (n_other.ge.1) then
+         fpixels(other_axes(1)) = chan_start
+         lpixels(other_axes(1)) = chan_start + chan_len - 1
+      endif
+      do k = 2, n_other
          fpixels(other_axes(k)) = other_idx(k)
          lpixels(other_axes(k)) = other_idx(k)
       enddo
 
+      ! Rank the 3 axes that matter (sky1, sky2, block) by ascending raw
+      ! axis number -- pairwise comparison, works for any 3 distinct
+      ! integers. natural_order (ranks already 1,2,3 in that order) is
+      ! the fast path; anything else needs the permute buffer.
+      ax_sky1 = pixaxes_in(1)
+      ax_sky2 = pixaxes_in(2)
+      ax_block = 0
+      if (n_other.ge.1) ax_block = other_axes(1)
+      rank_sky1 = 1
+      if (ax_sky2.lt.ax_sky1) rank_sky1 = rank_sky1 + 1
+      if (n_other.ge.1 .and. ax_block.lt.ax_sky1) rank_sky1 = rank_sky1 + 1
+      rank_sky2 = 1
+      if (ax_sky1.lt.ax_sky2) rank_sky2 = rank_sky2 + 1
+      if (n_other.ge.1 .and. ax_block.lt.ax_sky2) rank_sky2 = rank_sky2 + 1
+      rank_block = 3
+      if (n_other.ge.1) then
+         rank_block = 1
+         if (ax_sky1.lt.ax_block) rank_block = rank_block + 1
+         if (ax_sky2.lt.ax_block) rank_block = rank_block + 1
+      endif
+      natural_order = (rank_sky1.eq.1 .and. rank_sky2.eq.2 .and. rank_block.eq.3)
+
       fitsstat = 0
       blocksize = 1
-      unit = 5000 + omp_get_thread_num()
+      unit = 5000
       group = 1
       badval = ieee_value(badval, ieee_quiet_nan)
-      ! Serialised with the write critical section below (same lock name,
-      ! reproj_io), together with load_wcs's own CFITSIO calls during
-      ! per-thread setup -- a genuine cross-unit CFITSIO crash was
-      ! observed (ffpsse -> ffgcprll) with this read left unserialised,
-      ! but that run also had the unit-number collision bug described in
-      ! write_reprojected_file's comment (this read's unit could
-      ! numerically equal out_unit at higher thread counts), so it is
-      ! not confirmed whether genuinely concurrent CFITSIO calls on truly
-      ! distinct units are actually unsafe on this build or whether that
-      ! crash was just the same collision in different clothes. Kept
-      ! serialised rather than re-litigate that distinction: I/O is not
-      ! the dominant cost here, astResampleR is (see below), and it stays
-      ! outside any critical section so still runs fully in parallel
-      ! across threads regardless of how the I/O is serialised.
-      !$omp critical(reproj_io)
       call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
-      call FTGSVE(unit, group, naxis, naxes_in(1:naxis),&
-      &fpixels(1:naxis), lpixels(1:naxis), incs(1:naxis),&
-      &badval, data_in, anyflg, fitsstat)
+      if (natural_order) then
+         call FTGSVE(unit, group, naxis, naxes_in(1:naxis),&
+         &fpixels(1:naxis), lpixels(1:naxis), incs(1:naxis),&
+         &badval, block_data_in, anyflg, fitsstat)
+      else
+         dims(rank_sky1) = nx_in
+         dims(rank_sky2) = ny_in
+         dims(rank_block) = chan_len
+         allocate(natural_buf(dims(1), dims(2), dims(3)))
+         call FTGSVE(unit, group, naxis, naxes_in(1:naxis),&
+         &fpixels(1:naxis), lpixels(1:naxis), incs(1:naxis),&
+         &badval, natural_buf, anyflg, fitsstat)
+         if (fitsstat.eq.0) then
+            do c = 1, chan_len
+               do j = 1, ny_in
+                  do i = 1, nx_in
+                     idxvec(rank_sky1) = i
+                     idxvec(rank_sky2) = j
+                     idxvec(rank_block) = c
+                     block_data_in(i,j,c) = natural_buf(idxvec(1), idxvec(2), idxvec(3))
+                  enddo
+               enddo
+            enddo
+         endif
+         deallocate(natural_buf)
+      endif
       call FTCLOS(unit, fitsstat)
-      !$omp end critical(reproj_io)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: failed to read data plane from ', trim(filename)
+         write(*,*) 'ERROR: failed to read block (planes ', chan_start,&
+         &'-', chan_start+chan_len-1, ') from ', trim(filename)
          call printerror(fitsstat)
          status = -1
-         return
       endif
+   end subroutine read_one_block
 
-      nx_out = nint(ubnd_out_d(1) - lbnd_out_d(1)) + 1
-      ny_out = nint(ubnd_out_d(2) - lbnd_out_d(2)) + 1
-      allocate(data_out(nx_out, ny_out))
+   subroutine write_one_block(out_unit, naxes_in, other_axes, other_idx,&
+   &n_other, chan_start, chan_len, nx_out, ny_out, block_data_out, status)
+      !! Write chan_len consecutive resampled planes in one CFITSIO call.
+      !! Output axis layout (see write_reprojected_file's own comment):
+      !! sky always at output positions 1,2, full extent; other axes at
+      !! output positions 3.. (2+k for other_axes(k)) -- other_axes(1)'s
+      !! output slot spans the block's own chan_start:chan_start+
+      !! chan_len-1 range, every slower other axis fixed at
+      !! other_idx(2:n_other), same value just relocated to the output
+      !! file's own axis numbering. Always called from a single OpenMP
+      !! thread by construction -- see read_one_block's own comment on
+      !! why that means no locking is needed here either.
+      integer, intent(in) :: out_unit, n_other
+      integer, intent(in) :: naxes_in(:), other_axes(:), other_idx(:)
+      integer, intent(in) :: chan_start, chan_len, nx_out, ny_out
+      real, intent(in) :: block_data_out(:,:,:)
+      integer, intent(inout) :: status
 
-      lbnd_in(1) = 1
-      lbnd_in(2) = 1
-      ubnd_in(1) = nx_in
-      ubnd_in(2) = ny_in
-      lbnd_o(1) = nint(lbnd_out_d(1))
-      lbnd_o(2) = nint(lbnd_out_d(2))
-      ubnd_o(1) = nint(ubnd_out_d(1))
-      ubnd_o(2) = nint(ubnd_out_d(2))
-      params_dummy(1) = 0.0d0
+      integer :: fpixels_wr(max_axes), lpixels_wr(max_axes)
+      integer :: naxes_wr(max_axes), naxis_wr, k, fitsstat
 
-      ! Full 20-argument signature (this, ndim_in, lbnd_in, ubnd_in, in,
-      ! in_var, interp, finterp, params, flags, tol, maxpix, badval,
-      ! ndim_out, lbnd_out, ubnd_out, lbnd, ubnd, out, out_var) -- an
-      ! earlier attempt omitted "params" entirely, silently shifting every
-      ! later argument by one position (a REAL array landing where an
-      ! INTEGER "flags" scalar was expected, etc), which segfaulted.
-      ! in_var/out_var are unused here (no variance requested) but AST's
-      ! Fortran binding needs a validly-typed/sized array regardless of a
-      ! true C NULL, so data_in/data_out are reused as harmless
-      ! placeholders rather than risk an invalid "null" convention guess.
-      nbad = ast_resampler(map_in2ref, 2, lbnd_in, ubnd_in, data_in, data_in,&
-      &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval,&
-      &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o, data_out, data_out, status)
+      if (status.ne.0) return
 
-      ! --- Write this plane into the output file ---
-      ! Output axis layout (see write_reprojected_file's own comment):
-      ! sky always at output positions 1,2, full extent; other axes at
-      ! output positions 3.. (2+k for other_axes(k)), fixed at this
-      ! plane's own other_idx(k) -- same value, just relocated to the
-      ! output file's own axis numbering rather than the input's.
-      ! Wrapped in the same reproj_io critical section as the read above
-      ! (not just out_unit/stdout being shared -- see the read's own
-      ! comment on why CFITSIO calls need to be mutually exclusive across
-      ! ALL threads here, not merely per-unit).
       naxis_wr = 2 + n_other
       naxes_wr(1) = nx_out
       naxes_wr(2) = ny_out
@@ -864,36 +1004,25 @@ contains
       fpixels_wr(2) = 1
       lpixels_wr(1) = nx_out
       lpixels_wr(2) = ny_out
-      do k = 1, n_other
+      if (n_other.ge.1) then
+         naxes_wr(3) = naxes_in(other_axes(1))
+         fpixels_wr(3) = chan_start
+         lpixels_wr(3) = chan_start + chan_len - 1
+      endif
+      do k = 2, n_other
          naxes_wr(2+k) = naxes_in(other_axes(k))
          fpixels_wr(2+k) = other_idx(k)
          lpixels_wr(2+k) = other_idx(k)
       enddo
-      !$omp critical(reproj_io)
+
+      fitsstat = 0
       call FTPSSE(out_unit, 1, naxis_wr, naxes_wr(1:naxis_wr),&
-      &fpixels_wr(1:naxis_wr), lpixels_wr(1:naxis_wr), data_out, status)
+      &fpixels_wr(1:naxis_wr), lpixels_wr(1:naxis_wr), block_data_out, status)
       if (status.ne.0) then
-         write(*,*) 'ERROR: failed to write plane ', iplane, ' to output'
+         write(*,*) 'ERROR: failed to write block (planes ', chan_start,&
+         &'-', chan_start+chan_len-1, ') to output'
       endif
-
-      ! Verification print for a handful of representative planes only
-      ! (not all -- would flood output for a 200-channel cube): the
-      ! resampled value at reference pixel (5,9), for comparison against
-      ! known ground-truth values read directly from the original data
-      ! with a Python script beforehand, at 3 different channels.
-      if (status.eq.0 .and.&
-      &(iplane.eq.1 .or. iplane.eq.100 .or. iplane.eq.200) .and.&
-      &5.ge.lbnd_o(1) .and. 5.le.ubnd_o(1) .and.&
-      &9.ge.lbnd_o(2) .and. 9.le.ubnd_o(2)) then
-         write(*,'(A,I0,A,I0,A,F0.9)') '  plane ', iplane,&
-         &': bad=', nbad, ', value at reference pixel (5,9): ',&
-         &data_out(5-lbnd_o(1)+1, 9-lbnd_o(2)+1)
-      endif
-      !$omp end critical(reproj_io)
-
-      deallocate(data_in)
-      deallocate(data_out)
-   end subroutine resample_one_plane
+   end subroutine write_one_block
 
    subroutine compose_pix2pix(skymap_from, skyframe_from, skymap_to,&
    &skyframe_to, map_out, status)
@@ -1163,6 +1292,41 @@ contains
       call ast_annul(fitschan, status)
    end subroutine load_wcs
 
+   subroutine get_mem_total_kb(mem_total_kb)
+      !! Total system RAM in kB, from /proc/meminfo's MemTotal -- same
+      !! source and same reasoning as rm_synthesis.f90's own memory
+      !! planner (search that file for "Tile planning for memory-
+      !! efficient cube processing"): budgeting against TOTAL RAM rather
+      !! than instantaneously-available RAM makes the chosen block size
+      !! deterministic for a given cube/mem_frac_ram (reproducible across
+      !! runs) instead of fluctuating with whatever else the machine is
+      !! doing -- with the same caveat rm_synthesis documents: on a busy/
+      !! shared node, a large mem_frac_ram can over-commit, since memory
+      !! used by other jobs is not subtracted here. 4 GiB fallback if
+      !! /proc/meminfo can't be read (e.g. non-Linux), matching
+      !! rm_synthesis's own fallback constant exactly.
+      integer(kind=8), intent(out) :: mem_total_kb
+      integer :: mem_unit, ios_mem
+      character(len=128) :: mem_line
+      integer(kind=8) :: mem_kb_tmp
+
+      mem_total_kb = 0_8
+      open(newunit=mem_unit, file='/proc/meminfo', status='old', iostat=ios_mem)
+      if (ios_mem.eq.0) then
+         do
+            read(mem_unit, '(A)', iostat=ios_mem) mem_line
+            if (ios_mem.ne.0) exit
+            if (index(mem_line, 'MemTotal:').eq.1) then
+               read(mem_line(index(mem_line,':')+1:), *, iostat=ios_mem) mem_kb_tmp
+               if (ios_mem.eq.0) mem_total_kb = mem_kb_tmp
+               exit
+            endif
+         enddo
+         close(mem_unit)
+      endif
+      if (mem_total_kb.le.0_8) mem_total_kb = 4194304_8
+   end subroutine get_mem_total_kb
+
    subroutine print_usage()
       !! Shared by --help/-h and the argument-error path, so the two
       !! can't drift out of sync with each other.
@@ -1193,26 +1357,40 @@ contains
       write(*,'(A)') '  infiles = /path/band1.fits,/path/band2.fits,/path/band3.fits'
       write(*,'(A)') '(infiles is comma-separated, no spaces required; ''#'' or '';'''//&
       &' starts a comment.)'
+      write(*,'(A)') ''
+      write(*,'(A)') 'Optional key (CLI or config, default 0.25):'
+      write(*,'(A)') '  mem_frac_ram = fraction (0,0.95] of total system RAM budgeted'//&
+      &' for one read/resample/write block of planes at a time -- same concept'
+      write(*,'(A)') '  as rm_synthesis''s own mem_frac_ram. Smaller = more, smaller'//&
+      &' blocks (less peak memory, more CFITSIO calls); larger = fewer, bigger blocks.'
+      write(*,'(A)') '  Threads only parallelise WITHIN one block, never across blocks'//&
+      &' (blocks are processed strictly one after another) -- too small a'
+      write(*,'(A)') '  mem_frac_ram therefore also throws away most of the OpenMP'//&
+      &' speedup, not just increases I/O calls (a printed WARNING flags this).'
    end subroutine print_usage
 
-   subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs, status)
+   subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&
+   &mem_frac_ram, status)
       !! Parse a --config key=value file: three required keys, mode,
       !! reffile, and infiles (comma-separated, same csv-list convention
-      !! rm_synthesis's own multi-band keys use). Standalone re-
-      !! implementation of rm_synthesis_mod's split_key_value/csv_count/
-      !! csv_get_item (below) rather than a `use` dependency -- this tool
-      !! is deliberately kept off the main rm_synthesis build graph (own
-      !! binary, own dependency set, see the Makefile comment), and these
-      !! are a handful of generic string-parsing lines each, unlikely to
-      !! drift.
+      !! rm_synthesis's own multi-band keys use), plus one optional key,
+      !! mem_frac_ram (intent(inout) -- left untouched, keeping whatever
+      !! default the caller set, if the file doesn't mention it).
+      !! Standalone re-implementation of rm_synthesis_mod's
+      !! split_key_value/csv_count/csv_get_item (below) rather than a
+      !! `use` dependency -- this tool is deliberately kept off the main
+      !! rm_synthesis build graph (own binary, own dependency set, see
+      !! the Makefile comment), and these are a handful of generic
+      !! string-parsing lines each, unlikely to drift.
       character(len=*), intent(in) :: cfgfile
       character(len=*), intent(out) :: mode, reffile
       character(len=*), intent(out) :: infiles(:)
       integer, intent(out) :: n_inputs
+      real, intent(inout) :: mem_frac_ram
       integer, intent(out) :: status
 
       character(len=512) :: line, key, val, raw_infiles
-      integer :: unit_cfg, ios, line_no, j
+      integer :: unit_cfg, ios, line_no, j, ios_mfr
       logical :: has_kv, seen_mode, seen_reffile, seen_infiles
 
       status = 0
@@ -1246,6 +1424,15 @@ contains
          case ('infiles')
             raw_infiles = trim(val)
             seen_infiles = .true.
+         case ('mem_frac_ram')
+            read(val, *, iostat=ios_mfr) mem_frac_ram
+            if (ios_mfr.ne.0) then
+               write(*,*) 'ERROR: mem_frac_ram must be a number, at line ',&
+               &line_no, ' in ', trim(cfgfile)
+               status = -1
+               close(unit_cfg)
+               return
+            endif
          case default
             write(*,*) 'ERROR: unrecognised config key "', trim(key), '" at line ',&
             &line_no, ' in ', trim(cfgfile)
