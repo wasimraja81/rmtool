@@ -1563,3 +1563,239 @@ still-open gap -- see T9 below.
   FITS compared, 134 exact + the same 6 pre-existing NaN-artifact diffs
   seen in every prior sweep). Both code-inspection predictions confirmed
   empirically on the first attempt.
+
+### T10 — Cross-Band Geometry Alignment (`reproject_cubes`)
+
+- **Status:** done.
+- **Objective:** T0-T9 above assume every band already shares one sky
+  grid (same RA/Dec pixel-for-pixel) and, from T3 onward, one angular
+  resolution -- real multi-band ASKAP data does not arrive that way.
+  Before any of the multi-band merge machinery above can run on genuine
+  survey data, the bands need a preprocessing step that puts them on a
+  common WCS grid. `reproject_cubes` is that step: a standalone tool
+  (own binary, own build target, not linked into `rm_synthesis` at all --
+  see the Makefile's own comment on why it's kept off the main build
+  graph), built on Starlink AST for WCS handling and `astResampleR` for
+  the actual resampling.
+- **Scope:** `src/reproject_cubes.f90` (single file). Three footprint
+  modes (`intersection`/`union`/`reference`) computed from N input
+  files' own sky footprints against a reference file, via AST
+  `SkyFrame`-to-`SkyFrame` conversion (not whole-`FrameSet` conversion --
+  `astConvert`'s domain search does not recurse into a `CmpFrame`'s
+  internal components, so aligning two compound "STOKES-SKY-SPECTRUM"
+  frames needs the sky axes picked out first). Output axis layout always
+  puts the 2 sky axes first (RA-fastest-on-disk, matching
+  `rm_synthesis`'s own tile-read assumption), with full header
+  propagation: per-axis WCS keywords with correct CRPIX shift for
+  crop/grow, `PCi_j`/`CDi_j` sky rotation, `BUNIT`/`BMAJ`/`BMIN`/`BPA`/
+  `OBJECT`/etc. via a generic verbatim header copy. Reads/resamples/
+  writes in `mem_frac_ram`-budgeted blocks of planes (same tile-planning
+  concept as `rm_synthesis`'s own, see `get_mem_total_kb`), OpenMP-
+  parallelised across planes within a block -- each thread builds its
+  own private AST pixel-to-pixel Mapping from scratch rather than
+  sharing one across threads, since this Fortran AST binding exports no
+  `astLock_`/`astUnlock_` for handing an AST Object between threads
+  (checked against the actual linked `.so`'s symbol table, not assumed).
+- **Correctness gate:** resampled output matches independently-computed
+  (Python/astropy) ground truth exactly at spot-checked pixels in both
+  reference and intersection/union modes; intersection-mode `CRPIX`
+  shift verified against `rm_synthesis`'s own existing subimage-CRPIX
+  formula; union-mode uncovered-area NaN count matches the expected
+  geometric area exactly; a genuine axis-order bug (`FTGSVE` filling its
+  output array in ascending-axis-number order among non-degenerate axes,
+  not always sky-first) caught by a non-adjacent-sky-axis fixture,
+  fixed, and reverified byte-identical against the pre-fix output on
+  every other fixture; 25 repeated stress runs at default thread count,
+  no failures.
+- **Effort:** built incrementally across several commits (footprint
+  computation, resampling, output writing, CLI, OpenMP block I/O,
+  header metadata, sky-rotation propagation) -- see `git log
+  src/reproject_cubes.f90` for the full commit-by-commit record; not
+  reconstructed here since each commit message already documents its
+  own change and verification.
+- **Note on real-data readiness:** ASKAP data specifically needed the
+  `CROTA`/`PCi_j`/`CDi_j` sky-rotation propagation (not just per-axis
+  CRVAL/CRPIX/CDELT) -- confirmed present on real ASKAP headers, added
+  after being initially flagged as a documented future gap rather than
+  assumed absent.
+
+### T11 — Cross-Band Resolution Matching (`gaussft_mod`, `commonbeam_mod`, `convolve_cubes`)
+
+- **Status:** done.
+- **Objective:** T10 solves grid alignment; this ticket solves the
+  matching problem T3's own `δRM`/resolution diagnostic exists to warn
+  about in the first place -- real bands (and even single bands: ASKAP
+  per-channel restoring beams vary continuously across a band, not just
+  between bands) do not share one angular resolution, and merging
+  channels of different resolution into one RM synthesis without first
+  convolving them to a common beam is exactly the kind of silent
+  correctness gap this project's whole design philosophy (loudly refuse
+  or visibly warn, never silently produce a misleading answer) exists to
+  close. Three new pieces, each independently reusable, deliberately
+  split the way `reproject_cubes` already splits computation from I/O:
+  - **`src/gaussft.f90`** (`gaussft_mod`): pure computation, no FITS I/O.
+    Given one image plane, its own source elliptical-Gaussian PSF, and a
+    target PSF (same pixel grid), returns the plane convolved from one
+    to the other via FFT-domain deconvolve-then-reconvolve
+    (multiply by target-PSF-FT / source-PSF-FT, inverse-transform).
+    Split into `plan_convolution`/`convolve_to_beam`/
+    `destroy_convolution_plan` specifically so a caller can parallelise
+    across planes with OpenMP: FFTW's planner is not thread-safe and
+    must run once, serially, but a single plan's `fftw_execute_dft` (the
+    "new-array execute" form) is documented safe for concurrent use by
+    multiple threads supplying their own arrays -- verified directly,
+    not just trusted: 16 threads sharing one plan across 64 planes with
+    distinct per-plane beams reproduces a serial run bit-for-bit.
+    Corrected a real amplitude bug versus the original `src/gaussft.f`
+    prototype (and its direct Python port, and upstream `racs_tools`,
+    which all carry the same bug): the closed-form 2D-Gaussian FT
+    amplitude is `2*pi*sigma_x*sigma_y`, not
+    `sqrt(2*pi*sigma_x*sigma_y)` -- confirmed via closed-form derivation,
+    direct numerical integration to 15 significant figures, and
+    cross-checking against MIRIAD's own independent `gaufac` formula
+    (`au2.gauss_factor`, also in this repo).
+  - **`src/commonbeam.f90`** (`commonbeam_mod`): given N per-channel
+    beams, finds the smallest common beam every one of them can be
+    deconvolved from. A simpler "just take the largest beam" shortcut is
+    not generally correct -- real ASKAP per-channel BPA varies by more
+    than 90 degrees across a band, confirmed on a real cube's own BEAMS
+    table, so the single largest-major-axis beam does not always
+    deconvolve every other channel's beam. Follows the standard approach
+    (CASA `ia.commonbeam()`, the `radio_beam` Python package): sample
+    each beam's boundary, reduce to the 2D convex hull, fit the minimum-
+    volume enclosing ellipse (Khachiyan's algorithm), validate against
+    every real input beam via the Sault/MIRIAD "gaupar" deconvolution
+    formula (same formula family as `au2.gauss_factor` above), retry
+    with a larger safety margin if needed. One deliberate departure from
+    `radio_beam`'s own algorithm: since a beam here is pure shape with
+    no position, the ellipse fit uses the simpler origin-centred variant
+    of Khachiyan's algorithm rather than `radio_beam`'s general
+    free-centre one -- verified against `radio_beam` 0.3.9 itself on a
+    real 286-channel ASKAP BEAMS table (within 0.003 arcsec on
+    BMAJ/BMIN, PA matching mod 180 degrees, and independently confirmed
+    deconvolvable from all 286 real beams via `radio_beam`'s own
+    `deconvolve_optimized`).
+  - **`src/convolve_cubes.f90`**: the main program driving both modules,
+    mirroring `reproject_cubes`' own I/O-vs-computation split. Reads
+    per-channel PSFs via a CASA-style `BEAMS` binary table extension
+    (auto-detected) or a portable ASCII/CSV fallback (`cfg/
+    example_beamLog.txt`/`.csv`); a channel is bad -- written as an
+    all-NaN plane, not convolved -- if it's missing from the file
+    entirely, or present with BMAJ or BMIN equal to 0 (either alone is
+    enough; not an AND of both). Pools every good channel across ALL
+    input files before calling `commonbeam_mod` once, so multi-band
+    support needs no extra machinery: every band gets convolved to the
+    exact same shared target. `max_common_bmaj` lets a user cap the
+    auto-derived target and refuse to proceed if it comes out coarser
+    than expected, rather than silently convolving to an unchecked
+    resolution. `mem_frac_ram`-budgeted block I/O + OpenMP, same concept
+    as `reproject_cubes`. One correctness-critical piece specific to
+    this tool: FITS `BMAJ`/`BMIN`/`BPA` is a SKY-frame convention
+    (position angle from North through East), while `gaussft_mod`'s own
+    convention is PIXEL-frame -- converted via
+    `bpa_pixel = atan2(sign(CDELT2)*cos(theta), sign(CDELT1)*sin(theta))`,
+    derived from the local tangent-plane geometry and checked against
+    both real ASKAP CDELT signs' special cases (North, East) by hand
+    before being verified empirically via a bit-exact identity
+    round-trip (target beam set equal to one channel's own native beam
+    reproduces that channel's input data to the last bit).
+- **Correctness gate:** `gaussft_mod`'s own identity/asymmetric-beam/
+  thread-safety tests (above); `commonbeam_mod` against `radio_beam`
+  (above); `convolve_cubes`' BEAMS-table and ASCII/CSV readers verified
+  against real ASKAP header conventions and cross-checked against each
+  other; bad-channel union (degenerate beam, badchan_file, BMAJ-or-BMIN
+  zero) verified with exact expected counts; `max_common_bmaj` cutoff
+  verified to refuse correctly; full pipeline smoke-tested against a
+  genuine cutout of real ASKAP data (`/data1/tmp/cutout-stokesQ.fits`)
+  with no NaN/Inf and output stats matching input to high precision for
+  already-near-common-resolution channels.
+- **Not yet done:** a full run against the complete 23GB real cube
+  (only cutouts and synthetic data verified so far).
+- **Build/packaging:** own Makefile targets (`make reproject_cubes`,
+  `make convolve_cubes`, both independent of the main `rm_synthesis`
+  build graph), both packaged into `docker/dockerfile` (`libfftw3-dev`
+  added for `convolve_cubes`' FFTW3 dependency, `libstarlink-ast-dev`
+  and related packages already present for `reproject_cubes`) --
+  verified via a real `docker build` + `docker run`, not just Makefile
+  inspection.
+
+### T12 — `rm_synthesis` Beam-Metadata Propagation and Input Safety
+
+- **Status:** done.
+- **Objective:** two gaps found while making T10/T11's outputs
+  actually usable as `rm_synthesis` inputs, neither specific to
+  multi-band but both surfaced by working through this pipeline
+  end-to-end.
+  1. `rm_synthesis` never propagated `BMAJ`/`BMIN`/`BPA` (or any beam
+     metadata at all) to any of its 8 output products (AMP/PHA cubes,
+     mask, nvalid, peak/rmpeak/angpeak/snr maps) -- confirmed by grep,
+     zero references anywhere before this ticket. A user running
+     `rm_synthesis` on a `convolve_cubes`-processed (single, well-
+     defined resolution) input had no way to recover that resolution
+     from the output files at all.
+  2. All of `rm_synthesis`'s own input cubes (Q/U/I/mask, units
+     21/22/40/45) were opened `READWRITE` (`rwmode=1`) despite the code
+     never writing to any of them -- confirmed by grep (no `FTPKYx`/
+     `FTP2Dx`/`FTPPRx`/`FTPCLx`/`FTPHIS`/`FTPSSE` call anywhere in the
+     file targets those units) and by the fact that this file's own
+     parallel tile-reader threads for the same files already
+     independently open `READONLY`. An unnecessary, real (if latent)
+     risk to irreplaceable input science data, with no upside.
+- **Scope/decisions (confirmed with user):**
+  - `BMAJ`/`BMIN`/`BPA` propagated from the input Q cube's primary
+    header to all 8 outputs, unchanged from whatever the input carries
+    (including when meaningless -- see next point).
+  - If the input has `CASAMBM=T` (a genuine per-channel-varying beam,
+    e.g. an un-convolved CASA multi-beam cube), the propagated scalar
+    BMAJ/BMIN/BPA is only the input's own nominal/reference value and
+    means nothing on its own -- but instead of hiding that, the output
+    ALSO gets `CASAMBM=T` plus the input's own real per-channel `BEAMS`
+    binary table, attached as its own extension HDU, plus `HISTORY`
+    cards explaining why. Applies to AMP/PHA and, when `cubestat=y`,
+    the PEAK/RMPEAK/ANGPEAK/SNR maps -- every one of these is derived
+    from the actual flux-bearing data, so "which beams went into this"
+    is a real provenance question for all of them.
+  - Deliberately NOT applied to MASK.CUBE.FITS or NVALID.MAP.FITS: both
+    are pure per-pixel/per-channel validity bookkeeping (a flag, a
+    count), not flux data -- nobody convolves a flag table, and a
+    BEAMS extension there would only invite a confusing "why does this
+    have a beam?" instead of the intended "have we processed this
+    correctly?". Still carry the plain BMAJ/BMIN/BPA scalar, unchanged.
+  - Multi-band mode: the above only ever looked at the reference band's
+    own Q file -- extended to cross-check every non-reference band's
+    own primary header against the reference (BMAJ/BMIN/BPA numeric
+    mismatch beyond a small tolerance, presence mismatch, or its own
+    `CASAMBM=T`), warning with the actual differing values per band
+    rather than silently reflecting only one band's metadata. Not a
+    hard error -- this project already hard-stops on genuine geometry
+    mismatches (WCS/NAXIS/frequency-axis-index) earlier in the same
+    multi-band file-opening loop; a beam-metadata mismatch gets the
+    same warn-and-continue treatment as the single-band CASAMBM case,
+    since RM synthesis itself does not depend on beam metadata for
+    correctness.
+  - `rwmode` changed from 1 to 0 for units 21/22/40/45. Also brings
+    this file in line with `docs/ARCHITECTURE.md`'s own documented
+    CFITSIO lesson (a real historical SIGSEGV, see its "History:
+    `io_write_threads>1` was unsafe" postmortem): CFITSIO aliases
+    repeat `READWRITE` opens of an already-open file onto one shared
+    buffer, but exempts `READONLY` opens from that aliasing by design.
+- **Correctness gate:** identity check (target beam == one channel's
+  own native beam reproduces that channel's input exactly) already
+  covers `convolve_cubes`' own math; for T12 specifically -- injected
+  real BMAJ/BMIN/BPA into a test cube and confirmed exact propagation
+  to all 8 outputs, confirmed clean degradation when absent; injected a
+  genuine `CASAMBM=T` + `BEAMS` table and confirmed `CASAMBM`/BEAMS/
+  HISTORY land exactly on AMP/PHA/PEAK/RMPEAK/ANGPEAK/SNR and nowhere
+  else (MASK/NVALID untouched), BEAMS table content byte-identical to
+  the input's own, primary pixel data uncorrupted despite the HDU-
+  append-then-return-to-primary sequence; injected mismatched per-band
+  beams in a 2-band multi-band run and confirmed the cross-band warning
+  fires with the correct differing values, and confirmed it stays
+  silent (no false positive) when bands genuinely match; fed a real
+  `convolve_cubes`-produced NaN bad-channel plane into `rm_synthesis`
+  with no `badchan_file` at all and confirmed automatic exclusion via
+  the existing (default-on) NaN-check mechanism -- `NVALID` correctly
+  read 5 (not 6) everywhere, AMP cube had no NaN.
+- **Build/test:** all 4 build flavours (`scratch/make_all.sh`) clean;
+  full `tests/run_tests.sh` 49/49 pass, re-run clean after every
+  sub-change in this ticket.

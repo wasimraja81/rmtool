@@ -242,6 +242,20 @@ character(len=72) :: comment
 real(dp) cval,cdelt, pi
 real(sp) cpix, dRM
 
+ ! Multi-beam input passthrough (CASAMBM/BEAMS extension) -- see the
+ ! header-writing block's own comment for the full reasoning.
+logical :: casambm_val
+integer :: casambm_status, beams_unit, beams_status, hdutype_dum
+
+ ! Cross-band beam consistency check (multi-band mode only) -- see the
+ ! header-writing block's own comment on why this reads every band's own
+ ! primary header, not just the reference band's.
+real(dp) :: ref_bmaj_val, ref_bmin_val, ref_bpa_val
+logical :: ref_bmaj_present, ref_bmin_present, ref_bpa_present
+real(dp) :: band_beam_val
+logical :: band_casambm_val, band_beam_mismatch
+integer :: band_beam_status, band_casambm_status, iband_chk
+
 integer   rwmode
 character(len=272) :: message
 character(len=272) :: outfileAMP, outfileANG
@@ -1396,7 +1410,35 @@ group = 1
 firstpix = 1
 nullval = -999.0
 nbuffer = naxes(1)
-rwmode = 1
+ ! READONLY, not READWRITE: rm_synthesis only ever reads Q/U/I/mask
+ ! input cubes, never writes to them (verified: no FTPKYx/FTP2Dx/FTPPRx/
+ ! FTPCLx/FTPHIS/FTPSSE call anywhere in this file targets units
+ ! 21/22/40/45, the units opened with this rwmode) -- the parallel
+ ! tile-reader threads for these same files already independently open
+ ! READONLY (mode 0, not rwmode) a few hundred lines below, confirming
+ ! read-only access has always been sufficient. Opening irreplaceable
+ ! input science data READWRITE with no code path that ever needs write
+ ! access is a real, if latent, risk with no upside -- a stray write
+ ! call, a copy-pasted wrong unit number, or a crash mid-write could
+ ! corrupt the user's original data for no reason.
+ ! Also brings this file in line with docs/ARCHITECTURE.md's own
+ ! documented CFITSIO lesson (see its "History: io_write_threads>1 was
+ ! unsafe" postmortem, a real SIGSEGV): CFITSIO aliases repeat
+ ! READ-WRITE opens of an already-open file onto one shared buffer, but
+ ! exempts READ-ONLY opens from that aliasing by design ("2 different
+ ! threads cannot share the same FITSfile pointer") -- which is exactly
+ ! why io_read_threads' extra handles (par_unit_Q/par_unit_U at units
+ ! 200+/300+, opened READONLY) were always safe. Before this change,
+ ! io_read_threads>1 mixed one READWRITE handle (unit 21/22/40/45) with
+ ! several READONLY handles on the very same file -- not the exact
+ ! aliasing failure mode that postmortem describes (that needed multiple
+ ! READWRITE opens), but an unnecessary asymmetry in a documented-fragile
+ ! area with no upside. Now every concurrent handle on these files is
+ ! uniformly READONLY, matching the one pattern this project has already
+ ! confirmed safe by both source-level analysis and a real crash
+ ! postmortem. Full test suite (49/49, including the io_read_threads>1
+ ! multi-handle path) re-run clean after this change.
+rwmode = 0
 blocksize = 1
 out_amp_open = .false.
 ampha_handles_closed_early = .false.
@@ -2914,6 +2956,368 @@ if(out_snr_open)then
    call ftpkys(49,'bunit','SNR',&
    &'Signal-to-noise ratio',status)
 endif
+
+ ! --- BMAJ/BMIN/BPA: passthrough from input Q cube (unit 21) ---
+ ! RM synthesis operates per-pixel along the frequency/RM axis and does
+ ! not touch the spatial PSF -- every output here (the RM cubes and every
+ ! 2D map derived from them) shares the same angular resolution as the
+ ! input Q/U cubes, so the same BMAJ/BMIN/BPA applies to all of them.
+ ! Absent from the input (not every FITS cube declares a beam) is not an
+ ! error -- simply not written to the outputs either, same as this
+ ! project's other passthrough-if-present keywords just above.
+ ! Multi-band note: this reads only unit 21 (the primary Q input) --
+ ! correct as long as every band was already brought to one common
+ ! resolution before rm_synthesis runs (convolve_cubes' own job, see
+ ! src/convolve_cubes.f90), which is when a single BMAJ/BMIN/BPA is
+ ! actually meaningful for a multi-band RM cube in the first place.
+status = 0
+call ftgkyd(21,'bmaj',cval,comment,status)
+ref_bmaj_present = (status.eq.0)
+if(ref_bmaj_present) ref_bmaj_val = cval
+if(status.eq.0)then
+   call ftpkyd(41,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   call ftpkyd(42,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_mask_open)call ftpkyd(43,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_nvalid_open)call ftpkyd(44,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_peak_open)call ftpkyd(46,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_rmpeak_open)call ftpkyd(47,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_angpeak_open)call ftpkyd(48,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_snr_open)call ftpkyd(49,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+endif
+status = 0
+call ftgkyd(21,'bmin',cval,comment,status)
+ref_bmin_present = (status.eq.0)
+if(ref_bmin_present) ref_bmin_val = cval
+if(status.eq.0)then
+   call ftpkyd(41,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   call ftpkyd(42,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_mask_open)call ftpkyd(43,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_nvalid_open)call ftpkyd(44,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_peak_open)call ftpkyd(46,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_rmpeak_open)call ftpkyd(47,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_angpeak_open)call ftpkyd(48,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_snr_open)call ftpkyd(49,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+endif
+status = 0
+call ftgkyd(21,'bpa',cval,comment,status)
+ref_bpa_present = (status.eq.0)
+if(ref_bpa_present) ref_bpa_val = cval
+if(status.eq.0)then
+   call ftpkyd(41,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   call ftpkyd(42,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_mask_open)call ftpkyd(43,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_nvalid_open)call ftpkyd(44,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_peak_open)call ftpkyd(46,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_rmpeak_open)call ftpkyd(47,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_angpeak_open)call ftpkyd(48,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_snr_open)call ftpkyd(49,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+endif
+status = 0
+
+ ! --- CASAMBM/BEAMS: multi-beam input warning + provenance passthrough ---
+ ! The BMAJ/BMIN/BPA just written above is a single scalar copied from
+ ! the Q cube's own PRIMARY header. If the input has CASAMBM=T (a real
+ ! per-channel-VARYING restoring beam -- confirmed on real ASKAP data,
+ ! BPA swinging -89 to +90 degrees across a band, see src/commonbeam.f90's
+ ! own header comment), that scalar is only the input's own nominal/
+ ! reference value (often just the first channel) and means nothing on
+ ! its own -- but it is left unchanged regardless, and the OUTPUT also
+ ! gets CASAMBM=T plus the INPUT's own actual per-channel BEAMS table,
+ ! attached as its own extension HDU, so nothing is lost: a user who
+ ! reads BMAJ/BMIN/BPA alone gets a rough number, and a user who checks
+ ! CASAMBM/BEAMS gets the real per-channel picture, exactly as they would
+ ! from the input file itself.
+ !
+ ! This applies to AMP/PHA (units 41/42) and, when cubestat=y, the
+ ! PEAK/RMPEAK/ANGPEAK/SNR maps (46-49) -- every one of these is derived
+ ! from the actual flux-bearing Q/U data, so "which beams went into this"
+ ! is a real, useful provenance question for all of them, even though
+ ! none of their own axes directly correspond to input channels (AMP/
+ ! PHA's 3rd axis is Faraday depth; the maps are fully 2D, collapsed
+ ! across every channel already).
+ !
+ ! Deliberately NOT applied to MASK.CUBE.FITS or NVALID.MAP.FITS: both
+ ! are pure per-pixel/per-channel bookkeeping (a good/bad flag, a valid-
+ ! channel count) derived from data VALIDITY, not from the beam-convolved
+ ! flux itself -- nobody convolves a flag table, and a beam extension on
+ ! one would only invite a confused "why does this have a beam?" instead
+ ! of the intended "have we processed this correctly?". They still carry
+ ! the plain BMAJ/BMIN/BPA scalar from the block above, unchanged.
+status = 0
+casambm_status = 0
+call ftgkyl(21,'casambm',casambm_val,comment,casambm_status)
+if(casambm_status.eq.0 .and. casambm_val)then
+   write(*,*)'WARNING: input Q cube has CASAMBM=T (a per-channel-varying'
+   write(*,*)'  restoring beam) -- BMAJ/BMIN/BPA written to the outputs is'
+   write(*,*)'  only its primary-header nominal value, not a true common'
+   write(*,*)'  resolution across channels. Run convolve_cubes first to'
+   write(*,*)'  bring every channel to one common resolution if a single'
+   write(*,*)'  well-defined beam is required for these outputs.'
+
+   call ftphis(41,'Input Q cube has CASAMBM=T (per-channel',status)
+   call ftphis(41,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+   call ftphis(41,'the input''s nominal value; see CASAMBM/BEAMS',status)
+   call ftphis(41,'below for the true per-channel beam.',status)
+   call ftphis(42,'Input Q cube has CASAMBM=T (per-channel',status)
+   call ftphis(42,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+   call ftphis(42,'the input''s nominal value; see CASAMBM/BEAMS',status)
+   call ftphis(42,'below for the true per-channel beam.',status)
+   if(out_peak_open)then
+      call ftphis(46,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(46,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(46,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(46,'below for the true per-channel beam.',status)
+   endif
+   if(out_rmpeak_open)then
+      call ftphis(47,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(47,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(47,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(47,'below for the true per-channel beam.',status)
+   endif
+   if(out_angpeak_open)then
+      call ftphis(48,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(48,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(48,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(48,'below for the true per-channel beam.',status)
+   endif
+   if(out_snr_open)then
+      call ftphis(49,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(49,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(49,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(49,'below for the true per-channel beam.',status)
+   endif
+
+    ! Own dedicated unit (90), well outside the 21/22/41-49/200+ ranges
+    ! already in use elsewhere in this file (a real CFITSIO unit-number
+    ! collision bug bit this project once before -- see reproject_cubes'
+    ! own header comment on the same lesson) -- opened purely to read the
+    ! BEAMS extension without disturbing unit 21's own current-HDU
+    ! position (still needed below this block for OBJECT/OBSERVER/
+    ! TELESCOP passthrough from the Q cube's PRIMARY header).
+   beams_status = 0
+   beams_unit = 90
+   call ftopen(beams_unit,cfg%infileQ,0,blocksize,beams_status)
+   call ftmnhd(beams_unit,-1,'BEAMS',0,beams_status)
+   if(beams_status.eq.0)then
+       ! CASAMBM is only written alongside an actually-attached BEAMS
+       ! table -- claiming multi-beam without one to back it up (the
+       ! else branch below, a malformed input) would be worse than
+       ! saying nothing.
+      status = 0
+      call ftpkyl(41,'CASAMBM',.true.,&
+      &'Multiple beams per plane (see BEAMS ext)',status)
+      call ftcopy(beams_unit,41,0,status)
+      call ftmahd(41,1,hdutype_dum,status)
+      status = 0
+      call ftpkyl(42,'CASAMBM',.true.,&
+      &'Multiple beams per plane (see BEAMS ext)',status)
+      call ftcopy(beams_unit,42,0,status)
+      call ftmahd(42,1,hdutype_dum,status)
+      if(out_peak_open)then
+         status = 0
+         call ftpkyl(46,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,46,0,status)
+         call ftmahd(46,1,hdutype_dum,status)
+      endif
+      if(out_rmpeak_open)then
+         status = 0
+         call ftpkyl(47,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,47,0,status)
+         call ftmahd(47,1,hdutype_dum,status)
+      endif
+      if(out_angpeak_open)then
+         status = 0
+         call ftpkyl(48,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,48,0,status)
+         call ftmahd(48,1,hdutype_dum,status)
+      endif
+      if(out_snr_open)then
+         status = 0
+         call ftpkyl(49,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,49,0,status)
+         call ftmahd(49,1,hdutype_dum,status)
+      endif
+   else
+      write(*,*)'WARNING: CASAMBM=T but no BEAMS extension found in the'
+      write(*,*)'  Q cube -- cannot attach per-channel beam provenance.'
+   endif
+   beams_status = 0
+   call ftclos(beams_unit,beams_status)
+endif
+status = 0
+
+ ! --- Cross-band beam consistency (multi-band mode only) ---
+ ! Everything above only ever looked at the REFERENCE band's own Q file
+ ! (unit 21 = cfg%infileQ = cfg%band(cfg%reference_band)%infileQ) --
+ ! correct and complete for single-band runs, but a real gap for
+ ! multi-band ones (n_bands_t2>1): every non-reference band's own Q file
+ ! is opened independently, on its own unit (band_unit_Q(iband), already
+ ! open at this point -- opened early, closed only at final cleanup, see
+ ! this file's own multi-band file-opening loop), and its own primary
+ ! header could carry a DIFFERENT nominal BMAJ/BMIN/BPA or its own
+ ! CASAMBM=T, entirely unreflected by the single value already written
+ ! above. RM synthesis' actual computation does not depend on any of
+ ! this -- combining bands with genuinely different resolutions is not a
+ ! numerical-correctness bug -- but silently propagating only ONE band's
+ ! beam metadata while the others might disagree is exactly the same
+ ! kind of misleading-precision risk the CASAMBM handling above exists
+ ! to catch, one level up. Same policy applied consistently: warn
+ ! loudly, keep processing, record what was found via HISTORY -- not a
+ ! hard error (this project already hard-stops on genuine geometry
+ ! mismatches -- WCS/NAXIS/frequency-axis-index -- earlier in this same
+ ! multi-band file-opening loop; a beam mismatch is a metadata
+ ! completeness concern, not a geometry one, so it gets the softer
+ ! treatment already established for CASAMBM above, not that harder one).
+if(n_bands_t2.gt.1)then
+   band_beam_mismatch = .false.
+   do iband_chk = 1,n_bands_t2
+      if(iband_chk.eq.cfg%reference_band) cycle
+
+      band_beam_status = 0
+      call ftgkyd(band_unit_Q(iband_chk),'bmaj',band_beam_val,comment,&
+      &band_beam_status)
+      if(band_beam_status.eq.0 .and. ref_bmaj_present)then
+         if(abs(band_beam_val-ref_bmaj_val).gt.&
+         &1.0d-9*max(abs(ref_bmaj_val),abs(band_beam_val),1.0d-12))then
+            write(*,'(A,I0,A,F0.6,A,F0.6)')&
+            &' WARNING: band ',iband_chk,' BMAJ=',band_beam_val,&
+            &' differs from reference band BMAJ=',ref_bmaj_val
+            band_beam_mismatch = .true.
+         endif
+      else if(band_beam_status.eq.0 .neqv. ref_bmaj_present)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' BMAJ presence differs from reference band (one has it, the other does not)'
+         band_beam_mismatch = .true.
+      endif
+
+      band_beam_status = 0
+      call ftgkyd(band_unit_Q(iband_chk),'bmin',band_beam_val,comment,&
+      &band_beam_status)
+      if(band_beam_status.eq.0 .and. ref_bmin_present)then
+         if(abs(band_beam_val-ref_bmin_val).gt.&
+         &1.0d-9*max(abs(ref_bmin_val),abs(band_beam_val),1.0d-12))then
+            write(*,'(A,I0,A,F0.6,A,F0.6)')&
+            &' WARNING: band ',iband_chk,' BMIN=',band_beam_val,&
+            &' differs from reference band BMIN=',ref_bmin_val
+            band_beam_mismatch = .true.
+         endif
+      else if(band_beam_status.eq.0 .neqv. ref_bmin_present)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' BMIN presence differs from reference band (one has it, the other does not)'
+         band_beam_mismatch = .true.
+      endif
+
+      band_beam_status = 0
+      call ftgkyd(band_unit_Q(iband_chk),'bpa',band_beam_val,comment,&
+      &band_beam_status)
+      if(band_beam_status.eq.0 .and. ref_bpa_present)then
+         if(abs(band_beam_val-ref_bpa_val).gt.&
+         &1.0d-9*max(abs(ref_bpa_val),abs(band_beam_val),1.0d-12))then
+            write(*,'(A,I0,A,F0.6,A,F0.6)')&
+            &' WARNING: band ',iband_chk,' BPA=',band_beam_val,&
+            &' differs from reference band BPA=',ref_bpa_val
+            band_beam_mismatch = .true.
+         endif
+      else if(band_beam_status.eq.0 .neqv. ref_bpa_present)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' BPA presence differs from reference band (one has it, the other does not)'
+         band_beam_mismatch = .true.
+      endif
+
+      band_casambm_status = 0
+      call ftgkyl(band_unit_Q(iband_chk),'casambm',band_casambm_val,&
+      &comment,band_casambm_status)
+      if(band_casambm_status.eq.0 .and. band_casambm_val)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' input Q cube also has CASAMBM=T (its own per-channel'
+         write(*,*)'  beam table, not reflected in the propagated',&
+         &' BMAJ/BMIN/BPA either)'
+         band_beam_mismatch = .true.
+      endif
+   enddo
+
+   if(band_beam_mismatch)then
+      write(*,*)'WARNING: multi-band beam metadata is not consistent'
+      write(*,*)'  across all bands (see above) -- BMAJ/BMIN/BPA written'
+      write(*,*)'  to the outputs reflects only the reference band'
+      write(*,*)'  (cfg%reference_band). Run convolve_cubes across ALL'
+      write(*,*)'  bands together first if a single well-defined beam'
+      write(*,*)'  is required.'
+      call ftphis(41,'Beam metadata differs across bands (see run',status)
+      call ftphis(41,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+      call ftphis(41,'reference band, not every band that went into',status)
+      call ftphis(41,'this multi-band run.',status)
+      call ftphis(42,'Beam metadata differs across bands (see run',status)
+      call ftphis(42,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+      call ftphis(42,'reference band, not every band that went into',status)
+      call ftphis(42,'this multi-band run.',status)
+      if(out_mask_open)then
+         call ftphis(43,'Beam metadata differs across bands (see run',status)
+         call ftphis(43,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(43,'reference band, not every band that went into',status)
+         call ftphis(43,'this multi-band run.',status)
+      endif
+      if(out_nvalid_open)then
+         call ftphis(44,'Beam metadata differs across bands (see run',status)
+         call ftphis(44,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(44,'reference band, not every band that went into',status)
+         call ftphis(44,'this multi-band run.',status)
+      endif
+      if(out_peak_open)then
+         call ftphis(46,'Beam metadata differs across bands (see run',status)
+         call ftphis(46,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(46,'reference band, not every band that went into',status)
+         call ftphis(46,'this multi-band run.',status)
+      endif
+      if(out_rmpeak_open)then
+         call ftphis(47,'Beam metadata differs across bands (see run',status)
+         call ftphis(47,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(47,'reference band, not every band that went into',status)
+         call ftphis(47,'this multi-band run.',status)
+      endif
+      if(out_angpeak_open)then
+         call ftphis(48,'Beam metadata differs across bands (see run',status)
+         call ftphis(48,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(48,'reference band, not every band that went into',status)
+         call ftphis(48,'this multi-band run.',status)
+      endif
+      if(out_snr_open)then
+         call ftphis(49,'Beam metadata differs across bands (see run',status)
+         call ftphis(49,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(49,'reference band, not every band that went into',status)
+         call ftphis(49,'this multi-band run.',status)
+      endif
+   endif
+endif
+status = 0
 
  ! --- Metadata: OBJECT, OBSERVER, TELESCOP ---
 status = 0

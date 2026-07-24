@@ -94,12 +94,27 @@ brew install cfitsio
 # From source: https://heasarc.gsfc.nasa.gov/fitsio/
 ```
 
+### Starlink AST and FFTW3 (only needed for `reproject_cubes`/`convolve_cubes`)
+The main `rm_synthesis` build needs only gfortran + CFITSIO above.
+`reproject_cubes` and `convolve_cubes` are independent standalone tools
+(own binaries, own build targets, not linked into `rm_synthesis`) with
+their own extra dependencies:
+```bash
+# Debian/Ubuntu
+sudo apt-get install libstarlink-ast-dev libstarlink-ast-err9 \
+    libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev
+```
+Both packaged into `docker/dockerfile` already, if building via the
+container is easier than installing these directly.
+
 ## Build Targets
 
 | Target | Purpose |
 |--------|---------|
 | `make` | Build release executable |
 | `make MODE=debug` | Build with debugging info |
+| `make reproject_cubes` | Build the cross-band sky-grid alignment tool (`bin/reproject_cubes`) |
+| `make convolve_cubes` | Build the cross-band resolution-matching tool (`bin/convolve_cubes`) |
 | `make clean` | Remove build artifacts |
 | `make install` | Install to /usr/local/bin |
 | `make uninstall` | Remove installation |
@@ -114,14 +129,20 @@ rmtool/
 │   ├── rm_synthesis.f90          # Main program; `include`s myfits_info.f90/
 │   │                             # printerror.f90 below at compile time
 │   ├── myfits_info.f90           # FITS utilities
-│   └── printerror.f90            # Error handling
+│   ├── printerror.f90            # Error handling
+│   ├── reproject_cubes.f90       # Standalone: cross-band sky-grid alignment
+│   ├── gaussft.f90               # gaussft_mod: beam-matching convolution (pure)
+│   ├── commonbeam.f90            # commonbeam_mod: smallest common beam
+│   └── convolve_cubes.f90        # Standalone: cross-band resolution matching
 ├── build/                        # Build artifacts (Makefile)
 │   ├── modules/                  # Compiled .mod files
+│   ├── reproject_cubes/          # reproject_cubes' own build artifacts
+│   ├── convolve_cubes/           # convolve_cubes' own build artifacts
 │   └── *.o                       # Object files
-├── bin/                          # Final executable
+├── bin/                          # Final executables (rm_synthesis, reproject_cubes, convolve_cubes)
 ├── Makefile                      # Simple build
 ├── build.sh                      # Quick build script
-└── cfg/                          # Configuration files
+└── cfg/                          # Configuration files, incl. example_beamLog.txt/.csv
 ```
 
 ## Compiler Options

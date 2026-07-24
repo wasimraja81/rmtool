@@ -218,6 +218,42 @@ $(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUI
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
 	@echo "✓ Executable created: $@"
 
+# convolve_cubes: standalone common-resolution convolution tool (the
+# "main program" for gaussft_mod/commonbeam_mod -- see those modules' own
+# header comments). Independent of the main rm_synthesis build graph and
+# of reproject_cubes' own AST dependency -- own binary, own FFTW3
+# dependency, always built with OpenMP (its per-plane convolution is the
+# intended parallelism target, mirroring reproject_cubes' own per-plane
+# resampling). No -I/-L needed for FFTW3, same reasoning as AST_LIBS
+# above: apt installs fftw3.f/libfftw3.so into standard system paths
+# gfortran/ld already search by default.
+FFTW_LIBS := -lfftw3
+CONVOLVE_BINDIR ?= bin
+CONVOLVE_BUILDDIR := build/convolve_cubes
+CONVOLVE_EXECUTABLE := $(CONVOLVE_BINDIR)/convolve_cubes
+
+convolve_cubes: $(CONVOLVE_EXECUTABLE)
+
+$(CONVOLVE_BUILDDIR):
+	@mkdir -p $(CONVOLVE_BUILDDIR)
+
+# gaussft_mod and commonbeam_mod must compile before convolve_cubes.o
+# (which `use`s both) -- order-only prerequisites below via explicit .o
+# dependencies, not just directory creation, so `make -j` never races
+# convolve_cubes.o ahead of the .mod files it needs.
+$(CONVOLVE_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/convolve_cubes.o: $(SRCDIR)/convolve_cubes.f90 $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(CONVOLVE_BUILDDIR) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
+	@echo "✓ Executable created: $@"
+
 install: $(EXECUTABLE)
 	@install -d /usr/local/bin
 	@install -m 755 $(EXECUTABLE) /usr/local/bin/

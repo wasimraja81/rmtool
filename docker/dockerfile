@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstarlink-ast-err9 \
     libstarlink-ast-grf3d9 \
     libstarlink-pal-dev \
+    libfftw3-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -61,6 +62,13 @@ RUN set -eux; \
 # (those only remove rm_synthesis-specific build artifacts). Built once,
 # ends up at bin/reproject_cubes.
 RUN make reproject_cubes
+
+# convolve_cubes: common-resolution convolution tool (gaussft_mod +
+# commonbeam_mod -- see the Makefile's own comment), likewise independent
+# of the rm_synthesis build graph and of reproject_cubes' own AST
+# dependency (own binary, own FFTW3 dependency via libfftw3-dev above).
+# Built once, ends up at bin/convolve_cubes.
+RUN make convolve_cubes
 
 # plot_tile_async_swimlane.py: symlinked into bin/ (not copied) so there's
 # one source of truth -- editing scripts/plot_tile_async_swimlane.py in a

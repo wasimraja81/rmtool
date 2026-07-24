@@ -2,6 +2,91 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+Multi-band tomography milestone: two new standalone tools close the gap
+between real (grid-mismatched, resolution-mismatched) multi-band data and
+the multi-band `rm_synthesis` support already in place, plus fixes to
+`rm_synthesis` itself found while making that pipeline usable end-to-end.
+Full design/decision/verification record in
+`planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T10-T12).
+
+### Added
+- `reproject_cubes`: new standalone tool (own binary, `make
+  reproject_cubes`) reprojecting two or more FITS cubes onto one common
+  sky grid via Starlink AST + `astResampleR`, with three footprint modes
+  (`intersection`/`union`/`reference`), full WCS/header propagation
+  (including `CROTA`/`PCi_j`/`CDi_j` sky rotation), `mem_frac_ram`-budgeted
+  block I/O, and OpenMP parallelism across planes.
+- `gaussft_mod` (`src/gaussft.f90`): new pure-computation module for
+  elliptical-Gaussian FFT-domain beam-matching convolution (deconvolve
+  from a source PSF, reconvolve to a target PSF), thread-safe for OpenMP
+  via a plan-once/execute-many split (FFTW's planner is not thread-safe;
+  a single plan's "new-array execute" form is, verified directly).
+- `commonbeam_mod` (`src/commonbeam.f90`): new module finding the
+  smallest common beam every one of N per-channel PSFs can be
+  deconvolved from (convex hull + minimum-volume-enclosing-ellipse via
+  Khachiyan's algorithm + Sault/MIRIAD deconvolvability validation),
+  verified against the `radio_beam` Python package on real ASKAP data.
+- `convolve_cubes`: new standalone tool (own binary, `make
+  convolve_cubes`) driving `gaussft_mod`/`commonbeam_mod` to convolve
+  cubes — across one or several input files together — to one common
+  angular resolution. Reads per-channel beams from a CASA-style `BEAMS`
+  binary table or a portable ASCII/CSV beam log (`cfg/
+  example_beamLog.txt`/`.csv`, ready-to-adapt examples included); a
+  channel is bad if missing from the beam source or listed with BMAJ or
+  BMIN equal to 0. `max_common_bmaj` guards against silently convolving
+  to an unexpectedly coarse auto-derived resolution.
+- `rm_synthesis` now propagates `BMAJ`/`BMIN`/`BPA` to all 8 output
+  products (previously propagated none at all). If the input has
+  `CASAMBM=T` (a genuinely per-channel-varying beam not yet run through
+  `convolve_cubes`), the flux-derived outputs (AMP/PHA, and the
+  PEAK/RMPEAK/ANGPEAK/SNR maps when `cubestat=y`) additionally get
+  `CASAMBM=T` plus the input's own real per-channel `BEAMS` table
+  attached as an extension, plus a `HISTORY` note — deliberately not
+  MASK/NVALID, which are validity bookkeeping, not flux data. In
+  multi-band mode, every band's own beam metadata is now cross-checked
+  against the reference band's, with a runtime warning on mismatch.
+
+### Fixed
+- `rm_synthesis` opened its own Q/U/I/mask input cubes `READWRITE`
+  despite never writing to any of them (confirmed by grep: no write-type
+  CFITSIO call anywhere in the file targets those units), an unnecessary
+  risk to irreplaceable input data. Now opened `READONLY`, matching how
+  this file's own parallel tile-reader threads for the same files
+  already worked.
+- `convolve_cubes`' bad-channel detection (both the CASA `BEAMS`-table
+  and ASCII/CSV readers) only checked BMAJ for a degenerate (zero) beam
+  entry; a channel with BMAJ present but BMIN equal to 0 was silently
+  treated as good. Now checks both.
+
+### Validation
+- All 4 build flavours (`scratch/make_all.sh`) clean; full
+  `tests/run_tests.sh` 49/49 pass, re-run after every change above.
+- `reproject_cubes`: byte-identical to independently-computed
+  (Python/astropy) ground truth at spot-checked pixels; a real
+  `FTGSVE` axis-order bug caught by a non-adjacent-sky-axis fixture and
+  fixed; 25 repeated stress runs, no failures.
+- `gaussft_mod`: identity round-trip and asymmetric-beam cross-check
+  against an independent Python implementation; 16-OpenMP-thread
+  shared-plan concurrency test bit-identical to serial.
+- `commonbeam_mod`: matches `radio_beam` 0.3.9 on a real 286-channel
+  ASKAP `BEAMS` table to within 0.003 arcsec (BMAJ/BMIN) and mod-180
+  degrees (PA); independently confirmed deconvolvable from all 286 real
+  beams.
+- `convolve_cubes`: bit-exact identity check (target beam == a
+  channel's own native beam reproduces that channel's input exactly,
+  validating the SKY-to-PIXEL BPA convention conversion end-to-end);
+  smoke-tested against a real cutout of ASKAP data with no NaN/Inf.
+- `rm_synthesis` beam propagation: injected real BMAJ/BMIN/BPA and
+  `CASAMBM=T`/`BEAMS` cases and confirmed exact propagation to the
+  correct output subset only; injected mismatched per-band beams in a
+  multi-band run and confirmed the cross-band warning fires correctly
+  (and stays silent when bands genuinely match); fed a real
+  `convolve_cubes`-produced NaN bad-channel plane into `rm_synthesis`
+  with no `badchan_file` and confirmed automatic exclusion via existing
+  NaN detection.
+
 ## [4.1] - 2026-07-20
 
 Diagnostics milestone: closes a real gap in the run-timing picture found
