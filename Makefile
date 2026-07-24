@@ -254,6 +254,41 @@ $(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
 	@echo "✓ Executable created: $@"
 
+# match_cubes: consolidates reproject_cubes and convolve_cubes into one
+# tool that can run either stage alone or both chained THROUGH MEMORY
+# (no intermediate FITS file) -- see src/match_cubes.f90's own top
+# comment. Neither reproject_cubes.f90 nor convolve_cubes.f90 is touched
+# by this -- match_cubes.f90 duplicates (adapts) what it needs from both
+# rather than sharing a module, a deliberate choice to keep both existing
+# tools fully independent and unregressed. Needs both AST_LIBS (reproject
+# side) and FFTW_LIBS (convolve side), plus ast_grf_stub.o (same dummy
+# GRF stub reproject_cubes needs to link, for the same reason -- see that
+# target's own comment) and gaussft_mod/commonbeam_mod.
+MATCH_BINDIR ?= bin
+MATCH_BUILDDIR := build/match_cubes
+MATCH_EXECUTABLE := $(MATCH_BINDIR)/match_cubes
+
+match_cubes: $(MATCH_EXECUTABLE)
+
+$(MATCH_BUILDDIR):
+	@mkdir -p $(MATCH_BUILDDIR)
+
+$(MATCH_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/match_cubes.o: $(SRCDIR)/match_cubes.f90 $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(MATCH_BUILDDIR) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(MATCH_BUILDDIR)
+	$(CC) -O2 -c $< -o $@
+
+$(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
+	@echo "✓ Executable created: $@"
+
 install: $(EXECUTABLE)
 	@install -d /usr/local/bin
 	@install -m 755 $(EXECUTABLE) /usr/local/bin/

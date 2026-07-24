@@ -1,10 +1,13 @@
 # Release Notes 5.0
 
-Status: **in preparation on `multi-band-tomography`, not yet merged to
-`develop`/`main`, not yet tagged.** These notes are written anticipating
-that merge — see `CHANGELOG.md`'s own `[5.0]` entry and
-`planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T12) for the living
-record this document summarizes.
+Status: **T0-T12 merged to `develop` and tagged `5.0-rc.1`; real-scale
+validation against the complete 23GB ASKAP cube still pending before an
+actual `main` release. T13 (`match_cubes`) and T14 (`CASAMBM`/`BEAMS`
+propagation for the cross-band toolchain) landed on
+`multi-band-tomography` after that tag and are covered below, but not yet
+merged back to `develop` or re-tagged.** See `CHANGELOG.md`'s own `[5.0]`
+entry and `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T14) for
+the living record this document summarizes.
 
 ## Summary
 
@@ -123,7 +126,29 @@ automatically excluded by `rm_synthesis`'s own NaN detection downstream)
 if it's missing from the beam source entirely, or listed with BMAJ or
 BMIN equal to 0.
 
-### `rm_synthesis` beam-metadata propagation
+### `match_cubes` — reproject + convolve, chained through memory
+
+A third standalone tool (own binary, `make match_cubes`) consolidating
+`reproject_cubes` and `convolve_cubes` into one program: run either stage
+alone, or both CHAINED THROUGH MEMORY with no intermediate FITS file
+written at all (`stages=reproject|convolve|both`,
+`order=convolve_reproject|reproject_convolve`, default
+`convolve_reproject` — convolving before resampling avoids interpolation
+error and is usually cheaper too). For the real 200GB+ cubes this
+toolchain targets, the previous two-tool pipeline wrote and re-read a
+full extra copy of the data as a disk intermediate that nobody actually
+wanted; `match_cubes` removes that round-trip entirely. Neither existing
+standalone tool is modified — `match_cubes.f90` adapts the subroutines it
+needs from both rather than sharing a module, a deliberate
+maintenance-cost-for-zero-regression-risk tradeoff, since both tools are
+already shipped and in production use. Verified via "chaining
+equivalence": both chain orders reproduce the two OLD standalone tools'
+disk-based pipeline bit-for-bit, a check that directly caught two real
+bugs before release — a degenerate-axis (e.g. a size-1 STOKES axis)
+header-copy loss, and an FFTW plan-size mismatch in `reproject_convolve`
+order that crashed with heap corruption.
+
+### Beam-metadata propagation, `rm_synthesis` and the whole toolchain
 
 Previously, none of `rm_synthesis`'s 8 output products (AMP/PHA cubes,
 mask, nvalid, and — when `cubestat=y` — the peak/rmpeak/angpeak/snr maps)
@@ -141,6 +166,20 @@ flux data, and a beam extension there would only be confusing. In
 multi-band mode, every band's own beam metadata is now cross-checked
 against the reference band's, with a runtime warning (not a hard error)
 on any mismatch.
+
+The preprocessing toolchain now carries the same metadata through,
+upstream of `rm_synthesis`, each in the way that actually matches what it
+does to the beam: `reproject_cubes` (and `match_cubes` with
+`stages=reproject`) never touch the beam itself, so a genuine per-channel
+`BEAMS` table on the input is now copied through to the output unchanged
+(previously silently dropped). `convolve_cubes` (and `match_cubes`
+whenever `convolve` is active) genuinely change the beam, so instead they
+always attach `CASAMBM=T` plus a freshly synthesized `BEAMS` table — the
+common target beam for every good channel, and the same degenerate
+sentinel CASA itself uses for a bad/skipped one — so a downstream reader
+can tell exactly which channels reached the common resolution, rather
+than a single scalar that would misrepresent a bad/NaN channel as sharing
+it.
 
 ## Validation
 
@@ -172,6 +211,19 @@ on any mismatch.
   plane fed into `rm_synthesis` with no `badchan_file` at all was
   correctly excluded automatically via `rm_synthesis`'s existing
   (default-on) NaN detection.
+- `match_cubes`: single-stage equivalence (`stages=reproject`/`convolve`
+  alone byte-identical to the corresponding standalone tool) and chaining
+  equivalence (both chain orders bit-identical to the two old standalone
+  tools run back-to-back through a real disk intermediate) — see
+  `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T13.
+- Toolchain-wide `CASAMBM`/`BEAMS` propagation verified against the real
+  5-column CASA layout confirmed on a real ASKAP cube's own `BEAMS`
+  table: `reproject_cubes` output table byte-identical to the input's
+  own; `convolve_cubes` output table carries the common target beam on
+  every good channel and the degenerate sentinel on the known bad one,
+  matching the convolved data's own all-NaN bad-channel plane; `match_cubes`
+  confirmed identical to both standalone tools and to the two-step disk
+  pipeline in both chain orders — see ticket T14.
 
 ## Compatibility and behaviour notes
 
@@ -203,9 +255,12 @@ on any mismatch.
   multi-tile support, per-band channel sub-range selection, per-band
   bad-channel files, GPU offload, `io_read_threads`/`io_overlap` support.
 - `src/reproject_cubes.f90`, `src/gaussft.f90`, `src/commonbeam.f90`,
-  `src/convolve_cubes.f90` — new standalone tools and modules.
+  `src/convolve_cubes.f90`, `src/match_cubes.f90` — standalone tools and
+  modules.
 - `cfg/example_beamLog.txt`/`.csv` — ready-to-adapt beam-log examples.
-- `rm_synthesis` beam-metadata propagation and input-safety fixes.
+- `rm_synthesis` beam-metadata propagation and input-safety fixes;
+  matching `CASAMBM`/`BEAMS` propagation across the whole preprocessing
+  toolchain (`reproject_cubes`/`convolve_cubes`/`match_cubes`).
 - Full documentation pass: README, `docs/ARCHITECTURE.md`, `BUILD.md`,
   `QUICKSTART.md`, `cfg/CONFIG_README.md` all updated to cover the new
   toolchain (previously undocumented anywhere, including the earlier
@@ -215,6 +270,7 @@ on any mismatch.
 
 - A full run of the preprocessing toolchain against the complete 23GB
   real ASKAP cube this work targets — only cutouts and synthetic data
-  verified so far.
-- Merging `multi-band-tomography` into `develop`, then `main`, and
-  tagging `5.0` there — not yet done as of this document.
+  verified so far. Required before an actual `main` release.
+- Merging the T13/T14 work (`match_cubes`, toolchain-wide `CASAMBM`/
+  `BEAMS` propagation) back into `develop`, and eventually into `main`
+  with a fresh tag — not yet done as of this document.

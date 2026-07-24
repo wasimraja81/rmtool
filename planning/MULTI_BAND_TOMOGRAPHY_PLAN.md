@@ -2,10 +2,12 @@
 
 Branch: `multi-band-tomography` (from `develop`)
 
-**Status: all tickets (T0-T12) implemented and verified. Release-5.0-ready
-— see `CHANGELOG.md`'s `[5.0]` entry and `docs/RELEASE_NOTES_5.0.md` for
-the release-facing summary. Not yet merged to `develop`/`main`, not yet
-tagged.**
+**Status: T0-T12 merged to `develop` and tagged `5.0-rc.1` (real-scale
+validation pending before an actual `main` release -- see
+`CHANGELOG.md`'s `[5.0]` entry and `docs/RELEASE_NOTES_5.0.md`). T13
+(`match_cubes`) and T14 (`CASAMBM`/`BEAMS` propagation for the cross-band
+toolchain) implemented and verified on top of that on
+`multi-band-tomography`, not yet merged back to `develop`.**
 
 ## 1. Motivation
 
@@ -1802,3 +1804,253 @@ still-open gap -- see T9 below.
 - **Build/test:** all 4 build flavours (`scratch/make_all.sh`) clean;
   full `tests/run_tests.sh` 49/49 pass, re-run clean after every
   sub-change in this ticket.
+
+### T13 — `match_cubes`: In-Memory Chaining of Reproject + Convolve
+
+- **Status:** done.
+- **Objective:** `reproject_cubes` and `convolve_cubes` (T10/T11) each
+  read a full input cube and write a full output cube to disk. Run
+  back-to-back -- the recommended pipeline before multi-band
+  `rm_synthesis` -- the reprojected intermediate is written in full, then
+  immediately re-read in full by `convolve_cubes`, for an artifact nobody
+  wants on its own. At the user's real scale (200GB+ cubes) this doubles
+  disk I/O and disk space for no reason. `match_cubes` is a new
+  standalone tool that can run either stage alone, or both chained
+  THROUGH MEMORY with no intermediate FITS file, order configurable
+  (default convolve-then-reproject, confirmed with the user as the
+  right default -- see below).
+- **Order matters, not just for tidiness:** convolving to the common
+  target beam before reprojection low-pass-filters the image before
+  `astResampleR`'s linear interpolation touches it, so resampling
+  operates on smooth, well-sampled data rather than a band's own native
+  (possibly only marginally Nyquist-sampled) sharp PSF -- avoiding
+  interpolation/aliasing error that convolving afterward cannot undo,
+  since the error is already baked into the resampled pixel values by
+  then (the same reasoning as an anti-alias filter before downsampling
+  in ordinary signal processing). It also usually costs less: in
+  `union` footprint mode the reprojected output grid is larger than any
+  input's own native grid, so convolving first does the expensive FFT
+  work on the smaller native footprint. `reproject_convolve` order is
+  not wrong, just not the default, and remains fully selectable.
+- **Scope/decisions (confirmed with user):**
+  - Neither `reproject_cubes.f90` nor `convolve_cubes.f90` is touched --
+    both remain fully independent, already-tested, already-shipped tools
+    for anyone who wants just one stage without `match_cubes`.
+    `src/match_cubes.f90` therefore duplicates (adapts, not `use`s) the
+    subroutines it needs from both, rather than extracting a shared
+    module -- a real, accepted maintenance cost in exchange for zero
+    regression risk to two tools already in production use.
+  - `rm_synthesis` itself is out of scope here -- feeding it directly,
+    with no intermediate file at all, is a separate, harder design
+    question the user flagged for later (RM synthesis wants full
+    per-pixel spectra across the whole frequency axis for a spatial
+    tile, a fundamentally different access pattern than reproject/
+    convolve's own plane-at-a-time one -- the "corner turn" `rm_synthesis`
+    already performs internally exists for exactly this reason).
+  - Axis-scope handling is deliberately asymmetric by stage:
+    `stages=reproject` alone keeps `reproject_cubes`' own fully general
+    N-dimensional "other axes" handling (any number of non-sky axes) --
+    no new restriction. `stages=convolve` or `stages=both` adopt
+    `convolve_cubes`' own existing restriction instead (exactly 2 sky
+    axes + 1 FREQ axis, every other axis degenerate) -- not a new
+    limitation, the scope `gaussft_mod`'s own per-channel convolution
+    already has.
+  - Tool named `match_cubes` (matches the sky grid AND the resolution),
+    confirmed with the user over an alternative (`chain_cubes`).
+- **Implementation:** one new source file, `src/match_cubes.f90`
+  (~2400 lines). Pre-scan phase (once per run, order-independent of each
+  other): reproject footprint bounds (adapted from `reproject_cubes`'
+  own main-program logic) and convolve beam-pooling/common-beam
+  derivation (adapted from `convolve_cubes`' own), each only run when
+  its stage is active. Per-file processing dispatches to
+  `process_one_file_general` (stages=reproject alone, a near-verbatim
+  port of `reproject_cubes`' `write_reprojected_file`/`read_one_block`/
+  `write_one_block`) or `process_one_file_restricted` (stages=convolve
+  or both -- the new logic: one `!$omp parallel` region per block,
+  `!$omp single` read / `!$omp do` per-plane compute / `!$omp single`
+  write, coexisting two different thread-safety models in the same
+  region -- each thread's own *private* AST pixel-to-pixel Mapping,
+  required since AST objects can't be shared across threads without
+  lock/unlock this binding doesn't have, alongside ONE *shared*
+  `gaussft_mod` FFTW plan built once outside the parallel region, safe
+  to share via `fftw_execute_dft`'s "new-array execute" form). A bad
+  channel (from the convolve pre-scan's own bad-channel policy) skips
+  BOTH stages entirely and writes NaN straight to the final buffer,
+  cheaper than running either stage on known-bad data.
+- **Two real bugs found by this ticket's own verification, both fixed
+  before landing:**
+  1. `process_one_file_restricted`'s header writer explicitly copies
+     sky-axis WCS (from the reference) and the FREQ axis' own WCS (from
+     the input) when reproject is active, but originally never copied
+     any OTHER degenerate axis' WCS (e.g. a size-1 STOKES axis) at all --
+     `exclude_axis_wcs=true` in the generic header copy correctly
+     excludes ALL axis-indexed keywords from the verbatim pass-through,
+     but nothing then explicitly restored a degenerate axis outside
+     sky1/sky2/freq_axis, silently losing its CTYPE/CRVAL/CRPIX/CDELT.
+     Caught by this ticket's own chaining-equivalence diff (below)
+     against the two-step disk-based reference, which does carry this
+     through via `reproject_cubes`' own general "other axes" handling.
+     Fixed: an explicit loop over every axis that isn't sky1/sky2/
+     freq_axis, copying its own keywords through unchanged.
+  2. A serious one: `gaussft_mod`'s FFTW plan is sized for one specific
+     `(nx,ny)` and must never be executed against arrays of a different
+     size (FFTW's own "new-array execute" contract requires matching
+     dimensions -- using a mismatched-size array is undefined behaviour,
+     not a clean error). `order=reproject_convolve` convolves on the
+     OUTPUT grid, not the native one -- a genuinely different size
+     whenever `footprint_mode` crops or grows it -- but the plan was
+     being built once, unconditionally, for the native grid regardless
+     of order. Manifested as a real crash (`munmap_chunk(): invalid
+     pointer`, heap corruption) the first time `order=reproject_convolve`
+     was actually exercised end-to-end, not a subtle numerical
+     discrepancy -- exactly the kind of bug the chaining-equivalence
+     verification below exists to catch before it reaches real data.
+     Fixed: plan sized for whichever grid convolution will actually run
+     on for the selected order (native for convolve_reproject or
+     convolve-alone, output for reproject_convolve).
+- **Correctness gate (all four verified bit-identical, header AND
+  data, on a genuine 2-band scenario with offset grids, varying
+  per-channel beams including a real bad channel per band, and an
+  intersection-mode footprint crop):**
+  1. `match_cubes stages=reproject` vs standalone `reproject_cubes` on
+     the same inputs: bit-identical.
+  2. `match_cubes stages=convolve` vs standalone `convolve_cubes`: 
+     bit-identical.
+  3. `match_cubes stages=both order=convolve_reproject` vs the two *old*
+     standalone tools run back-to-back through a real disk intermediate
+     (`convolve_cubes` -> `_CONV.FITS` -> `reproject_cubes` on that
+     file): bit-identical -- confirms the in-memory chain changes
+     nothing numerically, only removes the disk round-trip.
+  4. `match_cubes stages=both order=reproject_convolve` vs the same two
+     tools in the other order (`reproject_cubes` -> `_REPROJ.FITS` ->
+     `convolve_cubes` on that file): bit-identical, after the two fixes
+     above.
+  - Incidental finding while constructing gate 3/4's own two-step disk
+    reference: `reproject_cubes`' own output never carries a `BEAMS`
+    binary table forward (it only ever copies primary-header cards, and
+    never touches binary table extensions at all) -- a real,
+    pre-existing characteristic of that already-shipped standalone tool,
+    not a bug introduced or fixed here. Worked around for the
+    verification itself by using an explicit ASCII beam log for both the
+    two-step reference and `match_cubes` in the `reproject_convolve`
+    gate, rather than relying on BEAMS-table auto-detection on an
+    already-reprojected intermediate.
+- **Build/packaging:** `make match_cubes` (own Makefile target, needs
+  both `AST_LIBS` and `FFTW_LIBS` plus `gaussft_mod`/`commonbeam_mod`/
+  `ast_grf_stub.o`, mirroring `reproject_cubes`/`convolve_cubes`' own
+  targets exactly); `docker/dockerfile` builds it alongside the other
+  two, needing no new apt packages (union of two already-packaged
+  dependency sets).
+- **Build/test:** all 4 `rm_synthesis` build flavours
+  (`scratch/make_all.sh`) clean; `reproject_cubes`/`convolve_cubes`/
+  `match_cubes` all build clean; full `tests/run_tests.sh` 49/49 pass,
+  unaffected (this ticket touches neither `rm_synthesis` nor the two
+  existing standalone tools' own source).
+
+### T14 — `CASAMBM`/`BEAMS` Propagation for `reproject_cubes`/`convolve_cubes`/`match_cubes`
+
+- **Status:** done.
+- **Objective:** T12 gave `rm_synthesis` a genuine `CASAMBM`/`BEAMS`
+  passthrough for its own outputs, downstream of the cross-band
+  preprocessing toolchain. The toolchain itself (`reproject_cubes`,
+  `convolve_cubes`, and T13's `match_cubes`) had no equivalent: a
+  multi-beam input's real per-channel restoring beam was silently lost
+  the moment it passed through either tool, well before `rm_synthesis`
+  ever saw it. This ticket closes that gap upstream, using the same
+  `CASAMBM=T` + `BEAMS` binary table extension convention T12 already
+  established, "much the same way" (the user's own framing) but adapted
+  to what each tool actually does to the beam.
+- **Decision (confirmed with user):** the two tools' own beam semantics
+  differ, so their propagation rule differs too, deliberately:
+  - `reproject_cubes` (and `match_cubes` with `stages=reproject`) never
+    touch the beam -- reprojection is a pure spatial resample, and
+    `BMAJ`/`BMIN`/`BPA` are stored in sky degrees, unaffected by it. So
+    the rule mirrors `rm_synthesis`' own T12 rule exactly: if the input
+    has `CASAMBM=T`, copy its real `BEAMS` table through to the output
+    unchanged.
+  - `convolve_cubes` (and `match_cubes` whenever `convolve` is active),
+    by contrast, genuinely changes the beam -- every good channel is
+    convolved to one common target beam. Copying the input's own BEAMS
+    table through unchanged would therefore be actively wrong (it would
+    describe the INPUT's pre-convolution beams, not the output's). The
+    user was asked directly whether the output should always get a
+    synthesized `CASAMBM=T`/`BEAMS` table, or only when the input itself
+    had one (mirroring `rm_synthesis`' trigger condition) -- confirmed:
+    **always attach**, since `convolve_cubes` always tracks a real
+    per-channel good/bad split internally regardless of the input's own
+    format (a plain scalar `BMAJ`/`BMIN`/`BPA` header, or an external
+    ASCII beam log, carries the same good/bad information a `BEAMS`
+    table would), so a scalar-only output would misrepresent every
+    bad/NaN (skipped) channel as sharing the common target beam.
+- **Real BEAMS table layout confirmed against production data:** read
+  directly off `/data1/tmp/cutout-stokesQ.fits` (the same real ASKAP cube
+  T10-T12 already used) via `astropy`: `BinTableHDU`, `EXTNAME='BEAMS'`,
+  5 columns `[BMAJ,BMIN,BPA,CHAN,POL]`, formats `[1E,1E,1E,1J,1J]`,
+  `BMAJ`/`BMIN` in arcsec, `BPA` in deg, `CHAN` 0-indexed, `POL` always 0
+  (single Stokes product per file). `convolve_cubes`'/`match_cubes`' own
+  new synthesized-table writer matches this layout exactly, including the
+  `POL=0` convention.
+- **Implementation:**
+  - `reproject_cubes.f90`'s `write_reprojected_file` and
+    `match_cubes.f90`'s `process_one_file_general`: after the existing
+    generic header copy (which already carries the scalar `CASAMBM`
+    keyword through verbatim as a raw header card, but cannot reach a
+    separate extension HDU), check `CASAMBM` on the freshly-written
+    output header; if true, open the INPUT file on its own dedicated unit
+    (`reproject_cubes.f90`: 45; `match_cubes.f90`: 45, disjoint from that
+    file's other unit numbers -- see each file's own comment), move to
+    its `BEAMS` HDU, and `ftcopy` it onto the output, then `ftmahd` back
+    to the output's own primary HDU. Missing `BEAMS` despite `CASAMBM=T`
+    (a malformed input) is a runtime warning, not a hard error -- matches
+    `rm_synthesis`' own T12 handling of the same edge case.
+  - `convolve_cubes.f90`'s new `write_beams_table` and
+    `match_cubes.f90`'s new `write_beams_table_match` (a verbatim port,
+    per this project's standing decision not to share code between
+    `match_cubes.f90` and the two standalone tools): builds the 5-column
+    table described above via `FTIBIN`/`FTGCNO`/`FTPCLE`/`FTPCLJ`, one
+    row per channel -- `(tgt_bmaj, tgt_bmin, tgt_bpa)` for a good channel,
+    `(tiny(1.0), tiny(1.0), 0.0)` for a bad one (the same degenerate
+    sentinel this project's own `BEAMS`-table readers already treat as
+    "no valid beam" -- see T11's own read-side handling), `CHAN=ich-1`,
+    `POL=0`. Called once, right before the output file closes (after all
+    per-channel data has already been written), alongside an explicit
+    `FTPKYL(...,'CASAMBM',.true.,...)` on the primary header --
+    `copy_generic_header_convolve`'s/`copy_generic_header_match`'s own
+    existing exclusion of `BMAJ`/`BMIN`/`BPA`/`CASAMBM` from the generic
+    verbatim copy (needed since those are recomputed, not copied) already
+    covered this; only its own comment needed updating, since it
+    previously (accurately, at the time) said this program never creates
+    a `BEAMS` extension at all.
+- **Correctness gate (real per-channel-beam fixtures, one genuine bad
+  channel, both good and bad rows exercised):**
+  1. `reproject_cubes` alone on a `CASAMBM=T` input: output `BEAMS` table
+     byte-identical to the input's own (all 3 good channel values, the
+     bad-channel row, in original order).
+  2. `convolve_cubes` alone: output `BMAJ`/`BMIN`/`BPA` scalar matches
+     the auto-derived common beam; `BEAMS` table has that same common
+     beam on every good channel and the `tiny(1.0)` sentinel on the known
+     bad channel (channel 4, confirmed absent from the ASCII beam log
+     fixture); convolved data plane for the bad channel confirmed
+     all-NaN, good-channel planes confirmed non-NaN.
+  3. `match_cubes stages=reproject` vs standalone `reproject_cubes`:
+     `BEAMS` table (and every other header field, and the data)
+     identical -- only the `HISTORY` provenance text differs, expectedly,
+     by tool name (`reproject_cubes:` vs `match_cubes:`, a length
+     difference that incidentally also changes whether CFITSIO wraps
+     that one `HISTORY` card into two -- confirmed benign, unrelated to
+     this ticket's own changes, by checking every OTHER header key,
+     the data, and the `BEAMS` table are all exactly equal).
+  4. `match_cubes stages=convolve` vs standalone `convolve_cubes`: same
+     result, `BEAMS` table and data identical.
+  5. `match_cubes stages=both order=convolve_reproject` vs the two OLD
+     standalone tools run back-to-back through a real disk intermediate
+     (`convolve_cubes` -> `reproject_cubes` on that intermediate,
+     confirming `reproject_cubes`' own new copy-through logic correctly
+     forwards the BEAMS table `convolve_cubes` just synthesized on the
+     intermediate file): `BEAMS` table and data identical.
+  6. `match_cubes stages=both order=reproject_convolve` vs the same two
+     tools in the other order: `BEAMS` table and data identical.
+- **Build/test:** `convolve_cubes`/`reproject_cubes`/`match_cubes` all
+  build clean; all 4 `rm_synthesis` build flavours (`scratch/make_all.sh`)
+  clean; full `tests/run_tests.sh` 49/49 pass, unaffected (this ticket
+  touches neither `rm_synthesis` nor its own test fixtures).
