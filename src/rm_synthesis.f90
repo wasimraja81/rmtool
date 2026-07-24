@@ -136,6 +136,64 @@ integer   bitpixM, naxisM, naxesM(max_axis)
 integer   bitpix, naxis, naxes(max_axis), naxes_out(max_axis)
 logical   simple, extend
 integer   decimals
+ ! Multi-band tomography (T1 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+ ! scratch header-info variables reused across every non-reference band's
+ ! Q and U file, in the new geometry-validation loop below. Only touched
+ ! when size(cfg%band).gt.1 -- a no-op, unallocated-branch-not-taken cost
+ ! for the ordinary single-band case.
+integer   bitpixQb, naxisQb, naxesQb(max_axis)
+integer(int64) :: hdrbytesQb
+real(sp) cxval_imQb, cyval_imQb, czval_imQb
+integer   cxpix_imQb, cypix_imQb, czpix_imQb
+real(sp) xinc_imQb, yinc_imQb, zinc_imQb
+integer   freq_axisQb
+logical   cubeQb
+integer   iband, iqu
+character(len=272) :: bandfile
+ ! T2 ticket (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band frequency
+ ! axis description (channel count + CRVAL/CRPIX/CDELT on the freq axis),
+ ! captured while validating each band's header in the geometry loop
+ ! below, and this run's merged per-band FITS unit numbers/channel
+ ! offsets into the enlarged, multi-band specQ/specU tile buffers. All
+ ! sized to size(cfg%band); index cfg%reference_band holds this run's
+ ! already-open reference-band values. Untouched, unallocated for
+ ! nbands=1.
+real(sp) czval_imQb_q, zinc_imQb_q
+integer   czpix_imQb_q, naxz_imQb_q
+real(sp), allocatable :: band_czval(:), band_zinc(:)
+integer, allocatable :: band_czpix(:), band_nz(:), band_offset(:)
+integer, allocatable :: band_unit_Q(:), band_unit_U(:)
+ ! band_naxes: each band's own full NAXES array (RA/Dec match the
+ ! reference band's by construction, but the freq-axis entry is that
+ ! band's own channel count) -- FTGSVE needs the actual file's dimensions
+ ! to compute strides, so the reference band's naxes(:) cannot be reused
+ ! for other bands' reads.
+integer, allocatable :: band_naxes(:,:)
+integer   n_bands_t2, nz_out_band
+ ! T6 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): each band's own resolved
+ ! channel sub-range (subim_chan_blc/trc/inc, 0/0/1 defaults meaning "full
+ ! band", applied only when cfg%subim=.true.). band_chan_blc holds the
+ ! resolved (never-0) first selected raw pixel index; band_chan_inc the
+ ! resolved stride. band_nz(iband) is redefined by this ticket to mean
+ ! that band's own *selected* channel count, not its raw NAXIS3 -- see the
+ ! per-band geometry-validation loop below. Unused for nbands=1.
+integer, allocatable :: band_chan_blc(:), band_chan_inc(:)
+integer   chan_trc_eff_t6
+ ! T2: per-band frequency/lambda^2 array construction for every
+ ! non-reference band, mirroring the reference band's own
+ ! frequency-unit-inference + linspace logic exactly, applied
+ ! independently per band (each band's receiver may report frequency in
+ ! different units). Unused for nbands=1.
+real(sp), allocatable :: zval_band(:)
+real(sp) conv_fac_band, z1_band, zn_band
+integer   nz1_band, nz_tmp_band
+ ! T3 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band and combined
+ ! delta_RM/max-RM-scale/Delta_RM (un-aliased span) diagnostic, informational
+ ! only -- read-only with respect to every array T1/T2 built, gated behind
+ ! nbands>1. Unused for nbands=1.
+real(sp) lam2_lo_edge, lam2_hi_edge, dlam2_band
+real(sp) drm_band, maxrmscale_band, deltarm_band
+real(sp) sum_dlam2_diag, min_lam2min_diag
 
 real(sp) cxval_im, cyval_im, czval_im
 integer   cxpix_im, cypix_im, czpix_im
@@ -183,6 +241,20 @@ character(len=64) :: ctype
 character(len=72) :: comment
 real(dp) cval,cdelt, pi
 real(sp) cpix, dRM
+
+ ! Multi-beam input passthrough (CASAMBM/BEAMS extension) -- see the
+ ! header-writing block's own comment for the full reasoning.
+logical :: casambm_val
+integer :: casambm_status, beams_unit, beams_status, hdutype_dum
+
+ ! Cross-band beam consistency check (multi-band mode only) -- see the
+ ! header-writing block's own comment on why this reads every band's own
+ ! primary header, not just the reference band's.
+real(dp) :: ref_bmaj_val, ref_bmin_val, ref_bpa_val
+logical :: ref_bmaj_present, ref_bmin_present, ref_bpa_present
+real(dp) :: band_beam_val
+logical :: band_casambm_val, band_beam_mismatch
+integer :: band_beam_status, band_casambm_status, iband_chk
 
 integer   rwmode
 character(len=272) :: message
@@ -287,6 +359,11 @@ integer(kind=int64) :: io_par_nz_k, io_par_z_off_k, io_par_buf_off
 integer   io_par_z_beg, io_par_z_end
 integer   io_par_anyflg_priv, io_par_status_priv
 integer   io_par_fpixels(max_axis), io_par_lpixels(max_axis)
+ ! T6 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band read stride for
+ ! the non-reference-band FTGSVE calls -- RA/Dec entries always match the
+ ! shared incs(:) (identical sky footprint across bands); only the
+ ! freq-axis entry differs per band (band_chan_inc(iband)).
+integer   io_par_incs_band(max_axis)
 logical   io_par_read_ok
  ! Write-side handle and scratch (RM-chunked for AMP/PHA cubes). Always a
  ! single handle now regardless of io_write_threads_eff -- see the T6
@@ -341,6 +418,20 @@ integer   nbad_chan, ngood_chan
 integer, allocatable :: flag_arr(:)
 integer, allocatable :: flag_arr_out(:)
 character(len=16) :: masksrc_key, nanchk_key
+ ! T7 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band bad-channel list,
+ ! same format/semantics as bad_chan/flag_arr above but sized to each
+ ! non-reference band's own raw NAXIS3 (band_naxes(iband,freq_axis)) --
+ ! read fresh, used, and discarded once per band inside the T2 append
+ ! loop, rather than kept as a persistent per-band array. Unused for
+ ! nbands=1.
+real(sp), allocatable :: bad_chan_band_t7(:)
+integer, allocatable :: flag_arr_band_t7(:)
+integer   nbad_chan_band_t7, ios_band_t7, i7
+ ! T7: total bad-channel count across every band (reference + others),
+ ! for the NBADGLOB output header -- equals nbad_chan (reference band's
+ ! own count, unchanged) whenever nbands=1, since the T2 loop that
+ ! accumulates the other bands' counts is then a no-op.
+integer   nbad_chan_total_t7
 
  ! processing related:
 
@@ -831,6 +922,267 @@ else
    bitpix = -32  ! force real*4 when discrepancy exist
 endif
 
+ ! Multi-band tomography (T1 ticket, extended by T2, see
+ ! planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): validate every additional
+ ! configured band's RA/Dec pixel geometry against the reference band's
+ ! (naxis/naxes/cxval_im/etc., just established above from
+ ! cfg%infileQ/cfg%infileU, i.e. cfg%band(cfg%reference_band)), and
+ ! capture each band's own frequency-axis description (channel count +
+ ! CRVAL/CRPIX/CDELT on the freq axis) for the merge below. A no-op when
+ ! only one band is configured -- the single-band validation above is
+ ! untouched by this block, and this whole branch is never entered.
+n_bands_t2 = size(cfg%band)
+if (n_bands_t2.gt.1)then
+   ! T2 scope narrowing (plan Sec 9, T2 ticket), progressively relaxed by
+   ! T4 (multi-tile), T6 (channel subimaging), T7 (per-band bad-channel
+   ! files), T8 (GPU offload), and T9 (io_read_threads>1/io_overlap,
+   ! planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): the features listed below
+   ! remain genuinely out of scope -- every one stops here, explicitly,
+   ! rather than silently producing wrong output.
+   if (cfg%remove_qu_bias)then
+      write(*,*)'ERROR: multi-band Q/U bias correction is not yet implemented.'
+      write(*,*)'Set remove_qu_bias=n, or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   else if (cfg%use_auto_rm_range.eq.1)then
+      ! Plan Sec 7 decision 5: the auto-range heuristic assumes uniform
+      ! channel spacing and would silently miscompute across a
+      ! multi-band gap -- forbidden outright for nbands>1, not merely
+      ! deferred. beg_rm/end_rm/nrm must be supplied explicitly.
+      write(*,*)'ERROR: use_auto_rm_range=1 is not supported for multi-band runs.'
+      write(*,*)'Set use_auto_rm_range=0 with explicit beg_rm/end_rm/nrm,'
+      write(*,*)'or use a single band (nbands=1).'
+      write(*,*)'Quitting now...'
+      stop
+   endif
+
+   allocate(band_czval(n_bands_t2), band_zinc(n_bands_t2))
+   allocate(band_czpix(n_bands_t2), band_nz(n_bands_t2))
+   allocate(band_offset(n_bands_t2))
+   allocate(band_unit_Q(n_bands_t2), band_unit_U(n_bands_t2))
+   allocate(band_naxes(n_bands_t2,max_axis))
+   allocate(band_chan_blc(n_bands_t2), band_chan_inc(n_bands_t2))
+
+   ! Reference band: already open (units 21/22) and already validated
+   ! (the pre-existing Q-vs-U block above); its freq-axis description is
+   ! already in czval_im/czpix_im/zinc_im/naxes(freq_axis).
+   band_czval(cfg%reference_band) = czval_im
+   band_czpix(cfg%reference_band) = czpix_im
+   band_zinc(cfg%reference_band) = zinc_im
+   ! T6: band_nz here must be the reference band's own *selected* channel
+   ! count (subim_chan_blc/trc/inc-aware, 0 defaults meaning "full band"),
+   ! not its raw NAXIS3 -- nz_out_band/band_offset below are accumulated
+   ! from band_nz before the pre-existing single-band subim block (further
+   ! down this file) ever runs, so this must be resolved independently
+   ! here, mirroring that block's own arithmetic.
+   if (.not. cfg%subim) then
+      band_chan_blc(cfg%reference_band) = 1
+      band_chan_inc(cfg%reference_band) = 1
+      band_nz(cfg%reference_band) = naxes(freq_axis)
+   else
+      if (cfg%band(cfg%reference_band)%chan_blc .eq. 0) then
+         band_chan_blc(cfg%reference_band) = 1
+      else
+         band_chan_blc(cfg%reference_band) = cfg%band(cfg%reference_band)%chan_blc
+      endif
+      if (cfg%band(cfg%reference_band)%chan_trc .eq. 0) then
+         chan_trc_eff_t6 = naxes(freq_axis)
+      else
+         chan_trc_eff_t6 = cfg%band(cfg%reference_band)%chan_trc
+      endif
+      band_chan_inc(cfg%reference_band) = cfg%band(cfg%reference_band)%chan_inc
+      if (band_chan_blc(cfg%reference_band) .gt. naxes(freq_axis) .or.&
+      &chan_trc_eff_t6 .gt. naxes(freq_axis))then
+         write(*,*)'ERROR: subim_chan_blc/trc exceeds NAXIS for the',&
+         &' reference band'
+         write(*,*)'NAXIS(freq axis) = ',naxes(freq_axis)
+         write(*,*)'Quitting now...'
+         stop
+      endif
+      band_nz(cfg%reference_band) = int((chan_trc_eff_t6 -&
+      &band_chan_blc(cfg%reference_band))/&
+      &band_chan_inc(cfg%reference_band)) + 1
+   endif
+   band_naxes(cfg%reference_band,1:naxis) = naxes(1:naxis)
+   band_unit_Q(cfg%reference_band) = 21
+   band_unit_U(cfg%reference_band) = 22
+
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      do iqu = 1,2
+         if (iqu.eq.1)then
+            bandfile = cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileQ(1:nchar(cfg%band(iband)%infileQ))
+         else
+            bandfile = cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileU(1:nchar(cfg%band(iband)%infileU))
+         endif
+         status = 0
+         call myfits_info(bandfile,&
+         &bitpixQb,naxisQb,naxesQb,&
+         &cxval_imQb,cxpix_imQb,xinc_imQb,&
+         &cyval_imQb,cypix_imQb,yinc_imQb,&
+         &czval_imQb,czpix_imQb,zinc_imQb,&
+         &freq_axisQb,cubeQb,message,status,hdrbytesQb)
+         if (status.ne.0)then
+            write(*,*)'ERROR: failed to read header for band ',iband
+            write(*,*)'file: ',bandfile(1:nchar(bandfile))
+            write(*,*)'message:',message(1:nchar(message))
+            write(*,*)'Quitting now...'
+            stop
+         else if (.not.cubeQb)then
+            write(*,*)'ERROR: Missing spectral axis in band ',iband,' file!'
+            write(*,*)'file: ',bandfile(1:nchar(bandfile))
+            write(*,*)'Quitting now...'
+            stop
+         else if (freq_axisQb.ne.freq_axis)then
+            write(*,*)'ERROR: Frequency-axis index mis-match for band ',iband
+            write(*,*)'Reference FREQ axis = ',freq_axis
+            write(*,*)'Band ',iband,' FREQ axis = ',freq_axisQb
+            write(*,*)'Quitting now...'
+            stop
+         else if (naxisQb.ne.naxis)then
+            write(*,*)'ERROR: NAXIS mis-match for band ',iband
+            write(*,*)'Reference NAXIS = ',naxis
+            write(*,*)'Band ',iband,' NAXIS = ',naxisQb
+            write(*,*)'Quitting now...'
+            stop
+         else if (naxesQb(1).ne.naxes(1))then
+            write(*,*)'ERROR: RA pixel-grid size mismatch for band ',iband
+            write(*,*)'Reference RA length = ',naxes(1)
+            write(*,*)'Band ',iband,' RA length = ',naxesQb(1)
+            write(*,*)'Quitting now...'
+            stop
+         else if (naxesQb(2).ne.naxes(2))then
+            write(*,*)'ERROR: Dec pixel-grid size mismatch for band ',iband
+            write(*,*)'Reference Dec length = ',naxes(2)
+            write(*,*)'Band ',iband,' Dec length = ',naxesQb(2)
+            write(*,*)'Quitting now...'
+            stop
+         else if (cxval_imQb.ne.cxval_im .or. cxpix_imQb.ne.cxpix_im .or.&
+         &xinc_imQb.ne.xinc_im)then
+            write(*,*)'ERROR: RA WCS mismatch for band ',iband
+            write(*,*)'Reference CRVAL1/CRPIX1/CDELT1 = ',&
+            &cxval_im,cxpix_im,xinc_im
+            write(*,*)'Band ',iband,' CRVAL1/CRPIX1/CDELT1 = ',&
+            &cxval_imQb,cxpix_imQb,xinc_imQb
+            write(*,*)'Quitting now...'
+            stop
+         else if (cyval_imQb.ne.cyval_im .or. cypix_imQb.ne.cypix_im .or.&
+         &yinc_imQb.ne.yinc_im)then
+            write(*,*)'ERROR: Dec WCS mismatch for band ',iband
+            write(*,*)'Reference CRVAL2/CRPIX2/CDELT2 = ',&
+            &cyval_im,cypix_im,yinc_im
+            write(*,*)'Band ',iband,' CRVAL2/CRPIX2/CDELT2 = ',&
+            &cyval_imQb,cypix_imQb,yinc_imQb
+            write(*,*)'Quitting now...'
+            stop
+         endif
+         if (iqu.eq.1)then
+            ! Stash band iband's Q freq-axis description; compared
+            ! against U's own (below) once iqu=2 has read it, mirroring
+            ! the reference band's own Q-vs-U freq-axis check above.
+            czval_imQb_q = czval_imQb
+            czpix_imQb_q = czpix_imQb
+            zinc_imQb_q = zinc_imQb
+            naxz_imQb_q = naxesQb(freq_axis)
+         else
+            if (czval_imQb.ne.czval_imQb_q .or. czpix_imQb.ne.czpix_imQb_q&
+            &.or. zinc_imQb.ne.zinc_imQb_q&
+            &.or. naxesQb(freq_axis).ne.naxz_imQb_q)then
+               write(*,*)'ERROR: Q/U freq-axis mismatch within band ',iband
+               write(*,*)'Q  CRVAL/CRPIX/CDELT/NAXIS = ',&
+               &czval_imQb_q,czpix_imQb_q,zinc_imQb_q,naxz_imQb_q
+               write(*,*)'U  CRVAL/CRPIX/CDELT/NAXIS = ',&
+               &czval_imQb,czpix_imQb,zinc_imQb,naxesQb(freq_axis)
+               write(*,*)'Quitting now...'
+               stop
+            endif
+            band_czval(iband) = czval_imQb_q
+            band_czpix(iband) = czpix_imQb_q
+            band_zinc(iband) = zinc_imQb_q
+            ! T6: band_nz here must be this band's own *selected* channel
+            ! count (subim_chan_blc/trc/inc-aware), not its raw NAXIS3 --
+            ! mirrors the reference band's own resolution just above.
+            if (.not. cfg%subim) then
+               band_chan_blc(iband) = 1
+               band_chan_inc(iband) = 1
+               band_nz(iband) = naxz_imQb_q
+            else
+               if (cfg%band(iband)%chan_blc .eq. 0) then
+                  band_chan_blc(iband) = 1
+               else
+                  band_chan_blc(iband) = cfg%band(iband)%chan_blc
+               endif
+               if (cfg%band(iband)%chan_trc .eq. 0) then
+                  chan_trc_eff_t6 = naxz_imQb_q
+               else
+                  chan_trc_eff_t6 = cfg%band(iband)%chan_trc
+               endif
+               band_chan_inc(iband) = cfg%band(iband)%chan_inc
+               if (band_chan_blc(iband) .gt. naxz_imQb_q .or.&
+               &chan_trc_eff_t6 .gt. naxz_imQb_q)then
+                  write(*,*)'ERROR: subim_chan_blc/trc exceeds NAXIS for',&
+                  &' band ',iband
+                  write(*,*)'NAXIS(freq axis) = ',naxz_imQb_q
+                  write(*,*)'Quitting now...'
+                  stop
+               endif
+               band_nz(iband) = int((chan_trc_eff_t6 -&
+               &band_chan_blc(iband))/band_chan_inc(iband)) + 1
+            endif
+            ! naxesQb here reflects U's just-validated read (equal to Q's,
+            ! per the Q-vs-U freq-axis check just above; RA/Dec already
+            ! matched the reference band earlier in this same iteration).
+            band_naxes(iband,1:naxisQb) = naxesQb(1:naxisQb)
+            ! Open this band's Q/U files on fresh units for the tile-read
+            ! loop -- distinct from the 200+/300+ io_read_threads-parallel
+            ! range and the 21/22/41/42/45 fixed units used elsewhere.
+            band_unit_Q(iband) = 600 + 2*iband
+            band_unit_U(iband) = 600 + 2*iband + 1
+            status = 0
+            blocksize = 1
+            call FTOPEN(band_unit_Q(iband),&
+            &cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileQ(1:nchar(cfg%band(iband)%infileQ)),&
+            &0,blocksize,status)
+            if (status.ne.0)then
+               write(*,*)'ERROR: failed to open Q-cube for band ',iband
+               stop
+            endif
+            status = 0
+            call FTOPEN(band_unit_U(iband),&
+            &cfg%path(1:nchar(cfg%path))//&
+            &cfg%band(iband)%infileU(1:nchar(cfg%band(iband)%infileU)),&
+            &0,blocksize,status)
+            if (status.ne.0)then
+               write(*,*)'ERROR: failed to open U-cube for band ',iband
+               stop
+            endif
+         endif
+      enddo
+   enddo
+   write(*,*)' '
+   write(*,*)'Multi-band geometry validated successfully across ',&
+   &n_bands_t2,' bands.'
+
+   ! Per-band channel offset into the merged, multi-band spectrum. The
+   ! reference band is always placed first (offset 0): its own L_sq/
+   ! flag_arr_out contribution is filled by the pre-existing single-band
+   ! code below, completely unchanged, writing into L_sq(1:nz_out) as it
+   ! always has -- putting any other band first would require that
+   ! existing loop to target a non-zero offset. Other bands follow in
+   ! their cfg%band(:) index order (skipping the reference band's own
+   ! index), appended after it.
+   band_offset(cfg%reference_band) = 0
+   nz_out_band = band_nz(cfg%reference_band)
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      band_offset(iband) = nz_out_band
+      nz_out_band = nz_out_band + band_nz(iband)
+   enddo
+endif
+
 
 
  ! Final sanity checks...
@@ -1058,7 +1410,35 @@ group = 1
 firstpix = 1
 nullval = -999.0
 nbuffer = naxes(1)
-rwmode = 1
+ ! READONLY, not READWRITE: rm_synthesis only ever reads Q/U/I/mask
+ ! input cubes, never writes to them (verified: no FTPKYx/FTP2Dx/FTPPRx/
+ ! FTPCLx/FTPHIS/FTPSSE call anywhere in this file targets units
+ ! 21/22/40/45, the units opened with this rwmode) -- the parallel
+ ! tile-reader threads for these same files already independently open
+ ! READONLY (mode 0, not rwmode) a few hundred lines below, confirming
+ ! read-only access has always been sufficient. Opening irreplaceable
+ ! input science data READWRITE with no code path that ever needs write
+ ! access is a real, if latent, risk with no upside -- a stray write
+ ! call, a copy-pasted wrong unit number, or a crash mid-write could
+ ! corrupt the user's original data for no reason.
+ ! Also brings this file in line with docs/ARCHITECTURE.md's own
+ ! documented CFITSIO lesson (see its "History: io_write_threads>1 was
+ ! unsafe" postmortem, a real SIGSEGV): CFITSIO aliases repeat
+ ! READ-WRITE opens of an already-open file onto one shared buffer, but
+ ! exempts READ-ONLY opens from that aliasing by design ("2 different
+ ! threads cannot share the same FITSfile pointer") -- which is exactly
+ ! why io_read_threads' extra handles (par_unit_Q/par_unit_U at units
+ ! 200+/300+, opened READONLY) were always safe. Before this change,
+ ! io_read_threads>1 mixed one READWRITE handle (unit 21/22/40/45) with
+ ! several READONLY handles on the very same file -- not the exact
+ ! aliasing failure mode that postmortem describes (that needed multiple
+ ! READWRITE opens), but an unnecessary asymmetry in a documented-fragile
+ ! area with no upside. Now every concurrent handle on these files is
+ ! uniformly READONLY, matching the one pattern this project has already
+ ! confirmed safe by both source-level analysis and a real crash
+ ! postmortem. Full test suite (49/49, including the io_read_threads>1
+ ! multi-handle path) re-run clean after this change.
+rwmode = 0
 blocksize = 1
 out_amp_open = .false.
 ampha_handles_closed_early = .false.
@@ -1472,6 +1852,13 @@ zpix_beg = fpixels(freq_axis)
 zpix_end = lpixels(freq_axis)
 nz_out = int((zpix_end - zpix_beg)/incs(freq_axis)) + 1
 
+ ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): nz_out above is still the
+ ! reference band's own channel count (unchanged from the single-band
+ ! computation). For nbands>1, redefine it as the merged multi-band total
+ ! -- every allocation below this point is sized to the corrected value.
+ ! A no-op for nbands=1 (n_bands_t2.gt.1 is false).
+if (n_bands_t2.gt.1) nz_out = nz_out_band
+
 ntot_out = nx_out*ny_out*nz_out
 
  ! Allocate per-pixel spectrum work buffers sized to actual nz_out
@@ -1588,11 +1975,181 @@ do i = zpix_beg,zpix_end,incs(freq_axis)
    flag_arr_out(cnt2) = flag_arr(i)
 enddo
 
+ ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): append every other
+ ! configured band's own channels/lambda^2 to L_sq/flag_arr_out, at the
+ ! offsets computed earlier -- the reference band's own contribution
+ ! above (indices 1:nz_out_ref, unchanged) is always first. Each band's
+ ! frequency-unit inference and z1/zn/linspace construction mirrors the
+ ! reference band's own logic above exactly, applied independently
+ ! (mirrors nz_1st's czpix_im.eq.0 edge case too). T7
+ ! (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): each non-reference band's own
+ ! bad-channel file (cfg%band(iband)%badchan_file, always required, same
+ ! format as the reference band's own -- raw pixel indices into that
+ ! band's own file) is read fresh here and applied via flag_arr_band_t7,
+ ! same as the reference band's flag_arr above; NaN-based per-pixel
+ ! masking is separate and still applies, downstream, regardless of which
+ ! band a channel came from. A no-op for nbands=1.
+nbad_chan_total_t7 = nbad_chan
+if (n_bands_t2.gt.1) then
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      allocate(flag_arr_band_t7(band_naxes(iband,freq_axis)))
+      flag_arr_band_t7 = 1
+      nbad_chan_band_t7 = 0
+      if (cfg%remove_badchan) then
+         allocate(bad_chan_band_t7(band_naxes(iband,freq_axis)))
+         open(71,file=cfg%band(iband)%badchan_file(&
+         &1:nchar(cfg%band(iband)%badchan_file)),&
+         &status='old',iostat=ios_band_t7)
+         if (ios_band_t7 .ne. 0)then
+            write(*,*)'ERROR: failed to open bad-channel file for band ',&
+            &iband
+            write(*,*)cfg%band(iband)%badchan_file(&
+            &1:nchar(cfg%band(iband)%badchan_file))
+            write(*,*)'Quitting now...'
+            stop
+         else
+            do while(.true.)
+               nbad_chan_band_t7 = nbad_chan_band_t7 + 1
+               if (nbad_chan_band_t7 .gt. band_naxes(iband,freq_axis))then
+                  write(*,*)'Too many bad channels for band ',iband
+                  write(*,*)'Max by cube:'
+                  write(*,*)band_naxes(iband,freq_axis)
+                  close(71)
+                  stop
+               endif
+               read(71,*,end=712)bad_chan_band_t7(nbad_chan_band_t7)
+            enddo
+712         continue
+            nbad_chan_band_t7 = nbad_chan_band_t7 - 1
+            write(*,*)'Number of Bad Channels (band ',iband,'): ',&
+            &nbad_chan_band_t7
+            close(71)
+            do i7 = 1,nbad_chan_band_t7
+               flag_arr_band_t7(int(bad_chan_band_t7(i7))) = 0
+            enddo
+         endif
+         deallocate(bad_chan_band_t7)
+         nbad_chan_total_t7 = nbad_chan_total_t7 + nbad_chan_band_t7
+      endif
+      if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
+         conv_fac_band = c_velocity
+      else if (band_czval(iband).ge.30.0e6.and.&
+      &band_czval(iband).le.10.0e9)then
+         conv_fac_band = c_velocity*1.0e6
+      else
+         write(*,*)'ERROR: Confusing frequency-unit magnitude for band ',&
+         &iband
+         write(*,*)'reference-frequency: ',band_czval(iband)
+         stop
+      endif
+      if (band_czpix(iband).eq.0)then
+         nz1_band = 0
+      else
+         nz1_band = band_czpix(iband) - 1
+      endif
+      ! T6: z1_band is the frequency at this band's own first *selected*
+      ! channel (raw pixel band_chan_blc(iband), 1 by default), not always
+      ! raw pixel 1; zn_band's step accounts for the selection stride
+      ! band_chan_inc(iband) (1 by default) between selected channels.
+      z1_band = band_czval(iband) - real(nz1_band,kind=sp)*band_zinc(iband)
+      z1_band = z1_band +&
+      &real(band_chan_blc(iband)-1,kind=sp)*band_zinc(iband)
+      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*&
+      &band_zinc(iband)*real(band_chan_inc(iband),kind=sp)
+      nz_tmp_band = band_nz(iband)
+      allocate(zval_band(band_nz(iband)))
+      call linspace(z1_band,zn_band,nz_tmp_band,zval_band)
+      do i = 1,band_nz(iband)
+         L_sq(band_offset(iband)+i) = (conv_fac_band/zval_band(i))**2
+         ! T7: raw pixel index of this band's i-th selected channel,
+         ! mirroring band_chan_blc/band_chan_inc's use in the tile-read
+         ! loop -- looks up that band's own flag_arr_band_t7 rather than
+         ! always marking the channel good.
+         flag_arr_out(band_offset(iband)+i) =&
+         &flag_arr_band_t7(band_chan_blc(iband)+(i-1)*band_chan_inc(iband))
+      enddo
+      deallocate(zval_band)
+      deallocate(flag_arr_band_t7)
+   enddo
+endif
+
  ! Count good channels for book-keeping
 ngood_chan = 0
 do i = 1, nz_out
    if(flag_arr_out(i).eq.1) ngood_chan = ngood_chan + 1
 enddo
+
+ ! T3 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): RM-range/resolution
+ ! diagnostic for multi-band runs, informational only -- does not gate or
+ ! auto-select beg_rm/end_rm/nrm (use_auto_rm_range=1 is already forbidden
+ ! for nbands>1, T1/T2). Read-only with respect to every array T1/T2
+ ! built; touches nothing any correctness gate covers. A no-op for
+ ! nbands=1, where the existing single-band use_auto_rm_range heuristic
+ ! already covers this ground.
+if (n_bands_t2.gt.1) then
+   write(*,*)' '
+   write(*,*)'RM-range/resolution diagnostic (informational; see'
+   write(*,*)'planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 7 decision 5):'
+   sum_dlam2_diag = 0.0_sp
+   min_lam2min_diag = huge(1.0_sp)
+   do iband = 1,n_bands_t2
+      ! Per-band edge frequencies -- same z1/zn construction as the
+      ! append-other-bands L_sq loop above, half a channel extended on
+      ! each edge (mirroring extract_general_setup's own Lsq1/Lsq2
+      ! treatment for a single band).
+      if (band_czpix(iband).eq.0)then
+         nz1_band = 0
+      else
+         nz1_band = band_czpix(iband) - 1
+      endif
+      ! T6: shift to this band's own first *selected* channel (mirrors the
+      ! append-other-bands L_sq loop above).
+      z1_band = band_czval(iband) - real(nz1_band,kind=sp)*band_zinc(iband)
+      z1_band = z1_band +&
+      &real(band_chan_blc(iband)-1,kind=sp)*band_zinc(iband)
+      zn_band = z1_band + real(band_nz(iband)-1,kind=sp)*&
+      &band_zinc(iband)*real(band_chan_inc(iband),kind=sp)
+      ! Independent per-band frequency-unit inference (a band's receiver
+      ! may report frequency in different units than another's).
+      if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
+         conv_fac_band = c_velocity
+      else if (band_czval(iband).ge.30.0e6.and.&
+      &band_czval(iband).le.10.0e9)then
+         conv_fac_band = c_velocity*1.0e6
+      else
+         conv_fac_band = c_velocity*1.0e6  ! already rejected above if
+         ! reached with a genuinely confusing magnitude; this branch is
+         ! unreachable in practice (see the append-bands L_sq loop, which
+         ! stops on this same condition before this diagnostic runs).
+      endif
+      lam2_lo_edge = (conv_fac_band/&
+      &(min(z1_band,zn_band)-0.5_sp*abs(band_zinc(iband))))**2
+      lam2_hi_edge = (conv_fac_band/&
+      &(max(z1_band,zn_band)+0.5_sp*abs(band_zinc(iband))))**2
+      dlam2_band = lam2_lo_edge - lam2_hi_edge
+      drm_band = cfg%fac / dlam2_band
+      maxrmscale_band = cfg%fac / lam2_hi_edge
+      deltarm_band = real(band_nz(iband),kind=sp) * drm_band
+      sum_dlam2_diag = sum_dlam2_diag + dlam2_band
+      min_lam2min_diag = min(min_lam2min_diag, lam2_hi_edge)
+      write(*,'(A,I0,A,F0.3,A,F0.3,A,F0.2,A,F0.2,A)')&
+      &'  band ',iband,': delta_RM=',drm_band,&
+      &' rad/m^2, max_RM_scale=',maxrmscale_band,&
+      &' rad/m^2, Delta_RM(un-aliased span)=',deltarm_band,&
+      &' rad/m^2 (max|RM|~',0.5_sp*deltarm_band,' rad/m^2)'
+   enddo
+   write(*,'(A,F0.3,A,F0.2,A)')&
+   &'  combined: delta_RM=',cfg%fac/sum_dlam2_diag,&
+   &' rad/m^2, max_RM_scale=',cfg%fac/min_lam2min_diag,' rad/m^2'
+   write(*,*)'  (no combined Delta_RM/un-aliased-span figure: the naive'
+   write(*,*)'  per-band sum is not the right multi-band generalization'
+   write(*,*)'  for this DFT-based (non-FFT) extraction -- open question,'
+   write(*,*)'  see planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 7 decision 5.)'
+   write(*,*)'  These figures guide, but do not auto-select, your'
+   write(*,*)'  beg_rm/end_rm/nrm choice below.'
+   write(*,*)' '
+endif
  ! Use explicit flag to select RM extraction mode
  ! nrm_out based on total channels (nz_out), not good channels
  ! Bad channels are masked during DFT via flag_arr and wts=0
@@ -1629,9 +2186,18 @@ close(77)
 
 open(78,file='sampled_freq.txt',status='unknown')
 write(78,*)"# freq       L_sq       flag (1=good, 0=bad)"
+ ! T2: zval(:) only covers the reference band's own channels
+ ! (size nz_totpix); nz_out beyond that range belongs to other bands
+ ! (merged L_sq/flag_arr_out, no single shared zval array), so this
+ ! diagnostic prints frequency only for the reference band's own indices
+ ! -- a no-op change for nbands=1, where nz_out never exceeds nz_totpix.
 do i = 1,nz_out
-   write(78,*)zval(zpix_beg + (i-1)*incs(freq_axis)),"    ",&
-   &L_sq(i),"   ",flag_arr_out(i)
+   if (n_bands_t2.gt.1 .and. i.gt.band_nz(cfg%reference_band))then
+      write(78,*)"# (other band)    ",L_sq(i),"   ",flag_arr_out(i)
+   else
+      write(78,*)zval(zpix_beg + (i-1)*incs(freq_axis)),"    ",&
+      &L_sq(i),"   ",flag_arr_out(i)
+   endif
 enddo
 close(78)
 
@@ -1707,6 +2273,22 @@ ny_sub = plan%ny_sub
 inflight_slots_planned = plan%inflight_slots_planned
 use_staging = plan%use_staging
 mem_frac_vram_per_slot = plan%mem_frac_vram_per_slot
+
+ ! T4 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): multi-tile multi-band runs
+ ! are supported -- the per-band tile-read loop (T2, below) already sits
+ ! inside the RA/Dec tile loop and already reuses each tile's own live
+ ! fpixels/lpixels, the same mechanism the reference band's own read
+ ! already relies on across many tiles. No tile-count restriction remains
+ ! here; T2's original single-tile-only stop (this exact location) has
+ ! been removed, not merely relaxed, after direct code inspection and a
+ ! bit-identical multi-tile-vs-single-tile verification (T4 Evidence).
+if (n_bands_t2.gt.1 .and.&
+&(cfg%tile_ra.lt.nx_out .or. cfg%tile_dec.lt.ny_out))then
+   write(*,*)' '
+   write(*,*)'Multi-band run spanning ',&
+   &((nx_out+cfg%tile_ra-1)/cfg%tile_ra)*((ny_out+cfg%tile_dec-1)/cfg%tile_dec),&
+   &' tile(s) (tile_ra,tile_dec = ',cfg%tile_ra,cfg%tile_dec,').'
+endif
 
 write(*,*)" "
 write(*,*)"Tile planner (Phase-2):"
@@ -2375,6 +2957,368 @@ if(out_snr_open)then
    &'Signal-to-noise ratio',status)
 endif
 
+ ! --- BMAJ/BMIN/BPA: passthrough from input Q cube (unit 21) ---
+ ! RM synthesis operates per-pixel along the frequency/RM axis and does
+ ! not touch the spatial PSF -- every output here (the RM cubes and every
+ ! 2D map derived from them) shares the same angular resolution as the
+ ! input Q/U cubes, so the same BMAJ/BMIN/BPA applies to all of them.
+ ! Absent from the input (not every FITS cube declares a beam) is not an
+ ! error -- simply not written to the outputs either, same as this
+ ! project's other passthrough-if-present keywords just above.
+ ! Multi-band note: this reads only unit 21 (the primary Q input) --
+ ! correct as long as every band was already brought to one common
+ ! resolution before rm_synthesis runs (convolve_cubes' own job, see
+ ! src/convolve_cubes.f90), which is when a single BMAJ/BMIN/BPA is
+ ! actually meaningful for a multi-band RM cube in the first place.
+status = 0
+call ftgkyd(21,'bmaj',cval,comment,status)
+ref_bmaj_present = (status.eq.0)
+if(ref_bmaj_present) ref_bmaj_val = cval
+if(status.eq.0)then
+   call ftpkyd(41,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   call ftpkyd(42,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_mask_open)call ftpkyd(43,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_nvalid_open)call ftpkyd(44,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_peak_open)call ftpkyd(46,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_rmpeak_open)call ftpkyd(47,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_angpeak_open)call ftpkyd(48,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+   if(out_snr_open)call ftpkyd(49,'bmaj',cval,decimals,&
+   &'Restoring beam major axis (deg)',status)
+endif
+status = 0
+call ftgkyd(21,'bmin',cval,comment,status)
+ref_bmin_present = (status.eq.0)
+if(ref_bmin_present) ref_bmin_val = cval
+if(status.eq.0)then
+   call ftpkyd(41,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   call ftpkyd(42,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_mask_open)call ftpkyd(43,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_nvalid_open)call ftpkyd(44,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_peak_open)call ftpkyd(46,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_rmpeak_open)call ftpkyd(47,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_angpeak_open)call ftpkyd(48,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+   if(out_snr_open)call ftpkyd(49,'bmin',cval,decimals,&
+   &'Restoring beam minor axis (deg)',status)
+endif
+status = 0
+call ftgkyd(21,'bpa',cval,comment,status)
+ref_bpa_present = (status.eq.0)
+if(ref_bpa_present) ref_bpa_val = cval
+if(status.eq.0)then
+   call ftpkyd(41,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   call ftpkyd(42,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_mask_open)call ftpkyd(43,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_nvalid_open)call ftpkyd(44,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_peak_open)call ftpkyd(46,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_rmpeak_open)call ftpkyd(47,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_angpeak_open)call ftpkyd(48,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+   if(out_snr_open)call ftpkyd(49,'bpa',cval,decimals,&
+   &'Restoring beam position angle (deg)',status)
+endif
+status = 0
+
+ ! --- CASAMBM/BEAMS: multi-beam input warning + provenance passthrough ---
+ ! The BMAJ/BMIN/BPA just written above is a single scalar copied from
+ ! the Q cube's own PRIMARY header. If the input has CASAMBM=T (a real
+ ! per-channel-VARYING restoring beam -- confirmed on real ASKAP data,
+ ! BPA swinging -89 to +90 degrees across a band, see src/commonbeam.f90's
+ ! own header comment), that scalar is only the input's own nominal/
+ ! reference value (often just the first channel) and means nothing on
+ ! its own -- but it is left unchanged regardless, and the OUTPUT also
+ ! gets CASAMBM=T plus the INPUT's own actual per-channel BEAMS table,
+ ! attached as its own extension HDU, so nothing is lost: a user who
+ ! reads BMAJ/BMIN/BPA alone gets a rough number, and a user who checks
+ ! CASAMBM/BEAMS gets the real per-channel picture, exactly as they would
+ ! from the input file itself.
+ !
+ ! This applies to AMP/PHA (units 41/42) and, when cubestat=y, the
+ ! PEAK/RMPEAK/ANGPEAK/SNR maps (46-49) -- every one of these is derived
+ ! from the actual flux-bearing Q/U data, so "which beams went into this"
+ ! is a real, useful provenance question for all of them, even though
+ ! none of their own axes directly correspond to input channels (AMP/
+ ! PHA's 3rd axis is Faraday depth; the maps are fully 2D, collapsed
+ ! across every channel already).
+ !
+ ! Deliberately NOT applied to MASK.CUBE.FITS or NVALID.MAP.FITS: both
+ ! are pure per-pixel/per-channel bookkeeping (a good/bad flag, a valid-
+ ! channel count) derived from data VALIDITY, not from the beam-convolved
+ ! flux itself -- nobody convolves a flag table, and a beam extension on
+ ! one would only invite a confused "why does this have a beam?" instead
+ ! of the intended "have we processed this correctly?". They still carry
+ ! the plain BMAJ/BMIN/BPA scalar from the block above, unchanged.
+status = 0
+casambm_status = 0
+call ftgkyl(21,'casambm',casambm_val,comment,casambm_status)
+if(casambm_status.eq.0 .and. casambm_val)then
+   write(*,*)'WARNING: input Q cube has CASAMBM=T (a per-channel-varying'
+   write(*,*)'  restoring beam) -- BMAJ/BMIN/BPA written to the outputs is'
+   write(*,*)'  only its primary-header nominal value, not a true common'
+   write(*,*)'  resolution across channels. Run convolve_cubes first to'
+   write(*,*)'  bring every channel to one common resolution if a single'
+   write(*,*)'  well-defined beam is required for these outputs.'
+
+   call ftphis(41,'Input Q cube has CASAMBM=T (per-channel',status)
+   call ftphis(41,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+   call ftphis(41,'the input''s nominal value; see CASAMBM/BEAMS',status)
+   call ftphis(41,'below for the true per-channel beam.',status)
+   call ftphis(42,'Input Q cube has CASAMBM=T (per-channel',status)
+   call ftphis(42,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+   call ftphis(42,'the input''s nominal value; see CASAMBM/BEAMS',status)
+   call ftphis(42,'below for the true per-channel beam.',status)
+   if(out_peak_open)then
+      call ftphis(46,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(46,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(46,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(46,'below for the true per-channel beam.',status)
+   endif
+   if(out_rmpeak_open)then
+      call ftphis(47,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(47,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(47,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(47,'below for the true per-channel beam.',status)
+   endif
+   if(out_angpeak_open)then
+      call ftphis(48,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(48,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(48,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(48,'below for the true per-channel beam.',status)
+   endif
+   if(out_snr_open)then
+      call ftphis(49,'Input Q cube has CASAMBM=T (per-channel',status)
+      call ftphis(49,'varying beam) -- BMAJ/BMIN/BPA above is only',status)
+      call ftphis(49,'the input''s nominal value; see CASAMBM/BEAMS',status)
+      call ftphis(49,'below for the true per-channel beam.',status)
+   endif
+
+    ! Own dedicated unit (90), well outside the 21/22/41-49/200+ ranges
+    ! already in use elsewhere in this file (a real CFITSIO unit-number
+    ! collision bug bit this project once before -- see reproject_cubes'
+    ! own header comment on the same lesson) -- opened purely to read the
+    ! BEAMS extension without disturbing unit 21's own current-HDU
+    ! position (still needed below this block for OBJECT/OBSERVER/
+    ! TELESCOP passthrough from the Q cube's PRIMARY header).
+   beams_status = 0
+   beams_unit = 90
+   call ftopen(beams_unit,cfg%infileQ,0,blocksize,beams_status)
+   call ftmnhd(beams_unit,-1,'BEAMS',0,beams_status)
+   if(beams_status.eq.0)then
+       ! CASAMBM is only written alongside an actually-attached BEAMS
+       ! table -- claiming multi-beam without one to back it up (the
+       ! else branch below, a malformed input) would be worse than
+       ! saying nothing.
+      status = 0
+      call ftpkyl(41,'CASAMBM',.true.,&
+      &'Multiple beams per plane (see BEAMS ext)',status)
+      call ftcopy(beams_unit,41,0,status)
+      call ftmahd(41,1,hdutype_dum,status)
+      status = 0
+      call ftpkyl(42,'CASAMBM',.true.,&
+      &'Multiple beams per plane (see BEAMS ext)',status)
+      call ftcopy(beams_unit,42,0,status)
+      call ftmahd(42,1,hdutype_dum,status)
+      if(out_peak_open)then
+         status = 0
+         call ftpkyl(46,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,46,0,status)
+         call ftmahd(46,1,hdutype_dum,status)
+      endif
+      if(out_rmpeak_open)then
+         status = 0
+         call ftpkyl(47,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,47,0,status)
+         call ftmahd(47,1,hdutype_dum,status)
+      endif
+      if(out_angpeak_open)then
+         status = 0
+         call ftpkyl(48,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,48,0,status)
+         call ftmahd(48,1,hdutype_dum,status)
+      endif
+      if(out_snr_open)then
+         status = 0
+         call ftpkyl(49,'CASAMBM',.true.,&
+         &'Multiple beams per plane (see BEAMS ext)',status)
+         call ftcopy(beams_unit,49,0,status)
+         call ftmahd(49,1,hdutype_dum,status)
+      endif
+   else
+      write(*,*)'WARNING: CASAMBM=T but no BEAMS extension found in the'
+      write(*,*)'  Q cube -- cannot attach per-channel beam provenance.'
+   endif
+   beams_status = 0
+   call ftclos(beams_unit,beams_status)
+endif
+status = 0
+
+ ! --- Cross-band beam consistency (multi-band mode only) ---
+ ! Everything above only ever looked at the REFERENCE band's own Q file
+ ! (unit 21 = cfg%infileQ = cfg%band(cfg%reference_band)%infileQ) --
+ ! correct and complete for single-band runs, but a real gap for
+ ! multi-band ones (n_bands_t2>1): every non-reference band's own Q file
+ ! is opened independently, on its own unit (band_unit_Q(iband), already
+ ! open at this point -- opened early, closed only at final cleanup, see
+ ! this file's own multi-band file-opening loop), and its own primary
+ ! header could carry a DIFFERENT nominal BMAJ/BMIN/BPA or its own
+ ! CASAMBM=T, entirely unreflected by the single value already written
+ ! above. RM synthesis' actual computation does not depend on any of
+ ! this -- combining bands with genuinely different resolutions is not a
+ ! numerical-correctness bug -- but silently propagating only ONE band's
+ ! beam metadata while the others might disagree is exactly the same
+ ! kind of misleading-precision risk the CASAMBM handling above exists
+ ! to catch, one level up. Same policy applied consistently: warn
+ ! loudly, keep processing, record what was found via HISTORY -- not a
+ ! hard error (this project already hard-stops on genuine geometry
+ ! mismatches -- WCS/NAXIS/frequency-axis-index -- earlier in this same
+ ! multi-band file-opening loop; a beam mismatch is a metadata
+ ! completeness concern, not a geometry one, so it gets the softer
+ ! treatment already established for CASAMBM above, not that harder one).
+if(n_bands_t2.gt.1)then
+   band_beam_mismatch = .false.
+   do iband_chk = 1,n_bands_t2
+      if(iband_chk.eq.cfg%reference_band) cycle
+
+      band_beam_status = 0
+      call ftgkyd(band_unit_Q(iband_chk),'bmaj',band_beam_val,comment,&
+      &band_beam_status)
+      if(band_beam_status.eq.0 .and. ref_bmaj_present)then
+         if(abs(band_beam_val-ref_bmaj_val).gt.&
+         &1.0d-9*max(abs(ref_bmaj_val),abs(band_beam_val),1.0d-12))then
+            write(*,'(A,I0,A,F0.6,A,F0.6)')&
+            &' WARNING: band ',iband_chk,' BMAJ=',band_beam_val,&
+            &' differs from reference band BMAJ=',ref_bmaj_val
+            band_beam_mismatch = .true.
+         endif
+      else if(band_beam_status.eq.0 .neqv. ref_bmaj_present)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' BMAJ presence differs from reference band (one has it, the other does not)'
+         band_beam_mismatch = .true.
+      endif
+
+      band_beam_status = 0
+      call ftgkyd(band_unit_Q(iband_chk),'bmin',band_beam_val,comment,&
+      &band_beam_status)
+      if(band_beam_status.eq.0 .and. ref_bmin_present)then
+         if(abs(band_beam_val-ref_bmin_val).gt.&
+         &1.0d-9*max(abs(ref_bmin_val),abs(band_beam_val),1.0d-12))then
+            write(*,'(A,I0,A,F0.6,A,F0.6)')&
+            &' WARNING: band ',iband_chk,' BMIN=',band_beam_val,&
+            &' differs from reference band BMIN=',ref_bmin_val
+            band_beam_mismatch = .true.
+         endif
+      else if(band_beam_status.eq.0 .neqv. ref_bmin_present)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' BMIN presence differs from reference band (one has it, the other does not)'
+         band_beam_mismatch = .true.
+      endif
+
+      band_beam_status = 0
+      call ftgkyd(band_unit_Q(iband_chk),'bpa',band_beam_val,comment,&
+      &band_beam_status)
+      if(band_beam_status.eq.0 .and. ref_bpa_present)then
+         if(abs(band_beam_val-ref_bpa_val).gt.&
+         &1.0d-9*max(abs(ref_bpa_val),abs(band_beam_val),1.0d-12))then
+            write(*,'(A,I0,A,F0.6,A,F0.6)')&
+            &' WARNING: band ',iband_chk,' BPA=',band_beam_val,&
+            &' differs from reference band BPA=',ref_bpa_val
+            band_beam_mismatch = .true.
+         endif
+      else if(band_beam_status.eq.0 .neqv. ref_bpa_present)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' BPA presence differs from reference band (one has it, the other does not)'
+         band_beam_mismatch = .true.
+      endif
+
+      band_casambm_status = 0
+      call ftgkyl(band_unit_Q(iband_chk),'casambm',band_casambm_val,&
+      &comment,band_casambm_status)
+      if(band_casambm_status.eq.0 .and. band_casambm_val)then
+         write(*,'(A,I0,A)')' WARNING: band ',iband_chk,&
+         &' input Q cube also has CASAMBM=T (its own per-channel'
+         write(*,*)'  beam table, not reflected in the propagated',&
+         &' BMAJ/BMIN/BPA either)'
+         band_beam_mismatch = .true.
+      endif
+   enddo
+
+   if(band_beam_mismatch)then
+      write(*,*)'WARNING: multi-band beam metadata is not consistent'
+      write(*,*)'  across all bands (see above) -- BMAJ/BMIN/BPA written'
+      write(*,*)'  to the outputs reflects only the reference band'
+      write(*,*)'  (cfg%reference_band). Run convolve_cubes across ALL'
+      write(*,*)'  bands together first if a single well-defined beam'
+      write(*,*)'  is required.'
+      call ftphis(41,'Beam metadata differs across bands (see run',status)
+      call ftphis(41,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+      call ftphis(41,'reference band, not every band that went into',status)
+      call ftphis(41,'this multi-band run.',status)
+      call ftphis(42,'Beam metadata differs across bands (see run',status)
+      call ftphis(42,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+      call ftphis(42,'reference band, not every band that went into',status)
+      call ftphis(42,'this multi-band run.',status)
+      if(out_mask_open)then
+         call ftphis(43,'Beam metadata differs across bands (see run',status)
+         call ftphis(43,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(43,'reference band, not every band that went into',status)
+         call ftphis(43,'this multi-band run.',status)
+      endif
+      if(out_nvalid_open)then
+         call ftphis(44,'Beam metadata differs across bands (see run',status)
+         call ftphis(44,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(44,'reference band, not every band that went into',status)
+         call ftphis(44,'this multi-band run.',status)
+      endif
+      if(out_peak_open)then
+         call ftphis(46,'Beam metadata differs across bands (see run',status)
+         call ftphis(46,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(46,'reference band, not every band that went into',status)
+         call ftphis(46,'this multi-band run.',status)
+      endif
+      if(out_rmpeak_open)then
+         call ftphis(47,'Beam metadata differs across bands (see run',status)
+         call ftphis(47,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(47,'reference band, not every band that went into',status)
+         call ftphis(47,'this multi-band run.',status)
+      endif
+      if(out_angpeak_open)then
+         call ftphis(48,'Beam metadata differs across bands (see run',status)
+         call ftphis(48,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(48,'reference band, not every band that went into',status)
+         call ftphis(48,'this multi-band run.',status)
+      endif
+      if(out_snr_open)then
+         call ftphis(49,'Beam metadata differs across bands (see run',status)
+         call ftphis(49,'log) -- BMAJ/BMIN/BPA above reflects only the',status)
+         call ftphis(49,'reference band, not every band that went into',status)
+         call ftphis(49,'this multi-band run.',status)
+      endif
+   endif
+endif
+status = 0
+
  ! --- Metadata: OBJECT, OBSERVER, TELESCOP ---
 status = 0
 call ftgkys(21,'object',ctype,comment,status)
@@ -2436,16 +3380,16 @@ if(out_nvalid_open)then
    &1:nchar(masksrc_key)),&
    &'Mask source: generated/input/combined',status)
 endif
-call ftpkyj(41,'NBADGLOB',nbad_chan,&
+call ftpkyj(41,'NBADGLOB',nbad_chan_total_t7,&
 &'No. of globally bad channels',status)
-call ftpkyj(42,'NBADGLOB',nbad_chan,&
+call ftpkyj(42,'NBADGLOB',nbad_chan_total_t7,&
 &'No. of globally bad channels',status)
 if(out_mask_open)then
-   call ftpkyj(43,'NBADGLOB',nbad_chan,&
+   call ftpkyj(43,'NBADGLOB',nbad_chan_total_t7,&
    &'No. of globally bad channels',status)
 endif
 if(out_nvalid_open)then
-   call ftpkyj(44,'NBADGLOB',nbad_chan,&
+   call ftpkyj(44,'NBADGLOB',nbad_chan_total_t7,&
    &'No. of globally bad channels',status)
 endif
 call ftpkys(41,'NANCHK',nanchk_key(1:nchar(nanchk_key)),&
@@ -2905,6 +3849,51 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       if(.not.io_par_read_ok)then
          write(*,*)' ERROR: one or more parallel FITS reads failed'
          status = 1
+      endif
+
+      ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): read every other
+      ! configured band's channels into its own offset slice of the
+      ! (now multi-band-sized) specQ/specU tile buffers -- one plain
+      ! FTGSVE call per band (io_read_threads is forced to 1 for
+      ! nbands>1 above, so there is no per-band parallel-channel
+      ! splitting to replicate here). RA/Dec fpixels/lpixels for this
+      ! tile are shared with the reference band's read above (identical
+      ! sky footprint, validated geometry); only the freq-axis
+      ! range/naxes differ per band. A no-op for nbands=1.
+      ! T6: freq-axis fpixels/lpixels/incs now come from this band's own
+      ! resolved chan sub-range (band_chan_blc/band_chan_inc, 1/1 defaults
+      ! meaning "full band from pixel 1") instead of always "1..band_nz".
+      if (n_bands_t2.gt.1) then
+         do iband = 1,n_bands_t2
+            if (iband.eq.cfg%reference_band) cycle
+            io_par_buf_off = int(band_offset(iband),kind=int64) *&
+            &io_par_per_plane + 1_int64
+            io_par_fpixels = fpixels
+            io_par_lpixels = lpixels
+            io_par_incs_band = incs
+            io_par_fpixels(freq_axis) = band_chan_blc(iband)
+            io_par_lpixels(freq_axis) = band_chan_blc(iband) +&
+            &(band_nz(iband)-1)*band_chan_inc(iband)
+            io_par_incs_band(freq_axis) = band_chan_inc(iband)
+            io_par_status_priv = 0
+            call FTGSVE(band_unit_Q(iband),group,naxis,&
+            &band_naxes(iband,:),&
+            &io_par_fpixels,io_par_lpixels,io_par_incs_band,&
+            &nullval,specQ(io_par_buf_off),io_par_anyflg_priv,&
+            &io_par_status_priv)
+            if (io_par_status_priv.ne.0) io_par_read_ok = .false.
+            io_par_status_priv = 0
+            call FTGSVE(band_unit_U(iband),group,naxis,&
+            &band_naxes(iband,:),&
+            &io_par_fpixels,io_par_lpixels,io_par_incs_band,&
+            &nullval,specU(io_par_buf_off),io_par_anyflg_priv,&
+            &io_par_status_priv)
+            if (io_par_status_priv.ne.0) io_par_read_ok = .false.
+         enddo
+         if (.not.io_par_read_ok) then
+            write(*,*)' ERROR: one or more multi-band FITS reads failed'
+            status = 1
+         endif
       endif
 
       call log_tile_bounds('tile_read','done',&
@@ -3780,6 +4769,16 @@ if (status .gt. 0)then
    call printerror(status)
 else
    write(*,*)"Successfully read and closed FITS Ucube..."
+endif
+ ! T2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): close every other
+ ! configured band's Q/U handles (units 21/22 above are the reference
+ ! band's, already closed). A no-op for nbands=1.
+if (n_bands_t2.gt.1) then
+   do iband = 1,n_bands_t2
+      if (iband.eq.cfg%reference_band) cycle
+      call FTCLOS(band_unit_Q(iband),status)
+      call FTCLOS(band_unit_U(iband),status)
+   enddo
 endif
 if(need_icube)then
    call FTCLOS(40,status)

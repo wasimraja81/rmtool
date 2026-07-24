@@ -26,12 +26,30 @@ High-level flow:
 - `src/rm_synthesis_mod.f90`: shared module utilities, timers/logging,
   configuration parsing, and helper routines.
 
+### Cross-Band Preprocessing Toolchain
+Standalone tools, own binaries, independent of the Core Runtime build graph
+above -- prepare mismatched-geometry/mismatched-resolution bands for a
+multi-band `rm_synthesis` run. See "Cross-Band Preprocessing Toolchain"
+below for the architecture, and
+[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](../planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+(tickets T10-T12) for full design/verification detail.
+- `src/reproject_cubes.f90`: reprojects cubes onto a common sky grid
+  (Starlink AST + `astResampleR`).
+- `src/gaussft.f90` (`gaussft_mod`): pure computation, elliptical-Gaussian
+  FFT-domain beam-matching convolution, no I/O.
+- `src/commonbeam.f90` (`commonbeam_mod`): smallest common beam across N
+  per-channel PSFs.
+- `src/convolve_cubes.f90`: convolves cubes to a common angular resolution,
+  drives `gaussft_mod` + `commonbeam_mod`.
+
 ### Build and Delivery
-- `Makefile`: primary development build matrix (OMP/GPU variants).
+- `Makefile`: primary development build matrix (OMP/GPU variants), plus
+  independent `reproject_cubes`/`convolve_cubes` targets.
 - `docker/`: container build and release helpers.
 
 ### Configuration and Operations
-- `cfg/`: runtime configuration files and schema guidance.
+- `cfg/`: runtime configuration files and schema guidance;
+  `example_beamLog.txt`/`.csv` for `convolve_cubes`' ASCII beam format.
 - `scratch/slurm/`: HPC job script examples and operational wrappers.
 
 ### Validation and Diagnostics
@@ -863,4 +881,124 @@ same at-a-glance baseline record the 2.0 entry provides:
   checks (no-overlapping-writes for `io_overlap`, bit-identical
   `io_write_threads=1` vs `=4`) alongside the existing output-correctness
   checks.
+
+---
+
+## Cross-Band Preprocessing Toolchain
+
+Two standalone tools -- own binaries, own build targets (`make
+reproject_cubes`, `make convolve_cubes`), independent of the Core Runtime
+build graph above -- prepare real multi-band data for `rm_synthesis`: real
+bands rarely share one sky grid or one angular resolution, and merging
+mismatched channels without addressing that first is exactly the kind of
+silent correctness gap this project's design philosophy exists to close
+(loudly refuse or visibly warn, never silently produce a misleading
+answer). Full design rationale, decisions, and verification evidence are
+recorded in
+[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](../planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+(tickets T10-T12); this section is the architecture summary, not a
+duplicate of that record.
+
+### `reproject_cubes` — sky-grid alignment
+
+Reprojects two or more FITS cubes onto one common sky grid via Starlink
+AST (WCS handling, `SkyFrame`-to-`SkyFrame` conversion) and `astResampleR`
+(resampling). Three footprint modes (`intersection`/`union`/`reference`).
+Output axis layout always puts the 2 sky axes first (RA-fastest-on-disk),
+matching the Core Runtime's own tile-read assumption above. Reads/
+resamples/writes in `mem_frac_ram`-budgeted blocks of planes (same
+tile-planning concept as the Core Runtime's own, see "Host RAM tiling"
+above), OpenMP-parallelised across planes within a block. Each thread
+builds its own private AST pixel-to-pixel Mapping from scratch, rather
+than sharing one Mapping across threads: this Fortran AST binding exports
+no `astLock_`/`astUnlock_` (checked against the linked `.so`'s actual
+symbol table) for handing an AST Object between threads, so per-thread
+construction is the only option this binding supports -- not a
+performance choice, a correctness requirement.
+
+### `gaussft_mod` — beam-matching convolution (pure computation)
+
+Given one image plane, its own source elliptical-Gaussian PSF, and a
+target PSF (same pixel grid), returns the plane convolved from one to the
+other via FFT-domain deconvolve-then-reconvolve: multiply `FT(image)` by
+`FT(target beam)/FT(source beam)`, inverse-transform. No FITS I/O, no
+per-channel bookkeeping -- that is `convolve_cubes`' job, mirroring the
+Core Runtime's own split between orchestration (`rm_synthesis.f90`) and
+shared computation (`rm_synthesis_mod.f90`).
+
+Split into `plan_convolution`/`convolve_to_beam`/`destroy_convolution_plan`
+specifically for OpenMP parallelism across planes: FFTW's planner is not
+thread-safe and must run once, serially, but a single plan's
+`fftw_execute_dft` ("new-array execute" form) is documented safe for
+concurrent use by multiple threads supplying their own arrays -- verified
+directly (16 threads sharing one plan across 64 planes with distinct
+per-plane beams reproduces a serial run bit-for-bit), not just trusted
+from the FFTW documentation alone.
+
+Corrected a real amplitude bug versus the original prototype (and its
+direct Python port, and upstream `racs_tools`, which all carry the same
+bug): the closed-form 2D-Gaussian FT amplitude is `2*pi*sigma_x*sigma_y`,
+not `sqrt(2*pi*sigma_x*sigma_y)` -- confirmed via closed-form derivation,
+direct numerical integration to 15 significant figures, and
+cross-checking against MIRIAD's own independent `gaufac` formula.
+
+### `commonbeam_mod` — smallest common beam across N PSFs
+
+Given N per-channel beams, finds the smallest beam every one of them can
+be deconvolved from. Real ASKAP per-channel BPA varies by more than 90
+degrees across a band (confirmed on a real cube's own `BEAMS` table), so
+a simpler "take the largest beam" shortcut is not generally correct.
+Follows the standard approach (CASA `ia.commonbeam()`, the `radio_beam`
+Python package): sample each beam's boundary, reduce to the 2D convex
+hull, fit the minimum-volume enclosing ellipse (Khachiyan's algorithm),
+validate against every real input beam via the Sault/MIRIAD "gaupar"
+deconvolution formula, retry with a larger safety margin if needed.
+
+One deliberate departure from `radio_beam`'s own algorithm: since a beam
+here is pure shape with no position, the ellipse fit uses the simpler
+origin-centred variant of Khachiyan's algorithm rather than `radio_beam`'s
+general free-centre one -- a better match for the actual problem (there is
+no centre to fit), not merely a simplification. Verified against
+`radio_beam` 0.3.9 itself on a real 286-channel ASKAP `BEAMS` table
+(within 0.003 arcsec on BMAJ/BMIN, PA matching mod 180 degrees, and
+independently confirmed deconvolvable from all 286 real beams via
+`radio_beam`'s own `deconvolve_optimized`).
+
+### `convolve_cubes` — main program
+
+Drives both modules above, mirroring `reproject_cubes`' own I/O-vs-
+computation split. Reads per-channel PSFs via a CASA-style `BEAMS` binary
+table extension (auto-detected) or a portable ASCII/CSV fallback (`cfg/
+example_beamLog.txt`/`.csv`). A channel is bad -- written as an all-NaN
+plane, not convolved -- if it's missing from the beam source entirely, or
+present with BMAJ or BMIN equal to 0 (either alone is enough). Pools every
+good channel across ALL input files before calling `commonbeam_mod` once,
+so multi-band support needs no extra machinery: every band gets convolved
+to the exact same shared target. `max_common_bmaj` lets a user cap the
+auto-derived target and refuse to proceed if it comes out coarser than
+expected. `mem_frac_ram`-budgeted block I/O + OpenMP, same concept as
+`reproject_cubes`.
+
+One correctness-critical piece specific to this tool: FITS
+`BMAJ`/`BMIN`/`BPA` is a SKY-frame convention (position angle from North
+through East), while `gaussft_mod`'s own convention is PIXEL-frame --
+converted via
+`bpa_pixel = atan2(sign(CDELT2)*cos(theta), sign(CDELT1)*sin(theta))`,
+derived from local tangent-plane geometry, verified empirically via a
+bit-exact identity round-trip (target beam set equal to one channel's own
+native beam reproduces that channel's input data to the last bit).
+
+### Feeding results back into `rm_synthesis`
+
+`rm_synthesis` propagates `BMAJ`/`BMIN`/`BPA` from its input Q cube's
+primary header to every one of its 8 output products. If the input still
+has `CASAMBM=T` (not yet run through `convolve_cubes`), the output also
+gets `CASAMBM=T` plus the input's own real per-channel `BEAMS` table
+attached as an extension, plus a `HISTORY` note -- applied to AMP/PHA and
+the PEAK/RMPEAK/ANGPEAK/SNR maps (flux-derived), deliberately not to
+MASK/NVALID (validity bookkeeping, not flux data). In multi-band mode,
+every non-reference band's own beam metadata is cross-checked against the
+reference band's, with a runtime warning (not a hard error) on mismatch.
+See ticket T12 in the multi-band plan for the full decision record and
+verification evidence.
 

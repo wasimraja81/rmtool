@@ -177,6 +177,83 @@ clean-all:
 	@rm -f $(BINDIR)/rm_synthesis $(BINDIR)/rm_synthesis_*
 	@echo "✓ Cleaned all build artifacts for every mode"
 
+# reproject_cubes: standalone pre-rm-synthesis geometry-matching tool
+# (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md). Reprojects two or more FITS
+# cubes onto a common grid -- not tied to the multi-band-tomography "band"
+# concept specifically, minimum input is just two cubes. Independent of
+# the main rm_synthesis build graph -- own binary, own AST/OpenMP
+# dependency, not linked into rm_synthesis itself. Proof-of-concept stage:
+# single source file, always built with OpenMP (the tool's per-channel
+# resampling is the intended parallelism target).
+# No -I/-L needed: apt installed headers/libs into standard system paths
+# (/usr/include, /usr/lib/x86_64-linux-gnu) that gfortran/ld already search
+# by default. AST_PAR itself (the vendor Fortran constants file) is never
+# `include`d -- it's fixed-form F77 and can't be pulled into a free-form
+# .f90 file, so the handful of symbols needed are declared directly in
+# reproject_cubes.f90 instead.
+# libstarlink_ast_grf3d: dummy stub satisfying AST's plotting-subsystem
+# symbol references (astGLine/astGMark/etc) that this tool never calls --
+# required to link even though nothing here does any graphics.
+AST_LIBS := -lstarlink_ast -lstarlink_ast_err -lstarlink_ast_grf3d
+REPROJECT_BINDIR ?= bin
+REPROJECT_BUILDDIR := build/reproject_cubes
+REPROJECT_EXECUTABLE := $(REPROJECT_BINDIR)/reproject_cubes
+
+reproject_cubes: $(REPROJECT_EXECUTABLE)
+
+$(REPROJECT_BUILDDIR):
+	@mkdir -p $(REPROJECT_BUILDDIR)
+
+$(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+# ast_grf_stub.c: no-op AST GRF (graphics-primitive) callbacks -- the AST
+# shared library references these (its Plot class) but does not define
+# them; reproject_cubes never uses Plot, but the symbols must still exist
+# to link.
+$(REPROJECT_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(REPROJECT_BUILDDIR)
+	$(CC) -O2 -c $< -o $@
+
+$(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
+	@echo "✓ Executable created: $@"
+
+# convolve_cubes: standalone common-resolution convolution tool (the
+# "main program" for gaussft_mod/commonbeam_mod -- see those modules' own
+# header comments). Independent of the main rm_synthesis build graph and
+# of reproject_cubes' own AST dependency -- own binary, own FFTW3
+# dependency, always built with OpenMP (its per-plane convolution is the
+# intended parallelism target, mirroring reproject_cubes' own per-plane
+# resampling). No -I/-L needed for FFTW3, same reasoning as AST_LIBS
+# above: apt installs fftw3.f/libfftw3.so into standard system paths
+# gfortran/ld already search by default.
+FFTW_LIBS := -lfftw3
+CONVOLVE_BINDIR ?= bin
+CONVOLVE_BUILDDIR := build/convolve_cubes
+CONVOLVE_EXECUTABLE := $(CONVOLVE_BINDIR)/convolve_cubes
+
+convolve_cubes: $(CONVOLVE_EXECUTABLE)
+
+$(CONVOLVE_BUILDDIR):
+	@mkdir -p $(CONVOLVE_BUILDDIR)
+
+# gaussft_mod and commonbeam_mod must compile before convolve_cubes.o
+# (which `use`s both) -- order-only prerequisites below via explicit .o
+# dependencies, not just directory creation, so `make -j` never races
+# convolve_cubes.o ahead of the .mod files it needs.
+$(CONVOLVE_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/convolve_cubes.o: $(SRCDIR)/convolve_cubes.f90 $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(CONVOLVE_BUILDDIR) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
+	@echo "✓ Executable created: $@"
+
 install: $(EXECUTABLE)
 	@install -d /usr/local/bin
 	@install -m 755 $(EXECUTABLE) /usr/local/bin/

@@ -2,6 +2,14 @@
 
 This project now uses a single KEY=VALUE config format.
 
+**Scope:** this document covers `rm_synthesis`'s own config format only.
+`reproject_cubes` and `convolve_cubes` (see the README's "Multi-Band
+Preprocessing Toolchain" section) are separate standalone tools with their
+own similar-but-separate KEY=VALUE parsers (deliberately not sharing this
+one — see each source file's own top comment for why) — run either with
+`--help` for its own full option list, or use `cfg/example_beamLog.txt`/
+`.csv` for `convolve_cubes`' ASCII beam-log format specifically.
+
 ## Parser Source
 
 The config parser is implemented in src/rm_synthesis_mod.f90:

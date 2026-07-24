@@ -2,6 +2,157 @@
 
 All notable changes to this project are documented in this file.
 
+## [5.0] - in preparation on `multi-band-tomography`
+
+Multi-band Faraday tomography milestone — by far the largest single body
+of work this project has shipped at once. Three parts, each usable on
+its own but designed to work as a pipeline: `rm_synthesis` itself can now
+merge frequency channels from several input files into one RM synthesis
+run; two new standalone tools (`reproject_cubes`, `convolve_cubes`)
+prepare real, mismatched-geometry/mismatched-resolution bands to actually
+be combined that way; and `rm_synthesis`'s own output metadata was fixed
+to faithfully carry beam information through the whole chain rather than
+silently dropping it. Full design rationale, decisions recorded with the
+user, and ticket-by-ticket verification evidence for all of this lives in
+`planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T12) — this entry is
+a summary, not a replacement for that record.
+
+### Added — multi-band RM synthesis (`rm_synthesis`, tickets T1-T9)
+- Comma-separated-list config schema for every per-band key (`infileQ`,
+  `infileU`, `resiQ`/`slopeQ`/`resiU`/`slopeU`, `infileI`/`path_I`,
+  `badchan_file`, and — new this release — `chan_blc`/`chan_trc`/
+  `chan_inc`): band count is derived from list length, no separate
+  `nbands` key. A config with no commas anywhere behaves exactly as
+  before — this is additive, not a breaking change to any existing cfg.
+- Unified N-band geometry validation (RA/Dec WCS, NAXIS, frequency-axis
+  index) against a `reference_band`, loudly refusing before any compute
+  on mismatch — the same exact-equality philosophy the existing Q-vs-U
+  check already used, generalized rather than replaced.
+- Multi-band frequency/λ² merge: every band's channels concatenated into
+  one merged spectrum (no deduplication in overlaps, no sort required —
+  the DFT kernel is order-independent) and run through the existing
+  single-band RM-synthesis compute path unchanged.
+- `δRM`/`max RM scale`/per-band `ΔRM` diagnostic, logged (not
+  auto-applied) for multi-band runs, since `use_auto_rm_range=1`'s
+  existing heuristic is unsafe across bands — verified against a
+  thesis-published table (Table 6.1) to within ~1%.
+- Multi-tile multi-band runs (previously single-tile only) — verified
+  bit-identical to the single-tile result of the same data.
+- Per-band channel sub-range selection (`chan_blc`/`chan_trc`/
+  `chan_inc`), independent per band — e.g. reject bad edge channels or
+  hand-pick a good sub-range per band.
+- Per-band bad-channel files — each band flags its own bad channels via
+  its own required file (same required-key convention as `infileQ`).
+- GPU offload for multi-band (no compute-path changes needed — the same
+  kernel already used by CPU and GPU; verified on real GPU hardware,
+  including the two-level VRAM staging path).
+- `io_read_threads>1`/`io_overlap` enabled for multi-band (previously
+  blocked entirely — found by code inspection, on direct challenge, that
+  the restriction was unnecessarily conservative, the same pattern as
+  several tickets before it).
+- A real thesis-scenario regression (`tests/check_thesis_scenario.py`):
+  point-source recovery, Faraday-thick component reveal (P+L combined
+  ~9x the P-alone peak amplitude in its own RM window), and F2/F3
+  resolved-vs-blended behaviour, reproduced from published Table 6.1
+  bands (P: 300/30 MHz, L: 1200/120 MHz).
+
+### Added — cross-band preprocessing toolchain (tickets T10-T11)
+- `reproject_cubes`: new standalone tool (own binary, `make
+  reproject_cubes`) reprojecting two or more FITS cubes onto one common
+  sky grid via Starlink AST + `astResampleR`, with three footprint modes
+  (`intersection`/`union`/`reference`), full WCS/header propagation
+  (including `CROTA`/`PCi_j`/`CDi_j` sky rotation), `mem_frac_ram`-budgeted
+  block I/O, and OpenMP parallelism across planes.
+- `gaussft_mod` (`src/gaussft.f90`): new pure-computation module for
+  elliptical-Gaussian FFT-domain beam-matching convolution (deconvolve
+  from a source PSF, reconvolve to a target PSF), thread-safe for OpenMP
+  via a plan-once/execute-many split (FFTW's planner is not thread-safe;
+  a single plan's "new-array execute" form is, verified directly).
+- `commonbeam_mod` (`src/commonbeam.f90`): new module finding the
+  smallest common beam every one of N per-channel PSFs can be
+  deconvolved from (convex hull + minimum-volume-enclosing-ellipse via
+  Khachiyan's algorithm + Sault/MIRIAD deconvolvability validation),
+  verified against the `radio_beam` Python package on real ASKAP data.
+- `convolve_cubes`: new standalone tool (own binary, `make
+  convolve_cubes`) driving `gaussft_mod`/`commonbeam_mod` to convolve
+  cubes — across one or several input files together — to one common
+  angular resolution. Reads per-channel beams from a CASA-style `BEAMS`
+  binary table or a portable ASCII/CSV beam log (`cfg/
+  example_beamLog.txt`/`.csv`, ready-to-adapt examples included); a
+  channel is bad if missing from the beam source or listed with BMAJ or
+  BMIN equal to 0. `max_common_bmaj` guards against silently convolving
+  to an unexpectedly coarse auto-derived resolution.
+
+### Added — beam-metadata propagation (ticket T12)
+- `rm_synthesis` now propagates `BMAJ`/`BMIN`/`BPA` to all 8 output
+  products (previously propagated none at all). If the input has
+  `CASAMBM=T` (a genuinely per-channel-varying beam not yet run through
+  `convolve_cubes`), the flux-derived outputs (AMP/PHA, and the
+  PEAK/RMPEAK/ANGPEAK/SNR maps when `cubestat=y`) additionally get
+  `CASAMBM=T` plus the input's own real per-channel `BEAMS` table
+  attached as an extension, plus a `HISTORY` note — deliberately not
+  MASK/NVALID, which are validity bookkeeping, not flux data. In
+  multi-band mode, every band's own beam metadata is now cross-checked
+  against the reference band's, with a runtime warning on mismatch.
+
+### Fixed
+- `rm_synthesis` opened its own Q/U/I/mask input cubes `READWRITE`
+  despite never writing to any of them (confirmed by grep: no write-type
+  CFITSIO call anywhere in the file targets those units), an unnecessary
+  risk to irreplaceable input data. Now opened `READONLY`, matching how
+  this file's own parallel tile-reader threads for the same files
+  already worked.
+- `convolve_cubes`' bad-channel detection (both the CASA `BEAMS`-table
+  and ASCII/CSV readers) only checked BMAJ for a degenerate (zero) beam
+  entry; a channel with BMAJ present but BMIN equal to 0 was silently
+  treated as good. Now checks both.
+- A latent bug in the per-band channel-count bookkeeping, surfaced (not
+  triggered — `subim` was blocked outright for multi-band until the same
+  ticket that found it) while adding per-band channel sub-range
+  selection: the reference band's own selected-channel count was being
+  computed from its raw NAXIS3 rather than its actual selected range.
+
+### Validation
+- All 4 build flavours (`scratch/make_all.sh`) clean; full
+  `tests/run_tests.sh` 49/49 pass (up from 28 at the start of this
+  branch), re-run clean after every change in this release.
+- Multi-band `rm_synthesis`: `nbands=1` bit-identical sweep (140/140
+  FITS outputs) held after every single ticket in this release, with no
+  exceptions — the explicit bar this whole effort was held to throughout.
+  Multi-tile-vs-single-tile, per-band-channel-sub-range, and per-band-
+  bad-channel-file all verified bit-identical against known-good
+  references, not merely "doesn't crash".
+- `reproject_cubes`: byte-identical to independently-computed
+  (Python/astropy) ground truth at spot-checked pixels; a real
+  `FTGSVE` axis-order bug caught by a non-adjacent-sky-axis fixture and
+  fixed; 25 repeated stress runs, no failures.
+- `gaussft_mod`: identity round-trip and asymmetric-beam cross-check
+  against an independent Python implementation; 16-OpenMP-thread
+  shared-plan concurrency test bit-identical to serial.
+- `commonbeam_mod`: matches `radio_beam` 0.3.9 on a real 286-channel
+  ASKAP `BEAMS` table to within 0.003 arcsec (BMAJ/BMIN) and mod-180
+  degrees (PA); independently confirmed deconvolvable from all 286 real
+  beams.
+- `convolve_cubes`: bit-exact identity check (target beam == a
+  channel's own native beam reproduces that channel's input exactly,
+  validating the SKY-to-PIXEL BPA convention conversion end-to-end);
+  smoke-tested against a real cutout of ASKAP data with no NaN/Inf.
+- `rm_synthesis` beam propagation: injected real BMAJ/BMIN/BPA and
+  `CASAMBM=T`/`BEAMS` cases and confirmed exact propagation to the
+  correct output subset only; injected mismatched per-band beams in a
+  multi-band run and confirmed the cross-band warning fires correctly
+  (and stays silent when bands genuinely match); fed a real
+  `convolve_cubes`-produced NaN bad-channel plane into `rm_synthesis`
+  with no `badchan_file` and confirmed automatic exclusion via existing
+  NaN detection.
+
+### Not yet done
+- A full run of the preprocessing toolchain against the complete 23GB
+  real ASKAP cube this work targets (only cutouts and synthetic data
+  verified so far).
+- This branch has not yet merged to `develop`/`main`; `5.0` is not yet
+  an actual git tag.
+
 ## [4.1] - 2026-07-20
 
 Diagnostics milestone: closes a real gap in the run-timing picture found

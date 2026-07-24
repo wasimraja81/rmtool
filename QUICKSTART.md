@@ -8,6 +8,7 @@
 5. [Requirements](#5-requirements)
 6. [Swim-lane plots](#6-swim-lane-plots)
 7. [Architecture notes](#7-architecture-notes)
+8. [Multi-band preprocessing: reproject_cubes, convolve_cubes](#8-multi-band-preprocessing-reproject_cubes-convolve_cubes)
 
 ---
 
@@ -269,6 +270,7 @@ cat scratch/runtime_estimate.txt       # wall-time estimate
 | CFITSIO | `libcfitsio-dev` | `brew install cfitsio` |
 | Python 3 + astropy + numpy | `pip install astropy numpy` | `pip install astropy numpy` |
 | GPU compiler (optional) | `nvfortran` (NVIDIA HPC SDK) or `gfortran ≥ 14` with libgomp offload | same |
+| Starlink AST + FFTW3 (only for `reproject_cubes`/`convolve_cubes`) | `libstarlink-ast-dev libstarlink-ast-err9 libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev` | see BUILD.md |
 
 ```bash
 # Minimal Ubuntu install
@@ -300,6 +302,34 @@ CPU/GPU timeline diagnostics are documented in:
 
 Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
 and GPU lanes from the run log.
+
+---
+
+## 8. Multi-band preprocessing: reproject_cubes, convolve_cubes
+
+Real multi-band data rarely arrives on the same sky grid or at the same
+angular resolution. Two standalone tools (own binaries, independent of
+the main `rm_synthesis` build) close that gap before a multi-band run:
+
+```bash
+# 1. Align sky grids
+make reproject_cubes
+bin/reproject_cubes mode=intersection reffile=ref.fits infiles=a.fits,b.fits
+
+# 2. Match angular resolution (across ALL bands together, one call)
+make convolve_cubes
+bin/convolve_cubes infiles=a_REPROJ.fits,b_REPROJ.fits mem_frac_ram=0.25
+
+# 3. Run multi-band RM synthesis on the now-matched inputs
+bin/rm_synthesis your_multiband.cfg
+```
+
+`--help` on either tool gives its full option list. `convolve_cubes`'
+per-channel beam input (a CASA-style `BEAMS` table, or a portable
+ASCII/CSV beam log — see `cfg/example_beamLog.txt`/`.csv`) and target-beam
+derivation are covered in the README's "Multi-Band Preprocessing
+Toolchain" section and, in full design/verification detail, in
+`planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T10-T12).
 
 ```bash
 python scripts/plot_tile_async_swimlane.py \

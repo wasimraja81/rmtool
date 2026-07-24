@@ -25,6 +25,42 @@
 #      7-tile run (T6 raw-write path bypasses CFITSIO for AMP/PHA pixel
 #      writes; guards against the CFITSIO handle-aliasing bug and the
 #      stale-buffer-at-close bug that raw-write mode replaced it with)
+#  15. Multi-band tomography (T1) – comma-separated-list infileQ/infileU
+#      config schema: matched-geometry two-band config validates and runs
+#      to completion (T2 replaced the earlier "not yet implemented" stop);
+#      mismatched-geometry config is loudly refused; inconsistent per-band
+#      list lengths are rejected at config-parse time
+#      (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+#  16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
+#      (Raja 2014 Table 6.1/6.2): P-band alone, L-band alone, and P+L
+#      combined, for a point source + Faraday-thick top-hat + F2/F3 pair.
+#      Also T4: multi-tile multi-band produces bit-identical output to
+#      the single-tile P+L run above (tiling must not change the answer)
+#  17. Split-band identity test (T5) – a contiguous 2-band split of the
+#      primary test cube (no gap) must reproduce the undivided cube's own
+#      output bit-for-bit; the most direct mechanical regression check
+#      for the frequency-merge architecture itself
+#  18. Per-band channel sub-range selection (T6) – a 2-band run where band 2
+#      is the full undivided primary test cube restricted via per-band
+#      subim_chan_blc/trc down to exactly the T5 split's high-channel range
+#      must reproduce T5's own bit-identical result; exercises the T6
+#      per-band offset/count/z1-shift arithmetic specifically
+#  19. Per-band bad-channel files (T7) – flagging raw channel 150 via a
+#      single-band badchan_file on the undivided primary test cube must
+#      reproduce, bit-identically, a 2-band split run that flags the same
+#      raw channel via band 2's own badchan_file (channel 50 in band 2's
+#      own numbering, since band 2 starts at original channel 101)
+#  20. GPU offload for multi-band (T8) – the T5 split-band config run
+#      through the GPU binary: non-staged within rtol=2e-3 of the CPU
+#      reference (matching every existing GPU test's own tolerance) plus
+#      RM-peak validation; staged (VRAM sub-block path, gpu_vram_mib=1)
+#      bit-identical to the non-staged GPU run
+#  21. io_overlap for multi-band (T9) – the T5 split-band config forced
+#      into 7 tiles with io_overlap=y, bit-identical to the existing
+#      single-tile split-band reference; confirms no overlapping tile
+#      writes
+#  22. io_read_threads>1 for multi-band (T9) – same config, 7 tiles,
+#      io_read_threads=4, bit-identical to the same single-tile reference
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -171,6 +207,7 @@ mkdir -p "$OUT_DIR"
 
 # Clean previous test outputs (binary refuses to overwrite)
 rm -f "$OUT_DIR"/serial.*.FITS "$OUT_DIR"/omp.*.FITS "$OUT_DIR"/gpu.*.FITS
+rm -f "$OUT_DIR"/mb_match.*.FITS "$OUT_DIR"/mb_mismatch.*.FITS "$OUT_DIR"/mb_lenmismatch.*.FITS
 rm -f "$OUT_DIR"/*.timing.csv
 rm -f "$OUT_DIR"/*.cfg "$OUT_DIR"/*.log
 
@@ -787,6 +824,709 @@ io_write_threads=4")
     fi
 else
     skip "OMP binary not available; skipping io_write_threads test"
+fi
+
+# ---------------------------------------------------------------------------
+# 15. Multi-band tomography (T1) – comma-list config schema + geometry
+#     validation (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md). Fortran's bare
+#     `stop` always exits 0 in this codebase (every existing error path
+#     uses it, matching the pattern already relied on elsewhere in this
+#     script), so these checks are log-content based, not exit-code based.
+# ---------------------------------------------------------------------------
+section "15. Multi-band config schema – geometry validation + frequency merge (T1/T2)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    mb_match_cfg="$OUT_DIR/mb_match.cfg"
+    mb_match_log="$OUT_DIR/mb_match.log"
+    cat > "$mb_match_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
+outfile             = ${OUT_DIR}/mb_match
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    "$BIN_SERIAL" "$mb_match_cfg" > "$mb_match_log" 2>&1
+    if grep -q "Multi-band geometry validated successfully across" "$mb_match_log" && \
+       grep -q "rm_synthesis run completed" "$mb_match_log"; then
+        pass "Multi-band matched-geometry config: validated 2 bands, ran to completion (T2)"
+    else
+        fail "Multi-band matched-geometry config: expected validation/completion messages not found (see $mb_match_log)"
+    fi
+
+    mb_match_amp="$OUT_DIR/mb_match.AMP.RMCUBE.FITS"
+    if [[ -f "$mb_match_amp" ]]; then
+        if python3 "$TESTS_DIR/check_rm_peak.py" "$mb_match_amp" "$TRUTH" > /dev/null 2>&1; then
+            pass "Multi-band matched-geometry config (T2): src_A/src_B recovered at correct RM from merged P+L-analogue bands"
+        else
+            fail "Multi-band matched-geometry config (T2): RM peak(s) not recovered correctly (see $mb_match_amp)"
+        fi
+    else
+        fail "Multi-band matched-geometry config (T2): expected output $mb_match_amp not found"
+    fi
+
+    mb_mismatch_cfg="$OUT_DIR/mb_mismatch.cfg"
+    mb_mismatch_log="$OUT_DIR/mb_mismatch.log"
+    sed -e "s|TEST_BAND2\.Q\.FITSCUBE|TEST_BAND2_MISMATCH.Q.FITSCUBE|" \
+        -e "s|${OUT_DIR}/mb_match|${OUT_DIR}/mb_mismatch|" \
+        "$mb_match_cfg" > "$mb_mismatch_cfg"
+    "$BIN_SERIAL" "$mb_mismatch_cfg" > "$mb_mismatch_log" 2>&1
+    if grep -q "ERROR: RA WCS mismatch for band" "$mb_mismatch_log" && \
+       ! grep -q "Multi-band geometry validated successfully" "$mb_mismatch_log"; then
+        pass "Multi-band mismatched-geometry config: loudly refused before compute"
+    else
+        fail "Multi-band mismatched-geometry config: expected loud-refuse message not found (see $mb_mismatch_log)"
+    fi
+
+    mb_lenmismatch_cfg="$OUT_DIR/mb_lenmismatch.cfg"
+    mb_lenmismatch_log="$OUT_DIR/mb_lenmismatch.log"
+    sed -e "s|infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE|infileU             = TEST.U.FITSCUBE|" \
+        -e "s|${OUT_DIR}/mb_match|${OUT_DIR}/mb_lenmismatch|" \
+        "$mb_match_cfg" > "$mb_lenmismatch_cfg"
+    "$BIN_SERIAL" "$mb_lenmismatch_cfg" > "$mb_lenmismatch_log" 2>&1
+    if grep -q "infileQ/infileU band-count mismatch" "$mb_lenmismatch_log"; then
+        pass "Multi-band inconsistent list-length config: rejected at parse time"
+    else
+        fail "Multi-band inconsistent list-length config: expected band-count-mismatch message not found (see $mb_lenmismatch_log)"
+    fi
+else
+    skip "Serial binary not available; skipping multi-band config tests"
+fi
+
+# ---------------------------------------------------------------------------
+# 16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
+#     (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md; Raja 2014 Table 6.1/6.2):
+#     P-band (300/30 MHz) alone, L-band (1200/120 MHz) alone, and the P+L
+#     combined synthesis, for a point source + Faraday-thick top-hat +
+#     the F2/F3 close-pair addition.
+# ---------------------------------------------------------------------------
+section "16. Multi-band frequency merge – Sec 10 thesis scenario (T2)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    if python3 "$TESTS_DIR/make_thesis_scenario_cubes.py"; then
+        pass "Sec 10 thesis-scenario cubes generated (P-band, L-band)"
+    else
+        fail "make_thesis_scenario_cubes.py failed"
+    fi
+
+    thesis_truth="$DATA_DIR/thesis_scenario_truth.json"
+    rm -f "$OUT_DIR"/thesis_p.*.FITS "$OUT_DIR"/thesis_l.*.FITS "$OUT_DIR"/thesis_pl.*.FITS
+
+    make_thesis_cfg() {
+        local tag="$1" infileQ="$2" infileU="$3" resi_list="$4"
+        local cfg="$OUT_DIR/${tag}.cfg"
+        # T7: badchan_file is a required per-band list, same cardinality as
+        # resi_list -- reuse its comma count rather than hard-coding it.
+        local badchan_list
+        badchan_list=$(echo "$resi_list" | sed 's/[^,]*/\/dev\/null/g')
+        cat > "$cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = ${infileQ}
+infileU             = ${infileU}
+outfile             = ${OUT_DIR}/${tag}
+remove_badchan      = n
+global_badchan_file = ${badchan_list}
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = ${resi_list}
+slopeQ              = ${resi_list}
+resiU               = ${resi_list}
+slopeU              = ${resi_list}
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -500.0
+end_rm              = 500.0
+nrm                 = 501
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        echo "$cfg"
+    }
+
+    thesis_p_cfg=$(make_thesis_cfg thesis_p THESIS_P.Q.FITSCUBE THESIS_P.U.FITSCUBE "0.0")
+    thesis_l_cfg=$(make_thesis_cfg thesis_l THESIS_L.Q.FITSCUBE THESIS_L.U.FITSCUBE "0.0")
+    thesis_pl_cfg=$(make_thesis_cfg thesis_pl "THESIS_P.Q.FITSCUBE,THESIS_L.Q.FITSCUBE" \
+        "THESIS_P.U.FITSCUBE,THESIS_L.U.FITSCUBE" "0.0,0.0")
+
+    thesis_p_log="$OUT_DIR/thesis_p.log"
+    thesis_l_log="$OUT_DIR/thesis_l.log"
+    thesis_pl_log="$OUT_DIR/thesis_pl.log"
+
+    if run_binary "$BIN_SERIAL" "$thesis_p_cfg" "$thesis_p_log" && \
+       run_binary "$BIN_SERIAL" "$thesis_l_cfg" "$thesis_l_log" && \
+       run_binary "$BIN_SERIAL" "$thesis_pl_cfg" "$thesis_pl_log"; then
+        pass "Sec 10 scenario: P-alone/L-alone/P+L runs all completed"
+
+        thesis_p_amp="$OUT_DIR/thesis_p.AMP.RMCUBE.FITS"
+        thesis_l_amp="$OUT_DIR/thesis_l.AMP.RMCUBE.FITS"
+        thesis_pl_amp="$OUT_DIR/thesis_pl.AMP.RMCUBE.FITS"
+        if python3 "$TESTS_DIR/check_thesis_scenario.py" \
+                "$thesis_p_amp" "$thesis_l_amp" "$thesis_pl_amp" "$thesis_truth"; then
+            pass "Sec 10 scenario: point source, thick-component washout/reveal, and F2/F3 P-alone/L-alone behaviour all match thesis-grounded expectations"
+        else
+            fail "Sec 10 scenario: one or more expected behaviours not observed (see check_thesis_scenario.py output above)"
+        fi
+
+        # T4 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): multi-tile multi-band
+        # must produce bit-identical output to the single-tile run above --
+        # tiling must not change the scientific answer.
+        thesis_plmt_cfg="$OUT_DIR/thesis_pl_multitile.cfg"
+        thesis_plmt_log="$OUT_DIR/thesis_pl_multitile.log"
+        rm -f "$OUT_DIR"/thesis_pl_multitile.*.FITS
+        { sed -e "s|outfile             = ${OUT_DIR}/thesis_pl\$|outfile             = ${OUT_DIR}/thesis_pl_multitile|" \
+              "$thesis_pl_cfg" | grep -v '^tile_'; \
+          echo "tile_ra = 16"; echo "tile_dec = 16"; echo "tile_auto = n"; \
+        } > "$thesis_plmt_cfg"
+        if run_binary "$BIN_SERIAL" "$thesis_plmt_cfg" "$thesis_plmt_log"; then
+            if grep -q "Multi-band run spanning.*4  tile(s)" "$thesis_plmt_log"; then
+                pass "Multi-tile multi-band (T4): confirmed 4-tile run (tile_ra=tile_dec=16 on a 32x32 image)"
+            else
+                fail "Multi-tile multi-band (T4): expected 4-tile message not found (see $thesis_plmt_log)"
+            fi
+            all_match=1
+            for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+                f1="$thesis_pl_amp"
+                [[ "$suffix" != "AMP.RMCUBE" ]] && f1="${thesis_pl_amp/AMP.RMCUBE/$suffix}"
+                f2="$OUT_DIR/thesis_pl_multitile.${suffix}.FITS"
+                if [[ -f "$f1" && -f "$f2" ]]; then
+                    if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact > /dev/null 2>&1; then
+                        all_match=0
+                        fail "Multi-tile multi-band (T4): ${suffix} differs from single-tile output"
+                    fi
+                else
+                    all_match=0
+                    fail "Multi-tile multi-band (T4): ${suffix} output missing (expected $f1 and $f2)"
+                fi
+            done
+            if [[ "$all_match" -eq 1 ]]; then
+                pass "Multi-tile multi-band (T4): all 4 output products bit-identical to single-tile multi-band"
+            fi
+        else
+            fail "Multi-tile multi-band (T4): run failed (see $thesis_plmt_log)"
+        fi
+    else
+        fail "Sec 10 scenario: one or more runs failed (see $thesis_p_log / $thesis_l_log / $thesis_pl_log)"
+    fi
+else
+    skip "Serial binary not available; skipping Sec 10 thesis scenario"
+fi
+
+# ---------------------------------------------------------------------------
+# 17. Split-band identity test (T5, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     the single most direct, mechanical regression check for the
+#     frequency-merge architecture -- splitting TEST.Q/U.FITSCUBE into two
+#     CONTIGUOUS halves (no gap) and running them as a 2-band multi-band
+#     config must reproduce the undivided cube's own output (section 5's
+#     "serial" run) bit-for-bit, not just approximately. Unlike the Sec 10
+#     scientific scenario, this has no qualitative-interpretation caveat --
+#     a mismatch here always means a real regression, never expected
+#     physics.
+# ---------------------------------------------------------------------------
+section "17. Split-band identity test – contiguous split == undivided cube (T5)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    split_cfg="$OUT_DIR/split_identity.cfg"
+    split_log="$OUT_DIR/split_identity.log"
+    rm -f "$OUT_DIR"/split_identity.*.FITS
+    cat > "$split_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/split_identity
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    if run_binary "$BIN_SERIAL" "$split_cfg" "$split_log"; then
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/serial.${suffix}.FITS"
+            f2="$OUT_DIR/split_identity.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "Split-band identity (T5): ${suffix} differs from undivided-cube output"
+                fi
+            else
+                all_match=0
+                fail "Split-band identity (T5): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "Split-band identity (T5): contiguous 2-band split bit-identical to undivided single-band cube"
+        fi
+    else
+        fail "Split-band identity (T5): run failed (see $split_log)"
+    fi
+else
+    skip "Serial binary not available; skipping split-band identity test"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. Per-band channel sub-range selection (T6, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     band 1 = TEST_SPLIT_LO (unrestricted, its own full 100-channel range),
+#     band 2 = the FULL undivided TEST.Q/U.FITSCUBE (200 channels) with
+#     subim_chan_blc/trc restricting it, per-band, down to exactly channels
+#     101-200 -- the same channels T5's TEST_SPLIT_HI file contains. Output
+#     must be bit-identical to T5's own already-passing result (itself
+#     bit-identical to the undivided single-band run). Only passes if the
+#     per-band offset/count/z1-shift arithmetic T6 adds is exactly right.
+# ---------------------------------------------------------------------------
+section "18. Per-band channel sub-range selection – restricted full cube == T5 split (T6)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    chan_cfg="$OUT_DIR/split_identity_chan.cfg"
+    chan_log="$OUT_DIR/split_identity_chan.log"
+    rm -f "$OUT_DIR"/split_identity_chan.*.FITS
+    cat > "$chan_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST.U.FITSCUBE
+outfile             = ${OUT_DIR}/split_identity_chan
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = y
+subim_chan_blc      = 0,101
+subim_chan_trc      = 0,200
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    if run_binary "$BIN_SERIAL" "$chan_cfg" "$chan_log"; then
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/serial.${suffix}.FITS"
+            f2="$OUT_DIR/split_identity_chan.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "Per-band chan sub-range (T6): ${suffix} differs from undivided-cube output"
+                fi
+            else
+                all_match=0
+                fail "Per-band chan sub-range (T6): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "Per-band chan sub-range (T6): restricted full cube bit-identical to undivided single-band cube"
+        fi
+    else
+        fail "Per-band chan sub-range (T6): run failed (see $chan_log)"
+    fi
+else
+    skip "Serial binary not available; skipping per-band channel sub-range test"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. Per-band bad-channel files (T7, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     raw channel 150 (1-indexed, into the undivided 200-channel TEST cube)
+#     flagged via a plain single-band badchan_file must reproduce,
+#     bit-identically, a 2-band split run (TEST_SPLIT_LO + TEST_SPLIT_HI)
+#     that flags the *same* raw channel via band 2's own badchan_file --
+#     channel 50 in band 2's own numbering, since band 2 (TEST_SPLIT_HI)
+#     starts at original channel 101 (150 - 100 = 50). Exercises the T7
+#     per-band bad-channel read/apply code specifically, composed with the
+#     existing frequency-merge architecture.
+# ---------------------------------------------------------------------------
+section "19. Per-band bad-channel files – flagged split-band run == flagged undivided cube (T7)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    badchan7_ref_list="$OUT_DIR/badchan7_ref_list.txt"
+    badchan7_band2_list="$OUT_DIR/badchan7_band2_list.txt"
+    badchan7_none_list="$OUT_DIR/badchan7_none_list.txt"
+    printf '150\n' > "$badchan7_ref_list"
+    printf '50\n' > "$badchan7_band2_list"
+    : > "$badchan7_none_list"
+
+    badchan7_ref_cfg="$OUT_DIR/badchan7_ref.cfg"
+    badchan7_ref_log="$OUT_DIR/badchan7_ref.log"
+    rm -f "$OUT_DIR"/badchan7_ref.*.FITS
+    cat > "$badchan7_ref_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE
+outfile             = ${OUT_DIR}/badchan7_ref
+remove_badchan      = y
+global_badchan_file = ${badchan7_ref_list}
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0
+slopeQ              = 0.0
+resiU               = 0.0
+slopeU              = 0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+
+    badchan7_split_cfg="$OUT_DIR/badchan7_split.cfg"
+    badchan7_split_log="$OUT_DIR/badchan7_split.log"
+    rm -f "$OUT_DIR"/badchan7_split.*.FITS
+    cat > "$badchan7_split_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/badchan7_split
+remove_badchan      = y
+global_badchan_file = ${badchan7_none_list},${badchan7_band2_list}
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+
+    if run_binary "$BIN_SERIAL" "$badchan7_ref_cfg" "$badchan7_ref_log" && \
+       run_binary "$BIN_SERIAL" "$badchan7_split_cfg" "$badchan7_split_log"; then
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/badchan7_ref.${suffix}.FITS"
+            f2="$OUT_DIR/badchan7_split.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "Per-band bad-channel files (T7): ${suffix} differs between flagged-undivided and flagged-split runs"
+                fi
+            else
+                all_match=0
+                fail "Per-band bad-channel files (T7): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if grep -q "Number of Bad Channels (band" "$badchan7_split_log"; then
+            pass "Per-band bad-channel files (T7): per-band badchan_file read path confirmed taken"
+        else
+            all_match=0
+            fail "Per-band bad-channel files (T7): expected per-band bad-channel log line not found (see $badchan7_split_log)"
+        fi
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "Per-band bad-channel files (T7): flagged split-band run bit-identical to flagged undivided cube"
+        fi
+    else
+        fail "Per-band bad-channel files (T7): one or more runs failed (see $badchan7_ref_log / $badchan7_split_log)"
+    fi
+else
+    skip "Serial binary not available; skipping per-band bad-channel files test"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. GPU offload for multi-band (T8, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     the same split-band 2-band config as T5/section 17, run through the
+#     GPU binary instead of serial. Mirrors the existing single-band GPU
+#     tests exactly: non-staged run checked via rtol=2e-3 against the CPU
+#     reference (test 7's own "ffast-math vs IEEE" tolerance, not a
+#     multi-band-specific relaxation) plus RM-peak-position validation;
+#     staged run (gpu_vram_mib=1 forces VRAM sub-block staging, the one
+#     path never previously exercised with a multi-band tile) checked
+#     bit-identical against the non-staged GPU run (test 9's own pattern).
+#     PHA.RMCUBE is deliberately not rtol-checked here, matching every
+#     existing GPU test -- phase angle near low-amplitude bins is known to
+#     amplify small ffast-math differences well past 2e-3, in the
+#     single-band case too (confirmed by direct comparison during this
+#     ticket's investigation), so it was never part of the GPU tolerance
+#     gate to begin with.
+# ---------------------------------------------------------------------------
+section "20. GPU offload for multi-band – split-band run via GPU (T8)"
+
+if [[ "$BUILD_GPU" -eq 1 && -x "$BIN_GPU" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
+    mbgpu_cfg="$OUT_DIR/mb_gpu.cfg"
+    mbgpu_log="$OUT_DIR/mb_gpu.log"
+    rm -f "$OUT_DIR"/mb_gpu.*.FITS
+    cat > "$mbgpu_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/mb_gpu
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = y
+CFGEOF
+    if run_binary "$BIN_GPU" "$mbgpu_cfg" "$mbgpu_log"; then
+        mbgpu_amp="$OUT_DIR/mb_gpu.AMP.RMCUBE.FITS"
+        if [[ -f "$mbgpu_amp" ]]; then
+            if python3 "$TESTS_DIR/check_rm_peak.py" "$mbgpu_amp" "$TRUTH" > /dev/null 2>&1; then
+                pass "Multi-band GPU (T8): RM peaks at correct positions"
+            else
+                fail "Multi-band GPU (T8): RM peak check failed (see check_rm_peak.py output)"
+            fi
+            if python3 "$TESTS_DIR/compare_cubes.py" \
+                    "$OUT_DIR/split_identity.AMP.RMCUBE.FITS" "$mbgpu_amp" \
+                    --rtol 2e-3 > /dev/null 2>&1; then
+                pass "Multi-band GPU AMP (T8): matches CPU reference within rtol=2e-3 (ffast-math vs IEEE)"
+            else
+                fail "Multi-band GPU AMP (T8): differs from CPU reference beyond rtol=2e-3"
+            fi
+        else
+            fail "Multi-band GPU (T8): AMP output cube not found: $mbgpu_amp"
+        fi
+    else
+        fail "Multi-band GPU (T8): run failed (see $mbgpu_log)"
+    fi
+
+    # Staging: force VRAM sub-block subdivision (gpu_vram_mib=1), same
+    # pattern as test 9. OMP_TARGET_OFFLOAD=DISABLED for determinism when
+    # comparing bit-for-bit against the non-staged run above -- both are
+    # the same -ffast-math-compiled kernel, so host-fallback vs real-device
+    # dispatch of that same compiled code is expected to be bit-identical
+    # (no cross-thread reduction in this kernel), exactly as test 9 already
+    # relies on for the single-band case.
+    export OMP_TARGET_OFFLOAD="${OMP_TARGET_OFFLOAD:-DISABLED}"
+    mbgpu_stg_cfg="$OUT_DIR/mb_gpu_stage.cfg"
+    mbgpu_stg_log="$OUT_DIR/mb_gpu_stage.log"
+    rm -f "$OUT_DIR"/mb_gpu_stage.*.FITS
+    { cat "$mbgpu_cfg"; echo "gpu_vram_mib=1"; echo "mem_frac_vram=0.10"; } | \
+        sed "s|outfile             = ${OUT_DIR}/mb_gpu\$|outfile             = ${OUT_DIR}/mb_gpu_stage|" \
+        > "$mbgpu_stg_cfg"
+    if run_binary "$BIN_GPU" "$mbgpu_stg_cfg" "$mbgpu_stg_log"; then
+        if grep -q "Staging sub-blocks:  T" "$mbgpu_stg_log"; then
+            mbgpu_stg_amp="$OUT_DIR/mb_gpu_stage.AMP.RMCUBE.FITS"
+            if [[ -f "$mbgpu_stg_amp" ]]; then
+                if python3 "$TESTS_DIR/compare_cubes.py" \
+                        "$OUT_DIR/mb_gpu.AMP.RMCUBE.FITS" "$mbgpu_stg_amp" \
+                        --exact > /dev/null 2>&1; then
+                    pass "Multi-band GPU staging AMP (T8): bit-identical to non-staged multi-band GPU"
+                else
+                    fail "Multi-band GPU staging AMP (T8): differs from non-staged multi-band GPU (gather/scatter bug?)"
+                fi
+            else
+                fail "Multi-band GPU staging (T8): AMP output cube not found: $mbgpu_stg_amp"
+            fi
+        else
+            fail "Multi-band GPU staging (T8): staging path was NOT activated (check planner logic)"
+        fi
+    else
+        fail "Multi-band GPU staging (T8): run failed (see $mbgpu_stg_log)"
+    fi
+else
+    skip "GPU binary or multi-band CPU reference not available; skipping multi-band GPU test"
+fi
+
+# ---------------------------------------------------------------------------
+# 21. io_overlap for multi-band (T9, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+#     the T5 split-band 2-band config, forced into 7 tiles (32 Dec rows / 5
+#     per tile, uneven remainder -- same shape as test 13's single-band
+#     case) with io_overlap=y. Must be bit-identical to the existing
+#     single-tile split_identity reference (test 17/T5) -- the ping-pong
+#     output buffers io_overlap double-buffers are sized from the already-
+#     merged nz_out and never touch how many bands contributed to it, so
+#     this exercises exactly the "genuinely does not care about band
+#     count" claim from the T9 investigation, not a new code path.
+# ---------------------------------------------------------------------------
+section "21. io_overlap for multi-band – multi-tile async write == single-tile reference (T9)"
+
+if [[ -x "$BIN_OMP" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
+    mbovl_cfg="$OUT_DIR/mb_io_overlap.cfg"
+    mbovl_log="$OUT_DIR/mb_io_overlap.log"
+    rm -f "$OUT_DIR"/mb_io_overlap.*.FITS
+    cat > "$mbovl_cfg" <<CFGEOF
+path                = ${DATA_DIR}/
+infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
+infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
+outfile             = ${OUT_DIR}/mb_io_overlap
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+tile_auto           = n
+tile_ra             = 32
+tile_dec            = 5
+io_overlap          = y
+log_level           = debug
+CFGEOF
+    if run_binary "$BIN_OMP" "$mbovl_cfg" "$mbovl_log"; then
+        n_tiles_mb=$(grep -c "Doing tile" "$mbovl_log" || true)
+        if [[ "$n_tiles_mb" -gt 1 ]]; then
+            pass "io_overlap multi-band (T9): multi-tile run confirmed (${n_tiles_mb} tiles)"
+        else
+            fail "io_overlap multi-band (T9): expected >1 tile, got $n_tiles_mb"
+        fi
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/split_identity.${suffix}.FITS"
+            f2="$OUT_DIR/mb_io_overlap.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "io_overlap multi-band (T9): ${suffix} differs from single-tile reference"
+                fi
+            else
+                all_match=0
+                fail "io_overlap multi-band (T9): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "io_overlap multi-band (T9): bit-identical to single-tile split-band reference"
+        fi
+        if require_no_overlapping_tile_writes "$mbovl_log" > /dev/null 2>&1; then
+            pass "io_overlap multi-band (T9): tile writes never overlap (single-handle serialization holds)"
+        else
+            fail "io_overlap multi-band (T9): two tile writes overlapped in time (see $mbovl_log)"
+        fi
+    else
+        fail "io_overlap multi-band (T9): run failed (see $mbovl_log)"
+    fi
+else
+    skip "OMP binary or multi-band CPU reference not available; skipping io_overlap multi-band test"
+fi
+
+# ---------------------------------------------------------------------------
+# 22. io_read_threads>1 for multi-band (T9): same split-band 2-band config,
+#     forced into 7 tiles, with io_read_threads=4. Must be bit-identical to
+#     the same single-tile split_identity reference -- the parallel
+#     channel-split read only ever touches the reference band's own
+#     channel range/buffer offset; the other bands' reads happen
+#     afterward, sequentially, outside that parallel region entirely.
+# ---------------------------------------------------------------------------
+section "22. io_read_threads>1 for multi-band – parallel read == single-tile reference (T9)"
+
+if [[ -x "$BIN_OMP" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
+    mbrt_cfg="$OUT_DIR/mb_io_read_threads.cfg"
+    mbrt_log="$OUT_DIR/mb_io_read_threads.log"
+    rm -f "$OUT_DIR"/mb_io_read_threads.*.FITS
+    sed -e "s|outfile             = ${OUT_DIR}/mb_io_overlap\$|outfile             = ${OUT_DIR}/mb_io_read_threads|" \
+        -e "s|io_overlap          = y|io_overlap          = n\nio_read_threads     = 4|" \
+        "$mbovl_cfg" > "$mbrt_cfg"
+    if run_binary "$BIN_OMP" "$mbrt_cfg" "$mbrt_log"; then
+        if grep -qE "Parallel FITS IO: opened +4 +handles/file" "$mbrt_log"; then
+            pass "io_read_threads>1 multi-band (T9): parallel-read path confirmed taken (4 handles)"
+        else
+            fail "io_read_threads>1 multi-band (T9): expected 4-handle parallel-read log line not found (see $mbrt_log)"
+        fi
+        all_match=1
+        for suffix in AMP.RMCUBE PHA.RMCUBE MASK.CUBE NVALID.MAP; do
+            f1="$OUT_DIR/split_identity.${suffix}.FITS"
+            f2="$OUT_DIR/mb_io_read_threads.${suffix}.FITS"
+            if [[ -f "$f1" && -f "$f2" ]]; then
+                if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f2" --exact \
+                        > /dev/null 2>&1; then
+                    all_match=0
+                    fail "io_read_threads>1 multi-band (T9): ${suffix} differs from single-tile reference"
+                fi
+            else
+                all_match=0
+                fail "io_read_threads>1 multi-band (T9): ${suffix} output missing (expected $f1 and $f2)"
+            fi
+        done
+        if [[ "$all_match" -eq 1 ]]; then
+            pass "io_read_threads>1 multi-band (T9): bit-identical to single-tile split-band reference"
+        fi
+    else
+        fail "io_read_threads>1 multi-band (T9): run failed (see $mbrt_log)"
+    fi
+else
+    skip "OMP binary or multi-band CPU reference not available; skipping io_read_threads>1 multi-band test"
 fi
 
 # ---------------------------------------------------------------------------
