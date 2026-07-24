@@ -146,6 +146,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
 - **[docs/RELEASE_NOTES_4.0.md](docs/RELEASE_NOTES_4.0.md)** — Detailed release notes for tag 4.0 (maintainability/documentation milestone)
 - **[docs/RELEASE_NOTES_4.1.md](docs/RELEASE_NOTES_4.1.md)** — Detailed release notes for tag 4.1 (diagnostics milestone)
+- **[docs/RELEASE_NOTES_5.0.md](docs/RELEASE_NOTES_5.0.md)** — Detailed release notes for 5.0 (multi-band Faraday tomography milestone; in preparation, not yet tagged)
 
 ## Configuration
 

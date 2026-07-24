@@ -2,7 +2,10 @@
 
 Branch: `multi-band-tomography` (from `develop`)
 
-**Status: planning only. No code changes on this branch yet.**
+**Status: all tickets (T0-T12) implemented and verified. Release-5.0-ready
+— see `CHANGELOG.md`'s `[5.0]` entry and `docs/RELEASE_NOTES_5.0.md` for
+the release-facing summary. Not yet merged to `develop`/`main`, not yet
+tagged.**
 
 ## 1. Motivation
 

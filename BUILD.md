@@ -6,6 +6,10 @@
 
 - Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`, `3.0`).
 - Current formal release: `4.1` (on `main`).
+- `5.0` (multi-band Faraday tomography) is release-ready on the
+  `multi-band-tomography` branch — see
+  [docs/RELEASE_NOTES_5.0.md](docs/RELEASE_NOTES_5.0.md) — but not yet
+  merged to `develop`/`main` or tagged.
 
 ### Building with Make
 
