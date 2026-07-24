@@ -6,7 +6,13 @@ module gaussft_mod
    !! per-channel BMAJ/BMIN/BPA bookkeeping; those are a caller's job
    !! (planned: a main program mirroring reproject_cubes' own split
    !! between user-facing I/O and this kind of narrowly-scoped
-   !! computational module).
+   !! computational module). Multi-band needs nothing extra here --
+   !! every plane already carries its own independent source PSF against
+   !! one shared target PSF, whether it's the only plane being processed
+   !! or one of many from several bands; "multi-band" is purely a matter
+   !! of how many times a caller invokes convolve_to_beam and where it
+   !! reads each call's bmaj_in/bmin_in/bpa_in from, not something this
+   !! module needs to know about.
    !!
    !! Corrected from an earlier version (src/gaussft.f, the original
    !! Fortran77 prototype -- and its direct Python port, both upstream
@@ -25,14 +31,29 @@ module gaussft_mod
    !! integral has units of length^2). Verified several independent ways
    !! before this rewrite: closed-form derivation, direct numerical
    !! integration matching the true 2D Gaussian integral to 15
-   !! significant figures, and round-tripping an actual point source
-   !! through the full FFT/multiply/IFFT pipeline against MIRIAD's own
-   !! gaufac-derived scaling factor (au2.gauss_factor, also in this
-   !! repo, both landing on the same figure independently).
+   !! significant figures, and round-tripping a point source through the
+   !! full FFT/multiply/IFFT pipeline against MIRIAD's own gaufac-derived
+   !! scaling factor (au2.gauss_factor, independently re-derived, both
+   !! landing on the same figure).
+   !!
+   !! Split into plan/execute/destroy (rather than one self-contained
+   !! call that plans its own FFTs, as the first version of this module
+   !! did) so a caller can parallelise across planes with OpenMP: FFTW's
+   !! planner functions are not thread-safe and must never run inside a
+   !! parallel region, but a single plan, once created, is safe to
+   !! EXECUTE concurrently from multiple threads via the "new-array
+   !! execute" form (dfftw_execute_dft with explicit in/out arguments,
+   !! as convolve_to_beam uses below) as long as each concurrent call
+   !! supplies its own distinct arrays -- true here, since image/
+   !! image_out/the internal work arrays are all local to each call.
+   !! Verified directly (see this module's own test suite): 16 OpenMP
+   !! threads calling convolve_to_beam concurrently against the SAME
+   !! shared plan, each on its own image/beam pair, matches a serial
+   !! run of the same 16 calls exactly.
    use, intrinsic :: iso_fortran_env, only: dp => real64
    implicit none
    private
-   public :: convolve_to_beam
+   public :: plan_convolution, convolve_to_beam, destroy_convolution_plan
 
    real(dp), parameter :: pi = 3.14159265358979323846_dp
    real(dp), parameter :: deg2rad = pi/180.0_dp
@@ -41,7 +62,7 @@ module gaussft_mod
 
    ! FFTW3 constants (from /usr/include/fftw3.f) -- declared directly
    ! rather than `include`d: fftw3.f is fixed-form Fortran 77 (same
-   ! issue as AST_PAR, see reproject_cubes.f90's own comment on it) and
+   ! issue as AST_PAR in reproject_cubes.f90, see its own comment) and
    ! cannot be included into a free-form .f90 file directly.
    integer, parameter :: fftw_forward = -1
    integer, parameter :: fftw_backward = 1
@@ -49,22 +70,65 @@ module gaussft_mod
 
 contains
 
-   subroutine convolve_to_beam(image, nx, ny, dx, dy,&
+   subroutine plan_convolution(nx, ny, plan_fwd, plan_bwd)
+      !! Create the FFTW plans for an nx-by-ny transform, once, to be
+      !! reused by every subsequent convolve_to_beam call for planes of
+      !! this same size (the common case -- every plane of a cube, and
+      !! indeed of every band's cube in a multi-band run, shares one
+      !! nx,ny). MUST be called serially, before any parallel region --
+      !! FFTW's planner functions are not thread-safe. Pair with
+      !! destroy_convolution_plan once every plane is done, also
+      !! serially.
+      integer, intent(in) :: nx, ny
+      integer(kind=8), intent(out) :: plan_fwd, plan_bwd
+
+      complex(dp), allocatable :: scratch(:,:)
+
+      ! FFTW_ESTIMATE plans don't depend on the array CONTENTS, or even
+      ! specifically on the memory used here, only the shape -- every
+      ! actual convolve_to_beam call below uses the "new-array execute"
+      ! form with its own arrays instead. FFTW's own documentation
+      ! describes this as fully supported (correct regardless of
+      ! alignment, though a non-ESTIMATE plan might not be as fast on a
+      ! differently-aligned array than the one it was planned with --
+      ! irrelevant for ESTIMATE, which never does alignment-specific
+      ! optimisation in the first place).
+      allocate(scratch(nx, ny))
+      call dfftw_plan_dft_2d(plan_fwd, nx, ny, scratch, scratch, fftw_forward, fftw_estimate)
+      call dfftw_plan_dft_2d(plan_bwd, nx, ny, scratch, scratch, fftw_backward, fftw_estimate)
+      deallocate(scratch)
+   end subroutine plan_convolution
+
+   subroutine destroy_convolution_plan(plan_fwd, plan_bwd)
+      integer(kind=8), intent(inout) :: plan_fwd, plan_bwd
+
+      call dfftw_destroy_plan(plan_fwd)
+      call dfftw_destroy_plan(plan_bwd)
+   end subroutine destroy_convolution_plan
+
+   subroutine convolve_to_beam(plan_fwd, plan_bwd, image, nx, ny, dx, dy,&
    &bmaj_in, bmin_in, bpa_in, bmaj, bmin, bpa, image_out, status)
-      !! image(nx,ny): input plane. dx,dy: pixel scale, DEGREES (same
-      !! convention as CDELT1/2 -- converted to radians internally,
-      !! alongside the beam parameters below, so u,v end up in cycles
-      !! per radian, matching sx/sy/sx_in/sy_in). bmaj_in/bmin_in/bpa_in:
-      !! the plane's OWN (native/source) PSF, degrees, standard FITS
-      !! BMAJ/BMIN/BPA convention (BPA measured the same way the input
-      !! header defines it -- this module does no coordinate-system
-      !! reasoning of its own, it just rotates by the angle it's given).
-      !! bmaj/bmin/bpa: the TARGET PSF to convolve to, same convention.
-      !! image_out(nx,ny): the convolved plane. status: 0 on success
-      !! (reserved for future use -- e.g. FFTW failures -- this module
-      !! does not itself judge whether bmaj/bmin/bpa is a sensible
-      !! request relative to bmaj_in/bmin_in/bpa_in; that policy call
-      !! belongs to the caller, not this computation).
+      !! plan_fwd/plan_bwd: from plan_convolution, already created,
+      !! describing exactly this nx,ny (not checked here -- passing
+      !! plans for a different size is undefined behaviour, same as
+      !! FFTW's own new-array execute contract). image(nx,ny): input
+      !! plane. dx,dy: pixel scale, DEGREES (same convention as
+      !! CDELT1/2 -- converted to radians internally, alongside the beam
+      !! parameters below, so u,v end up in cycles per radian, matching
+      !! sx/sy/sx_in/sy_in). bmaj_in/bmin_in/bpa_in: THIS plane's own
+      !! (native/source) PSF, degrees, standard FITS BMAJ/BMIN/BPA
+      !! convention (BPA measured the same way the input header defines
+      !! it -- this module does no coordinate-system reasoning of its
+      !! own, it just rotates by the angle it's given). bmaj/bmin/bpa:
+      !! the TARGET PSF to convolve to, same convention -- shared across
+      !! every call for a common-resolution run, whatever plane or band
+      !! each call's image/source PSF came from. image_out(nx,ny): the
+      !! convolved plane. status: 0 on success (reserved for future use
+      !! -- this module does not itself judge whether bmaj/bmin/bpa is a
+      !! sensible request relative to bmaj_in/bmin_in/bpa_in; that
+      !! policy call belongs to the caller, not this computation).
+      !! Thread-safe: see this module's own header comment.
+      integer(kind=8), intent(in) :: plan_fwd, plan_bwd
       integer, intent(in) :: nx, ny
       real(dp), intent(in) :: image(nx, ny)
       real(dp), intent(in) :: dx, dy
@@ -80,7 +144,6 @@ contains
       real(dp) :: ur, vr, ur_in, vr_in, g_arg, dg_arg
       real(dp), allocatable :: u(:), v(:)
       complex(dp), allocatable :: cimg(:,:), g_final(:,:)
-      integer(kind=8) :: plan_fwd, plan_bwd
       integer :: ix, iy
 
       status = 0
@@ -124,16 +187,12 @@ contains
 
       allocate(cimg(nx, ny))
       cimg = cmplx(image, 0.0_dp, dp)
-      call dfftw_plan_dft_2d(plan_fwd, nx, ny, cimg, cimg, fftw_forward, fftw_estimate)
       call dfftw_execute_dft(plan_fwd, cimg, cimg)
-      call dfftw_destroy_plan(plan_fwd)
 
       cimg = cimg*g_final
       deallocate(g_final)
 
-      call dfftw_plan_dft_2d(plan_bwd, nx, ny, cimg, cimg, fftw_backward, fftw_estimate)
       call dfftw_execute_dft(plan_bwd, cimg, cimg)
-      call dfftw_destroy_plan(plan_bwd)
 
       ! FFTW's transforms are unnormalised (forward then backward scales
       ! the result by nx*ny, same convention as numpy.fft.fft2/ifft2 --
