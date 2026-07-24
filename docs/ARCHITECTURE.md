@@ -32,7 +32,7 @@ above -- prepare mismatched-geometry/mismatched-resolution bands for a
 multi-band `rm_synthesis` run. See "Cross-Band Preprocessing Toolchain"
 below for the architecture, and
 [planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](../planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
-(tickets T10-T12) for full design/verification detail.
+(tickets T10-T14) for full design/verification detail.
 - `src/reproject_cubes.f90`: reprojects cubes onto a common sky grid
   (Starlink AST + `astResampleR`).
 - `src/gaussft.f90` (`gaussft_mod`): pure computation, elliptical-Gaussian
@@ -41,10 +41,18 @@ below for the architecture, and
   per-channel PSFs.
 - `src/convolve_cubes.f90`: convolves cubes to a common angular resolution,
   drives `gaussft_mod` + `commonbeam_mod`.
+- `src/match_cubes.f90`: consolidates `reproject_cubes` and `convolve_cubes`
+  into one tool that can run either stage alone, or both CHAINED THROUGH
+  MEMORY with no intermediate FITS file (`stages=`/`order=` options) --
+  avoids a full extra disk round-trip on real 200GB+ cubes. Neither of the
+  other two tools is modified or shared as a module; `match_cubes.f90`
+  adapts the subroutines it needs from both instead, a deliberate
+  maintenance-cost-for-zero-regression-risk tradeoff (see its own header
+  comment and T13 in the plan doc).
 
 ### Build and Delivery
 - `Makefile`: primary development build matrix (OMP/GPU variants), plus
-  independent `reproject_cubes`/`convolve_cubes` targets.
+  independent `reproject_cubes`/`convolve_cubes`/`match_cubes` targets.
 - `docker/`: container build and release helpers.
 
 ### Configuration and Operations
@@ -886,17 +894,17 @@ same at-a-glance baseline record the 2.0 entry provides:
 
 ## Cross-Band Preprocessing Toolchain
 
-Two standalone tools -- own binaries, own build targets (`make
-reproject_cubes`, `make convolve_cubes`), independent of the Core Runtime
-build graph above -- prepare real multi-band data for `rm_synthesis`: real
-bands rarely share one sky grid or one angular resolution, and merging
-mismatched channels without addressing that first is exactly the kind of
-silent correctness gap this project's design philosophy exists to close
-(loudly refuse or visibly warn, never silently produce a misleading
-answer). Full design rationale, decisions, and verification evidence are
-recorded in
+Three standalone tools -- own binaries, own build targets (`make
+reproject_cubes`, `make convolve_cubes`, `make match_cubes`), independent
+of the Core Runtime build graph above -- prepare real multi-band data for
+`rm_synthesis`: real bands rarely share one sky grid or one angular
+resolution, and merging mismatched channels without addressing that first
+is exactly the kind of silent correctness gap this project's design
+philosophy exists to close (loudly refuse or visibly warn, never silently
+produce a misleading answer). Full design rationale, decisions, and
+verification evidence are recorded in
 [planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](../planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
-(tickets T10-T12); this section is the architecture summary, not a
+(tickets T10-T14); this section is the architecture summary, not a
 duplicate of that record.
 
 ### `reproject_cubes` — sky-grid alignment
@@ -988,6 +996,32 @@ derived from local tangent-plane geometry, verified empirically via a
 bit-exact identity round-trip (target beam set equal to one channel's own
 native beam reproduces that channel's input data to the last bit).
 
+### `match_cubes` — reproject + convolve, chained through memory
+
+Consolidates `reproject_cubes` and `convolve_cubes` into one tool
+(`stages=reproject|convolve|both`, `order=convolve_reproject|
+reproject_convolve` when both are active, default `convolve_reproject`).
+Neither of the other two tools is modified, refactored, or shared as a
+module -- `match_cubes.f90` duplicates/adapts the subroutines it needs
+from both, a deliberate maintenance-cost-for-zero-regression-risk
+tradeoff, since both standalone tools are already shipped and in
+production use. When both stages run, the block-processing loop combines
+gaussft_mod convolution and AST resampling in one pass per block, in
+either order, with no intermediate FITS file -- avoiding a full extra
+read/write round-trip on real 200GB+ cubes. Axis scope is deliberately
+asymmetric by stage: `stages=reproject` alone keeps `reproject_cubes`' own
+fully general N-axis handling; `stages=convolve` or `both` adopt
+`convolve_cubes`'/`gaussft_mod`'s existing 2-sky+1-FREQ-axis restriction
+(not a new limitation, the scope those tools already have). Verified via
+"chaining equivalence": both chained orders reproduce, bit-for-bit, the
+same result as running the two OLD standalone tools back-to-back through a
+real disk intermediate -- the single most valuable check in this ticket,
+directly catching two real bugs before they reached production: a
+degenerate-axis (e.g. size-1 STOKES) header-copy loss, and an FFTW
+plan-size mismatch in `reproject_convolve` order that manifested as heap
+corruption (`munmap_chunk(): invalid pointer`). See ticket T13 in the
+multi-band plan for the full record.
+
 ### Feeding results back into `rm_synthesis`
 
 `rm_synthesis` propagates `BMAJ`/`BMIN`/`BPA` from its input Q cube's
@@ -1001,4 +1035,31 @@ every non-reference band's own beam metadata is cross-checked against the
 reference band's, with a runtime warning (not a hard error) on mismatch.
 See ticket T12 in the multi-band plan for the full decision record and
 verification evidence.
+
+`reproject_cubes` and `convolve_cubes` (and `match_cubes`, whichever
+stages it runs) propagate `CASAMBM`/`BEAMS` the same way, upstream of
+`rm_synthesis`:
+- `reproject_cubes` (and `match_cubes` with `stages=reproject`) never
+  touch the beam itself -- reprojection is a pure spatial resample, and
+  `BMAJ`/`BMIN`/`BPA` are stored in sky degrees, unaffected by it. A
+  genuine per-channel `BEAMS` table on the input (`CASAMBM=T`) is copied
+  through to the output unchanged (`ftcopy`, same pattern `rm_synthesis`
+  already uses for its own passthrough).
+- `convolve_cubes` (and `match_cubes` whenever `convolve` is active)
+  always attach `CASAMBM=T` plus a freshly SYNTHESIZED `BEAMS` table,
+  regardless of whether the input had one -- unlike reprojection,
+  convolution genuinely changes the beam, and this tool always tracks a
+  real per-channel good/bad split internally (even from a plain scalar
+  `BMAJ`/`BMIN`/`BPA` input, or an external ASCII beam log with no
+  `BEAMS` table at all). One row per channel: the common target beam for
+  every channel actually convolved, and the same degenerate sentinel
+  (`tiny(1.0)`, CASA's own ~1.18e-38 placeholder) this project's own
+  readers already treat as "no valid beam" for a bad/skipped channel --
+  so a downstream reader can tell exactly which channels reached the
+  common resolution, rather than a single scalar that would misrepresent
+  a bad/NaN channel as sharing it. Verified against the real 5-column
+  CASA layout (`BMAJ`/`BMIN`/`BPA`/`CHAN`/`POL`, confirmed on a real
+  ASKAP cube's own `BEAMS` table) via `FTIBIN`/`FTPCLE`/`FTPCLJ`. See
+  ticket T14 in the multi-band plan for the full decision record and
+  verification evidence.
 

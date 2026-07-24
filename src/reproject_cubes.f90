@@ -491,6 +491,9 @@ contains
       integer :: nx_in, ny_in
       integer :: ref_unit, out_unit, fitsstat, blocksize
       logical :: simple, extend
+      integer :: beams_unit, beams_status, casambm_status, hdutype_dum
+      logical :: casambm_val
+      character(len=80) :: comment
 
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes
       integer(kind=8) :: block_planes64
@@ -599,6 +602,38 @@ contains
       call FTPHIS(out_unit, 'reproject_cubes: reprojected from '//&
       &trim(infile)//' onto the grid of '//trim(reffile), fitsstat)
       call FTCLOS(ref_unit, fitsstat)
+
+      ! CASAMBM/BEAMS: reprojection is a pure spatial resample of each
+      ! plane -- it never touches the beam itself (BMAJ/BMIN/BPA are
+      ! stored in sky degrees, not pixels), so a genuine per-channel
+      ! BEAMS table on infile is still exactly correct for the
+      ! reprojected output and should follow it unchanged. The scalar
+      ! CASAMBM keyword itself already rode along verbatim as a raw
+      ! header card inside copy_generic_header just above; that copy
+      ! only ever touches the PRIMARY header, though, and can't reach
+      ! the separate BEAMS extension HDU the keyword refers to -- this
+      ! attaches that extension explicitly, matching the ftcopy pattern
+      ! rm_synthesis.f90 already uses for its own CASAMBM/BEAMS
+      ! passthrough. Own dedicated unit (45), disjoint from this file's
+      ! other unit numbers (43/44/1000+thread/5000).
+      casambm_status = 0
+      call ftgkyl(out_unit, 'CASAMBM', casambm_val, comment, casambm_status)
+      if (casambm_status.eq.0 .and. casambm_val) then
+         beams_unit = 45
+         beams_status = 0
+         call ftopen(beams_unit, trim(infile), 0, blocksize, beams_status)
+         call ftmnhd(beams_unit, -1, 'BEAMS', 0, beams_status)
+         if (beams_status.eq.0) then
+            status = 0
+            call ftcopy(beams_unit, out_unit, 0, status)
+            call ftmahd(out_unit, 1, hdutype_dum, status)
+         else
+            write(*,*) 'WARNING: CASAMBM=T but no BEAMS extension found in: ',&
+            &trim(infile), ' -- output keeps CASAMBM=T with no BEAMS table.'
+         endif
+         beams_status = 0
+         call ftclos(beams_unit, beams_status)
+      endif
 
       ! --- Block size: mem_frac_ram fraction of total system RAM,
       ! divided by the bytes one plane's worth of input+output costs

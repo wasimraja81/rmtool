@@ -8,7 +8,7 @@
 5. [Requirements](#5-requirements)
 6. [Swim-lane plots](#6-swim-lane-plots)
 7. [Architecture notes](#7-architecture-notes)
-8. [Multi-band preprocessing: reproject_cubes, convolve_cubes](#8-multi-band-preprocessing-reproject_cubes-convolve_cubes)
+8. [Multi-band preprocessing: reproject_cubes, convolve_cubes, match_cubes](#8-multi-band-preprocessing-reproject_cubes-convolve_cubes-match_cubes)
 
 ---
 
@@ -270,7 +270,7 @@ cat scratch/runtime_estimate.txt       # wall-time estimate
 | CFITSIO | `libcfitsio-dev` | `brew install cfitsio` |
 | Python 3 + astropy + numpy | `pip install astropy numpy` | `pip install astropy numpy` |
 | GPU compiler (optional) | `nvfortran` (NVIDIA HPC SDK) or `gfortran ≥ 14` with libgomp offload | same |
-| Starlink AST + FFTW3 (only for `reproject_cubes`/`convolve_cubes`) | `libstarlink-ast-dev libstarlink-ast-err9 libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev` | see BUILD.md |
+| Starlink AST + FFTW3 (only for `reproject_cubes`/`convolve_cubes`/`match_cubes`) | `libstarlink-ast-dev libstarlink-ast-err9 libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev` | see BUILD.md |
 
 ```bash
 # Minimal Ubuntu install
@@ -305,31 +305,45 @@ and GPU lanes from the run log.
 
 ---
 
-## 8. Multi-band preprocessing: reproject_cubes, convolve_cubes
+## 8. Multi-band preprocessing: reproject_cubes, convolve_cubes, match_cubes
 
 Real multi-band data rarely arrives on the same sky grid or at the same
-angular resolution. Two standalone tools (own binaries, independent of
-the main `rm_synthesis` build) close that gap before a multi-band run:
+angular resolution. Three standalone tools (own binaries, independent of
+the main `rm_synthesis` build) close that gap before a multi-band run —
+either as two separate calls:
 
 ```bash
-# 1. Align sky grids
-make reproject_cubes
-bin/reproject_cubes mode=intersection reffile=ref.fits infiles=a.fits,b.fits
-
-# 2. Match angular resolution (across ALL bands together, one call)
+# 1. Match angular resolution (across ALL bands together, one call)
 make convolve_cubes
-bin/convolve_cubes infiles=a_REPROJ.fits,b_REPROJ.fits mem_frac_ram=0.25
+bin/convolve_cubes infiles=a.fits,b.fits mem_frac_ram=0.25
+
+# 2. Align sky grids
+make reproject_cubes
+bin/reproject_cubes mode=intersection reffile=ref.fits infiles=a_CONV.fits,b_CONV.fits
 
 # 3. Run multi-band RM synthesis on the now-matched inputs
 bin/rm_synthesis your_multiband.cfg
 ```
 
-`--help` on either tool gives its full option list. `convolve_cubes`'
-per-channel beam input (a CASA-style `BEAMS` table, or a portable
-ASCII/CSV beam log — see `cfg/example_beamLog.txt`/`.csv`) and target-beam
-derivation are covered in the README's "Multi-Band Preprocessing
-Toolchain" section and, in full design/verification detail, in
-`planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T10-T12).
+or as one `match_cubes` call that chains both stages through memory, with
+no intermediate FITS file written — a real saving for 200GB+ cubes:
+
+```bash
+make match_cubes
+bin/match_cubes stages=both order=convolve_reproject \
+  footprint_mode=intersection reffile=ref.fits infiles=a.fits,b.fits \
+  mem_frac_ram=0.25
+```
+
+`--help` on any of the three tools gives its full option list.
+`convolve_cubes`'/`match_cubes`' per-channel beam input (a CASA-style
+`BEAMS` table, or a portable ASCII/CSV beam log — see `cfg/
+example_beamLog.txt`/`.csv`) and target-beam derivation are covered in
+the README's "Multi-Band Preprocessing Toolchain" section and, in full
+design/verification detail, in `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md`
+(tickets T10-T14). All three tools propagate `CASAMBM`/`BEAMS` beam
+metadata through to their outputs, the same way `rm_synthesis` does for
+its own.
 
 ```bash
 python scripts/plot_tile_async_swimlane.py \

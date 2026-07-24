@@ -140,7 +140,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
 - **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
 - **[planning/ENCAPSULATION_REFACTOR_PLAN.md](planning/ENCAPSULATION_REFACTOR_PLAN.md)** — Encapsulation refactor plan: config/tile-planner/IO-orchestration derived types, ticket-by-ticket (T0-T5, all adopted)
-- **[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)** — Multi-band Faraday tomography plan: config schema, frequency merge, cross-band geometry/resolution matching (`reproject_cubes`/`convolve_cubes`), beam-metadata propagation, ticket-by-ticket (T0-T12, all adopted)
+- **[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)** — Multi-band Faraday tomography plan: config schema, frequency merge, cross-band geometry/resolution matching (`reproject_cubes`/`convolve_cubes`/`match_cubes`), beam-metadata propagation, ticket-by-ticket (T0-T14, all adopted)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
@@ -628,7 +628,7 @@ correctness).
 ## Multi-Band Preprocessing Toolchain
 
 Real bands rarely arrive on the same sky grid or at the same angular
-resolution. Two standalone tools (own binaries, own build targets,
+resolution. Three standalone tools (own binaries, own build targets,
 independent of the main `rm_synthesis` build graph) close that gap before
 a multi-band run:
 
@@ -661,15 +661,49 @@ a multi-band run:
    # target_bpa are given explicitly; --help for the full option list
    ```
 
-Typical order for a genuinely mismatched multi-band dataset:
-`reproject_cubes` (align grids) → `convolve_cubes` (match resolution,
-across all bands together in one call) → `rm_synthesis` (multi-band RM
-synthesis on the now grid- and resolution-matched inputs).
+3. **`match_cubes`** — consolidates the two tools above into one: run
+   reproject alone, convolve alone, or both CHAINED THROUGH MEMORY with no
+   intermediate FITS file written at all. For real 200GB+ cubes, chaining
+   avoids writing (and re-reading) a full extra copy of the data to disk.
+   `order` controls which stage runs first when both are requested
+   (default `convolve_reproject` — convolving before resampling low-pass-
+   filters the image ahead of interpolation, avoiding aliasing error, and
+   is usually cheaper too):
+
+   ```bash
+   make match_cubes
+   bin/match_cubes stages=both order=convolve_reproject \
+     footprint_mode=intersection reffile=ref.fits infiles=bandA.fits,bandB.fits \
+     mem_frac_ram=0.25
+   # stages=reproject | convolve | both; --help for the full option list
+   ```
+
+   `reproject_cubes` and `convolve_cubes` are unaffected and remain fully
+   independent for anyone who only needs one stage.
+
+Typical order for a genuinely mismatched multi-band dataset: convolve
+(match resolution, across all bands together in one call) → reproject
+(align grids) → `rm_synthesis` (multi-band RM synthesis on the now
+resolution- and grid-matched inputs) — either as two standalone-tool
+calls, or as one `match_cubes stages=both` call with no intermediate file.
+
+**Beam metadata:** all three tools propagate `CASAMBM`/`BEAMS` the same
+way `rm_synthesis` does for its own outputs (see above). `reproject_cubes`
+(and `match_cubes` with `stages=reproject`) never touch the beam itself —
+a genuine per-channel `BEAMS` table on the input is copied through to the
+output unchanged. `convolve_cubes` (and `match_cubes` whenever `convolve`
+is active) always attach `CASAMBM=T` plus a freshly synthesized `BEAMS`
+table — one row per channel, the common target beam for every channel
+actually convolved, and the same degenerate sentinel CASA itself uses for
+a bad/skipped channel — so a downstream reader can tell exactly which
+channels reached the common resolution, rather than a single scalar
+`BMAJ`/`BMIN`/`BPA` that would misrepresent a bad/NaN channel as sharing
+it.
 
 Full design detail, verification evidence, and the underlying computation
 modules (`src/gaussft.f90`, `src/commonbeam.f90`) are documented in
 [planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
-(tickets T10-T12) and in each source file's own header comment.
+(tickets T10-T14) and in each source file's own header comment.
 
 ## Project Structure
 
@@ -687,6 +721,9 @@ rmtool/
 │   ├── commonbeam.f90         commonbeam_mod: smallest common beam across N PSFs
 │   ├── convolve_cubes.f90     Standalone: cross-band resolution matching (own binary),
 │   │                          drives gaussft_mod + commonbeam_mod
+│   ├── match_cubes.f90        Standalone: reproject_cubes + convolve_cubes consolidated,
+│   │                          chained through memory (own binary; neither of the above
+│   │                          two is modified/shared -- adapts their logic instead)
 │   └── legacy/                Older standalone FITS utilities, not part of the build
 ├── cfg/                        Configuration files, examples, and ARCHIVED/ (63 historical configs);
 │                                example_beamLog.txt/.csv for convolve_cubes' ASCII beam format

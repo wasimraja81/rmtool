@@ -70,6 +70,14 @@ RUN make reproject_cubes
 # Built once, ends up at bin/convolve_cubes.
 RUN make convolve_cubes
 
+# match_cubes: consolidates reproject_cubes and convolve_cubes into one
+# tool that can chain both stages through memory with no intermediate
+# FITS file (see src/match_cubes.f90's own top comment) -- needs no new
+# apt packages, since its dependencies (Starlink AST, FFTW3) are already
+# installed above for reproject_cubes/convolve_cubes individually. Built
+# once, ends up at bin/match_cubes.
+RUN make match_cubes
+
 # plot_tile_async_swimlane.py: symlinked into bin/ (not copied) so there's
 # one source of truth -- editing scripts/plot_tile_async_swimlane.py in a
 # later image layer or a bind-mounted dev checkout is still what actually

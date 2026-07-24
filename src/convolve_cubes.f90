@@ -1240,8 +1240,95 @@ contains
          return
       endif
 
+      ! CASAMBM/BEAMS: always attached (see write_beams_table's own
+      ! comment for why) -- convolve_cubes always tracks a real
+      ! per-channel good/bad split internally, even from a source with
+      ! no BEAMS table of its own (an ASCII beam log, or a plain scalar
+      ! BMAJ/BMIN/BPA header), so the scalar BMAJ/BMIN/BPA written above
+      ! alone would misrepresent every bad/NaN channel as sharing the
+      ! common target beam.
+      fitsstat = 0
+      call FTPKYL(out_unit, 'CASAMBM', .true.,&
+      &'Multiple beams per plane (see BEAMS ext)', fitsstat)
+      call write_beams_table(out_unit, nfreq, isbad, tgt_bmaj, tgt_bmin,&
+      &tgt_bpa, status_par)
+      if (status_par.ne.0) then
+         status = -1
+         call FTCLOS(out_unit, fitsstat)
+         return
+      endif
+
       call FTCLOS(out_unit, fitsstat)
    end subroutine write_convolved_file
+
+   subroutine write_beams_table(unit, nfreq, isbad, tgt_bmaj, tgt_bmin,&
+   &tgt_bpa, status)
+      !! Appends a CASA-style BEAMS binary table extension (EXTNAME=
+      !! 'BEAMS', columns BMAJ/BMIN/BPA/CHAN/POL -- matching the real
+      !! ASKAP cube's own 5-column layout this file's top comment
+      !! already documents: BMAJ/BMIN in arcsec, BPA in deg, CHAN
+      !! 0-indexed, POL always 0 since convolve_cubes processes one
+      !! Stokes product -- one file -- at a time) to the current
+      !! (primary) HDU of unit, one row per channel. A GOOD channel gets
+      !! the common target beam every good plane was actually convolved
+      !! to; a BAD (skipped, all-NaN) channel gets the same degenerate
+      !! sentinel (tiny(1.0), CASA's own ~1.18e-38 placeholder -- see
+      !! read_beams_table's own comment) this program's own readers
+      !! already treat as "no valid beam", so a downstream reader sees
+      !! exactly which channels were actually convolved, rather than a
+      !! single scalar BMAJ/BMIN/BPA that would claim every channel
+      !! (including bad/NaN ones) shares the common beam.
+      integer, intent(inout) :: unit
+      integer, intent(in) :: nfreq
+      logical, intent(in) :: isbad(nfreq)
+      real(dp), intent(in) :: tgt_bmaj, tgt_bmin, tgt_bpa
+      integer, intent(out) :: status
+
+      character(len=8) :: ttype(5), tform(5), tunit_(5)
+      real, allocatable :: col_bmaj(:), col_bmin(:), col_bpa(:)
+      integer, allocatable :: col_chan(:), col_pol(:)
+      integer :: fitsstat, ich, colnum
+
+      ttype = (/'BMAJ    ', 'BMIN    ', 'BPA     ', 'CHAN    ', 'POL     '/)
+      tform = (/'1E      ', '1E      ', '1E      ', '1J      ', '1J      '/)
+      tunit_ = (/'arcsec  ', 'arcsec  ', 'deg     ', '        ', '        '/)
+
+      allocate(col_bmaj(nfreq), col_bmin(nfreq), col_bpa(nfreq),&
+      &col_chan(nfreq), col_pol(nfreq))
+      do ich = 1, nfreq
+         col_chan(ich) = ich - 1
+         col_pol(ich) = 0
+         if (isbad(ich)) then
+            col_bmaj(ich) = tiny(1.0)
+            col_bmin(ich) = tiny(1.0)
+            col_bpa(ich) = 0.0
+         else
+            col_bmaj(ich) = real(tgt_bmaj)
+            col_bmin(ich) = real(tgt_bmin)
+            col_bpa(ich) = real(tgt_bpa)
+         endif
+      enddo
+
+      fitsstat = 0
+      call FTIBIN(unit, nfreq, 5, ttype, tform, tunit_, 'BEAMS', 0, fitsstat)
+      call FTGCNO(unit, .false., 'BMAJ', colnum, fitsstat)
+      call FTPCLE(unit, colnum, 1, 1, nfreq, col_bmaj, fitsstat)
+      call FTGCNO(unit, .false., 'BMIN', colnum, fitsstat)
+      call FTPCLE(unit, colnum, 1, 1, nfreq, col_bmin, fitsstat)
+      call FTGCNO(unit, .false., 'BPA', colnum, fitsstat)
+      call FTPCLE(unit, colnum, 1, 1, nfreq, col_bpa, fitsstat)
+      call FTGCNO(unit, .false., 'CHAN', colnum, fitsstat)
+      call FTPCLJ(unit, colnum, 1, 1, nfreq, col_chan, fitsstat)
+      call FTGCNO(unit, .false., 'POL', colnum, fitsstat)
+      call FTPCLJ(unit, colnum, 1, 1, nfreq, col_pol, fitsstat)
+      deallocate(col_bmaj, col_bmin, col_bpa, col_chan, col_pol)
+
+      status = 0
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to write BEAMS binary table extension'
+         status = -1
+      endif
+   end subroutine write_beams_table
 
    subroutine copy_generic_header_convolve(src_unit, dst_unit, status)
       !! No reprojection happens here (unlike reproject_cubes) -- input
@@ -1249,11 +1336,13 @@ contains
       !! header card copies through verbatim EXCEPT the structural
       !! keywords FTPHPR already wrote, and BMAJ/BMIN/BPA/CASAMBM (the
       !! caller overwrites BMAJ/BMIN/BPA with the new common beam right
-      !! after calling this, and never writes CASAMBM at all: the output
-      !! has one uniform beam, not a per-channel BEAMS table, and this
-      !! program never creates a BEAMS extension in its output, so a
-      !! stale CASAMBM=T left over from the input would be actively
-      !! misleading to a downstream reader).
+      !! after calling this, and writes its own CASAMBM=T plus a freshly
+      !! synthesized BEAMS table -- see write_beams_table -- once the
+      !! per-channel good/bad split is known; a stale CASAMBM=T/BEAMS
+      !! copied verbatim from the input here, describing the INPUT's own
+      !! pre-convolution per-channel beams, would be actively misleading
+      !! once every good channel has actually been convolved to one
+      !! common target beam).
       integer, intent(in) :: src_unit, dst_unit
       integer, intent(inout) :: status
       integer :: nkeys, nmore, i, fitsstat
