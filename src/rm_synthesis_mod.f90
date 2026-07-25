@@ -1624,6 +1624,23 @@ contains
     mean_val = mean_val / real(n, sp)
   end subroutine compute_mean
 
+  subroutine compute_rms(arr, n, rms_val)
+    !! RMS about the mean of arr (population RMS, divide by n -- matches
+    !! the RM-CLEAN lineage this is needed for, planning/
+    !! RMCLEAN_INTEGRATION_PLAN.md T1: used as the CLEAN loop's own
+    !! residual-noise estimate for its stopping criterion, recomputed
+    !! every iteration -- a whole-array intrinsic reduction (sum) rather
+    !! than a hand-rolled accumulator loop, since gfortran vectorizes the
+    !! former at least as well and it reads as one expression instead of
+    !! a loop.
+    integer(int32), intent(in) :: n
+    real(sp), intent(in) :: arr(n)
+    real(sp), intent(out) :: rms_val
+    real(sp) :: mean_val
+    call compute_mean(arr, n, mean_val)
+    rms_val = sqrt(sum((arr - mean_val)**2) / real(n, sp))
+  end subroutine compute_rms
+
   subroutine dot_product_custom(a, b, result, n)
     !! Compute dot product of two vectors
     integer(int32), intent(in) :: n

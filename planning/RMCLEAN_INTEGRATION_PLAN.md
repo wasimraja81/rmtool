@@ -2,12 +2,12 @@
 
 Branch: `rmclean-integration` (from `develop`)
 
-**Status: T0 done and verified (MASK.CUBE.FITS per-channel frequency/band
-table — prerequisite for everything else below). T1+ are scoped from
-design discussion with the user but not yet implemented; expect
-numbering/scope to firm up as each is actually started, per this
-project's own convention of writing a ticket's Evidence section only
-once its own work is done.**
+**Status: T0 (MASK.CUBE.FITS per-channel frequency/band table) and T1
+(RM-CLEAN core algorithm module, `src/rmclean.f90`) done and verified.
+T2 (standalone tool + per-pixel mask-pattern caching) scoped from design
+discussion but not yet implemented; expect numbering/scope to firm up
+once started, per this project's own convention of writing a ticket's
+Evidence section only once its own work is done.**
 
 ## Context
 
@@ -242,18 +242,133 @@ the shelved "single" variant driver and one dated backup file).
     confirmed by the existing bit-identical `compare_cubes.py` checks
     still passing throughout).
 
-### T1+ (not yet detailed — scoped from design discussion above, numbering/
-### scope to firm up as each is actually started)
+### T1 — RM-CLEAN core algorithm module (`rmclean_mod`)
 
-- RM-CLEAN core algorithm port: `rm_clean`/`compute_dirty_rmbeam`/
-  `rm_restore`, with the restore-order fix (decision 1), Re/Im-separate
-  interpolation (decision 4), and the offset-table optimization confined
-  inside `compute_dirty_rmbeam` (decisions 3, 9).
+- **Status:** done. Pure computation only, no FITS I/O, no standalone
+  binary yet — mirrors `gaussft_mod`'s own split between narrowly-scoped
+  computation and a caller that owns I/O/config. New file: `src/rmclean.f90`.
+- **Objective:** port the actual CLEAN algorithm
+  (`rm_clean`/`compute_dirty_rmbeam`/`rm_restore` from
+  `~/softwares/CURR_DEVEL/RM_CLEAN_TESTS/`), modernized and with every
+  fix from the design decisions above, into a tested, self-contained
+  module — the prerequisite for T2's standalone tool.
+- **Scope:** `index_absmax`, `peak_interp_parabolic` (decision 4),
+  `plan_fourier_interp`/`fourier_interp_complex` (FFTW-based, replacing
+  the original's in-house `fft1d`/`ifft1d`, per explicit instruction),
+  `rmsf_table_t`/`build_rmsf_offset_table`/`compute_dirty_rmbeam_direct`/
+  `compute_dirty_rmbeam` (decisions 3/9), `clean_complex` (decision 1),
+  `compute_rmsf_fwhm`/`restore_clean` (decisions 1/8). `rms_about_mean`:
+  a private local copy inside `rmclean_mod` itself (the public
+  `compute_rms` added to `rm_synthesis_mod.f90` per decision 7 is for
+  T-future's eventual inline-into-`rm_synthesis` path — `rmclean_mod`
+  deliberately doesn't `use rm_synthesis_mod` at all, same standalone-module
+  precedent as `gaussft_mod`/`commonbeam_mod`, so it needs its own tiny
+  copy today). Sub-pixel interpolation scope deliberately reduced from
+  the original's 4 modes (parabolic/Fourier-amplitude/Fourier-complex/
+  sinc) to parabolic only, since decision 4's fix (interpolate Re/Im
+  independently at the magnitude-derived offset) is what actually
+  matters and preserving all 4 modes added little beyond what the
+  original comment already called out as "(in use)"; `fourier_interp_complex`
+  is still built and tested as a general-purpose utility, just not wired
+  into `clean_complex`'s own peak-search as an alternative mode.
+- **Three real bugs found during the port, all via direct re-derivation
+  against the algorithm's own math, not just carried over or guessed at:**
+  1. `quad_interp.f`'s own closed-form vertex-value formula
+     (`peak_val = beta - 0.25*(alpha-gama)*peak`) used the *absolute*
+     fractional bin index where the correct formula requires the *local*
+     vertex offset alone — only numerically close in the original because
+     it was always called on a small (5-point) window. My own first
+     draft of the Re/Im-separate version repeated the same class of
+     mistake before being caught by re-deriving the general 3-point
+     quadratic (`y(x)=A x^2+Bx+C` via standard central-difference
+     coefficients) and evaluating it directly at the externally-supplied
+     offset, rather than reusing the vertex-only shortcut.
+  2. The original's `ClnFluxQ`/`ClnFluxU` component bookkeeping
+     accumulated `frac*ResiQ(imax)`/`frac*ResiU(imax)` — dimensionally
+     inconsistent with `frac*re_beam(i)`/`frac*im_beam(i)`, what is
+     actually subtracted from the residual every iteration, and unrelated
+     to it. Fixed to the standard Hogbom convention: the delta-function
+     component's own complex value is `frac*exp(i*phase_val)` (magnitude
+     `frac`, at the peak's own phase) — `frac*cos(phase_val)`/
+     `frac*sin(phase_val)` here.
+  3. The original passed `phase_val` (the residual's own `atan2(Im,Re)`
+     angle, already in the doubled `2*chi0` convention) straight into
+     `compute_dirty_rmbeam`'s `phase_in`, which itself doubles internally
+     (`2*(RM_in*L_sq+phase_in)`, matching the standard
+     `P(L_sq)=p*exp(2i*chi0)*exp(2i*RM*L_sq)` Faraday relation) — doubling
+     it again. Verified directly against this module's own
+     `compute_dirty_rmbeam` (not just derived on paper) that `phase_in=
+     phase_val/2` is the self-consistent choice: the beam's own value at
+     its exact peak (`delta=0`) must equal `exp(i*phase_val)`, unit
+     magnitude at exactly the residual's own phase.
+- **FFTW normalization bug (own new code, caught before it shipped):**
+  `fourier_interp_complex`'s first draft carried over the original's own
+  `norm=nout/npts` scale factor unchanged — correct for the original's
+  own `ifft1d`, which (like most hand-rolled FFT/IFFT pairs) normalizes
+  internally by `1/N`; wrong for FFTW's `dfftw_execute_dft`, which is
+  unnormalized in both directions. Fixed to `norm=1/npts`, the only
+  factor needed once FFTW itself does no internal normalization at all.
+- **`rm_restore.f`'s own FFT-shift sequence not ported as-is:** the
+  original does `fft` -> `fftshift` on both signal and kernel -> multiply
+  -> `ifft` -> `fftshift` on the result, an ordering not straightforward
+  to verify correct by inspection. Reimplemented as the standard,
+  textbook circular-convolution-via-FFT recipe instead: build the
+  Gaussian kernel directly in *wrapped* form (index 1 = RM=0, indices
+  past the midpoint = the "negative lag" tail wrapped to the array's own
+  end — the standard layout circular convolution via FFT requires), FFT
+  both arrays with no shifting at all, multiply, inverse FFT, divide by
+  `nrm`. Same underlying convolution, easier to verify by construction.
+- **Correctness gate (all verified numerically, not just derived):**
+  1. `peak_interp_parabolic`: synthetic Gaussian-envelope complex signal
+     with a known sub-pixel peak (offset 0.35 bins) — recovered offset
+     to `7e-7`; symmetric on-grid peak recovers offset `~0` and the exact
+     injected amplitude; degenerate (flat) input returns offset `0`, no
+     crash.
+  2. `fourier_interp_complex`: pure sinusoid at an exact DFT-basis
+     frequency reproduced to `~6e-7` at every interpolated point (the
+     defining property of bandlimited interpolation), and exactly (`0`
+     error) at the original sample locations.
+  3. `compute_dirty_rmbeam` (table-based) vs. `compute_dirty_rmbeam_direct`
+     (exact `O(nchan)` reference): cross-validated at 5 off-grid
+     `(RM_in,phase_in)` points, agreement to `~1.6e-6`. On-grid
+     self-beam sanity check (`RM_in` exactly on the `rm_samp` grid,
+     `phase_in=0`) gives `re=1.0,im=0.0` exactly, as physically required
+     (a point source's own beam at its own peak).
+  4. `restore_clean`: delta-function-input identity check (convolving a
+     unit spike with the restoring beam must reproduce the beam itself,
+     centred at the spike) — matched the analytic Gaussian to `~1e-6`
+     directly, with the one larger residual (`2.8e-4` at the array's far
+     edge) confirmed via independent calculation to be the exact,
+     expected periodic-wraparound contribution of the circular
+     convolution (`exp(-37^2/(2*sigma^2))` matched the measured error to
+     6 significant figures) — not a bug. Zero-component/nonzero-residual
+     passthrough: output exactly equals the residual, `0` error.
+  5. **End-to-end**: synthetic single point source (`RM=23.7` rad/m^2,
+     off-grid; intrinsic angle `chi0=0.35` rad; amplitude `5.0`; 200-channel
+     700-900 MHz synthetic band; no noise) run through
+     `clean_complex`+`restore_clean` in full: recovered dominant-bin
+     amplitude `4.9995` (true `5.0`); recovered phase `0.7000001` (true
+     `2*chi0=0.7`, `~6e-6` error — direct empirical confirmation that bug
+     3's phase-convention fix is correct, not just algebraically argued);
+     recovered RM snapped to the nearest grid bin (`24.0` vs true `23.7`,
+     within `dRM/2` as expected for delta-function component placement);
+     residual power dropped to `2.7e-13` of the dirty map's own power
+     (full convergence, as expected for a noise-free single point source
+     matching the basis exactly).
+- **Build/test:** `src/rmclean.f90` compiles clean standalone (`gfortran`
+  + `-fopenmp -lfftw3`); all 4 `rm_synthesis` build flavours
+  (`scratch/make_all.sh`) clean; full `tests/run_tests.sh` 49/49 pass,
+  unaffected (this ticket adds one new self-contained module file plus
+  the additive `compute_rms` in `rm_synthesis_mod.f90`, neither consumed
+  by any existing tool yet).
+
+### T2 (not yet detailed — standalone tool consuming T1, scoped from
+### design discussion above, numbering/scope to firm up once started)
+
 - Per-pixel mask-pattern pre-scan + pattern-keyed offset-table cache
   (decision 10), consuming T0's new per-channel table.
 - Standalone tool wiring: CLI/config schema, own binary/build target,
   consuming existing dirty AMP/PHA cubes (decision 11).
-- New `compute_rms` utility in `rm_synthesis_mod.f90` (decision 7).
 
 ### T-future — Bandwidth-depolarization in RM-CLEAN
 
