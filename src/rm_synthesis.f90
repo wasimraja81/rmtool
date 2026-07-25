@@ -256,6 +256,12 @@ real(dp) :: band_beam_val
 logical :: band_casambm_val, band_beam_mismatch
 integer :: band_beam_status, band_casambm_status, iband_chk
 
+ ! CHANFREQ binary table on MASK.CUBE.FITS (RMCLEAN_INTEGRATION_PLAN.md
+ ! T0) -- see the writing block's own comment for the full reasoning.
+integer, allocatable :: chanfreq_chan(:), chanfreq_band(:)
+real(dp), allocatable :: chanfreq_freq(:)
+integer :: chanfreq_colnum, chanfreq_fitsstat, chanfreq_i, chanfreq_iband
+
 integer   rwmode
 character(len=272) :: message
 character(len=272) :: outfileAMP, outfileANG
@@ -4752,6 +4758,76 @@ if(allocated(par_unit_Q))    deallocate(par_unit_Q)
 if(allocated(par_unit_U))    deallocate(par_unit_U)
 if(allocated(par_unit_mask)) deallocate(par_unit_mask)
 if(allocated(par_unit_I))    deallocate(par_unit_I)
+
+ ! --- CHANFREQ: per-channel frequency/band binary table on MASK.CUBE.FITS
+ ! (RMCLEAN_INTEGRATION_PLAN.md T0) ---
+ ! MASK.CUBE.FITS's own ctype3/crval3/cdelt3 header (written earlier, see
+ ! that block's own comment) is a single linear FREQ WCS -- correct for a
+ ! single band, but NOT for a multi-band run: the merged channel axis is
+ ! a concatenation of each band's own channel list (reference band first,
+ ! at band_offset=0, every other band appended after -- see the "Per-band
+ ! channel offset" comment near band_offset's own population above), and
+ ! a single CRVAL/CDELT pair cannot represent that concatenation's true
+ ! per-channel frequencies. This is the same class of gap already
+ ! documented for use_auto_rm_range=1 being rejected outright for
+ ! nbands>1. Rather than rely on the linear axis at all -- for either
+ ! single- or multi-band, one mechanism, no special-casing -- attach an
+ ! explicit per-channel table instead, mirroring the CASAMBM/BEAMS
+ ! binary-table-extension pattern above. This is a genuine prerequisite
+ ! for RM-CLEAN (planning/RMCLEAN_INTEGRATION_PLAN.md): a standalone
+ ! clean tool consuming a saved dirty AMP/PHA cube has no other reliable
+ ! way to recover each channel's true lambda-squared.
+ !
+ ! Written from L_sq/flag_arr_out/band_offset, which are still fully
+ ! populated and unchanged since the tile-processing loop finished (none
+ ! of the three are deallocated until the "Deallocate all dynamically
+ ! allocated arrays" block further below) -- same 1..nz_out channel
+ ! indexing MASK.CUBE.FITS's own data planes were written with (see
+ ! mask_tile_arr's own iz derivation in the tile_mask stage), so table
+ ! row i lines up exactly with MASK's own axis-3 plane i.
+ !
+ ! FREQ is derived from L_sq (already in physical m^2 regardless of
+ ! which unit branch built it -- MHz-form or Hz-form both normalise into
+ ! m^2, see conv_fac's own comment) via freq_Hz = c_velocity(Mm/s) *
+ ! 1.0e6 / sqrt(L_sq), matching MASK's own existing cunit3='Hz'
+ ! convention. BAND is 0-indexed (0 for every channel in a single-band
+ ! run); CHAN is 0-indexed, matching the BEAMS table's own CHAN
+ ! convention above.
+if(out_mask_open)then
+   allocate(chanfreq_chan(nz_out), chanfreq_band(nz_out), chanfreq_freq(nz_out))
+   do chanfreq_i = 1,nz_out
+      chanfreq_chan(chanfreq_i) = chanfreq_i - 1
+      chanfreq_freq(chanfreq_i) = dble(c_velocity)*1.0d6/&
+      &sqrt(dble(L_sq(chanfreq_i)))
+      chanfreq_band(chanfreq_i) = 0
+   enddo
+   if(n_bands_t2.gt.1)then
+      do chanfreq_iband = 1,n_bands_t2
+         do chanfreq_i = band_offset(chanfreq_iband)+1,&
+         &band_offset(chanfreq_iband)+band_nz(chanfreq_iband)
+            chanfreq_band(chanfreq_i) = chanfreq_iband - 1
+         enddo
+      enddo
+   endif
+
+   chanfreq_fitsstat = 0
+   call FTIBIN(43,nz_out,3,(/'CHAN    ','FREQ    ','BAND    '/),&
+   &(/'1J      ','1D      ','1J      '/),&
+   &(/'        ','Hz      ','        '/),'CHANFREQ',0,chanfreq_fitsstat)
+   call FTGCNO(43,.false.,'CHAN',chanfreq_colnum,chanfreq_fitsstat)
+   call FTPCLJ(43,chanfreq_colnum,1,1,nz_out,chanfreq_chan,chanfreq_fitsstat)
+   call FTGCNO(43,.false.,'FREQ',chanfreq_colnum,chanfreq_fitsstat)
+   call FTPCLD(43,chanfreq_colnum,1,1,nz_out,chanfreq_freq,chanfreq_fitsstat)
+   call FTGCNO(43,.false.,'BAND',chanfreq_colnum,chanfreq_fitsstat)
+   call FTPCLJ(43,chanfreq_colnum,1,1,nz_out,chanfreq_band,chanfreq_fitsstat)
+   call FTMAHD(43,1,hdutype_dum,chanfreq_fitsstat)
+   if(chanfreq_fitsstat.ne.0)then
+      write(*,*)'WARNING: failed to write CHANFREQ binary table onto '//&
+      &'MASK.CUBE.FITS'
+   endif
+   deallocate(chanfreq_chan, chanfreq_band, chanfreq_freq)
+endif
+
  ! par_wunit_amp/par_wunit_pha are always aliases of units 41/42 now (see
  ! "Parallel write handle setup" above) -- no separate handles were opened,
  ! so there is nothing extra to close here; 41/42 are closed below.
