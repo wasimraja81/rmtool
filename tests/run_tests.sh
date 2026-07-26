@@ -70,6 +70,13 @@
 #      renders PNGs in the thesis figures' own panel style (tests/output/
 #      rmclean_plots/) via tests/plot_thesis_scenario_rmclean.py, skipped
 #      gracefully if ~/venv/rmtool's python3 isn't found.
+#  24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_zero – a single
+#      point source with a NONZERO intrinsic angle, cleaned twice (once
+#      at lsq_ref=0, once at a band-mean reference requiring a far
+#      coarser RM grid per required_drm_nyquist), confirming
+#      derotate_to_lsq_zero recovers the same intrinsic polarization
+#      angle at lambda_sq=0 in both cases, within a tolerance derived
+#      from each case's own grid resolution (not an arbitrary constant).
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -1583,6 +1590,36 @@ if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
     fi
 else
     skip "FFTW3 (or gfortran) not available for rmclean_mod; skipping RM-CLEAN thesis scenario test (see $OUT_DIR/rmclean_mod_build.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# 24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_zero
+# ---------------------------------------------------------------------------
+section "24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_zero"
+
+lsqref_flex_bin="$RMCLEAN_BUILD_DIR/test_rmclean_lsqref_flex"
+lsqref_flex_log="$OUT_DIR/test_rmclean_lsqref_flex.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_rmclean_lsqref_flex.f90" "$rmclean_o" \
+            -o "$lsqref_flex_bin" -lfftw3 2>"$OUT_DIR/rmclean_lsqref_flex_build.log"; then
+        if "$lsqref_flex_bin" > "$lsqref_flex_log" 2>&1; then
+            while IFS= read -r line; do
+                case "$line" in
+                    *"[PASS]"*) pass "${line#*\[PASS\] }" ;;
+                    *"[FAIL]"*) fail "${line#*\[FAIL\] }" ;;
+                esac
+            done < "$lsqref_flex_log"
+        else
+            fail "RM-CLEAN lsq_ref flexibility: program exited non-zero (see $lsqref_flex_log)"
+        fi
+    else
+        fail "RM-CLEAN lsq_ref flexibility: build failed (see $OUT_DIR/rmclean_lsqref_flex_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN lsq_ref flexibility test"
 fi
 
 # ---------------------------------------------------------------------------

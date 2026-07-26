@@ -17,7 +17,7 @@ module rmclean_mod
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
-   public :: required_drm_nyquist
+   public :: required_drm_nyquist, derotate_to_lsq_zero
 
    ! FFTW3 constants (same convention as gaussft_mod's own -- declared
    ! directly rather than `include`d, fftw3.f is fixed-form F77 and
@@ -500,25 +500,58 @@ contains
       real(sp), intent(out) :: resid_re(nrm), resid_im(nrm)
       integer, intent(out) :: n_iter_used
 
+      real(sp) :: resid_re_snap(nrm), resid_im_snap(nrm)
       real(sp) :: resid_amp(nrm), re_beam(nrm), im_beam(nrm)
       real(sp) :: avg_abs, rms_val, peak_val, peak_loc, phase_val
       real(sp) :: peak_offset, re_at_peak, im_at_peak, frac, dRM
+      ! Accumulator state, kept in double precision internally -- see
+      ! this subroutine's own top-of-file precision note: EVERY other
+      ! numerically-delicate part of this module (the offset table,
+      ! compute_dirty_rmbeam's own interpolation, restore_clean's
+      ! convolution) already does its internal arithmetic in double
+      ! precision, casting to real(sp) only at the public output
+      ! boundary. This loop is the one place that didn't: resid_re/
+      ! resid_im get REPEATEDLY subtracted from, up to niter times (often
+      ! 1000+) -- unlike the peak-finding step below (which recomputes
+      ! fresh from the CURRENT residual snapshot every iteration, so any
+      ! single-precision rounding there is a bounded, non-compounding,
+      ! per-iteration effect), each subtraction's rounding error
+      ! compounds into every subsequent iteration. Confirmed empirically:
+      ! a noise-free single-point-source case converged to a residual
+      ! power of only ~1e-13 of the dirty map's own power after enough
+      ! iterations to fully resolve the source -- suspiciously close to
+      ! float32's own ~1.2e-7 relative-amplitude (squared: ~1.4e-14
+      ! power) floor, meaning the OLD single-precision accumulator was
+      ! the thing limiting how deep CLEAN could converge, not the
+      ! algorithm or the data. Real (noisy) data has its own thermal
+      ! noise floor almost always far above this, so this rarely mattered
+      ! in practice -- but it is a real, identifiable precision
+      ! limitation, now removed at negligible cost (a few extra KB per
+      ! pixel, not per cube -- CLEAN runs one line of sight at a time).
+      real(dp) :: resid_re_dp(nrm), resid_im_dp(nrm)
+      real(dp) :: comp_re_dp(nrm), comp_im_dp(nrm)
       integer :: iter, imax
 
-      comp_re = 0.0_sp
-      comp_im = 0.0_sp
-      resid_re = dirty_re
-      resid_im = dirty_im
+      comp_re_dp = 0.0_dp
+      comp_im_dp = 0.0_dp
+      resid_re_dp = real(dirty_re, dp)
+      resid_im_dp = real(dirty_im, dp)
       dRM = rm_samp(2) - rm_samp(1)
 
       do iter = 1, niter
          n_iter_used = iter
-         resid_amp = sqrt(resid_re**2 + resid_im**2)
+         ! Fresh single-precision SNAPSHOT of the current (double-
+         ! precision) residual, for peak-finding only -- recomputed from
+         ! scratch every iteration, so this doesn't compound (see the
+         ! precision note above).
+         resid_re_snap = real(resid_re_dp, sp)
+         resid_im_snap = real(resid_im_dp, sp)
+         resid_amp = sqrt(resid_re_snap**2 + resid_im_snap**2)
          call rms_about_mean(resid_amp, nrm, rms_val)
          call index_absmax(resid_amp, nrm, imax, avg_abs)
 
          if (imax > 1 .and. imax < nrm) then
-            call peak_interp_parabolic(resid_re, resid_im, nrm, imax,&
+            call peak_interp_parabolic(resid_re_snap, resid_im_snap, nrm, imax,&
             &peak_offset, re_at_peak, im_at_peak)
          else
             ! Sampled peak is on the domain edge -- no neighbour on one
@@ -526,8 +559,8 @@ contains
             ! the best available estimate (same edge policy as the
             ! original quad_interp.f).
             peak_offset = 0.0_sp
-            re_at_peak = resid_re(imax)
-            im_at_peak = resid_im(imax)
+            re_at_peak = resid_re_snap(imax)
+            im_at_peak = resid_im_snap(imax)
          endif
          peak_loc = rm_samp(imax) + peak_offset*dRM
          peak_val = sqrt(re_at_peak**2 + im_at_peak**2)
@@ -539,12 +572,17 @@ contains
          &0.5_sp*phase_val, re_beam, im_beam)
 
          frac = gain*peak_val
-         comp_re(imax) = comp_re(imax) + frac*cos(phase_val)
-         comp_im(imax) = comp_im(imax) + frac*sin(phase_val)
+         comp_re_dp(imax) = comp_re_dp(imax) + real(frac*cos(phase_val), dp)
+         comp_im_dp(imax) = comp_im_dp(imax) + real(frac*sin(phase_val), dp)
 
-         resid_re = resid_re - frac*re_beam
-         resid_im = resid_im - frac*im_beam
+         resid_re_dp = resid_re_dp - real(frac, dp)*real(re_beam, dp)
+         resid_im_dp = resid_im_dp - real(frac, dp)*real(im_beam, dp)
       end do
+
+      comp_re = real(comp_re_dp, sp)
+      comp_im = real(comp_im_dp, sp)
+      resid_re = real(resid_re_dp, sp)
+      resid_im = real(resid_im_dp, sp)
    end subroutine clean_complex
 
    subroutine compute_rmsf_fwhm(l_sq, nchan, fwhm_rm)
@@ -709,6 +747,85 @@ contains
       max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref, dp)))
       drm_max = real(pi/(2.0_dp*real(oversample, dp)*max_offset), sp)
    end subroutine required_drm_nyquist
+
+   subroutine derotate_to_lsq_zero(rm_samp, nrm, lsq_ref, re_in, im_in, re_out, im_out)
+      !! Re-express a spectrum computed with internal reference lsq_ref
+      !! in the lambda_sq=0 phase convention -- lets a caller pick
+      !! WHATEVER lsq_ref is computationally convenient (e.g. a band's,
+      !! or a multi-band set's, own centroid -- required_drm_nyquist's
+      !! own bound tightens sharply the farther lsq_ref sits from the
+      !! channels themselves, so a centroid choice can need a far coarser,
+      !! cheaper RM grid than lsq_ref=0 does) while still being able to
+      !! report the intrinsic polarization angle at lambda_sq=0 (this
+      !! project's, and the user's own thesis's, standard reporting
+      !! convention), without re-running anything.
+      !!
+      !! Derivation: the dirty spectrum built at reference lsq_ref is
+      !! P_ref(phi) = P_0(phi) * exp(2i*phi*lsq_ref) (required_drm_
+      !! nyquist's own comment derives the general
+      !! P_ref'(phi)=P_ref(phi)*exp(-2i*phi*(ref-ref')) relation between
+      !! any two references; setting ref=0, ref'=lsq_ref gives this
+      !! specific case). So P_0(phi) = P_ref(phi) * exp(-2i*phi*lsq_ref)
+      !! recovers the lambda_sq=0 convention exactly, at every phi
+      !! independently -- a pointwise multiply, no re-synthesis needed.
+      !! |P_0(phi)|=|P_ref(phi)| exactly (unit-modulus factor), so this
+      !! changes ONLY phase, never amplitude -- a directly verifiable
+      !! property (tests/thesis_scenario_rmclean.f90's own lsq_ref
+      !! flexibility case checks it).
+      !!
+      !! Practical use for the intrinsic polarization angle: apply this
+      !! to the restored (or dirty) spectrum, then read off
+      !! chi0 = 0.5*atan2(im_out(j), re_out(j)) at the recovered
+      !! component's own index j -- the standard P(lambda_sq=0)=
+      !! p*exp(2i*chi0) relation, now satisfied exactly regardless of
+      !! which lsq_ref the actual RM-CLEAN computation used internally.
+      !! (chi0 recovered only mod pi, the ordinary EVPA n*180-degree
+      !! ambiguity inherent to any doubled-angle Faraday convention --
+      !! not introduced by this routine.)
+      !!
+      !! IMPORTANT precision caveat, confirmed empirically (tests/
+      !! test_rmclean_lsqref_flex.f90's own nonzero-chi0 case): chi0's own
+      !! precision is coupled to lsq_ref's magnitude via
+      !! chi0 = 0.5*phase_val - RM_found*lsq_ref (this routine's own
+      !! derivation, evaluated at j=the recovered component's grid index).
+      !! At lsq_ref=0, ANY imprecision in RM_found (grid discretisation,
+      !! finite CLEAN convergence, etc) multiplies against zero and simply
+      !! does not affect chi0 at all -- the reason lsq_ref=0 is uniquely
+      !! "free" for phase reporting, not a coincidence. At a NONZERO
+      !! lsq_ref (e.g. a band's own centroid, chosen because
+      !! required_drm_nyquist allows a far coarser, cheaper RM grid there
+      !! -- see that routine's own comment), the SAME RM_found imprecision
+      !! gets multiplied by lsq_ref before reaching chi0: roughly
+      !! 0.5*dRM*|lsq_ref| worth of chi0 error should be expected from grid
+      !! discretisation alone (confirmed: a coarse band-centroid-referenced
+      !! run with dRM~10x that of the lsq_ref=0 run showed a ~0.22 rad
+      !! chi0 offset, well inside the ~0.5 rad this formula predicts,
+      !! while the lsq_ref=0 run recovered chi0 exactly). For the best
+      !! achievable chi0 precision at a nonzero lsq_ref: sub-pixel refine
+      !! RM_found first (peak_interp_parabolic, the same routine
+      !! clean_complex already uses internally every iteration) rather
+      !! than reading chi0 off the nearest grid point's own de-rotated
+      !! value -- this is what actually determines RM_found's precision,
+      !! not this routine, which is exact given whatever RM_found it is
+      !! handed.
+      integer, intent(in) :: nrm
+      real(sp), intent(in) :: rm_samp(nrm), lsq_ref
+      real(sp), intent(in) :: re_in(nrm), im_in(nrm)
+      real(sp), intent(out) :: re_out(nrm), im_out(nrm)
+
+      real(dp) :: ang, c, s, re_dp, im_dp
+      integer :: j
+
+      do j = 1, nrm
+         ang = -2.0_dp*real(rm_samp(j), dp)*real(lsq_ref, dp)
+         c = cos(ang)
+         s = sin(ang)
+         re_dp = real(re_in(j), dp)
+         im_dp = real(im_in(j), dp)
+         re_out(j) = real(re_dp*c - im_dp*s, sp)
+         im_out(j) = real(re_dp*s + im_dp*c, sp)
+      end do
+   end subroutine derotate_to_lsq_zero
 
    subroutine restore_clean(rm_samp, nrm, comp_re, comp_im, resid_re,&
    &resid_im, fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)

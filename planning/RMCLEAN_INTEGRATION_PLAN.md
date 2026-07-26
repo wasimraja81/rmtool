@@ -544,6 +544,105 @@ extended feature's flux that neither band alone can, while the isolated
 point source is recovered reliably and to essentially full power in
 every case.
 
+**Addendum — build coverage, a real precision gap, and lsq_ref flexibility
+(post-commit follow-up, user review):**
+
+1. **`scratch/make_all.sh` now also builds the ancillary standalone tools**
+   (`reproject_cubes`, `convolve_cubes`, `match_cubes`) — previously it
+   only cycled `rm_synthesis`'s own 4 OMP/GPU flavours, silently never
+   rebuilding the other three tools at all. Checked the Makefile
+   directly rather than assuming: those three targets hard-code
+   `CPU_OPTFLAGS`/`CPU_OMPFLAGS` and never read the `OMP=`/`GPU=`
+   variables, so unlike `rm_synthesis` there is no 4-way matrix to
+   rebuild — one clean+build per tool suffices. (RM-CLEAN itself still
+   has no Makefile target — T2, not yet started.)
+2. **Precision audit (`float32` vs `float64`), requested directly —
+   found one real gap.** Read the whole module against this question:
+   every numerically-delicate part (the RMSF offset table, `compute_
+   dirty_rmbeam`'s interpolation, `restore_clean`'s convolution, FFTW's
+   own `complex(dp)` arrays matching the double-precision `-lfftw3` it
+   links against) already does its internal arithmetic in double
+   precision, casting to `real(sp)` only at the public boundary — except
+   `clean_complex`'s own accumulator loop, which was `real(sp)`
+   throughout. Unlike the PEAK-FINDING step (recomputed fresh from the
+   current residual every iteration, so any single-precision rounding
+   there is bounded and non-compounding), the residual/component
+   SUBTRACTION (`resid = resid - frac*beam`) is applied repeatedly to
+   the SAME accumulator across up to `niter` (often 1000+) iterations —
+   exactly the case where rounding error compounds. Confirmed this was
+   real, not theoretical: a noise-free single-point-source case had
+   previously converged to a residual power of only ~`1e-13` of the
+   dirty map's own power — suspiciously close to `float32`'s own
+   `~1.2e-7` relative-amplitude (squared: `~1.4e-14` power) floor,
+   meaning the accumulator's own precision, not the algorithm or the
+   data, was capping how deep CLEAN could converge. Fixed by promoting
+   `resid_re`/`resid_im`/`comp_re`/`comp_im` to `real(dp)` internally
+   for the duration of the loop (a fresh `real(sp)` snapshot is taken
+   each iteration for the unchanged peak-finding calls), casting back to
+   `real(sp)` only in the final output — the same "double internally,
+   single at the boundary" convention every other routine in this module
+   already follows, extended to the one place that didn't. Negligible
+   cost (a few extra KB per pixel — CLEAN runs one line of sight at a
+   time, not per-cube). Real data's own thermal noise floor is almost
+   always far above `float32`'s epsilon regardless, so this rarely
+   mattered in practice — but it was a real, identifiable, and now
+   removed limitation, not a hypothetical one.
+3. **`lsq_ref` flexibility + `derotate_to_lsq_zero`, at the user's
+   explicit request** ("users should be given a chance to select
+   reference lambda-sq... we would still like to report extracted
+   intrinsic polarisation angle de-rotated to lambda_sq=0"). `lsq_ref`
+   was already a free, explicit parameter to `compute_dirty_rmbeam_
+   direct`/`build_rmsf_offset_table` (this session's earlier fix) — the
+   missing piece was a way to report results at the STANDARD
+   `lambda_sq=0` convention regardless of which `lsq_ref` was used
+   internally for the actual computation. New public subroutine,
+   `derotate_to_lsq_zero(rm_samp, nrm, lsq_ref, re_in, im_in, re_out,
+   im_out)`: the dirty/restored spectrum built at reference `lsq_ref` is
+   `P_ref(phi) = P_0(phi)*exp(2i*phi*lsq_ref)` (the same general
+   reference-change relation `required_drm_nyquist`'s own comment
+   derives), so `P_0(phi) = P_ref(phi)*exp(-2i*phi*lsq_ref)` recovers
+   the `lambda_sq=0` convention exactly, pointwise, with no re-synthesis
+   needed — a genuine closed-form identity, not an approximation.
+   `|P_0|=|P_ref|` exactly (a unit-modulus factor changes only phase),
+   directly verified in the new test below.
+   - **This connects directly to `required_drm_nyquist`'s own finding**
+     (a band's own centroid as `lsq_ref` needs a far coarser, cheaper RM
+     grid than `lsq_ref=0` does) — this is very likely the actual
+     motivation for wanting `lsq_ref` flexibility at all, so the two
+     features were designed to compose: pick whatever `lsq_ref` is
+     computationally convenient, then de-rotate to report chi0 at the
+     standard convention.
+   - **A second, genuine precision coupling found while validating this
+     (not by inspection — the first version of the new test failed,
+     revealing it):** chi0 = `0.5*phase_val - RM_found*lsq_ref`. At
+     `lsq_ref=0` this is exact regardless of any imprecision in
+     `RM_found` (the multiplication by zero cancels it) — the reason
+     `lsq_ref=0` is uniquely "free" for phase reporting, not a
+     coincidence. At a NONZERO `lsq_ref`, the SAME `RM_found`
+     imprecision (bounded by grid resolution, roughly half a cell even
+     after sub-pixel refinement) gets multiplied by `lsq_ref` before
+     reaching chi0 — a real, physical trade-off for choosing a coarser,
+     cheaper grid, not a bug. Documented directly in `derotate_to_lsq_
+     zero`'s own comment, with the practical mitigation: sub-pixel
+     refine `RM_found` first (`peak_interp_parabolic`, the same routine
+     `clean_complex` already uses internally every iteration) before
+     reading off chi0, rather than settling for the nearest grid point.
+4. **New test, `tests/test_rmclean_lsqref_flex.f90`** (wired into
+   `tests/run_tests.sh` as section 24): a single point source with a
+   DELIBERATELY NONZERO intrinsic angle (chi0=0.3 rad — the existing
+   thesis-scenario test's own sky model is all PA=0, which cannot catch
+   a sign error in a derotation formula), cleaned once at `lsq_ref=0`
+   and once at the band's own mean, confirming: (a) the mean reference
+   allows a `>5x` coarser grid (confirmed `10.7x` here); (b) both cases
+   recover chi0 within a tolerance DERIVED from each case's own grid
+   resolution (`0.02` rad at `lsq_ref=0`, exact; `0.5*dRM*|lsq_ref|` at
+   the coarser reference, not an arbitrary loosened number — matches
+   finding 3 above directly); (c) `|P|` is unchanged by derotation to
+   better than `1e-4` relative, confirming the transform is phase-only.
+   All checks pass; full regression (`scratch/make_all.sh` + `tests/
+   run_tests.sh`) is 65/65, up from 57/57 (this test's own 7 new checks
+   plus the ancillary-tools build coverage above).
+
 ### T2 (not yet detailed — standalone tool consuming T1, scoped from
 ### design discussion above, numbering/scope to firm up once started)
 
