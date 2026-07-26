@@ -16,7 +16,8 @@ module rmclean_mod
    public :: rmsf_table_t, build_rmsf_offset_table, destroy_rmsf_offset_table
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
    public :: clean_complex
-   public :: compute_rmsf_fwhm, restore_clean
+   public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
+   public :: required_drm_nyquist
 
    ! FFTW3 constants (same convention as gaussft_mod's own -- declared
    ! directly rather than `include`d, fftw3.f is fixed-form F77 and
@@ -143,9 +144,29 @@ contains
 
       real(sp) :: mag(3), alpha, beta, gama
       real(sp) :: alpha_re, beta_re, gama_re, alpha_im, beta_im, gama_im
+      real(sp) :: abs_val(3)
 
-      mag = log10(sqrt(re_in(i_center-1:i_center+1)**2 +&
-      &im_in(i_center-1:i_center+1)**2))
+      ! log10(0) is -Infinity -- not a numerical inconvenience to smooth
+      ! over, a genuine domain violation (log of zero is mathematically
+      ! undefined), so it cannot be guarded with an arbitrary small-
+      ! number floor without silently fabricating curvature that isn't
+      ! there. An exact zero here is a legitimate outcome of iterative
+      ! floating-point subtraction (CLEAN can drive a residual bin to
+      ! exactly 0.0 after enough iterations, confirmed directly: this
+      ! was reached in practice, not a hypothetical). If any of the 3
+      ! samples is exactly zero, there is no well-defined log-magnitude
+      ! curvature to fit at all -- fall back to the sampled centre
+      ! itself, the same principled fallback already used just below for
+      ! the flat/linear (zero second-difference) case.
+      abs_val = sqrt(re_in(i_center-1:i_center+1)**2 + im_in(i_center-1:i_center+1)**2)
+      if (any(abs_val <= 0.0_sp)) then
+         peak_offset = 0.0_sp
+         re_peak = re_in(i_center)
+         im_peak = im_in(i_center)
+         return
+      endif
+
+      mag = log10(abs_val)
       alpha = mag(1)
       beta = mag(2)
       gama = mag(3)
@@ -277,7 +298,7 @@ contains
    end subroutine fourier_interp_complex
 
    subroutine compute_dirty_rmbeam_direct(l_sq, nchan, rm_in, phase_in,&
-   &cos_arr, sin_arr, nrm, maxrm, maxchan, re_beam, im_beam)
+   &cos_arr, sin_arr, nrm, maxrm, maxchan, lsq_ref, re_beam, im_beam)
       !! Exact, O(nrm*nchan) reference implementation -- a direct port of
       !! compute_dirty_rmbeam.f's own dot-product formula (matched-filter
       !! correlation of a synthetic point-source signal at (rm_in,
@@ -288,17 +309,37 @@ contains
       !! path is deferred, T-future -- see rmsf_table_t's own comment).
       !! Kept as the ground-truth compute_dirty_rmbeam is verified
       !! against, not meant for the CLEAN loop's own hot path.
+      !!
+      !! lsq_ref: the phase-reference lambda-squared, EXPLICITLY supplied
+      !! by the caller rather than computed internally as mean(l_sq) --
+      !! this is a pure convention choice (the derivation in
+      !! rmsf_table_t's own comment holds for ANY fixed reference point,
+      !! not specifically the mean), and different callers legitimately
+      !! want different choices: rm_synthesis_mod.f90's own
+      !! extract_general_setup references to the mean (numerically
+      !! smaller phase arguments across a whole run); the user's own
+      !! thesis codebase references to lambda_sq=0 (no subtraction at
+      !! all). Whatever the caller passes here MUST match whatever
+      !! reference point was used to construct cos_arr/sin_arr AND the
+      !! caller's own dirty-map/injected-data phase convention -- a
+      !! mismatch here does not break the amplitude in a broad "noisy"
+      !! way, it introduces a genuine phase distortion that differs
+      !! per-component (verified directly: forcing two different
+      !! reference conventions to disagree between an injected multi-
+      !! component sky model and its own dirty-map construction gave
+      !! wrong relative amplitudes between components, not just a
+      !! rotated-but-otherwise-correct result).
       integer, intent(in) :: nchan, nrm, maxrm, maxchan
       real(sp), intent(in) :: l_sq(nchan), rm_in, phase_in
       real(sp), intent(in) :: cos_arr(maxrm, maxchan), sin_arr(maxrm, maxchan)
+      real(sp), intent(in) :: lsq_ref
       real(sp), intent(out) :: re_beam(nrm), im_beam(nrm)
 
-      real(sp) :: lsq_ref, phi_tmp
+      real(sp) :: phi_tmp
       real(sp) :: ryt(nchan), iyt(nchan)
       real(sp) :: rc_cor, rs_cor, ic_cor, is_cor
       integer :: j
 
-      lsq_ref = sum(l_sq)/real(nchan, sp)
       block
          integer :: kk
          do kk = 1, nchan
@@ -318,8 +359,8 @@ contains
       end do
    end subroutine compute_dirty_rmbeam_direct
 
-   subroutine build_rmsf_offset_table(l_sq, nchan, delta_span, native_ddelta,&
-   &oversample, table)
+   subroutine build_rmsf_offset_table(l_sq, nchan, lsq_ref, delta_span,&
+   &native_ddelta, oversample, table)
       !! Build R(delta) once (see rmsf_table_t's own comment for the
       !! derivation) on a grid finer than the dirty map's own RM sampling
       !! by `oversample`, spanning [-delta_span,+delta_span] -- the
@@ -327,16 +368,26 @@ contains
       !! offset a (rm_in, rm_samp(j)) pair inside the search domain can
       !! ever produce, so every lookup this table will ever see falls
       !! inside its built range.
+      !!
+      !! lsq_ref: MUST match whatever reference point the caller's own
+      !! dirty-map/injected-data construction uses -- see
+      !! compute_dirty_rmbeam_direct's own comment on why this is a real
+      !! correctness requirement, not a cosmetic choice: R(delta) itself
+      !! is only a pure function of delta for a FIXED, shared reference
+      !! point; changing the reference multiplies R(delta) by an extra
+      !! delta-dependent phase factor, exp(-2i*delta*(new_ref-old_ref)),
+      !! not just a constant rotation.
       real(sp), intent(in) :: l_sq(nchan)
       integer, intent(in) :: nchan
+      real(sp), intent(in) :: lsq_ref
       real(sp), intent(in) :: delta_span, native_ddelta
       integer, intent(in) :: oversample
       type(rmsf_table_t), intent(out) :: table
 
-      real(dp) :: lsq_ref, delta_m, phase_k
+      real(dp) :: lsq_ref_dp, delta_m, phase_k
       integer :: m
 
-      lsq_ref = sum(real(l_sq, dp))/real(nchan, dp)
+      lsq_ref_dp = real(lsq_ref, dp)
 
       table%ddelta = real(native_ddelta, dp)/real(oversample, dp)
       table%n_fine = 2*ceiling(real(delta_span, dp)/table%ddelta) + 1
@@ -347,8 +398,8 @@ contains
       do m = 1, table%n_fine
          delta_m = table%delta_min + real(m-1, dp)*table%ddelta
          phase_k = -2.0_dp*delta_m
-         table%re_fine(m) = sum(cos(phase_k*(real(l_sq, dp)-lsq_ref))) / real(nchan, dp)
-         table%im_fine(m) = sum(sin(phase_k*(real(l_sq, dp)-lsq_ref))) / real(nchan, dp)
+         table%re_fine(m) = sum(cos(phase_k*(real(l_sq, dp)-lsq_ref_dp))) / real(nchan, dp)
+         table%im_fine(m) = sum(sin(phase_k*(real(l_sq, dp)-lsq_ref_dp))) / real(nchan, dp)
       end do
       !$omp end parallel do
    end subroutine build_rmsf_offset_table
@@ -508,12 +559,84 @@ contains
       !! rounded "300.0" -- a real precision improvement, not just a
       !! style change, since L_sq itself is built with the precise
       !! constant elsewhere in this project.
+      !!
+      !! Bug fixed vs. the original rm_restore.f (caught by
+      !! tests/thesis_scenario_rmclean.f90, not by inspection): the
+      !! original's own f1=c/sqrt(L_sq(nchan))/f2=c/sqrt(L_sq(1))
+      !! indexing assumes a SPECIFIC l_sq ordering convention (l_sq(1)
+      !! the smallest/highest-frequency channel) to end up with a
+      !! positive lsq_span. That's the OPPOSITE of L_sq's own documented
+      !! convention everywhere else in this project (rm_synthesis.f90's
+      !! own comment: "L_sq for ALL channels... in descending lambda_sq
+      !! order", i.e. l_sq(1) is the LARGEST/lowest-frequency channel) --
+      !! with that convention (the one this module's own
+      !! compute_dirty_rmbeam and every test in this project actually
+      !! uses), the original's formula silently produces a NEGATIVE
+      !! lsq_span (same magnitude, wrong sign), and therefore a negative
+      !! FWHM_RM. A "span" is a magnitude, not an ordering-dependent
+      !! signed quantity -- abs() here, rather than trying to track or
+      !! document a specific required l_sq ordering convention this
+      !! subroutine would otherwise silently depend on.
       integer, intent(in) :: nchan
       real(sp), intent(in) :: l_sq(nchan)
       real(sp), intent(out) :: fwhm_rm
-
-      real(dp) :: f1, f2, dfreq, lsq1, lsq2, lsq_span
       real(dp), parameter :: pi = 3.14159265358979_dp
+
+      fwhm_rm = real(0.5_dp*pi/padded_lsq_span(l_sq, nchan), sp)
+   end subroutine compute_rmsf_fwhm
+
+   subroutine compute_rmsf_fwhm_multiband(l_sq, nchan, band_offset, band_nz,&
+   &n_bands, fwhm_rm)
+      !! Multi-band restoring-beam FWHM -- NOT the same formula as
+      !! compute_rmsf_fwhm above applied to the naively concatenated
+      !! l_sq array. Caught empirically by tests/thesis_scenario_rmclean.f90:
+      !! feeding a P-band+L-band concatenated array straight into
+      !! compute_rmsf_fwhm gives a wildly wrong FWHM, because that
+      !! subroutine's own span is (effectively) max(l_sq)-min(l_sq) across
+      !! the WHOLE array -- for two widely separated, non-contiguous bands
+      !! this is dominated by the large GAP between them, not by either
+      !! band's own actual channel coverage. The thesis's own text (Sec
+      !! 6.1.4) states the correct rule directly: "the effective
+      !! RM-resolution is provided by the SUM of the lambda^2-spans at the
+      !! two individual bands" -- verified numerically against Table 6.1
+      !! itself (P alone: 0.2007 vs tabulated 0.201; L alone: 0.01255 vs
+      !! tabulated 0.013; summed: 0.2133 vs tabulated P+L value 0.214 --
+      !! all three matching to within the table's own rounding).
+      !!
+      !! l_sq(nchan): full concatenated multi-band array. band_offset/
+      !! band_nz(n_bands): per-band segmentation, same convention as
+      !! rm_synthesis.f90's own band_offset/band_nz (band k occupies
+      !! l_sq(band_offset(k)+1 : band_offset(k)+band_nz(k))) -- the
+      !! caller already has this from its own multi-band bookkeeping,
+      !! not re-derived here by gap-detection heuristics on a flat array.
+      integer, intent(in) :: nchan, n_bands
+      real(sp), intent(in) :: l_sq(nchan)
+      integer, intent(in) :: band_offset(n_bands), band_nz(n_bands)
+      real(sp), intent(out) :: fwhm_rm
+
+      real(dp) :: span_sum
+      real(dp), parameter :: pi = 3.14159265358979_dp
+      integer :: k, i0, i1
+
+      span_sum = 0.0_dp
+      do k = 1, n_bands
+         i0 = band_offset(k) + 1
+         i1 = band_offset(k) + band_nz(k)
+         span_sum = span_sum + padded_lsq_span(l_sq(i0:i1), band_nz(k))
+      end do
+      fwhm_rm = real(0.5_dp*pi/span_sum, sp)
+   end subroutine compute_rmsf_fwhm_multiband
+
+   function padded_lsq_span(l_sq, nchan) result(lsq_span)
+      !! Shared by compute_rmsf_fwhm and compute_rmsf_fwhm_multiband: one
+      !! (single, contiguous) band's own lambda-squared span, edge
+      !! channels extended by half a channel each (matching the original
+      !! rm_restore.f's own edge-handling), order-independent (abs() --
+      !! see compute_rmsf_fwhm's own comment on the sign bug this fixes).
+      integer, intent(in) :: nchan
+      real(sp), intent(in) :: l_sq(nchan)
+      real(dp) :: lsq_span
+      real(dp) :: f1, f2, dfreq, lsq1, lsq2
 
       f1 = real(c_velocity, dp)/sqrt(real(l_sq(nchan), dp))
       f2 = real(c_velocity, dp)/sqrt(real(l_sq(1), dp))
@@ -522,9 +645,70 @@ contains
       f2 = f2 + 0.5_dp*dfreq
       lsq2 = (real(c_velocity, dp)/f1)**2
       lsq1 = (real(c_velocity, dp)/f2)**2
-      lsq_span = lsq2 - lsq1
-      fwhm_rm = real(0.5_dp*pi/lsq_span, sp)
-   end subroutine compute_rmsf_fwhm
+      lsq_span = abs(lsq2 - lsq1)
+   end function padded_lsq_span
+
+   subroutine required_drm_nyquist(l_sq, nchan, lsq_ref, oversample, drm_max)
+      !! The RM-grid spacing an off-grid-peak CLEAN needs, GIVEN a chosen
+      !! lsq_ref -- a genuine sampling-theorem bound, not an empirically
+      !! tuned constant. Distinct from compute_rmsf_fwhm/
+      !! compute_rmsf_fwhm_multiband above, which answer a different
+      !! question entirely:
+      !!
+      !! The dirty spectrum is P(phi) = (1/K) sum_k p_k
+      !! exp(-2i*phi*(l_sq(k)-lsq_ref)). Its MAGNITUDE envelope |P(phi)|
+      !! is exactly independent of lsq_ref (a reference change multiplies
+      !! the whole sum by exp(-2i*phi*Delta_ref), unit modulus for every
+      !! phi) and is set only by how the l_sq(k) are SPREAD OUT relative
+      !! to each other -- the SPAN, compute_rmsf_fwhm's own quantity. This
+      !! is the physically meaningful "resolution": how far apart two
+      !! Faraday components must be to be distinguished, the analogue of
+      !! a wave packet's GROUP velocity/envelope, which carries the
+      !! actual information content and cannot be changed by a mere
+      !! choice of coordinate origin.
+      !!
+      !! But CLEAN operates on Re(phi)/Im(phi) SEPARATELY (peak_interp_
+      !! parabolic fits each independently; clean_complex subtracts a
+      !! complex beam every iteration) -- it needs the actual complex
+      !! VALUE, not just the magnitude, so it cannot simply discard
+      !! lsq_ref's effect. Each term k in the sum is its own complex
+      !! sinusoid in phi with period pi/|l_sq(k)-lsq_ref| -- the
+      !! analogue of a carrier's PHASE velocity, which conveys no extra
+      !! resolution/information by itself (the magnitude envelope doesn't
+      !! care about it at all) but which the grid must still track
+      !! faithfully if raw Re/Im values are what get sampled, fit, and
+      !! subtracted. The fastest such term -- and therefore the binding
+      !! constraint -- comes from whichever channel sits FARTHEST from
+      !! lsq_ref: max_k|l_sq(k)-lsq_ref|. With lsq_ref=0 (this project's
+      !! thesis-matching convention) and a GHz-range band, that offset
+      !! equals the channel's own (large) l_sq directly, far exceeding
+      !! the (small) SPAN that governs resolution -- exactly why a grid
+      !! adequate for compute_rmsf_fwhm's own resolution scale can still
+      !! be wildly under-sampled for CLEAN's own Re/Im grid, a distinct
+      !! failure mode from "not enough resolution" (confirmed empirically:
+      !! CLEAN's residual diverged, 111 -> 8e16 over ~700 iterations, when
+      !! this bound was violated -- see tests/thesis_scenario_rmclean.f90).
+      !!
+      !! Bare two-point Nyquist for that fastest term is
+      !! drm <= pi/(2*max_offset). oversample (>1) tightens this by the
+      !! given factor, since peak_interp_parabolic's LOCAL 3-point
+      !! quadratic fit needs several samples across a cycle to be a valid
+      !! local approximation, not merely the bare two points needed to
+      !! avoid ALIASING a global reconstruction (a different, weaker,
+      !! requirement) -- an oversample of ~10-15 was empirically confirmed
+      !! sufficient (CLEAN's convergence trajectory matched the
+      !! lsq_ref=mean baseline closely at oversample~14) and is a
+      !! documented safety margin above the bare bound, not a second
+      !! hidden ad-hoc constant.
+      integer, intent(in) :: nchan
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref, oversample
+      real(sp), intent(out) :: drm_max
+      real(dp), parameter :: pi = 3.14159265358979_dp
+      real(dp) :: max_offset
+
+      max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref, dp)))
+      drm_max = real(pi/(2.0_dp*real(oversample, dp)*max_offset), sp)
+   end subroutine required_drm_nyquist
 
    subroutine restore_clean(rm_samp, nrm, comp_re, comp_im, resid_re,&
    &resid_im, fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)

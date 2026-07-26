@@ -357,10 +357,192 @@ the shelved "single" variant driver and one dated backup file).
      matching the basis exactly).
 - **Build/test:** `src/rmclean.f90` compiles clean standalone (`gfortran`
   + `-fopenmp -lfftw3`); all 4 `rm_synthesis` build flavours
-  (`scratch/make_all.sh`) clean; full `tests/run_tests.sh` 49/49 pass,
-  unaffected (this ticket adds one new self-contained module file plus
-  the additive `compute_rms` in `rm_synthesis_mod.f90`, neither consumed
-  by any existing tool yet).
+  (`scratch/make_all.sh`) clean; full `tests/run_tests.sh` (49 pre-existing
+  + 6 new, see addendum below) pass, unaffected (this ticket adds one new
+  self-contained module file plus the additive `compute_rms` in
+  `rm_synthesis_mod.f90`, neither consumed by any existing tool yet).
+
+**Addendum — thesis-scenario test, two more bugs found:** at the user's
+request, added `tests/thesis_scenario_rmclean.f90`, a single line-of-sight
+reproduction of Raja (2014) Chapter 6 Figures 6.1/6.2/6.3 (Table 6.1/6.2
+exact: a point source at RM=-100 amplitude 15, a Faraday-thick top-hat
+RM 100-130 total amplitude 5, both PA=0; CLEAN parameters niter=1000,
+loop-gain=0.1 taken directly from the figures' own panel labels), cleaned
+from P-band alone, L-band alone, and P+L combined — no FITS/cube I/O
+needed, `rmclean_mod` used directly. Wired into `tests/run_tests.sh` as
+section 23 (compiles fresh each run, skips gracefully if FFTW3 isn't
+available).
+
+This test caught two further real bugs beyond the three already listed
+above, both via comparing against Table 6.1's own published numbers, not
+by inspection:
+
+1. `compute_rmsf_fwhm` (T1's own new subroutine, not carried from the
+   original) came out **negative** for every case except one. Root
+   cause: the underlying `lsq_span` formula's sign depends on which end
+   of the array `l_sq(1)`/`l_sq(nchan)` represents, and the original
+   `rm_restore.f` this was ported from implicitly assumed the *opposite*
+   ordering convention from the one `L_sq` actually has everywhere else
+   in this project (`rm_synthesis.f90`'s own comment: descending, i.e.
+   `l_sq(1)` is the largest/lowest-frequency channel). A span is a
+   magnitude, not an ordering-dependent signed quantity — fixed with
+   `abs()`, refactored into a shared `padded_lsq_span` function reused by
+   both `compute_rmsf_fwhm` and the new multi-band variant below.
+2. Feeding a naively-concatenated P+L channel array into
+   `compute_rmsf_fwhm` gave a wildly wrong (order-of-magnitude-too-small)
+   FWHM. That subroutine's own span is effectively
+   `max(l_sq)-min(l_sq)` across the *whole* array — for two
+   widely-separated, non-contiguous bands this is dominated by the large
+   *gap* between them, not by either band's own actual channel coverage.
+   The thesis states the correct rule directly (Sec 6.1.4): "the
+   effective RM-resolution is provided by the **sum** of the
+   lambda-squared-spans at the two individual bands" — added a new
+   `compute_rmsf_fwhm_multiband(l_sq, nchan, band_offset, band_nz,
+   n_bands, fwhm_rm)`, same `band_offset`/`band_nz` per-band segmentation
+   convention `rm_synthesis.f90` already uses, summing each band's own
+   `padded_lsq_span`. Verified directly against Table 6.1 itself: P alone
+   0.2007 vs tabulated 0.201; L alone 0.01255 vs tabulated 0.013; summed
+   0.2133 vs the table's own P+L value 0.214 — all three matching to
+   within the table's rounding.
+
+**Addendum revision — flux metric, phase-reference convention, and a
+genuine CLEAN-divergence bug, all found from further user review:**
+
+1. **Flux metric was wrong.** The first version reported a bare restored
+   *peak* inside the `[100,130]` window for the Faraday-thick component.
+   Per the user's own correction: a point source's peak already equals
+   its total flux (unresolved, standard convention), but an *extended*
+   feature's total flux is the *integral* (area) of its restored profile
+   over its own extent — exactly how a real interferometric image's
+   resolved-source flux is measured, not read off a single peak pixel.
+   Fixed with a new `window_flux` (Riemann sum, `Σ spec(j)*dRM` inside
+   `[lo,hi]`), then further corrected to divide by the restoring beam's
+   own continuous area (`sigma*sqrt(2*pi)`, `sigma=0.42466*FWHM_RM`) —
+   the restoring kernel is normalized to unit *peak* height, not unit
+   area (`restore_clean`'s own `kernel_c(i)=exp(...)`, height 1 at
+   center), so integrating the restored map directly double-counts the
+   beam's own area on top of the true flux (caught empirically: an
+   early attempt reported L-alone recovering `1526%` of the true flux,
+   obviously unphysical, before the beam-area correction).
+2. **Phase-reference convention: `lsq_ref` must be an explicit,
+   caller-supplied parameter, not silently computed as `mean(l_sq)`
+   inside `compute_dirty_rmbeam_direct`/`build_rmsf_offset_table`.** Per
+   the user's explicit instruction ("My thesis refers to lambda_sq=0
+   for phase reference, and I want to use the same here"), the test now
+   injects the sky model and builds the dirty spectrum both at
+   `lsq_ref=0` (no subtraction), matching the thesis's own convention,
+   rather than this project's usual mean-referencing (used purely for
+   numerically smaller phase arguments — a cosmetic convenience, not a
+   physical requirement). This is a real correctness constraint, not a
+   style choice: `R(Δ)` is only a pure function of the offset
+   `Δ=RM-RM_true` for a FIXED reference shared between the injected data
+   and the matched-filter template — mismatching references was
+   confirmed empirically to distort *relative* amplitudes between
+   components, not just add a rotation. `compute_rmsf_fwhm_multiband`
+   also needed a genuine fix here, not just this test: the naive
+   concatenated-array approach used `max(l_sq)-min(l_sq)` across bands,
+   which is dominated by the inter-band gap; fixed by summing each
+   band's own `padded_lsq_span` directly (already covered above).
+3. **`lsq_ref=0` triggered a genuine CLEAN divergence, root-caused as a
+   Nyquist-type sampling violation, not a numerical-precision issue —
+   and the fix is now a DERIVED bound, not a tuned constant.** With
+   `lsq_ref=0`, the dirty spectrum's Re/Im oscillate at a rate set by
+   each channel's *absolute* λ² (~1.1 for P-band), not the small spread
+   around a mean (~0.2) that mean-referencing produces. The original
+   RM-grid spacing (`dRM=2.0`, `nrm=226`) was too coarse for
+   `peak_interp_parabolic`'s 3-point quadratic fit to stay valid across
+   that oscillation, and CLEAN's residual grew exponentially
+   (`111 -> 8e16` over ~700 iterations) — confirmed via a dedicated A/B
+   test (`lsq_ref=0` vs `lsq_ref=mean`, otherwise identical) that isolated
+   `lsq_ref=0` as the true trigger, and via an independent finer-grid
+   test (`dRM=0.1`) that converged cleanly under otherwise-identical
+   conditions. The first fix hardcoded that empirically-found `dRM=0.1`
+   directly — flagged by the user as looking ad hoc, correctly. Replaced
+   with a genuine sampling-theorem derivation, `rmclean_mod`'s new public
+   `required_drm_nyquist(l_sq, nchan, lsq_ref, oversample, drm_max)`:
+   the dirty spectrum is `P(φ)=(1/K)Σ_k p_k·exp(-2iφ(l_sq(k)-lsq_ref))`,
+   a sum of complex sinusoids in φ. Its *magnitude* envelope `|P(φ)|` is
+   exactly independent of `lsq_ref` (a reference change multiplies the
+   whole sum by `exp(-2iφ·Δref)`, unit modulus for every φ) and is set
+   only by how the channels' own λ² are spread relative to each other —
+   the SPAN, `compute_rmsf_fwhm`'s own quantity, the physically
+   meaningful resolution (the user's own analogy: a wave packet's GROUP
+   velocity/envelope, which carries the actual information content and
+   cannot be changed by a mere choice of coordinate origin). But CLEAN
+   operates on Re(φ)/Im(φ) *separately* (needs the actual complex value,
+   not just the magnitude, to know what to subtract) and each term k is
+   its own sinusoid with period `π/|l_sq(k)-lsq_ref|` — the analogue of a
+   carrier's PHASE velocity, conveying no extra resolution/information
+   by itself, but which the grid must still track faithfully since raw
+   Re/Im values are what get sampled, fit, and subtracted. The binding
+   constraint is therefore the *farthest* channel from `lsq_ref`:
+   `max_k|l_sq(k)-lsq_ref|`. Bare two-point Nyquist for that term gives
+   `dRM ≤ π/(2·max_offset)`; an `oversample` factor (used at `15` in the
+   test) tightens this further, since `peak_interp_parabolic`'s *local*
+   3-point quadratic fit needs several samples per cycle to be valid,
+   not merely the two points needed to avoid aliasing a global
+   reconstruction (a distinct, weaker requirement). Re-deriving `dRM`
+   this way (rather than the hardcoded literal) lands at `dRM≈0.0947`
+   (`nrm=4748`) for this scenario — matching the empirically-found
+   `0.1` closely, confirming the original number was in fact the right
+   order of magnitude, just not derived. All checks still pass
+   identically with the derived value. Separately, `peak_interp_parabolic`
+   gained a scientifically-grounded zero-magnitude guard (`log10(0)` is a
+   genuine domain violation; falls back to the sampled center value,
+   mirroring the pre-existing flat-curvature fallback) — a real
+   robustness fix, verified not to be what resolved the divergence on
+   its own (the dRM fix is the actual root cause).
+4. **Pass/fail criteria rebalanced per the user's explicit direction:**
+   strict, quantitative checks belong only on the *isolated* Faraday-simple
+   point source ("retrieve at its RM location with nearly equal power as
+   simulated"); the Faraday-thick component (never fully resolved by
+   design, per the thesis's own scenario) uses generous, qualitative
+   markers instead ("significant fraction... restored"), not a number
+   tuned tight to whatever the code happens to currently produce. Point
+   source: within `1.0 rad/m^2` and `15%` of true amplitude (actual
+   deviations ~0.1 rad/m^2 / ~2.5%, so the tolerance is not
+   loosened-until-passing). Thick component: P+L flux `>5x` P-alone flux
+   (actual ~27x) and `>10%` of the true simulated total flux (actual
+   ~40%) — both generous relative to the observed margins.
+5. **Plotting (`tests/plot_thesis_scenario_rmclean.py`), matching the
+   thesis's own Figure 6.1-6.3 panel style directly** (dirty Re/Im/Amp +
+   cleaned amplitude, dirty + restored phase, true input model, λ²
+   coverage), two more bugs found by inspecting the rendered plots
+   against the thesis's own figures:
+   - The λ² coverage panel initially tried to detect per-band segments
+     from λ²-spacing statistics alone (gap > 10x the global median
+     diff) — this silently shattered the P-band into 61 spurious
+     single-point "segments", because P-band's own channel-to-channel λ²
+     spacing (coarser, near the low-frequency end) is itself ~30x larger
+     than L-band's, so no single global threshold can separate a real
+     inter-band gap from a coarser band's own ordinary spacing. Fixed by
+     having the Fortran side emit explicit band membership (a `band`
+     column in `<slug>_lsq.csv`, from the same `band_offset`/`band_nz`
+     already used for `compute_rmsf_fwhm_multiband`) rather than
+     inferring it — the plot now groups by true band membership,
+     confirmed visually to render both the L-band and P-band segments
+     correctly in the combined case.
+   - Once `lsq_ref=0` was correctly implemented with the tightened,
+     `required_drm_nyquist`-derived grid, the dirty Re/Im panels show
+     many oscillation
+     cycles across the RM range, matching the thesis's own Figure 6.1/6.2
+     (previously showed only one cycle, under the old mean-referenced,
+     coarser-grid version) — confirmed by visual inspection of the
+     regenerated PNGs.
+6. **Channel counts (`nchan=61` P-band, `nchan=121` L-band):** not
+   independently specified anywhere in Table 6.1 itself; inherited from
+   `tests/make_thesis_scenario_cubes.py`'s own pre-existing precedent
+   (`BAND_P`/`BAND_L` dicts) for this same thesis scenario, used
+   as-is rather than invented fresh for this test.
+
+Final result (all checks passing, current numbers): P-alone point
+source `97.6%` of true amplitude / thick-component flux `1.5%` of true
+total; L-alone point `86.9%` / thick `7.8%`; P+L combined point `97.8%`
+/ thick `39.9%` — matching the thesis's own qualitative conclusion (Sec
+6.1.2-6.1.4) that combining bands recovers a significant fraction of the
+extended feature's flux that neither band alone can, while the isolated
+point source is recovered reliably and to essentially full power in
+every case.
 
 ### T2 (not yet detailed — standalone tool consuming T1, scoped from
 ### design discussion above, numbering/scope to firm up once started)

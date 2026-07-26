@@ -61,6 +61,15 @@
 #      writes
 #  22. io_read_threads>1 for multi-band (T9) – same config, 7 tiles,
 #      io_read_threads=4, bit-identical to the same single-tile reference
+#  23. RM-CLEAN thesis scenario (planning/RMCLEAN_INTEGRATION_PLAN.md T1) –
+#      single line-of-sight reproduction of Raja (2014) Chapter 6 Figures
+#      6.1/6.2/6.3 (Table 6.1/6.2 exact): point source + Faraday-thick
+#      top-hat, cleaned from P-band alone, L-band alone, and P+L combined.
+#      Standalone Fortran program (rmclean_mod has no FITS I/O/binary yet,
+#      T2), compiled fresh here; skipped if FFTW3 isn't available. Also
+#      renders PNGs in the thesis figures' own panel style (tests/output/
+#      rmclean_plots/) via tests/plot_thesis_scenario_rmclean.py, skipped
+#      gracefully if ~/venv/rmtool's python3 isn't found.
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -1527,6 +1536,53 @@ if [[ -x "$BIN_OMP" && -f "${OUT_DIR}/split_identity.AMP.RMCUBE.FITS" ]]; then
     fi
 else
     skip "OMP binary or multi-band CPU reference not available; skipping io_read_threads>1 multi-band test"
+fi
+
+# ---------------------------------------------------------------------------
+# 23. RM-CLEAN thesis scenario (T1) – Chapter 6 Figures 6.1-6.3
+# ---------------------------------------------------------------------------
+section "23. RM-CLEAN thesis scenario – Chapter 6 Figures 6.1/6.2/6.3 (T1)"
+
+RMCLEAN_BUILD_DIR="$OUT_DIR/rmclean_build"
+RMCLEAN_CSV_DIR="$OUT_DIR/rmclean_csv"
+RMCLEAN_PLOT_DIR="$OUT_DIR/rmclean_plots"
+mkdir -p "$RMCLEAN_BUILD_DIR" "$RMCLEAN_CSV_DIR" "$RMCLEAN_PLOT_DIR"
+rmclean_o="$RMCLEAN_BUILD_DIR/rmclean.o"
+rmclean_mod_dir="$RMCLEAN_BUILD_DIR"
+rmclean_bin="$RMCLEAN_BUILD_DIR/thesis_scenario_rmclean"
+rmclean_log="$OUT_DIR/thesis_scenario_rmclean.log"
+RMCLEAN_VENV_PY="$HOME/venv/rmtool/bin/python3"
+
+if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+        -O3 -fopenmp -J"$rmclean_mod_dir" -c "$REPO_ROOT/src/rmclean.f90" \
+        -o "$rmclean_o" 2>"$OUT_DIR/rmclean_mod_build.log" \
+    && gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+        -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+        "$TESTS_DIR/thesis_scenario_rmclean.f90" "$rmclean_o" \
+        -o "$rmclean_bin" -lfftw3 2>>"$OUT_DIR/rmclean_mod_build.log"; then
+    if "$rmclean_bin" "$RMCLEAN_CSV_DIR" > "$rmclean_log" 2>&1; then
+        while IFS= read -r line; do
+            case "$line" in
+                *"[PASS]"*) pass "${line#*\[PASS\] }" ;;
+                *"[FAIL]"*) fail "${line#*\[FAIL\] }" ;;
+            esac
+        done < "$rmclean_log"
+        if [[ -x "$RMCLEAN_VENV_PY" ]]; then
+            if "$RMCLEAN_VENV_PY" "$TESTS_DIR/plot_thesis_scenario_rmclean.py" \
+                    "$RMCLEAN_CSV_DIR" "$RMCLEAN_PLOT_DIR" \
+                    > "$OUT_DIR/rmclean_plot.log" 2>&1; then
+                pass "RM-CLEAN thesis scenario: plots written to $RMCLEAN_PLOT_DIR"
+            else
+                fail "RM-CLEAN thesis scenario: plotting failed (see $OUT_DIR/rmclean_plot.log)"
+            fi
+        else
+            skip "~/venv/rmtool python3 not found; skipping RM-CLEAN thesis scenario plots"
+        fi
+    else
+        fail "RM-CLEAN thesis scenario: program exited non-zero (see $rmclean_log)"
+    fi
+else
+    skip "FFTW3 (or gfortran) not available for rmclean_mod; skipping RM-CLEAN thesis scenario test (see $OUT_DIR/rmclean_mod_build.log)"
 fi
 
 # ---------------------------------------------------------------------------
