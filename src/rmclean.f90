@@ -17,7 +17,7 @@ module rmclean_mod
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
-   public :: required_drm_nyquist, derotate_to_lsq_zero
+   public :: required_drm_nyquist, derotate_to_lsq_zero, optimal_lsq_ref_midpoint
 
    ! FFTW3 constants (same convention as gaussft_mod's own -- declared
    ! directly rather than `include`d, fftw3.f is fixed-form F77 and
@@ -791,6 +791,56 @@ contains
       max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref, dp)))
       drm_max = real(pi/(2.0_dp*real(oversample, dp)*max_offset), sp)
    end subroutine required_drm_nyquist
+
+   subroutine optimal_lsq_ref_midpoint(l_sq, nchan, lsq_ref_opt)
+      !! The lsq_ref choice that MINIMIZES required_drm_nyquist's own
+      !! bound -- i.e. the cheapest safe RM grid -- across however many
+      !! bands l_sq spans. Added at the user's own request, after they
+      !! correctly pushed back on an earlier, wrong intuition (centering
+      !! on the LOWEST-frequency band's own centroid) with two sharp
+      !! questions: is the midpoint really optimal, and does channel
+      !! count matter? Both answered rigorously, not just asserted:
+      !!
+      !! required_drm_nyquist's bound is set by max_k|l_sq(k)-lsq_ref|,
+      !! the SINGLE worst channel's offset. For any fixed set of values,
+      !! this maximum is determined ENTIRELY by the two EXTREME values
+      !! (min(l_sq), max(l_sq)) -- every other channel, however many
+      !! there are or wherever they sit between the extremes, can never
+      !! exceed whichever extreme is farther from lsq_ref, so it never
+      !! enters the max(). Minimizing max(|max(l_sq)-lsq_ref|,
+      !! |lsq_ref-min(l_sq)|) over choice of lsq_ref is solved exactly by
+      !! making the two terms equal -- i.e. lsq_ref =
+      !! (min(l_sq)+max(l_sq))/2, the midpoint of the overall extent. A
+      !! classic 1D minimax/Chebyshev-centre result. Channel COUNT
+      !! (per-band or overall) does not enter this at all: it is a
+      !! genuine, provable mathematical fact for THIS specific criterion,
+      !! not an approximation -- confirmed numerically (tests/
+      !! test_optimal_lsq_ref.f90) against a P-band(61ch)+L-band(121ch)
+      !! combination, where the midpoint (0.5806) needs a grid nrm=2253,
+      !! against nrm=3127 for the channel-count-weighted mean (0.3771,
+      !! pulled toward L-band's own values by its 2x channel count),
+      !! nrm=4060 for centring on the lowest-frequency (P) band's own
+      !! centroid (1.0011 -- barely better than lsq_ref=0's own 4748,
+      !! since doing so leaves the OTHER band almost as exposed as
+      !! lsq_ref=0 did), and nrm=4748 for lsq_ref=0 itself.
+      !!
+      !! Channel count DOES matter for a different, unrelated question --
+      !! the actual achievable statistical precision (SNR-driven, per the
+      !! usual RM-synthesis noise-propagation relations) -- but that is
+      !! now fully decoupled from lsq_ref choice once clean_complex's own
+      !! comp_rm_refined and derotate_to_lsq_zero are used correctly (see
+      !! their own comments): lsq_ref choice affects ONLY grid cost, never
+      !! precision, so there is no need to trade one against the other.
+      !!
+      !! Works identically for a single band or a concatenated multi-band
+      !! l_sq array -- the criterion (extremes only) does not care how
+      !! many bands are represented or how the channels are grouped.
+      integer, intent(in) :: nchan
+      real(sp), intent(in) :: l_sq(nchan)
+      real(sp), intent(out) :: lsq_ref_opt
+
+      lsq_ref_opt = 0.5_sp*(minval(l_sq) + maxval(l_sq))
+   end subroutine optimal_lsq_ref_midpoint
 
    subroutine derotate_to_lsq_zero(rm_samp, nrm, lsq_ref, re_in, im_in, re_out, im_out)
       !! Re-express a spectrum computed with internal reference lsq_ref

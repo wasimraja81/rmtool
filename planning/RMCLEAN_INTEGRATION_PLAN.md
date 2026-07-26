@@ -716,6 +716,60 @@ argued from theory alone:
    (grid cost via `required_drm_nyquist`) decoupled from achievable chi0
    precision.
 
+**Addendum — `optimal_lsq_ref_midpoint`: the cheapest safe `lsq_ref`
+choice, and why a plausible-sounding alternative is actually poor.** The
+user asked directly, correctly declining to just accept "band centroid":
+is the midpoint of the channel set's own l_sq extent really optimal, and
+shouldn't centring on the LOWEST-frequency band's own centroid be
+better (that band drives `required_drm_nyquist`'s tightest per-band
+constraint)? Checked numerically on the same imbalanced P-band(61ch)/
+L-band(121ch) combination used throughout this plan (`required_drm_
+nyquist`, `oversample=15`, `rm_span=450`):
+
+| `lsq_ref` choice | value | `dRM≤` | `nrm` |
+|---|---|---|---|
+| `0` | `0` | `0.0948` | `4748` |
+| channel-count-weighted mean | `0.3771` | `0.1440` | `3127` |
+| P-band (lowest-freq) centroid | `1.0011` | `0.1109` | `4060` |
+| L-band centroid | `0.0626` | `0.1005` | `4479` |
+| **midpoint of overall extent** | `0.5806` | `0.1999` | **`2253`** |
+
+Centring on the lowest-frequency band is barely better than `lsq_ref=0`
+(`4060` vs `4748`, ~15%) — it only shrinks that ONE band's own offset,
+while leaving the OTHER band almost as exposed as `lsq_ref=0` did,
+merely relocating the worst case rather than reducing it.
+`required_drm_nyquist`'s bound is `max_k|l_sq(k)-lsq_ref|` — a max over
+the WHOLE channel set — and for any fixed set of values this maximum is
+determined entirely by the two EXTREME values (`min(l_sq)`,
+`max(l_sq)`): every other channel, however many there are or wherever
+they sit between the extremes, can never exceed whichever extreme is
+farther from `lsq_ref`, so it never enters the max. Minimizing
+`max(|max(l_sq)-lsq_ref|, |lsq_ref-min(l_sq)|)` is solved exactly by
+equalizing the two terms — the midpoint, `(min(l_sq)+max(l_sq))/2` — a
+classic 1D minimax/Chebyshev-centre result, not an approximation.
+Channel count (per-band or overall) provably does not enter this
+criterion at all — confirmed by construction, not just observation:
+the weighted mean (`0.3771`) sits far from the midpoint (`0.5806`)
+specifically because it's pulled toward L-band's own values by its 2x
+channel-count advantage, yet the midpoint still beats it.
+
+Channel count DOES matter for a different, unrelated question — the
+actual achievable statistical precision (SNR-driven, the usual
+RM-synthesis noise-propagation relations) — but per finding 5 above,
+that is now fully decoupled from `lsq_ref` choice once `comp_rm_refined`
+and `derotate_to_lsq_zero` are used correctly: `lsq_ref` affects ONLY
+grid cost, never precision, so there is no need to trade one against
+the other.
+
+New public `optimal_lsq_ref_midpoint(l_sq, nchan, lsq_ref_opt)`:
+`lsq_ref_opt = 0.5*(minval(l_sq)+maxval(l_sq))`. New test, `tests/
+test_optimal_lsq_ref.f90` (`run_tests.sh` section 25): confirms the
+formula directly, and confirms the midpoint's own `required_drm_nyquist`
+bound is at least as cheap as every alternative above, on this
+deliberately-imbalanced combination where a wrong intuition looks most
+plausible. Full regression: 72/72 (up from 65/65: this test's own 6
+checks).
+
 ### T2 (not yet detailed — standalone tool consuming T1, scoped from
 ### design discussion above, numbering/scope to firm up once started)
 

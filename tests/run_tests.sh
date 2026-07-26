@@ -77,6 +77,11 @@
 #      derotate_to_lsq_zero recovers the same intrinsic polarization
 #      angle at lambda_sq=0 in both cases, within a tolerance derived
 #      from each case's own grid resolution (not an arbitrary constant).
+#  25. RM-CLEAN optimal_lsq_ref_midpoint – confirms the midpoint of a
+#      channel set's own l_sq extent (not a channel-count-weighted mean,
+#      not any single band's own centroid) minimizes required_drm_
+#      nyquist's bound, on a deliberately imbalanced P-band(61ch)/
+#      L-band(121ch) combination where those candidates diverge.
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -1620,6 +1625,36 @@ if [[ -f "$rmclean_o" ]]; then
     fi
 else
     skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN lsq_ref flexibility test"
+fi
+
+# ---------------------------------------------------------------------------
+# 25. RM-CLEAN optimal_lsq_ref_midpoint
+# ---------------------------------------------------------------------------
+section "25. RM-CLEAN optimal_lsq_ref_midpoint"
+
+optimal_lsqref_bin="$RMCLEAN_BUILD_DIR/test_optimal_lsq_ref"
+optimal_lsqref_log="$OUT_DIR/test_optimal_lsq_ref.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_optimal_lsq_ref.f90" "$rmclean_o" \
+            -o "$optimal_lsqref_bin" -lfftw3 2>"$OUT_DIR/rmclean_optimal_lsqref_build.log"; then
+        if "$optimal_lsqref_bin" > "$optimal_lsqref_log" 2>&1; then
+            while IFS= read -r line; do
+                case "$line" in
+                    *"[PASS]"*) pass "${line#*\[PASS\] }" ;;
+                    *"[FAIL]"*) fail "${line#*\[FAIL\] }" ;;
+                esac
+            done < "$optimal_lsqref_log"
+        else
+            fail "RM-CLEAN optimal_lsq_ref_midpoint: program exited non-zero (see $optimal_lsqref_log)"
+        fi
+    else
+        fail "RM-CLEAN optimal_lsq_ref_midpoint: build failed (see $OUT_DIR/rmclean_optimal_lsqref_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN optimal_lsq_ref_midpoint test"
 fi
 
 # ---------------------------------------------------------------------------
