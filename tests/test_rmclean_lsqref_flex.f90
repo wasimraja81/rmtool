@@ -9,7 +9,19 @@ program test_rmclean_lsqref_flex
    !! extract_general_setup convention, numerically cheaper); and (2) the
    !! new derotate_to_lsq_zero utility, letting either choice still report
    !! the intrinsic polarization angle at lambda_sq=0 (the standard
-   !! convention) exactly, without re-running anything.
+   !! convention) exactly, without re-running anything; and (3)
+   !! clean_complex's own comp_rm_refined output, root-caused during this
+   !! test's own development to be the actual fix for a real chi0-
+   !! precision gap at nonzero lsq_ref (a coarse grid's own restored
+   !! profile is grid-quantised, up to dRM/2 away from the true
+   !! continuous RM even though it looks perfectly clean and symmetric --
+   !! no amount of re-interpolating that already-quantised output can
+   !! recover information already discarded; comp_rm_refined is exactly
+   !! that discarded sub-pixel information, recovered). Confirms both
+   !! lsq_ref choices now recover chi0 to the SAME tight tolerance at
+   !! their own (very different) grid costs -- the actual answer to "can
+   !! we keep the RM-grid coarse and still trust chi0(lambda_sq=0)": yes,
+   !! provided comp_rm_refined is used, not a bare grid coordinate.
    !!
    !! Sky model: a single Faraday-thin point source, RM=50 rad/m^2,
    !! amplitude=10 Jy/(rad/m^2), intrinsic angle chi0=0.3 rad -- DELIBERATELY
@@ -59,23 +71,19 @@ program test_rmclean_lsqref_flex
    call check(drm_centroid > 5.0_sp*drm_zero,&
    &'band-mean reference allows a >5x coarser RM grid than lsq_ref=0', all_pass)
 
-   ! chi0 acceptance tolerance: at lsq_ref=0, chi0 = 0.5*phase_val exactly
-   ! (RM_found*lsq_ref vanishes identically), so any RM-recovery
-   ! imprecision cannot leak into chi0 at all -- a tight, exact tolerance
-   ! is the right, meaningful check there. At a NONZERO lsq_ref, chi0 =
-   ! 0.5*phase_val - RM_found*lsq_ref (derotate_to_lsq_zero's own
-   ! comment): whatever imprecision remains in RM_found (bounded by the
-   ! grid's own resolution, roughly half a cell even after sub-pixel
-   ! refinement) gets multiplied by lsq_ref before reaching chi0 -- a
-   ! real, physical trade-off for choosing a coarser, computationally
-   ! cheaper grid, not a bug, and not something a fixed tight number
-   ! should be forced against. 0.5*dRM*|lsq_ref| is the natural, derived
-   ! ceiling for that leakage (confirmed empirically: observed error 0.22
-   ! rad comfortably inside the ~0.5 rad bound this predicts here).
+   ! chi0 acceptance tolerance: BOTH cases now use clean_complex's own
+   ! comp_rm_refined (a flux-weighted sub-pixel RM location it already
+   ! computes internally every iteration, previously discarded once filed
+   ! into an integer grid bin) rather than a bare grid coordinate -- this
+   ! decouples chi0 precision from dRM entirely (root-caused empirically:
+   ! the earlier ~0.22 rad discrepancy at a coarse, nonzero-lsq_ref grid
+   ! was a bookkeeping loss, not a fundamental grid-resolution limit; using
+   ! comp_rm_refined at that SAME coarse grid recovered chi0 exactly).
+   ! Both cases therefore get the same tight tolerance now.
    call run_case('lsq_ref=0 (thesis convention)', 0.0_sp, drm_zero, l_sq, q, u,&
    &0.02_sp, all_pass)
    call run_case('lsq_ref=band-mean (cheaper grid)', lsq_mean, drm_centroid, l_sq, q, u,&
-   &0.5_sp*drm_centroid*abs(lsq_mean), all_pass)
+   &0.02_sp, all_pass)
 
    if (all_pass) then
       write(*,'(A)') '[PASS] test_rmclean_lsqref_flex: all checks passed'
@@ -145,16 +153,18 @@ contains
       integer :: nrm_l, j, ipeak, n_iter_used
       real(sp), allocatable :: rm(:), dirty_re(:), dirty_im(:)
       real(sp), allocatable :: comp_re(:), comp_im(:), resid_re(:), resid_im(:)
+      real(sp), allocatable :: comp_rm_refined(:), comp_amp(:)
       real(sp), allocatable :: out_re(:), out_im(:), out_amp(:)
       real(sp), allocatable :: derot_re(:), derot_im(:)
       real(sp) :: fwhm_rm, amp_before, amp_after, max_amp_err
       type(rmsf_table_t) :: table
       integer(kind=8) :: plan_fwd, plan_bwd
-      real(sp) :: rm_found, chi0_found, peak_offset, re_at_peak, im_at_peak
+      real(sp) :: rm_found, chi0_found
 
       nrm_l = nint(rm_span/drm) + 1
       allocate(rm(nrm_l), dirty_re(nrm_l), dirty_im(nrm_l))
       allocate(comp_re(nrm_l), comp_im(nrm_l), resid_re(nrm_l), resid_im(nrm_l))
+      allocate(comp_rm_refined(nrm_l), comp_amp(nrm_l))
       allocate(out_re(nrm_l), out_im(nrm_l), out_amp(nrm_l))
       allocate(derot_re(nrm_l), derot_im(nrm_l))
 
@@ -168,34 +178,30 @@ contains
       call plan_fourier_interp(nrm_l, nrm_l, plan_fwd, plan_bwd)
 
       call clean_complex(rm, nrm_l, dirty_re, dirty_im, table, 500, 0.1_sp,&
-      &1.0e-4_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used)
+      &1.0e-4_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
       out_amp = sqrt(out_re**2 + out_im**2)
+      comp_amp = sqrt(comp_re**2 + comp_im**2)
 
+      ! Find the recovered COMPONENT (not the restored map's own peak):
+      ! comp_rm_refined(j) is a flux-weighted average of the sub-pixel
+      ! peak_loc clean_complex already computes every iteration for
+      ! accurate beam subtraction -- previously discarded once filed into
+      ! its integer grid bin j. Reading chi0 off the restored map's own
+      ! (grid-quantised, up to dRM/2 biased) peak location was the actual
+      ! bug behind the earlier ~0.22 rad discrepancy at a nonzero lsq_ref
+      ! -- not insufficient interpolation, a genuine bookkeeping loss now
+      ! fixed at the source (rmclean_mod's own comp_rm_refined comment).
       ipeak = 1
       do j = 1, nrm_l
          if (abs(rm(j)-point_rm) < abs(rm(ipeak)-point_rm)) ipeak = j
       end do
       do j = 1, nrm_l
-         if (abs(rm(j)-point_rm) <= 10.0_sp .and. out_amp(j) > out_amp(ipeak)) ipeak = j
+         if (abs(rm(j)-point_rm) <= 10.0_sp .and. comp_amp(j) > comp_amp(ipeak)) ipeak = j
       end do
-
-      ! chi0 = 0.5*phase_val - RM_found*lsq_ref (derotate_to_lsq_zero's own
-      ! comment) is exact, but at NONZERO lsq_ref, RM_found's own precision
-      ! now matters for chi0 (at lsq_ref=0 it cancels out completely --
-      ! the reason lsq_ref=0 is special, not a coincidence). A coarser
-      ! grid (the whole point of choosing a nonzero, band-centred
-      ! lsq_ref) only pins the sampled peak down to +/-0.5*dRM; reading
-      ! chi0 off the nearest GRID point under-uses the precision CLEAN
-      ! itself already has via peak_interp_parabolic's own sub-pixel
-      ! refinement (the same routine clean_complex calls every
-      ! iteration). Sub-pixel-refine here too, matching that existing
-      ! internal practice, rather than settling for grid resolution.
-      call peak_interp_parabolic(out_re, out_im, nrm_l, ipeak,&
-      &peak_offset, re_at_peak, im_at_peak)
-      rm_found = rm(ipeak) + peak_offset*drm
-      chi0_found = 0.5_sp*atan2(im_at_peak, re_at_peak) - rm_found*lsq_ref
+      rm_found = comp_rm_refined(ipeak)
+      chi0_found = 0.5_sp*atan2(comp_im(ipeak), comp_re(ipeak)) - rm_found*lsq_ref
       ! chi0 has period pi (the doubled-angle EVPA ambiguity) -- wrap the
       ! raw result (which can be an arbitrarily large multiple of pi away
       ! from the canonical branch once rm_found*lsq_ref is itself large)
@@ -205,7 +211,10 @@ contains
       ! Separately, confirm derotate_to_lsq_zero's own array-wise identity
       ! (a pure per-grid-point phase rotation, |P| unchanged everywhere --
       ! a property of the transform itself, independent of any peak-
-      ! finding precision question above).
+      ! finding precision question above). Applied to the restored map
+      ! here specifically to exercise that array-wise path too (not the
+      ! single-component path above) -- both are part of the public API
+      ! and both need their own coverage.
       call derotate_to_lsq_zero(rm, nrm_l, lsq_ref, out_re, out_im, derot_re, derot_im)
 
       ! |P| invariance under derotation: a pure phase rotation must not

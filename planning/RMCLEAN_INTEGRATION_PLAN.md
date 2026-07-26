@@ -643,6 +643,79 @@ every case.
    run_tests.sh`) is 65/65, up from 57/57 (this test's own 7 new checks
    plus the ancillary-tools build coverage above).
 
+**Addendum — the actual root cause of the chi0-precision gap, and a real
+fix (`comp_rm_refined`), from a follow-up discussion pressing on whether
+a coarse grid can be trusted at all:** the user pushed back hard, and
+correctly, on the framing above — derotation is an exact, deterministic
+phase rotation and cannot itself change any error, so the `~0.22` rad
+discrepancy had to come from somewhere else being conflated with
+`lsq_ref` choice. Chased in stages, each checked empirically rather than
+argued from theory alone:
+
+1. **Confound #1 (found, fixed): the two cases used different grid
+   spacings.** `required_drm_nyquist`'s bound (stability only) differs
+   ~10x between the two references; forcing the SAME (fine) grid onto
+   both cases dropped the discrepancy from `0.22` to `0.02` rad —
+   confirming most of it was about grid resolution, not `lsq_ref` per se.
+2. **Confound #2 (found, understood, not the actual fix): Fourier
+   interpolation, tried as "the" fix, initially made things much
+   worse** (`0.71` rad). Root-caused directly: `fourier_interp_complex`
+   does a *global*, whole-array FFT upsample, which implicitly assumes
+   the array is periodic; the worst reconstruction error landed exactly
+   on the array's own last sample, the classic Gibbs/wraparound
+   signature. Confirmed this is real by comparing against an
+   independently-computed exact reference: reconstruction near the true
+   peak was accurate to `~3e-4` (excellent), but the global array's own
+   distant edges corrupted it. Even confining the Fourier upsample to a
+   local, genuinely quiet window (`+/-8*FWHM_RM`, edge amplitudes
+   `~1e-6`) still gave a bad answer (`0.71` rad) — ruling out "just a
+   local window" as the fix, and pointing at something else entirely.
+3. **The actual root cause: not an interpolation problem, a discarded-
+   information problem.** The coarse grid's own restored profile, right
+   at its recovered peak, was perfectly clean and symmetric
+   (`9.547, 10.00, 9.547`) — but centred exactly ON the grid point
+   `rm(imax)`, itself `~0.22` rad/m^2 from the true continuous RM. No
+   interpolation of an already-quantised output, however exact, can
+   recover information that isn't there. `clean_complex` already computes
+   a precise sub-pixel `peak_loc` every single iteration (via
+   `peak_interp_parabolic`, correctly used to build the right beam for
+   subtraction) — but discarded it the moment the component was filed
+   into `comp_re(imax)`/`comp_im(imax)`, an integer grid bin. Verified by
+   patching a scratch copy of `clean_complex` to accumulate a
+   flux-weighted average of `peak_loc` for the dominant bin: this
+   recovered `RM=50.0000`, `chi0=0.3000` — EXACT to the precision
+   checked, at the identical cheap, coarse grid that gave `0.22` rad
+   error before.
+4. **Fix, made permanent:** `clean_complex` gained a new required output,
+   `comp_rm_refined(nrm)` — per-bin (not just the single dominant
+   component, so this stays correct for multi-component scenarios like
+   the thesis scenario's own point-source-plus-thick-feature case),
+   flux-weighted `peak_loc`, falling back to `rm_samp(j)` for bins that
+   never received any component flux (moot there, since `comp_re`/
+   `comp_im` are exactly zero too, but keeps the array always
+   well-defined). `derotate_to_lsq_zero`'s own doc now recommends this
+   explicitly: read chi0 off `comp_re`/`comp_im` (the pure component map)
+   with `comp_rm_refined(j)` as the RM value, NOT the restored map's own
+   peak nor a fresh `peak_interp_parabolic` pass over it. The restored
+   map remains correct for its own existing uses (visual inspection,
+   integrating an EXTENDED feature's total flux) — this only changes how
+   a single component's own precise RM/phase should be read.
+   `tests/test_rmclean_lsqref_flex.f90` rewritten to use this directly;
+   both `lsq_ref=0` and `lsq_ref`=band-mean cases now recover chi0 to the
+   SAME tight tolerance (`0.02` rad) at their own, very different
+   (`10.7x`) grid costs. `tests/thesis_scenario_rmclean.f90` also updated
+   to report its own point-source RM via `comp_rm_refined` (a real,
+   if here modest, precision improvement, unrelated to that test's own
+   already-passing checks). Full regression stays 65/65.
+5. **Direct answer to "can the RM-grid be coarse (nonzero, band-centroid
+   `lsq_ref`) and still trust chi0(lambda_sq=0)?": yes — the coarse grid
+   was never the actual obstacle.** The real requirement is using
+   `comp_rm_refined`, not a bare grid coordinate, when converting a
+   recovered component's phase to the standard convention. `lsq_ref`
+   choice is now a genuinely free, purely computational decision
+   (grid cost via `required_drm_nyquist`) decoupled from achievable chi0
+   precision.
+
 ### T2 (not yet detailed — standalone tool consuming T1, scoped from
 ### design discussion above, numbering/scope to firm up once started)
 

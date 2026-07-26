@@ -377,6 +377,7 @@ contains
       real(sp) :: q(nchan), u(nchan)
       real(sp) :: dirty_re(nrm_l), dirty_im(nrm_l)
       real(sp) :: comp_re(nrm_l), comp_im(nrm_l), resid_re(nrm_l), resid_im(nrm_l)
+      real(sp) :: comp_rm_refined(nrm_l)
       real(sp) :: out_re(nrm_l), out_im(nrm_l), out_amp(nrm_l), fwhm_rm
       real(sp) :: input_amp(nrm_l)
       type(rmsf_table_t) :: table
@@ -396,7 +397,7 @@ contains
       call plan_fourier_interp(nrm_l, nrm_l, plan_fwd, plan_bwd)
 
       call clean_complex(rm, nrm_l, dirty_re, dirty_im, table, 1000, 0.1_sp,&
-      &0.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used)
+      &0.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
       out_amp = sqrt(out_re**2 + out_im**2)
@@ -418,7 +419,12 @@ contains
          if (abs(rm(j)-point_rm) <= 10.0_sp .and. out_amp(j) > out_amp(ipeak)) ipeak = j
       end do
       point_peak = out_amp(ipeak)
-      point_rm_found = rm(ipeak)
+      ! comp_rm_refined(ipeak): the flux-weighted sub-pixel RM location
+      ! clean_complex's own CLEAN loop already computed (rmclean_mod's own
+      ! comment on this output) -- a real precision improvement over the
+      ! bare grid coordinate rm(ipeak), not just a style change (see
+      ! derotate_to_lsq_zero's own comment for the empirical evidence).
+      point_rm_found = comp_rm_refined(ipeak)
 
       ! Standard "Jy/beam -> Jy" integrated-flux-density measurement
       ! (the same technique used to measure a resolved source's total

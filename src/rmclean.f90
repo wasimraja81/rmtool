@@ -447,7 +447,7 @@ contains
    end subroutine compute_dirty_rmbeam
 
    subroutine clean_complex(rm_samp, nrm, dirty_re, dirty_im, table, niter,&
-   &gain, thresh, comp_re, comp_im, resid_re, resid_im, n_iter_used)
+   &gain, thresh, comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
       !! Hogbom-style complex CLEAN on the dirty FDF (dirty_re/dirty_im),
       !! against its own RM-dependent dirty beam (rmsf_table_t). Ported
       !! from rm_clean.f, modernized, with planning/
@@ -492,6 +492,36 @@ contains
       !!    self-consistent choice for subtracting a real-scalar fraction
       !!    of the actual peak value. phase_val/2 is used here, not
       !!    phase_val.
+      !!
+      !! comp_rm_refined(nrm): per-bin FLUX-WEIGHTED sub-pixel RM location
+      !! -- added at the user's own request, root-causing a real chi0-
+      !! precision gap. Every iteration already computes a precise
+      !! sub-pixel peak_loc (via peak_interp_parabolic, used correctly to
+      !! build the right beam for subtraction) -- but that information was
+      !! previously DISCARDED once the component got filed into its
+      !! integer grid bin imax, leaving comp_re/comp_im accurate in
+      !! amplitude and phase but silently tied to whatever grid point imax
+      !! happens to be, which can be biased up to half a grid cell (dRM/2)
+      !! away from the true continuous location -- harmless for reading
+      !! amplitude/phase off comp_re/comp_im directly (both already
+      !! correctly flux-and-phase-weighted across iterations), but a real
+      !! problem for anything that needs the RM value itself precisely,
+      !! e.g. derotate_to_lsq_zero's own chi0 = 0.5*phase_val -
+      !! RM_found*lsq_ref (whose precision scales directly with RM_found's
+      !! own). Confirmed empirically: reading chi0 off a coarse grid's own
+      !! (perfectly clean, symmetric, but grid-centred) restored profile
+      !! gave a ~0.22 rad error at a band-centroid lsq_ref reference;
+      !! using this flux-weighted comp_rm_refined instead, at the SAME
+      !! coarse grid, gave chi0 exactly matching the true value (0.0000
+      !! rad error) -- confirming the actual bottleneck was never
+      !! insufficient global grid resolution or interpolation quality, but
+      !! this discarded bookkeeping. Per-bin (not just for the single
+      !! dominant component) so this stays correct for multi-component
+      !! scenarios too (e.g. a point source AND a separate resolved
+      !! feature, as in tests/thesis_scenario_rmclean.f90's own scenario).
+      !! Bins that never receive any component flux fall back to their own
+      !! rm_samp(j) (moot, since comp_re/comp_im are exactly zero there
+      !! too, but keeps this array always well-defined, no NaN/garbage).
       type(rmsf_table_t), intent(in) :: table
       integer, intent(in) :: nrm, niter
       real(sp), intent(in) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
@@ -499,6 +529,7 @@ contains
       real(sp), intent(out) :: comp_re(nrm), comp_im(nrm)
       real(sp), intent(out) :: resid_re(nrm), resid_im(nrm)
       integer, intent(out) :: n_iter_used
+      real(sp), intent(out) :: comp_rm_refined(nrm)
 
       real(sp) :: resid_re_snap(nrm), resid_im_snap(nrm)
       real(sp) :: resid_amp(nrm), re_beam(nrm), im_beam(nrm)
@@ -530,12 +561,15 @@ contains
       ! pixel, not per cube -- CLEAN runs one line of sight at a time).
       real(dp) :: resid_re_dp(nrm), resid_im_dp(nrm)
       real(dp) :: comp_re_dp(nrm), comp_im_dp(nrm)
-      integer :: iter, imax
+      real(dp) :: rmloc_wsum(nrm), rmloc_wloc(nrm)
+      integer :: iter, imax, j
 
       comp_re_dp = 0.0_dp
       comp_im_dp = 0.0_dp
       resid_re_dp = real(dirty_re, dp)
       resid_im_dp = real(dirty_im, dp)
+      rmloc_wsum = 0.0_dp
+      rmloc_wloc = 0.0_dp
       dRM = rm_samp(2) - rm_samp(1)
 
       do iter = 1, niter
@@ -574,6 +608,8 @@ contains
          frac = gain*peak_val
          comp_re_dp(imax) = comp_re_dp(imax) + real(frac*cos(phase_val), dp)
          comp_im_dp(imax) = comp_im_dp(imax) + real(frac*sin(phase_val), dp)
+         rmloc_wsum(imax) = rmloc_wsum(imax) + real(frac, dp)
+         rmloc_wloc(imax) = rmloc_wloc(imax) + real(frac, dp)*real(peak_loc, dp)
 
          resid_re_dp = resid_re_dp - real(frac, dp)*real(re_beam, dp)
          resid_im_dp = resid_im_dp - real(frac, dp)*real(im_beam, dp)
@@ -583,6 +619,14 @@ contains
       comp_im = real(comp_im_dp, sp)
       resid_re = real(resid_re_dp, sp)
       resid_im = real(resid_im_dp, sp)
+
+      do j = 1, nrm
+         if (rmloc_wsum(j) > 0.0_dp) then
+            comp_rm_refined(j) = real(rmloc_wloc(j)/rmloc_wsum(j), sp)
+         else
+            comp_rm_refined(j) = rm_samp(j)
+         endif
+      end do
    end subroutine clean_complex
 
    subroutine compute_rmsf_fwhm(l_sq, nchan, fwhm_rm)
@@ -773,41 +817,55 @@ contains
       !! property (tests/thesis_scenario_rmclean.f90's own lsq_ref
       !! flexibility case checks it).
       !!
-      !! Practical use for the intrinsic polarization angle: apply this
-      !! to the restored (or dirty) spectrum, then read off
-      !! chi0 = 0.5*atan2(im_out(j), re_out(j)) at the recovered
-      !! component's own index j -- the standard P(lambda_sq=0)=
-      !! p*exp(2i*chi0) relation, now satisfied exactly regardless of
-      !! which lsq_ref the actual RM-CLEAN computation used internally.
-      !! (chi0 recovered only mod pi, the ordinary EVPA n*180-degree
-      !! ambiguity inherent to any doubled-angle Faraday convention --
-      !! not introduced by this routine.)
+      !! Practical use for the intrinsic polarization angle: apply this to
+      !! clean_complex's own comp_re/comp_im (the pure component map, NOT
+      !! the restored/convolved out_re/out_im -- see the precision
+      !! guidance below for why), passing clean_complex's own
+      !! comp_rm_refined(j) as rm_samp(j) (the actual continuous location,
+      !! not the bare grid coordinate) for the bin j of interest, then
+      !! read off chi0 = 0.5*atan2(im_out(j), re_out(j)) -- the standard
+      !! P(lambda_sq=0)=p*exp(2i*chi0) relation, now satisfied exactly
+      !! regardless of which lsq_ref the actual RM-CLEAN computation used
+      !! internally. (chi0 recovered only mod pi, the ordinary EVPA
+      !! n*180-degree ambiguity inherent to any doubled-angle Faraday
+      !! convention -- not introduced by this routine.) The restored map
+      !! remains the right choice for visual inspection and for
+      !! integrating an EXTENDED feature's total flux (tests/
+      !! thesis_scenario_rmclean.f90's own window_flux) -- it is only for
+      !! a single component's own precise RM/phase that comp_re/comp_im
+      !! plus comp_rm_refined should be used instead of the restored map.
       !!
-      !! IMPORTANT precision caveat, confirmed empirically (tests/
-      !! test_rmclean_lsqref_flex.f90's own nonzero-chi0 case): chi0's own
-      !! precision is coupled to lsq_ref's magnitude via
-      !! chi0 = 0.5*phase_val - RM_found*lsq_ref (this routine's own
-      !! derivation, evaluated at j=the recovered component's grid index).
-      !! At lsq_ref=0, ANY imprecision in RM_found (grid discretisation,
-      !! finite CLEAN convergence, etc) multiplies against zero and simply
-      !! does not affect chi0 at all -- the reason lsq_ref=0 is uniquely
-      !! "free" for phase reporting, not a coincidence. At a NONZERO
-      !! lsq_ref (e.g. a band's own centroid, chosen because
-      !! required_drm_nyquist allows a far coarser, cheaper RM grid there
-      !! -- see that routine's own comment), the SAME RM_found imprecision
-      !! gets multiplied by lsq_ref before reaching chi0: roughly
-      !! 0.5*dRM*|lsq_ref| worth of chi0 error should be expected from grid
-      !! discretisation alone (confirmed: a coarse band-centroid-referenced
-      !! run with dRM~10x that of the lsq_ref=0 run showed a ~0.22 rad
-      !! chi0 offset, well inside the ~0.5 rad this formula predicts,
-      !! while the lsq_ref=0 run recovered chi0 exactly). For the best
-      !! achievable chi0 precision at a nonzero lsq_ref: sub-pixel refine
-      !! RM_found first (peak_interp_parabolic, the same routine
-      !! clean_complex already uses internally every iteration) rather
-      !! than reading chi0 off the nearest grid point's own de-rotated
-      !! value -- this is what actually determines RM_found's precision,
-      !! not this routine, which is exact given whatever RM_found it is
-      !! handed.
+      !! IMPORTANT precision guidance, root-caused empirically (not just
+      !! theorised): chi0 = 0.5*phase_val - RM_found*lsq_ref (this
+      !! routine's own derivation). At lsq_ref=0, ANY imprecision in
+      !! RM_found multiplies against zero and cannot affect chi0 at all --
+      !! the reason lsq_ref=0 is uniquely "free" for phase reporting, not
+      !! a coincidence. At a NONZERO lsq_ref (e.g. a band's own centroid,
+      !! chosen because required_drm_nyquist allows a far coarser, cheaper
+      !! RM grid there -- see that routine's own comment), the SAME
+      !! RM_found imprecision gets multiplied by lsq_ref before reaching
+      !! chi0.
+      !!
+      !! USE clean_complex's OWN comp_rm_refined(j) for RM_found here, NOT
+      !! rm_samp(j) and NOT a fresh peak_interp_parabolic pass over the
+      !! restored map. First-principles root-cause (tests/
+      !! test_rmclean_lsqref_flex.f90's own nonzero-chi0 case): a coarse,
+      !! band-centroid-referenced run's own restored profile looked
+      !! perfectly clean and symmetric around its peak, yet was centred
+      !! exactly on the GRID POINT rm_samp(imax), ~0.22 rad/m^2 away from
+      !! the true continuous RM -- no amount of re-interpolating that
+      !! already-quantised output (parabolic or Fourier) can recover
+      !! information that was already discarded. clean_complex computes a
+      !! precise sub-pixel peak_loc every iteration already (used
+      !! correctly for the beam subtraction itself) but used to throw it
+      !! away once the component was filed into its integer grid bin --
+      !! comp_rm_refined is exactly that discarded information, recovered
+      !! (a flux-weighted average of peak_loc across every iteration that
+      !! touched a given bin). Confirmed: using comp_rm_refined instead of
+      !! rm_samp(imax) at the SAME coarse grid dropped the chi0 error from
+      !! ~0.22 rad to 0.0000 rad (exact, to the precision checked) --
+      !! confirming the bottleneck was never grid resolution or
+      !! interpolation quality, but this specific discarded bookkeeping.
       integer, intent(in) :: nrm
       real(sp), intent(in) :: rm_samp(nrm), lsq_ref
       real(sp), intent(in) :: re_in(nrm), im_in(nrm)
