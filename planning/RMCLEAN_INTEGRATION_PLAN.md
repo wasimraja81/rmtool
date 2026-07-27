@@ -171,6 +171,78 @@ the shelved "single" variant driver and one dated backup file).
     this project. **Promoted to T0 below, at the user's explicit
     request, so it doesn't keep delaying the CLEAN ticket itself.**
 
+## Choosing parameters
+
+`rmclean_mod` (T1) has no config/CLI layer yet — that's T2's job, not
+started — so every parameter below is set explicitly by the caller today
+(as in `tests/*.f90`). This section is the reference for what T2's own
+defaults should be, and for anyone calling the module directly meanwhile.
+Added at the user's own request for organized, scope-clean naming and an
+explicit decision guide, after `lsq_ref` alone started doing double duty
+for two genuinely unrelated concerns.
+
+**Two deliberately separate reference parameters — do not conflate them:**
+
+| Name | Role | Governs | Default recommendation |
+|---|---|---|---|
+| `lsq_ref_compute` | Internal computation reference (`build_rmsf_offset_table`, `compute_dirty_rmbeam_direct`, `required_drm_nyquist`) | ONLY grid cost (`required_drm_nyquist`'s bound) — never chi0 precision, once `comp_rm_refined`/`derotate_to_lsq_ref` are used correctly | `optimal_lsq_ref_midpoint(l_sq, nchan)` — cheapest safe grid |
+| `lsq_ref_report` | Reporting convention (`derotate_to_lsq_ref`'s own target reference) | ONLY where chi0 is quoted — a bookkeeping choice, not a computation | `0.0` (this project's thesis convention) as the default; `lsq_ref_report_centroid(l_sq, nchan)` as an explicit opt-in for statistically decorrelated (RM, chi0) uncertainty pairs (Brentjens & de Bruyn 2005-style) |
+
+These answer different questions and are optimized by different,
+non-interchangeable criteria — confirmed, not just asserted:
+`optimal_lsq_ref_midpoint` minimizes `max_k|l_sq(k)-lsq_ref_compute|` (a
+minimax/Chebyshev-centre problem over the two extreme channels only,
+driven by numerical grid-stability, no noise involved); `lsq_ref_report_
+centroid` targets the (weighted) mean specifically to decorrelate a
+jointly-fitted RM and chi0's own statistical uncertainty (a linear-
+regression centering result, driven by noise/covariance, no grid-cost
+involved). They coincide only by coincidence for special cases (a single,
+symmetric, evenly-sampled band) and diverge meaningfully for realistic,
+channel-imbalanced multi-band data (`tests/test_optimal_lsq_ref.f90`'s own
+P+L case: `0.5806` vs `0.3771`/`1.0011`/`0.0626` depending which of the
+four candidates you compute). Neither is "more correct" — pick
+`lsq_ref_compute` for cost, `lsq_ref_report` for what you want to quote,
+independently of each other.
+
+**Reading a component's own precise RM/chi0 (not the restored map):**
+always use `clean_complex`'s own `comp_rm_refined(j)` for the RM value,
+never `rm_samp(j)` and never a fresh `peak_interp_parabolic` pass over
+the restored map — root-caused empirically (see `derotate_to_lsq_ref`'s
+own comment): the restored map's own peak is grid-quantised (up to
+`dRM/2` away from the true continuous RM) even when it looks perfectly
+clean and symmetric, and no amount of re-interpolating that output,
+however exact, can recover information already discarded at the moment
+the component was filed into an integer bin. The restored map itself
+remains correct for its own separate uses — visual inspection, and
+integrating an EXTENDED feature's total flux (`window_flux`) — just not
+for a single component's own precise RM/phase.
+
+**The two same-named "oversample" parameters are unrelated — do not
+confuse them:**
+
+| Where | Controls | Cost if increased |
+|---|---|---|
+| `required_drm_nyquist`'s `oversample` | The OUTER RM-grid's own fineness relative to the bare stability floor (`nrm`, hence the size of every `nrm`-length array in `clean_complex`) | Expensive — scales the whole grid |
+| `build_rmsf_offset_table`'s `oversample` | The INTERNAL 1D RMSF lookup table's own fineness relative to the outer grid's `dRM` | Cheap — a 1D table built once, independent of `nrm` |
+
+Defaults used throughout this project's own tests: `15` for the former
+(empirically validated — matched the fine-grid convergence trajectory;
+not rigorously proven tight, a reasonable conservative starting point,
+not a derived constant), `20` for the latter (comfortably cheap
+regardless of value).
+
+**CLEAN loop parameters (`niter`, `gain`, `thresh`):** `gain=0.1` is the
+conventional Hogbom choice, no reason found to deviate. `thresh` needs a
+documented warning, not a blind default: a moderate `thresh` caused
+`clean_complex` to stop after a single iteration on a broad
+(Faraday-thick) feature in the P+L thesis scenario, because that
+feature's own mean residual sits close to its peak from the very first
+iteration — `thresh=0.0` (letting `niter` alone govern convergence) was
+needed there. A single fixed default is genuinely risky across source
+morphologies; T2 should either default to `thresh=0.0` with a generous
+`niter`, or implement a shape-aware stopping heuristic, not just pick a
+number.
+
 ## Ticket sequence
 
 ### T0 — `MASK.CUBE.FITS` per-channel frequency/band binary table
@@ -769,6 +841,60 @@ bound is at least as cheap as every alternative above, on this
 deliberately-imbalanced combination where a wrong intuition looks most
 plausible. Full regression: 72/72 (up from 65/65: this test's own 6
 checks).
+
+**Addendum — naming cleanup and a generalized reporting reference, at
+the user's own explicit request** ("be correct", "be organised — clean
+in variable naming and scope", "separate compute efficiency choices from
+'reporting to community' choices"). Three changes, all covered by the
+new "Choosing parameters" section above:
+
+1. **Renamed `lsq_ref` → `lsq_ref_compute` everywhere it means the
+   internal computation reference** (`compute_dirty_rmbeam_direct`,
+   `build_rmsf_offset_table`, `required_drm_nyquist`,
+   `optimal_lsq_ref_midpoint`'s own output) — a single bare name was
+   starting to do double duty for two unrelated concerns once a second,
+   reporting-side reference entered the picture; renamed throughout via
+   a word-boundary rename (verified it left `lsq_ref_dp` and similar
+   longer identifiers untouched) plus a full rebuild/regression, not a
+   partial or comment-only rename.
+2. **`derotate_to_lsq_zero` generalized to `derotate_to_lsq_ref(rm_samp,
+   nrm, lsq_ref_compute, lsq_ref_report, re_in, im_in, re_out, im_out)`**
+   — the same exact pointwise identity as before, just parameterized by
+   an arbitrary target `lsq_ref_report` instead of a hardcoded `0.0`
+   (`lsq_ref_report=0.0` reproduces the old behaviour exactly). New
+   public `lsq_ref_report_centroid(l_sq, nchan, lsq_ref_report)`: the
+   Brentjens & de Bruyn (2005)-style reporting reference — the
+   (weighted) mean, which this module's own current equal-per-channel
+   `(1/nchan)` weighting convention makes a plain arithmetic mean (would
+   need to become a genuine weighted mean if this module ever gains
+   real per-channel noise weights — flagged directly in its own doc
+   comment so that future addition doesn't silently leave it stale).
+3. **Why B&dB's centroid and `optimal_lsq_ref_midpoint`'s own midpoint
+   are NOT competing answers to the same question**, worked through with
+   the user directly: B&dB's centroid minimizes the STATISTICAL
+   COVARIANCE between a jointly-fitted RM and chi0 (a classic linear-
+   regression centering result — centering a regressor at its own
+   weighted mean decorrelates the fitted intercept and slope) — a
+   concern about NOISE, most directly relevant to a QU-fitting-style
+   joint estimation, or to what reference to QUOTE final results at for
+   statistically clean reported uncertainties. `optimal_lsq_ref_midpoint`
+   minimizes `required_drm_nyquist`'s worst-case grid-stability bound — a
+   concern about NUMERICAL COST for the iterative, grid-based CLEAN
+   algorithm specifically, with no noise or covariance anywhere in it.
+   They coincide only for a single, symmetric, evenly-sampled band;
+   `tests/test_optimal_lsq_ref.f90`'s own imbalanced P+L combination
+   shows them diverging (`0.5806` vs `0.3771`).
+
+`tests/test_rmclean_lsqref_flex.f90` extended (not just renamed) to
+directly exercise the new reporting-reference capability: for each
+`lsq_ref_compute` case, chi0 is now checked at BOTH `lambda_sq=0` and at
+`lsq_ref_report_centroid`'s own value, against an INDEPENDENTLY derived
+closed-form expectation (`chi0_true + RM_true*lsq_ref_report`, not
+derived from `derotate_to_lsq_ref` itself, so this is a real test of the
+formula, not a tautological confirmation) — confirmed both
+`lsq_ref_compute` choices agree with each other and with the closed form
+exactly. Full regression: 74/74 (up from 72/72: two new checks per
+compute case).
 
 ### T2 (not yet detailed — standalone tool consuming T1, scoped from
 ### design discussion above, numbering/scope to firm up once started)

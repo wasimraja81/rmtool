@@ -7,7 +7,10 @@ module rmclean_mod
    !! own thesis Fortran77 code (~/softwares/CURR_DEVEL/RM_CLEAN_TESTS/),
    !! not a raw port -- see planning/RMCLEAN_INTEGRATION_PLAN.md for the
    !! full design record (decisions confirmed with the user) this module
-   !! implements.
+   !! implements, including that file's own "Choosing parameters" section
+   !! -- start there for what to set lsq_ref_compute/lsq_ref_report/
+   !! oversample/thresh to; this module has no config layer or defaults
+   !! of its own yet (T2).
    use, intrinsic :: iso_fortran_env, only: sp => real32, dp => real64
    implicit none
    private
@@ -17,7 +20,8 @@ module rmclean_mod
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
-   public :: required_drm_nyquist, derotate_to_lsq_zero, optimal_lsq_ref_midpoint
+   public :: required_drm_nyquist, derotate_to_lsq_ref
+   public :: optimal_lsq_ref_midpoint, lsq_ref_report_centroid
 
    ! FFTW3 constants (same convention as gaussft_mod's own -- declared
    ! directly rather than `include`d, fftw3.f is fixed-form F77 and
@@ -42,7 +46,7 @@ module rmclean_mod
       !! CLEAN component at (rm_in,phase_in) is
       !!   re_beam(j)+i*im_beam(j) = exp(2i*phase_in) * R(delta_j)
       !! with delta_j = rm_samp(j)-rm_in and
-      !!   R(delta) = (1/nchan) * sum_k exp(-2i*delta*(L_sq(k)-lsq_ref))
+      !!   R(delta) = (1/nchan) * sum_k exp(-2i*delta*(L_sq(k)-lsq_ref_compute))
       !! -- i.e. the ENTIRE (rm_samp(j), rm_in) dependence collapses to
       !! one scalar offset delta, and phase_in enters only as a global
       !! post-multiply, not inside the sum at all. R(delta) is built
@@ -298,7 +302,7 @@ contains
    end subroutine fourier_interp_complex
 
    subroutine compute_dirty_rmbeam_direct(l_sq, nchan, rm_in, phase_in,&
-   &cos_arr, sin_arr, nrm, maxrm, maxchan, lsq_ref, re_beam, im_beam)
+   &cos_arr, sin_arr, nrm, maxrm, maxchan, lsq_ref_compute, re_beam, im_beam)
       !! Exact, O(nrm*nchan) reference implementation -- a direct port of
       !! compute_dirty_rmbeam.f's own dot-product formula (matched-filter
       !! correlation of a synthetic point-source signal at (rm_in,
@@ -310,7 +314,7 @@ contains
       !! Kept as the ground-truth compute_dirty_rmbeam is verified
       !! against, not meant for the CLEAN loop's own hot path.
       !!
-      !! lsq_ref: the phase-reference lambda-squared, EXPLICITLY supplied
+      !! lsq_ref_compute: the phase-reference lambda-squared, EXPLICITLY supplied
       !! by the caller rather than computed internally as mean(l_sq) --
       !! this is a pure convention choice (the derivation in
       !! rmsf_table_t's own comment holds for ANY fixed reference point,
@@ -332,7 +336,7 @@ contains
       integer, intent(in) :: nchan, nrm, maxrm, maxchan
       real(sp), intent(in) :: l_sq(nchan), rm_in, phase_in
       real(sp), intent(in) :: cos_arr(maxrm, maxchan), sin_arr(maxrm, maxchan)
-      real(sp), intent(in) :: lsq_ref
+      real(sp), intent(in) :: lsq_ref_compute
       real(sp), intent(out) :: re_beam(nrm), im_beam(nrm)
 
       real(sp) :: phi_tmp
@@ -343,7 +347,7 @@ contains
       block
          integer :: kk
          do kk = 1, nchan
-            phi_tmp = 2.0_sp*(rm_in*(l_sq(kk)-lsq_ref) + phase_in)
+            phi_tmp = 2.0_sp*(rm_in*(l_sq(kk)-lsq_ref_compute) + phase_in)
             ryt(kk) = cos(phi_tmp)
             iyt(kk) = sin(phi_tmp)
          end do
@@ -359,7 +363,7 @@ contains
       end do
    end subroutine compute_dirty_rmbeam_direct
 
-   subroutine build_rmsf_offset_table(l_sq, nchan, lsq_ref, delta_span,&
+   subroutine build_rmsf_offset_table(l_sq, nchan, lsq_ref_compute, delta_span,&
    &native_ddelta, oversample, table)
       !! Build R(delta) once (see rmsf_table_t's own comment for the
       !! derivation) on a grid finer than the dirty map's own RM sampling
@@ -369,7 +373,7 @@ contains
       !! ever produce, so every lookup this table will ever see falls
       !! inside its built range.
       !!
-      !! lsq_ref: MUST match whatever reference point the caller's own
+      !! lsq_ref_compute: MUST match whatever reference point the caller's own
       !! dirty-map/injected-data construction uses -- see
       !! compute_dirty_rmbeam_direct's own comment on why this is a real
       !! correctness requirement, not a cosmetic choice: R(delta) itself
@@ -379,7 +383,7 @@ contains
       !! not just a constant rotation.
       real(sp), intent(in) :: l_sq(nchan)
       integer, intent(in) :: nchan
-      real(sp), intent(in) :: lsq_ref
+      real(sp), intent(in) :: lsq_ref_compute
       real(sp), intent(in) :: delta_span, native_ddelta
       integer, intent(in) :: oversample
       type(rmsf_table_t), intent(out) :: table
@@ -387,7 +391,7 @@ contains
       real(dp) :: lsq_ref_dp, delta_m, phase_k
       integer :: m
 
-      lsq_ref_dp = real(lsq_ref, dp)
+      lsq_ref_dp = real(lsq_ref_compute, dp)
 
       table%ddelta = real(native_ddelta, dp)/real(oversample, dp)
       table%n_fine = 2*ceiling(real(delta_span, dp)/table%ddelta) + 1
@@ -506,11 +510,11 @@ contains
       !! amplitude/phase off comp_re/comp_im directly (both already
       !! correctly flux-and-phase-weighted across iterations), but a real
       !! problem for anything that needs the RM value itself precisely,
-      !! e.g. derotate_to_lsq_zero's own chi0 = 0.5*phase_val -
-      !! RM_found*lsq_ref (whose precision scales directly with RM_found's
+      !! e.g. derotate_to_lsq_ref's own chi0 = 0.5*phase_val -
+      !! RM_found*lsq_ref_compute (whose precision scales directly with RM_found's
       !! own). Confirmed empirically: reading chi0 off a coarse grid's own
       !! (perfectly clean, symmetric, but grid-centred) restored profile
-      !! gave a ~0.22 rad error at a band-centroid lsq_ref reference;
+      !! gave a ~0.22 rad error at a band-centroid lsq_ref_compute reference;
       !! using this flux-weighted comp_rm_refined instead, at the SAME
       !! coarse grid, gave chi0 exactly matching the true value (0.0000
       !! rad error) -- confirming the actual bottleneck was never
@@ -730,16 +734,16 @@ contains
       lsq_span = abs(lsq2 - lsq1)
    end function padded_lsq_span
 
-   subroutine required_drm_nyquist(l_sq, nchan, lsq_ref, oversample, drm_max)
+   subroutine required_drm_nyquist(l_sq, nchan, lsq_ref_compute, oversample, drm_max)
       !! The RM-grid spacing an off-grid-peak CLEAN needs, GIVEN a chosen
-      !! lsq_ref -- a genuine sampling-theorem bound, not an empirically
+      !! lsq_ref_compute -- a genuine sampling-theorem bound, not an empirically
       !! tuned constant. Distinct from compute_rmsf_fwhm/
       !! compute_rmsf_fwhm_multiband above, which answer a different
       !! question entirely:
       !!
       !! The dirty spectrum is P(phi) = (1/K) sum_k p_k
-      !! exp(-2i*phi*(l_sq(k)-lsq_ref)). Its MAGNITUDE envelope |P(phi)|
-      !! is exactly independent of lsq_ref (a reference change multiplies
+      !! exp(-2i*phi*(l_sq(k)-lsq_ref_compute)). Its MAGNITUDE envelope |P(phi)|
+      !! is exactly independent of lsq_ref_compute (a reference change multiplies
       !! the whole sum by exp(-2i*phi*Delta_ref), unit modulus for every
       !! phi) and is set only by how the l_sq(k) are SPREAD OUT relative
       !! to each other -- the SPAN, compute_rmsf_fwhm's own quantity. This
@@ -753,15 +757,15 @@ contains
       !! parabolic fits each independently; clean_complex subtracts a
       !! complex beam every iteration) -- it needs the actual complex
       !! VALUE, not just the magnitude, so it cannot simply discard
-      !! lsq_ref's effect. Each term k in the sum is its own complex
-      !! sinusoid in phi with period pi/|l_sq(k)-lsq_ref| -- the
+      !! lsq_ref_compute's effect. Each term k in the sum is its own complex
+      !! sinusoid in phi with period pi/|l_sq(k)-lsq_ref_compute| -- the
       !! analogue of a carrier's PHASE velocity, which conveys no extra
       !! resolution/information by itself (the magnitude envelope doesn't
       !! care about it at all) but which the grid must still track
       !! faithfully if raw Re/Im values are what get sampled, fit, and
       !! subtracted. The fastest such term -- and therefore the binding
       !! constraint -- comes from whichever channel sits FARTHEST from
-      !! lsq_ref: max_k|l_sq(k)-lsq_ref|. With lsq_ref=0 (this project's
+      !! lsq_ref_compute: max_k|l_sq(k)-lsq_ref_compute|. With lsq_ref_compute=0 (this project's
       !! thesis-matching convention) and a GHz-range band, that offset
       !! equals the channel's own (large) l_sq directly, far exceeding
       !! the (small) SPAN that governs resolution -- exactly why a grid
@@ -779,21 +783,21 @@ contains
       !! avoid ALIASING a global reconstruction (a different, weaker,
       !! requirement) -- an oversample of ~10-15 was empirically confirmed
       !! sufficient (CLEAN's convergence trajectory matched the
-      !! lsq_ref=mean baseline closely at oversample~14) and is a
+      !! lsq_ref_compute=mean baseline closely at oversample~14) and is a
       !! documented safety margin above the bare bound, not a second
       !! hidden ad-hoc constant.
       integer, intent(in) :: nchan
-      real(sp), intent(in) :: l_sq(nchan), lsq_ref, oversample
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute, oversample
       real(sp), intent(out) :: drm_max
       real(dp), parameter :: pi = 3.14159265358979_dp
       real(dp) :: max_offset
 
-      max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref, dp)))
+      max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref_compute, dp)))
       drm_max = real(pi/(2.0_dp*real(oversample, dp)*max_offset), sp)
    end subroutine required_drm_nyquist
 
-   subroutine optimal_lsq_ref_midpoint(l_sq, nchan, lsq_ref_opt)
-      !! The lsq_ref choice that MINIMIZES required_drm_nyquist's own
+   subroutine optimal_lsq_ref_midpoint(l_sq, nchan, lsq_ref_compute)
+      !! The lsq_ref_compute choice that MINIMIZES required_drm_nyquist's own
       !! bound -- i.e. the cheapest safe RM grid -- across however many
       !! bands l_sq spans. Added at the user's own request, after they
       !! correctly pushed back on an earlier, wrong intuition (centering
@@ -801,15 +805,15 @@ contains
       !! questions: is the midpoint really optimal, and does channel
       !! count matter? Both answered rigorously, not just asserted:
       !!
-      !! required_drm_nyquist's bound is set by max_k|l_sq(k)-lsq_ref|,
+      !! required_drm_nyquist's bound is set by max_k|l_sq(k)-lsq_ref_compute|,
       !! the SINGLE worst channel's offset. For any fixed set of values,
       !! this maximum is determined ENTIRELY by the two EXTREME values
       !! (min(l_sq), max(l_sq)) -- every other channel, however many
       !! there are or wherever they sit between the extremes, can never
-      !! exceed whichever extreme is farther from lsq_ref, so it never
-      !! enters the max(). Minimizing max(|max(l_sq)-lsq_ref|,
-      !! |lsq_ref-min(l_sq)|) over choice of lsq_ref is solved exactly by
-      !! making the two terms equal -- i.e. lsq_ref =
+      !! exceed whichever extreme is farther from lsq_ref_compute, so it never
+      !! enters the max(). Minimizing max(|max(l_sq)-lsq_ref_compute|,
+      !! |lsq_ref_compute-min(l_sq)|) over choice of lsq_ref_compute is solved exactly by
+      !! making the two terms equal -- i.e. lsq_ref_compute =
       !! (min(l_sq)+max(l_sq))/2, the midpoint of the overall extent. A
       !! classic 1D minimax/Chebyshev-centre result. Channel COUNT
       !! (per-band or overall) does not enter this at all: it is a
@@ -820,16 +824,16 @@ contains
       !! against nrm=3127 for the channel-count-weighted mean (0.3771,
       !! pulled toward L-band's own values by its 2x channel count),
       !! nrm=4060 for centring on the lowest-frequency (P) band's own
-      !! centroid (1.0011 -- barely better than lsq_ref=0's own 4748,
+      !! centroid (1.0011 -- barely better than lsq_ref_compute=0's own 4748,
       !! since doing so leaves the OTHER band almost as exposed as
-      !! lsq_ref=0 did), and nrm=4748 for lsq_ref=0 itself.
+      !! lsq_ref_compute=0 did), and nrm=4748 for lsq_ref_compute=0 itself.
       !!
       !! Channel count DOES matter for a different, unrelated question --
       !! the actual achievable statistical precision (SNR-driven, per the
       !! usual RM-synthesis noise-propagation relations) -- but that is
-      !! now fully decoupled from lsq_ref choice once clean_complex's own
-      !! comp_rm_refined and derotate_to_lsq_zero are used correctly (see
-      !! their own comments): lsq_ref choice affects ONLY grid cost, never
+      !! now fully decoupled from lsq_ref_compute choice once clean_complex's own
+      !! comp_rm_refined and derotate_to_lsq_ref are used correctly (see
+      !! their own comments): lsq_ref_compute choice affects ONLY grid cost, never
       !! precision, so there is no need to trade one against the other.
       !!
       !! Works identically for a single band or a concatenated multi-band
@@ -837,35 +841,54 @@ contains
       !! many bands are represented or how the channels are grouped.
       integer, intent(in) :: nchan
       real(sp), intent(in) :: l_sq(nchan)
-      real(sp), intent(out) :: lsq_ref_opt
+      real(sp), intent(out) :: lsq_ref_compute
 
-      lsq_ref_opt = 0.5_sp*(minval(l_sq) + maxval(l_sq))
+      lsq_ref_compute = 0.5_sp*(minval(l_sq) + maxval(l_sq))
    end subroutine optimal_lsq_ref_midpoint
 
-   subroutine derotate_to_lsq_zero(rm_samp, nrm, lsq_ref, re_in, im_in, re_out, im_out)
-      !! Re-express a spectrum computed with internal reference lsq_ref
-      !! in the lambda_sq=0 phase convention -- lets a caller pick
-      !! WHATEVER lsq_ref is computationally convenient (e.g. a band's,
-      !! or a multi-band set's, own centroid -- required_drm_nyquist's
-      !! own bound tightens sharply the farther lsq_ref sits from the
-      !! channels themselves, so a centroid choice can need a far coarser,
-      !! cheaper RM grid than lsq_ref=0 does) while still being able to
-      !! report the intrinsic polarization angle at lambda_sq=0 (this
-      !! project's, and the user's own thesis's, standard reporting
-      !! convention), without re-running anything.
+   subroutine derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute, lsq_ref_report,&
+   &re_in, im_in, re_out, im_out)
+      !! Re-express a spectrum computed with internal reference
+      !! lsq_ref_compute at an ARBITRARY reporting reference
+      !! lsq_ref_report -- two DELIBERATELY separate knobs, addressing two
+      !! unrelated questions (the user's own explicit ask, after finding
+      !! the original lsq_ref-everywhere naming was starting to blur
+      !! them): lsq_ref_compute is a pure COMPUTATIONAL COST lever (see
+      !! required_drm_nyquist/optimal_lsq_ref_midpoint -- it affects ONLY
+      !! grid size, never precision, once comp_rm_refined is used
+      !! correctly); lsq_ref_report is a REPORTING CONVENTION choice about
+      !! where to QUOTE the intrinsic polarization angle, independent of
+      !! how the computation was actually done. lsq_ref_report=0.0
+      !! recovers this project's own thesis convention (formerly this
+      !! routine's own hardcoded target, when it was named
+      !! derotate_to_lsq_zero); lsq_ref_report=lsq_ref_report_centroid's
+      !! own output recovers the Brentjens & de Bruyn (2005)-style
+      !! convention, chosen there to minimize the STATISTICAL COVARIANCE
+      !! between a jointly-fitted RM and chi0 in the presence of noise (a
+      !! classic linear-regression centering result: centering the
+      !! regressor at its own weighted mean decorrelates the fitted
+      !! intercept and slope) -- a genuinely DIFFERENT optimization
+      !! criterion from optimal_lsq_ref_midpoint's own (which minimizes
+      !! required_drm_nyquist's worst-case grid-stability bound instead).
+      !! Neither is "more correct" than the other; they answer different
+      !! questions, and this routine supports reporting at EITHER (or any
+      !! other reference the caller wants) equally well.
       !!
-      !! Derivation: the dirty spectrum built at reference lsq_ref is
-      !! P_ref(phi) = P_0(phi) * exp(2i*phi*lsq_ref) (required_drm_
+      !! Derivation: the dirty/restored spectrum built at reference
+      !! lsq_ref_compute is P_compute(phi) = P_report(phi) *
+      !! exp(2i*phi*(lsq_ref_compute-lsq_ref_report)) (required_drm_
       !! nyquist's own comment derives the general
       !! P_ref'(phi)=P_ref(phi)*exp(-2i*phi*(ref-ref')) relation between
-      !! any two references; setting ref=0, ref'=lsq_ref gives this
-      !! specific case). So P_0(phi) = P_ref(phi) * exp(-2i*phi*lsq_ref)
-      !! recovers the lambda_sq=0 convention exactly, at every phi
+      !! ANY two references; this is that relation with
+      !! ref=lsq_ref_compute, ref'=lsq_ref_report). So P_report(phi) =
+      !! P_compute(phi) * exp(-2i*phi*(lsq_ref_compute-lsq_ref_report))
+      !! recovers the target convention exactly, at every phi
       !! independently -- a pointwise multiply, no re-synthesis needed.
-      !! |P_0(phi)|=|P_ref(phi)| exactly (unit-modulus factor), so this
-      !! changes ONLY phase, never amplitude -- a directly verifiable
-      !! property (tests/thesis_scenario_rmclean.f90's own lsq_ref
-      !! flexibility case checks it).
+      !! |P_report(phi)|=|P_compute(phi)| exactly (unit-modulus factor),
+      !! so this changes ONLY phase, never amplitude -- a directly
+      !! verifiable property (tests/test_rmclean_lsqref_flex.f90's own
+      !! checks). lsq_ref_report=0.0 reduces exactly to this routine's own
+      !! original (derotate_to_lsq_zero) behaviour.
       !!
       !! Practical use for the intrinsic polarization angle: apply this to
       !! clean_complex's own comp_re/comp_im (the pure component map, NOT
@@ -873,28 +896,30 @@ contains
       !! guidance below for why), passing clean_complex's own
       !! comp_rm_refined(j) as rm_samp(j) (the actual continuous location,
       !! not the bare grid coordinate) for the bin j of interest, then
-      !! read off chi0 = 0.5*atan2(im_out(j), re_out(j)) -- the standard
-      !! P(lambda_sq=0)=p*exp(2i*chi0) relation, now satisfied exactly
-      !! regardless of which lsq_ref the actual RM-CLEAN computation used
-      !! internally. (chi0 recovered only mod pi, the ordinary EVPA
-      !! n*180-degree ambiguity inherent to any doubled-angle Faraday
-      !! convention -- not introduced by this routine.) The restored map
-      !! remains the right choice for visual inspection and for
-      !! integrating an EXTENDED feature's total flux (tests/
-      !! thesis_scenario_rmclean.f90's own window_flux) -- it is only for
-      !! a single component's own precise RM/phase that comp_re/comp_im
-      !! plus comp_rm_refined should be used instead of the restored map.
+      !! read off chi0_report = 0.5*atan2(im_out(j), re_out(j)) -- the
+      !! standard P(lsq_ref_report)=p*exp(2i*chi0_report) relation, now
+      !! satisfied exactly regardless of which lsq_ref_compute the actual
+      !! RM-CLEAN computation used internally. (chi0_report recovered
+      !! only mod pi, the ordinary EVPA n*180-degree ambiguity inherent to
+      !! any doubled-angle Faraday convention -- not introduced by this
+      !! routine.) The restored map remains the right choice for visual
+      !! inspection and for integrating an EXTENDED feature's total flux
+      !! (tests/thesis_scenario_rmclean.f90's own window_flux) -- it is
+      !! only for a single component's own precise RM/phase that
+      !! comp_re/comp_im plus comp_rm_refined should be used instead of
+      !! the restored map.
       !!
       !! IMPORTANT precision guidance, root-caused empirically (not just
-      !! theorised): chi0 = 0.5*phase_val - RM_found*lsq_ref (this
-      !! routine's own derivation). At lsq_ref=0, ANY imprecision in
-      !! RM_found multiplies against zero and cannot affect chi0 at all --
-      !! the reason lsq_ref=0 is uniquely "free" for phase reporting, not
-      !! a coincidence. At a NONZERO lsq_ref (e.g. a band's own centroid,
-      !! chosen because required_drm_nyquist allows a far coarser, cheaper
-      !! RM grid there -- see that routine's own comment), the SAME
-      !! RM_found imprecision gets multiplied by lsq_ref before reaching
-      !! chi0.
+      !! theorised): chi0_report = 0.5*phase_val -
+      !! RM_found*(lsq_ref_compute-lsq_ref_report) (this routine's own
+      !! derivation). When lsq_ref_compute EQUALS lsq_ref_report, ANY
+      !! imprecision in RM_found multiplies against zero and cannot affect
+      !! chi0_report at all -- the reason matching the two (e.g.
+      !! lsq_ref_compute=lsq_ref_report=0, this routine's own original
+      !! special case) is uniquely "free" for phase reporting, not a
+      !! coincidence. Whenever the two DIFFER, the SAME RM_found
+      !! imprecision gets multiplied by that difference before reaching
+      !! chi0_report.
       !!
       !! USE clean_complex's OWN comp_rm_refined(j) for RM_found here, NOT
       !! rm_samp(j) and NOT a fresh peak_interp_parabolic pass over the
@@ -917,15 +942,16 @@ contains
       !! confirming the bottleneck was never grid resolution or
       !! interpolation quality, but this specific discarded bookkeeping.
       integer, intent(in) :: nrm
-      real(sp), intent(in) :: rm_samp(nrm), lsq_ref
+      real(sp), intent(in) :: rm_samp(nrm), lsq_ref_compute, lsq_ref_report
       real(sp), intent(in) :: re_in(nrm), im_in(nrm)
       real(sp), intent(out) :: re_out(nrm), im_out(nrm)
 
-      real(dp) :: ang, c, s, re_dp, im_dp
+      real(dp) :: ang, c, s, re_dp, im_dp, ref_diff
       integer :: j
 
+      ref_diff = real(lsq_ref_compute, dp) - real(lsq_ref_report, dp)
       do j = 1, nrm
-         ang = -2.0_dp*real(rm_samp(j), dp)*real(lsq_ref, dp)
+         ang = -2.0_dp*real(rm_samp(j), dp)*ref_diff
          c = cos(ang)
          s = sin(ang)
          re_dp = real(re_in(j), dp)
@@ -933,7 +959,52 @@ contains
          re_out(j) = real(re_dp*c - im_dp*s, sp)
          im_out(j) = real(re_dp*s + im_dp*c, sp)
       end do
-   end subroutine derotate_to_lsq_zero
+   end subroutine derotate_to_lsq_ref
+
+   subroutine lsq_ref_report_centroid(l_sq, nchan, lsq_ref_report)
+      !! The Brentjens & de Bruyn (2005)-style REPORTING reference: the
+      !! (weighted) mean of the channels' own l_sq -- a genuinely
+      !! DIFFERENT optimum from optimal_lsq_ref_midpoint's own, answering
+      !! a different question (the user's own explicit ask to keep these
+      !! separate, after asking directly why B&dB advocate the centroid
+      !! rather than the mean, and whether that contradicts this module's
+      !! own midpoint result -- it does not; they solve different
+      !! problems).
+      !!
+      !! B&dB's own motivation is a classic linear-regression result: when
+      !! jointly fitting chi(lambda^2) = chi0 + RM*lambda^2 to noisy
+      !! multi-channel data, the estimated intercept (chi0) and slope (RM)
+      !! are, in general, statistically CORRELATED -- exactly the same
+      !! correlation any linear regression's intercept and slope have
+      !! against a regressor not centred at its own mean. Centering
+      !! lambda^2 at its own weighted mean before fitting/reporting
+      !! removes that correlation entirely (a standard, provable property
+      !! of least-squares regression, not specific to RM synthesis). This
+      !! is UNRELATED to optimal_lsq_ref_midpoint's own criterion
+      !! (minimizing required_drm_nyquist's worst-case grid-stability
+      !! bound, driven only by the two extreme channels, with no noise or
+      !! covariance anywhere in it) -- the two routines answer different
+      !! questions and are not expected to agree.
+      !!
+      !! "Weighted" here means weighted by each channel's own actual
+      !! contribution to the RM-synthesis sum. This module's own
+      !! (1/nchan) normalization (compute_dirty_rmbeam_direct,
+      !! build_rmsf_offset_table) already treats every channel EQUALLY --
+      !! there is no separate per-channel noise-weight concept anywhere in
+      !! rmclean_mod today -- so the plain arithmetic mean computed here
+      !! IS the correct, consistent centroid for this module's own current
+      !! scope, not an approximation to a "real" weighted version. If
+      !! per-channel weights are ever added to this module (e.g. inverse-
+      !! variance weighting for genuinely non-uniform channel
+      !! sensitivity), this routine would need to become a true weighted
+      !! mean, Sum(w_k*l_sq(k))/Sum(w_k), to stay correct -- flagged here
+      !! so that addition doesn't silently leave this routine stale.
+      integer, intent(in) :: nchan
+      real(sp), intent(in) :: l_sq(nchan)
+      real(sp), intent(out) :: lsq_ref_report
+
+      lsq_ref_report = sum(l_sq)/real(nchan, sp)
+   end subroutine lsq_ref_report_centroid
 
    subroutine restore_clean(rm_samp, nrm, comp_re, comp_im, resid_re,&
    &resid_im, fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
