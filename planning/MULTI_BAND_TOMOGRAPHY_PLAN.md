@@ -2,12 +2,14 @@
 
 Branch: `multi-band-tomography` (from `develop`)
 
-**Status: T0-T12 merged to `develop` and tagged `5.0-rc.1` (real-scale
+**Status: T0-T14 all merged to `develop` and tagged `5.0-rc.1` (real-scale
 validation pending before an actual `main` release -- see
 `CHANGELOG.md`'s `[5.0]` entry and `docs/RELEASE_NOTES_5.0.md`). T13
 (`match_cubes`) and T14 (`CASAMBM`/`BEAMS` propagation for the cross-band
-toolchain) implemented and verified on top of that on
-`multi-band-tomography`, not yet merged back to `develop`.**
+toolchain) were implemented and verified on `multi-band-tomography` and
+merged into `develop` via `5e2291f` -- confirmed directly against git
+history (`git merge-base --is-ancestor 5e2291f develop`), not assumed;
+this line previously said "not yet merged," which was stale.**
 
 ## 1. Motivation
 
