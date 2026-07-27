@@ -70,14 +70,14 @@
 #      renders PNGs in the thesis figures' own panel style (tests/output/
 #      rmclean_plots/) via tests/plot_thesis_scenario_rmclean.py, skipped
 #      gracefully if ~/venv/rmtool's python3 isn't found.
-#  24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_zero – a single
+#  24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_ref – a single
 #      point source with a NONZERO intrinsic angle, cleaned twice (once
 #      at lsq_ref=0, once at a band-mean reference requiring a far
-#      coarser RM grid per required_drm_nyquist), confirming
-#      derotate_to_lsq_zero recovers the same intrinsic polarization
+#      coarser RM grid per suggest_drm), confirming
+#      derotate_to_lsq_ref recovers the same intrinsic polarization
 #      angle at lambda_sq=0 in both cases, within a tolerance derived
 #      from each case's own grid resolution (not an arbitrary constant).
-#  25. RM-CLEAN optimal_lsq_ref_midpoint – confirms the midpoint of a
+#  25. RM-CLEAN suggest_lsq_ref_compute – confirms the midpoint of a
 #      channel set's own l_sq extent (not a channel-count-weighted mean,
 #      not any single band's own centroid) minimizes required_drm_
 #      nyquist's bound, on a deliberately imbalanced P-band(61ch)/
@@ -1598,9 +1598,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_zero
+# 24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_ref
 # ---------------------------------------------------------------------------
-section "24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_zero"
+section "24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_ref"
 
 lsqref_flex_bin="$RMCLEAN_BUILD_DIR/test_rmclean_lsqref_flex"
 lsqref_flex_log="$OUT_DIR/test_rmclean_lsqref_flex.log"
@@ -1628,9 +1628,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 25. RM-CLEAN optimal_lsq_ref_midpoint
+# 25. RM-CLEAN suggest_lsq_ref_compute
 # ---------------------------------------------------------------------------
-section "25. RM-CLEAN optimal_lsq_ref_midpoint"
+section "25. RM-CLEAN suggest_lsq_ref_compute"
 
 optimal_lsqref_bin="$RMCLEAN_BUILD_DIR/test_optimal_lsq_ref"
 optimal_lsqref_log="$OUT_DIR/test_optimal_lsq_ref.log"
@@ -1648,13 +1648,13 @@ if [[ -f "$rmclean_o" ]]; then
                 esac
             done < "$optimal_lsqref_log"
         else
-            fail "RM-CLEAN optimal_lsq_ref_midpoint: program exited non-zero (see $optimal_lsqref_log)"
+            fail "RM-CLEAN suggest_lsq_ref_compute: program exited non-zero (see $optimal_lsqref_log)"
         fi
     else
-        fail "RM-CLEAN optimal_lsq_ref_midpoint: build failed (see $OUT_DIR/rmclean_optimal_lsqref_build.log)"
+        fail "RM-CLEAN suggest_lsq_ref_compute: build failed (see $OUT_DIR/rmclean_optimal_lsqref_build.log)"
     fi
 else
-    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN optimal_lsq_ref_midpoint test"
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN suggest_lsq_ref_compute test"
 fi
 
 # ---------------------------------------------------------------------------

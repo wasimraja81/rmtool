@@ -20,8 +20,8 @@ module rmclean_mod
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
-   public :: required_drm_nyquist, derotate_to_lsq_ref
-   public :: optimal_lsq_ref_midpoint, lsq_ref_report_centroid
+   public :: suggest_drm, derotate_to_lsq_ref
+   public :: suggest_lsq_ref_compute, suggest_lsq_ref_report
 
    ! FFTW3 constants (same convention as gaussft_mod's own -- declared
    ! directly rather than `include`d, fftw3.f is fixed-form F77 and
@@ -734,7 +734,7 @@ contains
       lsq_span = abs(lsq2 - lsq1)
    end function padded_lsq_span
 
-   subroutine required_drm_nyquist(l_sq, nchan, lsq_ref_compute, oversample, drm_max)
+   subroutine suggest_drm(l_sq, nchan, lsq_ref_compute, oversample, drm_max)
       !! The RM-grid spacing an off-grid-peak CLEAN needs, GIVEN a chosen
       !! lsq_ref_compute -- a genuine sampling-theorem bound, not an empirically
       !! tuned constant. Distinct from compute_rmsf_fwhm/
@@ -794,10 +794,10 @@ contains
 
       max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref_compute, dp)))
       drm_max = real(pi/(2.0_dp*real(oversample, dp)*max_offset), sp)
-   end subroutine required_drm_nyquist
+   end subroutine suggest_drm
 
-   subroutine optimal_lsq_ref_midpoint(l_sq, nchan, lsq_ref_compute)
-      !! The lsq_ref_compute choice that MINIMIZES required_drm_nyquist's own
+   subroutine suggest_lsq_ref_compute(l_sq, nchan, lsq_ref_compute)
+      !! The lsq_ref_compute choice that MINIMIZES suggest_drm's own
       !! bound -- i.e. the cheapest safe RM grid -- across however many
       !! bands l_sq spans. Added at the user's own request, after they
       !! correctly pushed back on an earlier, wrong intuition (centering
@@ -805,7 +805,7 @@ contains
       !! questions: is the midpoint really optimal, and does channel
       !! count matter? Both answered rigorously, not just asserted:
       !!
-      !! required_drm_nyquist's bound is set by max_k|l_sq(k)-lsq_ref_compute|,
+      !! suggest_drm's bound is set by max_k|l_sq(k)-lsq_ref_compute|,
       !! the SINGLE worst channel's offset. For any fixed set of values,
       !! this maximum is determined ENTIRELY by the two EXTREME values
       !! (min(l_sq), max(l_sq)) -- every other channel, however many
@@ -844,7 +844,7 @@ contains
       real(sp), intent(out) :: lsq_ref_compute
 
       lsq_ref_compute = 0.5_sp*(minval(l_sq) + maxval(l_sq))
-   end subroutine optimal_lsq_ref_midpoint
+   end subroutine suggest_lsq_ref_compute
 
    subroutine derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute, lsq_ref_report,&
    &re_in, im_in, re_out, im_out)
@@ -854,30 +854,30 @@ contains
       !! unrelated questions (the user's own explicit ask, after finding
       !! the original lsq_ref-everywhere naming was starting to blur
       !! them): lsq_ref_compute is a pure COMPUTATIONAL COST lever (see
-      !! required_drm_nyquist/optimal_lsq_ref_midpoint -- it affects ONLY
+      !! suggest_drm/suggest_lsq_ref_compute -- it affects ONLY
       !! grid size, never precision, once comp_rm_refined is used
       !! correctly); lsq_ref_report is a REPORTING CONVENTION choice about
       !! where to QUOTE the intrinsic polarization angle, independent of
       !! how the computation was actually done. lsq_ref_report=0.0
       !! recovers this project's own thesis convention (formerly this
       !! routine's own hardcoded target, when it was named
-      !! derotate_to_lsq_zero); lsq_ref_report=lsq_ref_report_centroid's
+      !! derotate_to_lsq_zero); lsq_ref_report=suggest_lsq_ref_report's
       !! own output recovers the Brentjens & de Bruyn (2005)-style
       !! convention, chosen there to minimize the STATISTICAL COVARIANCE
       !! between a jointly-fitted RM and chi0 in the presence of noise (a
       !! classic linear-regression centering result: centering the
       !! regressor at its own weighted mean decorrelates the fitted
       !! intercept and slope) -- a genuinely DIFFERENT optimization
-      !! criterion from optimal_lsq_ref_midpoint's own (which minimizes
-      !! required_drm_nyquist's worst-case grid-stability bound instead).
+      !! criterion from suggest_lsq_ref_compute's own (which minimizes
+      !! suggest_drm's worst-case grid-stability bound instead).
       !! Neither is "more correct" than the other; they answer different
       !! questions, and this routine supports reporting at EITHER (or any
       !! other reference the caller wants) equally well.
       !!
       !! Derivation: the dirty/restored spectrum built at reference
       !! lsq_ref_compute is P_compute(phi) = P_report(phi) *
-      !! exp(2i*phi*(lsq_ref_compute-lsq_ref_report)) (required_drm_
-      !! nyquist's own comment derives the general
+      !! exp(2i*phi*(lsq_ref_compute-lsq_ref_report)) (suggest_drm's
+      !! own comment derives the general
       !! P_ref'(phi)=P_ref(phi)*exp(-2i*phi*(ref-ref')) relation between
       !! ANY two references; this is that relation with
       !! ref=lsq_ref_compute, ref'=lsq_ref_report). So P_report(phi) =
@@ -961,10 +961,10 @@ contains
       end do
    end subroutine derotate_to_lsq_ref
 
-   subroutine lsq_ref_report_centroid(l_sq, nchan, lsq_ref_report)
+   subroutine suggest_lsq_ref_report(l_sq, nchan, lsq_ref_report)
       !! The Brentjens & de Bruyn (2005)-style REPORTING reference: the
       !! (weighted) mean of the channels' own l_sq -- a genuinely
-      !! DIFFERENT optimum from optimal_lsq_ref_midpoint's own, answering
+      !! DIFFERENT optimum from suggest_lsq_ref_compute's own, answering
       !! a different question (the user's own explicit ask to keep these
       !! separate, after asking directly why B&dB advocate the centroid
       !! rather than the mean, and whether that contradicts this module's
@@ -980,31 +980,41 @@ contains
       !! lambda^2 at its own weighted mean before fitting/reporting
       !! removes that correlation entirely (a standard, provable property
       !! of least-squares regression, not specific to RM synthesis). This
-      !! is UNRELATED to optimal_lsq_ref_midpoint's own criterion
-      !! (minimizing required_drm_nyquist's worst-case grid-stability
+      !! is UNRELATED to suggest_lsq_ref_compute's own criterion
+      !! (minimizing suggest_drm's worst-case grid-stability
       !! bound, driven only by the two extreme channels, with no noise or
       !! covariance anywhere in it) -- the two routines answer different
       !! questions and are not expected to agree.
       !!
       !! "Weighted" here means weighted by each channel's own actual
-      !! contribution to the RM-synthesis sum. This module's own
-      !! (1/nchan) normalization (compute_dirty_rmbeam_direct,
-      !! build_rmsf_offset_table) already treats every channel EQUALLY --
-      !! there is no separate per-channel noise-weight concept anywhere in
-      !! rmclean_mod today -- so the plain arithmetic mean computed here
-      !! IS the correct, consistent centroid for this module's own current
-      !! scope, not an approximation to a "real" weighted version. If
-      !! per-channel weights are ever added to this module (e.g. inverse-
-      !! variance weighting for genuinely non-uniform channel
-      !! sensitivity), this routine would need to become a true weighted
-      !! mean, Sum(w_k*l_sq(k))/Sum(w_k), to stay correct -- flagged here
-      !! so that addition doesn't silently leave this routine stale.
+      !! contribution to the RM-synthesis sum -- CORRECTED after review:
+      !! this project already has real per-channel weighting, at the
+      !! rm_synthesis_mod.f90 level (MASK.CUBE.FITS/wts_gpu, a genuine
+      !! per-PIXEL, per-CHANNEL 0/1 mask, confirmed by reading that
+      !! module's own source rather than assumed) -- nowhere in this
+      !! whole project, checked directly, is any GRADUATED (e.g. inverse-
+      !! noise-variance) weight ever used; masking (full inclusion or
+      !! full exclusion) is the entire weighting scheme this project has,
+      !! and a 0/1 mask reduces exactly to "average over the surviving
+      !! channels" -- precisely the plain arithmetic mean this routine
+      !! already computes. rmclean_mod itself takes no mask argument
+      !! directly (it only ever sees l_sq(nchan), same as every other
+      !! routine here) -- masking is therefore the CALLER's
+      !! responsibility: build l_sq per pixel from only that pixel's own
+      !! unmasked channels (varying nchan pixel-to-pixel is fine) before
+      !! calling this routine, exactly as any other rmclean_mod routine
+      !! already expects. Given that, this routine is ALREADY correct for
+      !! per-pixel masking today, not merely for a future addition. Only
+      !! a genuinely graduated (non-0/1) weight, if this project ever
+      !! adopts one, would require this formula to become a true weighted
+      !! mean, Sum(w_k*l_sq(k))/Sum(w_k) -- flagged here so that addition
+      !! doesn't silently leave this routine stale.
       integer, intent(in) :: nchan
       real(sp), intent(in) :: l_sq(nchan)
       real(sp), intent(out) :: lsq_ref_report
 
       lsq_ref_report = sum(l_sq)/real(nchan, sp)
-   end subroutine lsq_ref_report_centroid
+   end subroutine suggest_lsq_ref_report
 
    subroutine restore_clean(rm_samp, nrm, comp_re, comp_im, resid_re,&
    &resid_im, fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)

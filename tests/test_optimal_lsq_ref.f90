@@ -1,6 +1,6 @@
 program test_optimal_lsq_ref
-   !! Validates rmclean_mod's optimal_lsq_ref_midpoint against the actual
-   !! claim it's built on: minimizing required_drm_nyquist's own bound
+   !! Validates rmclean_mod's suggest_lsq_ref_compute against the actual
+   !! claim it's built on: minimizing suggest_drm's own bound
    !! (i.e. the cheapest safe RM grid) is achieved by the midpoint of the
    !! channel set's own l_sq extent, NOT by a channel-count-weighted mean
    !! and NOT by centring on any single band's own centroid -- added after
@@ -39,7 +39,7 @@ program test_optimal_lsq_ref
    lsq_mean_l = sum(l_sq_l)/real(n_l, sp)
    lsq_expected_midpoint = 0.5_sp*(minval(l_sq_all)+maxval(l_sq_all))
 
-   call optimal_lsq_ref_midpoint(l_sq_all, n_p+n_l, lsq_midpoint)
+   call suggest_lsq_ref_compute(l_sq_all, n_p+n_l, lsq_midpoint)
 
    write(*,'(A)') '===================================================='
    write(*,'(A,F0.4,A,F0.4)') 'overall l_sq range: min=', minval(l_sq_all),&
@@ -47,17 +47,17 @@ program test_optimal_lsq_ref
    write(*,'(A,F0.4)') 'channel-count-weighted mean (182 channels): ', lsq_mean_all
    write(*,'(A,F0.4)') 'P-band-only centroid (61 channels): ', lsq_mean_p
    write(*,'(A,F0.4)') 'L-band-only centroid (121 channels): ', lsq_mean_l
-   write(*,'(A,F0.4)') 'optimal_lsq_ref_midpoint result: ', lsq_midpoint
+   write(*,'(A,F0.4)') 'suggest_lsq_ref_compute result: ', lsq_midpoint
    write(*,'(A)') '===================================================='
 
    call check(abs(lsq_midpoint - lsq_expected_midpoint) < 1.0e-6_sp,&
-   &'optimal_lsq_ref_midpoint returns exactly (min+max)/2', all_pass)
+   &'suggest_lsq_ref_compute returns exactly (min+max)/2', all_pass)
 
-   call required_drm_nyquist(l_sq_all, n_p+n_l, 0.0_sp, 15.0_sp, drm_zero)
-   call required_drm_nyquist(l_sq_all, n_p+n_l, lsq_mean_all, 15.0_sp, drm_mean_all)
-   call required_drm_nyquist(l_sq_all, n_p+n_l, lsq_mean_p, 15.0_sp, drm_p_centre)
-   call required_drm_nyquist(l_sq_all, n_p+n_l, lsq_mean_l, 15.0_sp, drm_l_centre)
-   call required_drm_nyquist(l_sq_all, n_p+n_l, lsq_midpoint, 15.0_sp, drm_midpoint)
+   call suggest_drm(l_sq_all, n_p+n_l, 0.0_sp, 15.0_sp, drm_zero)
+   call suggest_drm(l_sq_all, n_p+n_l, lsq_mean_all, 15.0_sp, drm_mean_all)
+   call suggest_drm(l_sq_all, n_p+n_l, lsq_mean_p, 15.0_sp, drm_p_centre)
+   call suggest_drm(l_sq_all, n_p+n_l, lsq_mean_l, 15.0_sp, drm_l_centre)
+   call suggest_drm(l_sq_all, n_p+n_l, lsq_midpoint, 15.0_sp, drm_midpoint)
 
    write(*,'(A,F0.5,A,I0)') 'lsq_ref=0:                 dRM<=', drm_zero,&
    &'  nrm(span=450)=', nint(450.0_sp/drm_zero)+1

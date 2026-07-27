@@ -80,7 +80,7 @@ program thesis_scenario_rmclean
    ! fit to be valid at all (fitting a quadratic through 3 samples of a
    ! function that completes a full oscillation cycle within a handful of
    ! samples is meaningless, not just imprecise). dRM is therefore DERIVED
-   ! below via rmclean_mod's own required_drm_nyquist (not a hardcoded
+   ! below via rmclean_mod's own suggest_drm (not a hardcoded
    ! literal): confirmed directly that a coarser grid violating this bound
    ! (dRM=2, fine enough only for lsq_ref=mean's much slower oscillation)
    ! made CLEAN's own residual DIVERGE under lsq_ref=0 -- peak growing from
@@ -112,14 +112,14 @@ program thesis_scenario_rmclean
 
    ! Derive the RM-grid spacing from the ACTUAL channel set that will be
    ! used (P-band's own l_sq dominates, being farthest from lsq_ref=0 --
-   ! see required_drm_nyquist's own doc comment -- but L-band is folded in
+   ! see suggest_drm's own doc comment -- but L-band is folded in
    ! too so this stays correct even if the band setup changes later),
    ! rather than hardcoding a literal value tuned to just this scenario.
    call band_channels(300.0_sp, 30.0_sp, 61, l_sq_p_worst)
    call band_channels(1200.0_sp, 120.0_sp, 121, l_sq_l_worst)
    l_sq_worst(1:61) = l_sq_p_worst
    l_sq_worst(62:182) = l_sq_l_worst
-   call required_drm_nyquist(l_sq_worst, 182, 0.0_sp, rm_drm_oversample, drm)
+   call suggest_drm(l_sq_worst, 182, 0.0_sp, rm_drm_oversample, drm)
    nrm = nint(rm_span/drm) + 1
    allocate(rm_samp(nrm))
    call build_rm_axis(rm_samp, nrm, rm_lo, drm)
