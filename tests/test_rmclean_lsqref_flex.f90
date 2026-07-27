@@ -9,16 +9,17 @@ program test_rmclean_lsqref_flex
    !! project's thesis-matching convention, tests/thesis_scenario_
    !! rmclean.f90's own) and the band's own mean (this project's
    !! rm_synthesis_mod.f90's own extract_general_setup convention,
-   !! numerically cheaper per suggest_drm); and (2)
+   !! numerically cheaper per get_drm); and (2)
    !! lsq_ref_report, a separate REPORTING CONVENTION choice -- via
    !! derotate_to_lsq_ref (generalized from this test's own earlier,
    !! lsq_zero-only version), letting a caller report the intrinsic
-   !! polarization angle at EITHER lambda_sq=0 (this project's own
-   !! thesis convention) OR at suggest_lsq_ref_report's own Brentjens &
-   !! de Bruyn (2005)-style value (chosen there to decorrelate the
-   !! estimated RM and chi0's own statistical uncertainty -- a different
-   !! optimization criterion from suggest_lsq_ref_compute's own, not a
-   !! competing answer to the same question), confirmed here to agree
+   !! polarization angle at EITHER lambda_sq=0 (mode=lsq_ref_report_
+   !! intrinsic, this project's own thesis convention) OR at
+   !! mode=lsq_ref_report_centroid's own Brentjens & de Bruyn (2005)-style
+   !! value (chosen there to decorrelate the estimated RM and chi0's own
+   !! statistical uncertainty -- a different optimization criterion from
+   !! get_lsq_ref_compute's own mid mode, not a competing answer to the
+   !! same question), confirmed here to agree
    !! with an independently-derived closed-form expectation regardless of
    !! which lsq_ref_compute was used internally; and (3) clean_complex's
    !! own comp_rm_refined output, root-caused during this test's own
@@ -68,26 +69,29 @@ program test_rmclean_lsqref_flex
    call sky_model_qu(l_sq, nchan, q, u)
 
    ! lsq_ref_compute_mean here is being used as a CHEAP COMPUTE reference
-   ! (the "band-mean" case below) -- numerically identical to what
-   ! suggest_lsq_ref_report computes (same arithmetic mean formula), but
+   ! (the "band-mean" case below), via mode=lsq_ref_compute_centroid --
+   ! numerically identical to what get_lsq_ref_report(mode=lsq_ref_
+   ! report_centroid) computes (same arithmetic mean formula), but
    ! playing a conceptually DIFFERENT role: a compute-cost lever here,
    ! not a reporting convention. lsq_ref_report_val (below) is the
    ! SEPARATE, reporting-side use of that same formula, called via its
-   ! own dedicated routine to exercise that public entry point directly.
-   lsq_ref_compute_mean = sum(l_sq)/real(nchan, sp)
-   call suggest_lsq_ref_report(l_sq, nchan, lsq_ref_report_val)
+   ! own dedicated mode to exercise that public entry point directly.
+   call get_lsq_ref_compute(l_sq, nchan, mode=lsq_ref_compute_centroid,&
+   &lsq_ref_compute=lsq_ref_compute_mean)
+   call get_lsq_ref_report(l_sq, nchan, mode=lsq_ref_report_centroid,&
+   &lsq_ref_report=lsq_ref_report_val)
 
-   call suggest_drm(l_sq, nchan, 0.0_sp, rm_drm_oversample, drm_zero)
-   call suggest_drm(l_sq, nchan, lsq_ref_compute_mean, rm_drm_oversample, drm_centroid)
+   call get_drm(l_sq, nchan, 0.0_sp, drm_zero, oversample=rm_drm_oversample)
+   call get_drm(l_sq, nchan, lsq_ref_compute_mean, drm_centroid, oversample=rm_drm_oversample)
 
    write(*,'(A)') '===================================================='
    write(*,'(A,F0.1,A,F0.1,A,F0.2,A)') 'Sky model: point source RM=', point_rm,&
    &' amp=', point_amp, ' chi0=', chi0_true, ' rad'
-   write(*,'(A,F0.6,A,F0.6,A)') 'suggest_drm: lsq_ref_compute=0 -> dRM<=',&
+   write(*,'(A,F0.6,A,F0.6,A)') 'get_drm: lsq_ref_compute=0 -> dRM<=',&
    &drm_zero, '   lsq_ref_compute=band-mean -> dRM<=', drm_centroid, ' rad/m^2'
    write(*,'(A,F0.1,A)') '  (band-mean compute reference is ', drm_centroid/drm_zero,&
    &'x coarser -- the computational motivation for choosing it)'
-   write(*,'(A,F0.4)') 'suggest_lsq_ref_report (B&dB-style reporting reference): ',&
+   write(*,'(A,F0.4)') 'get_lsq_ref_report(mode=lsq_ref_report_centroid), B&dB-style: ',&
    &lsq_ref_report_val
    write(*,'(A)') '===================================================='
 

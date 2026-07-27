@@ -73,15 +73,24 @@
 #  24. RM-CLEAN lsq_ref flexibility + derotate_to_lsq_ref – a single
 #      point source with a NONZERO intrinsic angle, cleaned twice (once
 #      at lsq_ref=0, once at a band-mean reference requiring a far
-#      coarser RM grid per suggest_drm), confirming
+#      coarser RM grid per get_drm), confirming
 #      derotate_to_lsq_ref recovers the same intrinsic polarization
 #      angle at lambda_sq=0 in both cases, within a tolerance derived
 #      from each case's own grid resolution (not an arbitrary constant).
-#  25. RM-CLEAN suggest_lsq_ref_compute – confirms the midpoint of a
+#  25. RM-CLEAN get_lsq_ref_compute – confirms the midpoint of a
 #      channel set's own l_sq extent (not a channel-count-weighted mean,
-#      not any single band's own centroid) minimizes required_drm_
-#      nyquist's bound, on a deliberately imbalanced P-band(61ch)/
-#      L-band(121ch) combination where those candidates diverge.
+#      not any single band's own centroid) minimizes get_drm's bound, on
+#      a deliberately imbalanced P-band(61ch)/L-band(121ch) combination
+#      where those candidates diverge.
+#  26. RM-CLEAN get_drm oversample floor – demonstrates WHY the enforced
+#      floor is oversample>=2, not the bare 2-point Nyquist value of 1:
+#      oversample=1 (computed by hand, since get_drm itself now refuses
+#      it) recovers a WRONG chi0 on a single point source, not just an
+#      imprecise one; oversample=2 already recovers it correctly.
+#  27. RM-CLEAN get_drm enforcement – confirms get_drm actually REFUSES
+#      (stops with a nonzero exit) an unsafe oversample<2, rather than
+#      merely producing a bad answer if a caller passes one. Inverted
+#      pass logic: a nonzero exit IS the expected, correct outcome here.
 #
 # A summary of PASS/FAIL is printed at the end.
 # Exit code: 0 = all passed, 1 = at least one failure.
@@ -1628,9 +1637,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 25. RM-CLEAN suggest_lsq_ref_compute
+# 25. RM-CLEAN get_lsq_ref_compute
 # ---------------------------------------------------------------------------
-section "25. RM-CLEAN suggest_lsq_ref_compute"
+section "25. RM-CLEAN get_lsq_ref_compute"
 
 optimal_lsqref_bin="$RMCLEAN_BUILD_DIR/test_optimal_lsq_ref"
 optimal_lsqref_log="$OUT_DIR/test_optimal_lsq_ref.log"
@@ -1648,13 +1657,70 @@ if [[ -f "$rmclean_o" ]]; then
                 esac
             done < "$optimal_lsqref_log"
         else
-            fail "RM-CLEAN suggest_lsq_ref_compute: program exited non-zero (see $optimal_lsqref_log)"
+            fail "RM-CLEAN get_lsq_ref_compute: program exited non-zero (see $optimal_lsqref_log)"
         fi
     else
-        fail "RM-CLEAN suggest_lsq_ref_compute: build failed (see $OUT_DIR/rmclean_optimal_lsqref_build.log)"
+        fail "RM-CLEAN get_lsq_ref_compute: build failed (see $OUT_DIR/rmclean_optimal_lsqref_build.log)"
     fi
 else
-    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN suggest_lsq_ref_compute test"
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN get_lsq_ref_compute test"
+fi
+
+# ---------------------------------------------------------------------------
+# 26. RM-CLEAN get_drm's oversample floor -- why it's 2, not bare Nyquist
+# ---------------------------------------------------------------------------
+section "26. RM-CLEAN get_drm oversample floor (why 2, not bare Nyquist)"
+
+drmfloor_bin="$RMCLEAN_BUILD_DIR/test_drm_floor"
+drmfloor_log="$OUT_DIR/test_drm_floor.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_drm_floor.f90" "$rmclean_o" \
+            -o "$drmfloor_bin" -lfftw3 2>"$OUT_DIR/rmclean_drmfloor_build.log"; then
+        if "$drmfloor_bin" > "$drmfloor_log" 2>&1; then
+            while IFS= read -r line; do
+                case "$line" in
+                    *"[PASS]"*) pass "${line#*\[PASS\] }" ;;
+                    *"[FAIL]"*) fail "${line#*\[FAIL\] }" ;;
+                esac
+            done < "$drmfloor_log"
+        else
+            fail "RM-CLEAN get_drm oversample floor: program exited non-zero (see $drmfloor_log)"
+        fi
+    else
+        fail "RM-CLEAN get_drm oversample floor: build failed (see $OUT_DIR/rmclean_drmfloor_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN get_drm oversample floor test"
+fi
+
+# ---------------------------------------------------------------------------
+# 27. RM-CLEAN get_drm actually REFUSES an unsafe oversample -- inverted
+#     pass logic: this program is EXPECTED to be terminated by get_drm's
+#     own stop(1), so a NONZERO exit code is the correct outcome here.
+# ---------------------------------------------------------------------------
+section "27. RM-CLEAN get_drm refuses unsafe oversample (enforcement)"
+
+drmenforce_bin="$RMCLEAN_BUILD_DIR/test_drm_floor_enforcement"
+drmenforce_log="$OUT_DIR/test_drm_floor_enforcement.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_drm_floor_enforcement.f90" "$rmclean_o" \
+            -o "$drmenforce_bin" -lfftw3 2>"$OUT_DIR/rmclean_drmenforce_build.log"; then
+        if "$drmenforce_bin" > "$drmenforce_log" 2>&1; then
+            fail "get_drm: incorrectly ALLOWED an unsafe oversample to proceed (see $drmenforce_log)"
+        else
+            pass "get_drm: correctly refused an unsafe oversample (<2) with a nonzero exit"
+        fi
+    else
+        fail "RM-CLEAN get_drm enforcement: build failed (see $OUT_DIR/rmclean_drmenforce_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN get_drm enforcement test"
 fi
 
 # ---------------------------------------------------------------------------

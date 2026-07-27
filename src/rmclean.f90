@@ -20,8 +20,12 @@ module rmclean_mod
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
-   public :: suggest_drm, derotate_to_lsq_ref
-   public :: suggest_lsq_ref_compute, suggest_lsq_ref_report
+   public :: get_drm, derotate_to_lsq_ref
+   public :: get_lsq_ref_compute, get_lsq_ref_report
+   public :: lsq_ref_compute_mid, lsq_ref_compute_intrinsic, lsq_ref_compute_centroid
+   public :: lsq_ref_compute_min, lsq_ref_compute_max, lsq_ref_compute_fixed
+   public :: lsq_ref_report_intrinsic, lsq_ref_report_centroid, lsq_ref_report_mid
+   public :: lsq_ref_report_min, lsq_ref_report_max, lsq_ref_report_fixed
 
    ! FFTW3 constants (same convention as gaussft_mod's own -- declared
    ! directly rather than `include`d, fftw3.f is fixed-form F77 and
@@ -29,6 +33,34 @@ module rmclean_mod
    integer, parameter :: fftw_forward = -1
    integer, parameter :: fftw_backward = 1
    integer, parameter :: fftw_estimate = 64
+
+   ! get_lsq_ref_compute's own recognized modes -- the RECOMMENDED,
+   ! default choice is lsq_ref_compute_mid (=1, listed first
+   ! deliberately): it minimizes get_drm's own grid-cost bound (a
+   ! genuine, provable property -- get_lsq_ref_compute's own comment)
+   ! and, once comp_rm_refined/derotate_to_lsq_ref are used correctly,
+   ! costs NOTHING in chi0 precision -- so there is no accuracy trade-off
+   ! for choosing it, only a computational win. The rest exist so a
+   ! caller can experiment or match some other external convention;
+   ! none of them changes what get_drm subsequently enforces, since
+   ! get_drm always derives its own bound from whichever
+   ! lsq_ref_compute value is actually in use, regardless of mode.
+   integer, parameter :: lsq_ref_compute_mid       = 1
+   integer, parameter :: lsq_ref_compute_intrinsic = 2
+   integer, parameter :: lsq_ref_compute_centroid  = 3
+   integer, parameter :: lsq_ref_compute_min       = 4
+   integer, parameter :: lsq_ref_compute_max       = 5
+   integer, parameter :: lsq_ref_compute_fixed     = 6
+
+   ! get_lsq_ref_report's own recognized modes -- lsq_ref_report_
+   ! intrinsic (=1, listed first) is this project's own default
+   ! reporting convention (matches the user's own thesis).
+   integer, parameter :: lsq_ref_report_intrinsic = 1
+   integer, parameter :: lsq_ref_report_centroid  = 2
+   integer, parameter :: lsq_ref_report_min       = 3
+   integer, parameter :: lsq_ref_report_max       = 4
+   integer, parameter :: lsq_ref_report_mid       = 5
+   integer, parameter :: lsq_ref_report_fixed     = 6
 
    ! Speed of light, Mm/s (matches rm_synthesis_mod.f90's own c_velocity
    ! exactly -- this module deliberately doesn't `use` that module, same
@@ -734,117 +766,178 @@ contains
       lsq_span = abs(lsq2 - lsq1)
    end function padded_lsq_span
 
-   subroutine suggest_drm(l_sq, nchan, lsq_ref_compute, oversample, drm_max)
-      !! The RM-grid spacing an off-grid-peak CLEAN needs, GIVEN a chosen
-      !! lsq_ref_compute -- a genuine sampling-theorem bound, not an empirically
-      !! tuned constant. Distinct from compute_rmsf_fwhm/
-      !! compute_rmsf_fwhm_multiband above, which answer a different
-      !! question entirely:
+   subroutine get_drm(l_sq, nchan, lsq_ref_compute, drm, oversample)
+      !! The RM-grid spacing to actually use, GIVEN a chosen
+      !! lsq_ref_compute -- a genuine sampling-theorem bound, not an
+      !! empirically tuned constant, and (at the user's own explicit
+      !! request) the ONLY way to influence dRM at all: there is no raw
+      !! "requested dRM" input anywhere in this module's API, deliberately
+      !! -- unlike lsq_ref_compute/lsq_ref_report (genuine free choices,
+      !! no wrong answer), sampling below this bound is a CORRECTNESS
+      !! failure, not a preference, so the only knob exposed is
+      !! `oversample`, a multiplier ALWAYS applied on top of the mandatory
+      !! floor -- it is architecturally impossible to ask this routine for
+      !! an unsafe dRM.
+      !!
+      !! Distinct from compute_rmsf_fwhm/compute_rmsf_fwhm_multiband
+      !! above, which answer a different question entirely:
       !!
       !! The dirty spectrum is P(phi) = (1/K) sum_k p_k
-      !! exp(-2i*phi*(l_sq(k)-lsq_ref_compute)). Its MAGNITUDE envelope |P(phi)|
-      !! is exactly independent of lsq_ref_compute (a reference change multiplies
-      !! the whole sum by exp(-2i*phi*Delta_ref), unit modulus for every
-      !! phi) and is set only by how the l_sq(k) are SPREAD OUT relative
-      !! to each other -- the SPAN, compute_rmsf_fwhm's own quantity. This
-      !! is the physically meaningful "resolution": how far apart two
-      !! Faraday components must be to be distinguished, the analogue of
-      !! a wave packet's GROUP velocity/envelope, which carries the
-      !! actual information content and cannot be changed by a mere
-      !! choice of coordinate origin.
+      !! exp(-2i*phi*(l_sq(k)-lsq_ref_compute)). Its MAGNITUDE envelope
+      !! |P(phi)| is exactly independent of lsq_ref_compute (a reference
+      !! change multiplies the whole sum by exp(-2i*phi*Delta_ref), unit
+      !! modulus for every phi) and is set only by how the l_sq(k) are
+      !! SPREAD OUT relative to each other -- the SPAN, compute_rmsf_
+      !! fwhm's own quantity. This is the physically meaningful
+      !! "resolution": how far apart two Faraday components must be to be
+      !! distinguished, the analogue of a wave packet's GROUP
+      !! velocity/envelope, which carries the actual information content
+      !! and cannot be changed by a mere choice of coordinate origin.
       !!
       !! But CLEAN operates on Re(phi)/Im(phi) SEPARATELY (peak_interp_
       !! parabolic fits each independently; clean_complex subtracts a
       !! complex beam every iteration) -- it needs the actual complex
       !! VALUE, not just the magnitude, so it cannot simply discard
-      !! lsq_ref_compute's effect. Each term k in the sum is its own complex
-      !! sinusoid in phi with period pi/|l_sq(k)-lsq_ref_compute| -- the
-      !! analogue of a carrier's PHASE velocity, which conveys no extra
-      !! resolution/information by itself (the magnitude envelope doesn't
-      !! care about it at all) but which the grid must still track
-      !! faithfully if raw Re/Im values are what get sampled, fit, and
-      !! subtracted. The fastest such term -- and therefore the binding
-      !! constraint -- comes from whichever channel sits FARTHEST from
-      !! lsq_ref_compute: max_k|l_sq(k)-lsq_ref_compute|. With lsq_ref_compute=0 (this project's
-      !! thesis-matching convention) and a GHz-range band, that offset
-      !! equals the channel's own (large) l_sq directly, far exceeding
-      !! the (small) SPAN that governs resolution -- exactly why a grid
-      !! adequate for compute_rmsf_fwhm's own resolution scale can still
-      !! be wildly under-sampled for CLEAN's own Re/Im grid, a distinct
-      !! failure mode from "not enough resolution" (confirmed empirically:
-      !! CLEAN's residual diverged, 111 -> 8e16 over ~700 iterations, when
-      !! this bound was violated -- see tests/thesis_scenario_rmclean.f90).
+      !! lsq_ref_compute's effect. Each term k in the sum is its own
+      !! complex sinusoid in phi with period pi/|l_sq(k)-lsq_ref_compute|
+      !! -- the analogue of a carrier's PHASE velocity, which conveys no
+      !! extra resolution/information by itself (the magnitude envelope
+      !! doesn't care about it at all) but which the grid must still
+      !! track faithfully if raw Re/Im values are what get sampled, fit,
+      !! and subtracted. The fastest such term -- and therefore the
+      !! binding constraint -- comes from whichever channel sits FARTHEST
+      !! from lsq_ref_compute: max_k|l_sq(k)-lsq_ref_compute|. With
+      !! lsq_ref_compute=0 (this project's thesis-matching convention)
+      !! and a GHz-range band, that offset equals the channel's own
+      !! (large) l_sq directly, far exceeding the (small) SPAN that
+      !! governs resolution -- exactly why a grid adequate for
+      !! compute_rmsf_fwhm's own resolution scale can still be wildly
+      !! under-sampled for CLEAN's own Re/Im grid, a distinct failure mode
+      !! from "not enough resolution" (confirmed empirically: CLEAN's
+      !! residual diverged, 111 -> 8e16 over ~700 iterations, when this
+      !! bound was violated -- see tests/thesis_scenario_rmclean.f90).
       !!
-      !! Bare two-point Nyquist for that fastest term is
-      !! drm <= pi/(2*max_offset). oversample (>1) tightens this by the
-      !! given factor, since peak_interp_parabolic's LOCAL 3-point
+      !! oversample floor, root-caused empirically (not assumed): bare
+      !! two-point Nyquist (oversample=1) does NOT diverge -- residual
+      !! power stayed small in every scenario tested -- but it recovers
+      !! the WRONG answer, not just an imprecise one: a single point
+      !! source (RM=50, chi0=0.3 rad) came back as chi0=-0.025 rad at
+      !! oversample=1 (tests/test_drm_floor.f90), a genuine error, not
+      !! noise. oversample=2 already recovered chi0 to 0.3002 rad
+      !! (matching oversample=15's own 0.3000 to within float32 rounding)
+      !! -- the transition from "wrong" to "correct" happens somewhere in
+      !! (1,2]. This is because peak_interp_parabolic's LOCAL 3-point
       !! quadratic fit needs several samples across a cycle to be a valid
       !! local approximation, not merely the bare two points needed to
-      !! avoid ALIASING a global reconstruction (a different, weaker,
-      !! requirement) -- an oversample of ~10-15 was empirically confirmed
-      !! sufficient (CLEAN's convergence trajectory matched the
-      !! lsq_ref_compute=mean baseline closely at oversample~14) and is a
-      !! documented safety margin above the bare bound, not a second
-      !! hidden ad-hoc constant.
+      !! avoid ALIASING a global reconstruction (a different, weaker
+      !! requirement -- stability alone does not imply correctness here).
+      !! Enforced hard floor: oversample must be >= 2 (a margin above the
+      !! observed transition point, checked on one scenario only -- not
+      !! swept across band shapes/multi-component cases, so treat 2 as a
+      !! floor with a safety margin already built in, not a knife-edge
+      !! value). Default (if oversample is omitted): 4, giving further
+      !! margin above the floor at a fraction of oversample=15's own grid
+      !! cost (nrm=80 vs nrm=297 in the tested P-band scenario).
       integer, intent(in) :: nchan
-      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute, oversample
-      real(sp), intent(out) :: drm_max
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute
+      real(sp), intent(out) :: drm
+      real(sp), intent(in), optional :: oversample
       real(dp), parameter :: pi = 3.14159265358979_dp
-      real(dp) :: max_offset
+      real(dp) :: max_offset, os
+
+      os = 4.0_dp
+      if (present(oversample)) os = real(oversample, dp)
+      if (os < 2.0_dp) then
+         write(*,'(A)') 'FATAL: get_drm: oversample must be >= 2 -- bare'//&
+         &' Nyquist sampling (oversample=1) is confirmed empirically to'//&
+         &' recover a WRONG (not just imprecise) chi0/RM; see this'//&
+         &' routine''s own doc comment and tests/test_drm_floor.f90.'
+         stop 1
+      endif
 
       max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref_compute, dp)))
-      drm_max = real(pi/(2.0_dp*real(oversample, dp)*max_offset), sp)
-   end subroutine suggest_drm
+      drm = real(pi/(2.0_dp*os*max_offset), sp)
+   end subroutine get_drm
 
-   subroutine suggest_lsq_ref_compute(l_sq, nchan, lsq_ref_compute)
-      !! The lsq_ref_compute choice that MINIMIZES suggest_drm's own
-      !! bound -- i.e. the cheapest safe RM grid -- across however many
-      !! bands l_sq spans. Added at the user's own request, after they
-      !! correctly pushed back on an earlier, wrong intuition (centering
-      !! on the LOWEST-frequency band's own centroid) with two sharp
-      !! questions: is the midpoint really optimal, and does channel
-      !! count matter? Both answered rigorously, not just asserted:
+   subroutine get_lsq_ref_compute(l_sq, nchan, mode, lsq_ref_compute, fixed_value)
+      !! Computes lsq_ref_compute for the requested mode -- see the
+      !! lsq_ref_compute_* constants declared at the top of this module
+      !! for the full menu. mode=lsq_ref_compute_mid is the RECOMMENDED
+      !! DEFAULT (the user's own explicit instruction): pick it unless you
+      !! have a specific reason not to. The other modes exist so a caller
+      !! can experiment or match some other external convention -- doing
+      !! so costs nothing in SAFETY (get_drm enforces its own floor
+      !! against whichever lsq_ref_compute value actually results,
+      !! regardless of mode) but can cost real GRID SIZE (see below).
       !!
-      !! suggest_drm's bound is set by max_k|l_sq(k)-lsq_ref_compute|,
-      !! the SINGLE worst channel's offset. For any fixed set of values,
-      !! this maximum is determined ENTIRELY by the two EXTREME values
-      !! (min(l_sq), max(l_sq)) -- every other channel, however many
-      !! there are or wherever they sit between the extremes, can never
-      !! exceed whichever extreme is farther from lsq_ref_compute, so it never
-      !! enters the max(). Minimizing max(|max(l_sq)-lsq_ref_compute|,
-      !! |lsq_ref_compute-min(l_sq)|) over choice of lsq_ref_compute is solved exactly by
-      !! making the two terms equal -- i.e. lsq_ref_compute =
-      !! (min(l_sq)+max(l_sq))/2, the midpoint of the overall extent. A
-      !! classic 1D minimax/Chebyshev-centre result. Channel COUNT
-      !! (per-band or overall) does not enter this at all: it is a
-      !! genuine, provable mathematical fact for THIS specific criterion,
-      !! not an approximation -- confirmed numerically (tests/
-      !! test_optimal_lsq_ref.f90) against a P-band(61ch)+L-band(121ch)
-      !! combination, where the midpoint (0.5806) needs a grid nrm=2253,
-      !! against nrm=3127 for the channel-count-weighted mean (0.3771,
-      !! pulled toward L-band's own values by its 2x channel count),
-      !! nrm=4060 for centring on the lowest-frequency (P) band's own
-      !! centroid (1.0011 -- barely better than lsq_ref_compute=0's own 4748,
-      !! since doing so leaves the OTHER band almost as exposed as
-      !! lsq_ref_compute=0 did), and nrm=4748 for lsq_ref_compute=0 itself.
+      !! Why mid is not just harmless but actively the smart choice --
+      !! both halves of this claim verified, not asserted:
       !!
-      !! Channel count DOES matter for a different, unrelated question --
-      !! the actual achievable statistical precision (SNR-driven, per the
-      !! usual RM-synthesis noise-propagation relations) -- but that is
-      !! now fully decoupled from lsq_ref_compute choice once clean_complex's own
-      !! comp_rm_refined and derotate_to_lsq_ref are used correctly (see
-      !! their own comments): lsq_ref_compute choice affects ONLY grid cost, never
-      !! precision, so there is no need to trade one against the other.
+      !! 1) HARMLESS for accuracy: lsq_ref_compute is a pure bookkeeping
+      !!    choice for the CLEAN computation, with NO effect on chi0
+      !!    precision once clean_complex's own comp_rm_refined and
+      !!    derotate_to_lsq_ref are used correctly (their own comments
+      !!    derive and empirically confirm this: chi0 came back IDENTICAL,
+      !!    to float32 rounding, whether lsq_ref_compute was 0 or the
+      !!    band's own mean, tests/test_rmclean_lsqref_flex.f90). Choosing
+      !!    mid therefore trades nothing away.
+      !! 2) SMART for cost: get_drm's own bound is set by
+      !!    max_k|l_sq(k)-lsq_ref_compute|, the SINGLE worst channel's
+      !!    offset. For any fixed set of values, this maximum is
+      !!    determined ENTIRELY by the two EXTREME values (min(l_sq),
+      !!    max(l_sq)) -- every other channel, however many there are or
+      !!    wherever they sit between the extremes, can never exceed
+      !!    whichever extreme is farther from lsq_ref_compute, so it never
+      !!    enters the max(). Minimizing max(|max(l_sq)-lsq_ref_compute|,
+      !!    |lsq_ref_compute-min(l_sq)|) over choice of lsq_ref_compute is
+      !!    solved exactly by making the two terms equal -- i.e.
+      !!    lsq_ref_compute=(min(l_sq)+max(l_sq))/2, mid's own formula. A
+      !!    classic 1D minimax/Chebyshev-centre result, not an
+      !!    approximation. Channel COUNT (per-band or overall) does not
+      !!    enter this at all -- confirmed numerically (tests/
+      !!    test_optimal_lsq_ref.f90) against a P-band(61ch)+L-band(121ch)
+      !!    combination, where mid (0.5806) needs a grid nrm=2253, against
+      !!    nrm=3127 for the channel-count-weighted mean (0.3771, pulled
+      !!    toward L-band's own values by its 2x channel count), nrm=4060
+      !!    for centring on the lowest-frequency (P) band's own centroid
+      !!    (1.0011 -- barely better than lsq_ref_compute=0's own 4748,
+      !!    since doing so leaves the OTHER band almost as exposed as 0
+      !!    did), and nrm=4748 for lsq_ref_compute=0 (intrinsic) itself --
+      !!    mid is a genuine ~2x-or-more grid-size win here, for zero
+      !!    accuracy cost.
       !!
-      !! Works identically for a single band or a concatenated multi-band
-      !! l_sq array -- the criterion (extremes only) does not care how
-      !! many bands are represented or how the channels are grouped.
-      integer, intent(in) :: nchan
+      !! Channel count/SNR DOES matter for a different, unrelated
+      !! question -- the actual achievable statistical precision -- but
+      !! that is a property of the DATA, decoupled entirely from this
+      !! choice (see point 1 above).
+      integer, intent(in) :: nchan, mode
       real(sp), intent(in) :: l_sq(nchan)
       real(sp), intent(out) :: lsq_ref_compute
+      real(sp), intent(in), optional :: fixed_value
 
-      lsq_ref_compute = 0.5_sp*(minval(l_sq) + maxval(l_sq))
-   end subroutine suggest_lsq_ref_compute
+      select case (mode)
+      case (lsq_ref_compute_mid)
+         lsq_ref_compute = 0.5_sp*(minval(l_sq) + maxval(l_sq))
+      case (lsq_ref_compute_intrinsic)
+         lsq_ref_compute = 0.0_sp
+      case (lsq_ref_compute_centroid)
+         lsq_ref_compute = sum(l_sq)/real(nchan, sp)
+      case (lsq_ref_compute_min)
+         lsq_ref_compute = minval(l_sq)
+      case (lsq_ref_compute_max)
+         lsq_ref_compute = maxval(l_sq)
+      case (lsq_ref_compute_fixed)
+         if (.not. present(fixed_value)) then
+            write(*,'(A)') 'FATAL: get_lsq_ref_compute: mode=lsq_ref_compute_fixed'//&
+            &' requires fixed_value to be supplied.'
+            stop 1
+         endif
+         lsq_ref_compute = fixed_value
+      case default
+         write(*,'(A)') 'FATAL: get_lsq_ref_compute: unrecognized mode.'
+         stop 1
+      end select
+   end subroutine get_lsq_ref_compute
 
    subroutine derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute, lsq_ref_report,&
    &re_in, im_in, re_out, im_out)
@@ -854,29 +947,29 @@ contains
       !! unrelated questions (the user's own explicit ask, after finding
       !! the original lsq_ref-everywhere naming was starting to blur
       !! them): lsq_ref_compute is a pure COMPUTATIONAL COST lever (see
-      !! suggest_drm/suggest_lsq_ref_compute -- it affects ONLY
+      !! get_drm/get_lsq_ref_compute -- it affects ONLY
       !! grid size, never precision, once comp_rm_refined is used
       !! correctly); lsq_ref_report is a REPORTING CONVENTION choice about
       !! where to QUOTE the intrinsic polarization angle, independent of
       !! how the computation was actually done. lsq_ref_report=0.0
-      !! recovers this project's own thesis convention (formerly this
-      !! routine's own hardcoded target, when it was named
-      !! derotate_to_lsq_zero); lsq_ref_report=suggest_lsq_ref_report's
-      !! own output recovers the Brentjens & de Bruyn (2005)-style
+      !! (mode=lsq_ref_report_intrinsic) recovers this project's own
+      !! thesis convention (formerly this routine's own hardcoded target,
+      !! when it was named derotate_to_lsq_zero); mode=lsq_ref_report_
+      !! centroid recovers the Brentjens & de Bruyn (2005)-style
       !! convention, chosen there to minimize the STATISTICAL COVARIANCE
       !! between a jointly-fitted RM and chi0 in the presence of noise (a
       !! classic linear-regression centering result: centering the
       !! regressor at its own weighted mean decorrelates the fitted
       !! intercept and slope) -- a genuinely DIFFERENT optimization
-      !! criterion from suggest_lsq_ref_compute's own (which minimizes
-      !! suggest_drm's worst-case grid-stability bound instead).
+      !! criterion from get_lsq_ref_compute's own mid mode (which
+      !! minimizes get_drm's worst-case grid-stability bound instead).
       !! Neither is "more correct" than the other; they answer different
       !! questions, and this routine supports reporting at EITHER (or any
       !! other reference the caller wants) equally well.
       !!
       !! Derivation: the dirty/restored spectrum built at reference
       !! lsq_ref_compute is P_compute(phi) = P_report(phi) *
-      !! exp(2i*phi*(lsq_ref_compute-lsq_ref_report)) (suggest_drm's
+      !! exp(2i*phi*(lsq_ref_compute-lsq_ref_report)) (get_drm's
       !! own comment derives the general
       !! P_ref'(phi)=P_ref(phi)*exp(-2i*phi*(ref-ref')) relation between
       !! ANY two references; this is that relation with
@@ -961,15 +1054,18 @@ contains
       end do
    end subroutine derotate_to_lsq_ref
 
-   subroutine suggest_lsq_ref_report(l_sq, nchan, lsq_ref_report)
-      !! The Brentjens & de Bruyn (2005)-style REPORTING reference: the
-      !! (weighted) mean of the channels' own l_sq -- a genuinely
-      !! DIFFERENT optimum from suggest_lsq_ref_compute's own, answering
-      !! a different question (the user's own explicit ask to keep these
-      !! separate, after asking directly why B&dB advocate the centroid
-      !! rather than the mean, and whether that contradicts this module's
-      !! own midpoint result -- it does not; they solve different
-      !! problems).
+   subroutine get_lsq_ref_report(l_sq, nchan, mode, lsq_ref_report, fixed_value)
+      !! Computes lsq_ref_report for the requested mode -- see the
+      !! lsq_ref_report_* constants declared at the top of this module.
+      !! mode=lsq_ref_report_intrinsic (lambda_sq=0) is this project's own
+      !! default reporting convention (the user's own thesis). mode=
+      !! lsq_ref_report_centroid is the Brentjens & de Bruyn (2005)-style
+      !! alternative, a genuinely DIFFERENT optimum from get_lsq_ref_
+      !! compute's own mid mode, answering a different question (the
+      !! user's own explicit ask to keep these separate, after asking
+      !! directly why B&dB advocate the centroid rather than the mean,
+      !! and whether that contradicts this module's own mid result -- it
+      !! does not; they solve different problems).
       !!
       !! B&dB's own motivation is a classic linear-regression result: when
       !! jointly fitting chi(lambda^2) = chi0 + RM*lambda^2 to noisy
@@ -980,41 +1076,67 @@ contains
       !! lambda^2 at its own weighted mean before fitting/reporting
       !! removes that correlation entirely (a standard, provable property
       !! of least-squares regression, not specific to RM synthesis). This
-      !! is UNRELATED to suggest_lsq_ref_compute's own criterion
-      !! (minimizing suggest_drm's worst-case grid-stability
-      !! bound, driven only by the two extreme channels, with no noise or
-      !! covariance anywhere in it) -- the two routines answer different
-      !! questions and are not expected to agree.
+      !! is UNRELATED to get_lsq_ref_compute's own mid criterion
+      !! (minimizing get_drm's worst-case grid-stability bound, driven
+      !! only by the two extreme channels, with no noise or covariance
+      !! anywhere in it) -- the two answer different questions and are
+      !! not expected to agree.
       !!
-      !! "Weighted" here means weighted by each channel's own actual
-      !! contribution to the RM-synthesis sum -- CORRECTED after review:
-      !! this project already has real per-channel weighting, at the
-      !! rm_synthesis_mod.f90 level (MASK.CUBE.FITS/wts_gpu, a genuine
-      !! per-PIXEL, per-CHANNEL 0/1 mask, confirmed by reading that
-      !! module's own source rather than assumed) -- nowhere in this
-      !! whole project, checked directly, is any GRADUATED (e.g. inverse-
-      !! noise-variance) weight ever used; masking (full inclusion or
-      !! full exclusion) is the entire weighting scheme this project has,
-      !! and a 0/1 mask reduces exactly to "average over the surviving
-      !! channels" -- precisely the plain arithmetic mean this routine
-      !! already computes. rmclean_mod itself takes no mask argument
+      !! mode=lsq_ref_report_centroid's own "weighted" mean -- CORRECTED
+      !! after review: this project already has real per-channel
+      !! weighting, at the rm_synthesis_mod.f90 level (MASK.CUBE.FITS/
+      !! wts_gpu, a genuine per-PIXEL, per-CHANNEL 0/1 mask, confirmed by
+      !! reading that module's own source rather than assumed) -- nowhere
+      !! in this whole project, checked directly, is any GRADUATED (e.g.
+      !! inverse-noise-variance) weight ever used; masking (full
+      !! inclusion or full exclusion) is the entire weighting scheme this
+      !! project has, and a 0/1 mask reduces exactly to "average over the
+      !! surviving channels" -- precisely the plain arithmetic mean this
+      !! mode already computes. rmclean_mod itself takes no mask argument
       !! directly (it only ever sees l_sq(nchan), same as every other
       !! routine here) -- masking is therefore the CALLER's
       !! responsibility: build l_sq per pixel from only that pixel's own
       !! unmasked channels (varying nchan pixel-to-pixel is fine) before
       !! calling this routine, exactly as any other rmclean_mod routine
-      !! already expects. Given that, this routine is ALREADY correct for
+      !! already expects. Given that, this mode is ALREADY correct for
       !! per-pixel masking today, not merely for a future addition. Only
       !! a genuinely graduated (non-0/1) weight, if this project ever
-      !! adopts one, would require this formula to become a true weighted
+      !! adopts one, would require this branch to become a true weighted
       !! mean, Sum(w_k*l_sq(k))/Sum(w_k) -- flagged here so that addition
       !! doesn't silently leave this routine stale.
-      integer, intent(in) :: nchan
+      !!
+      !! mode=lsq_ref_report_fixed lets a caller request chi0 be quoted at
+      !! any OTHER specific lambda_sq value they have their own reason to
+      !! want (matching some external paper's own convention, say) --
+      !! fixed_value is read only for this mode.
+      integer, intent(in) :: nchan, mode
       real(sp), intent(in) :: l_sq(nchan)
       real(sp), intent(out) :: lsq_ref_report
+      real(sp), intent(in), optional :: fixed_value
 
-      lsq_ref_report = sum(l_sq)/real(nchan, sp)
-   end subroutine suggest_lsq_ref_report
+      select case (mode)
+      case (lsq_ref_report_intrinsic)
+         lsq_ref_report = 0.0_sp
+      case (lsq_ref_report_centroid)
+         lsq_ref_report = sum(l_sq)/real(nchan, sp)
+      case (lsq_ref_report_min)
+         lsq_ref_report = minval(l_sq)
+      case (lsq_ref_report_max)
+         lsq_ref_report = maxval(l_sq)
+      case (lsq_ref_report_mid)
+         lsq_ref_report = 0.5_sp*(minval(l_sq) + maxval(l_sq))
+      case (lsq_ref_report_fixed)
+         if (.not. present(fixed_value)) then
+            write(*,'(A)') 'FATAL: get_lsq_ref_report: mode=lsq_ref_report_fixed'//&
+            &' requires fixed_value to be supplied.'
+            stop 1
+         endif
+         lsq_ref_report = fixed_value
+      case default
+         write(*,'(A)') 'FATAL: get_lsq_ref_report: unrecognized mode.'
+         stop 1
+      end select
+   end subroutine get_lsq_ref_report
 
    subroutine restore_clean(rm_samp, nrm, comp_re, comp_im, resid_re,&
    &resid_im, fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)

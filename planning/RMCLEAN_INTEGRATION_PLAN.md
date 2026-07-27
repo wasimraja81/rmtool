@@ -185,41 +185,78 @@ for two genuinely unrelated concerns.
 
 | Name | Role | Governs | Default recommendation |
 |---|---|---|---|
-| `lsq_ref_compute` | Internal computation reference (`build_rmsf_offset_table`, `compute_dirty_rmbeam_direct`, `suggest_drm`) | ONLY grid cost (`suggest_drm`'s bound) — never chi0 precision, once `comp_rm_refined`/`derotate_to_lsq_ref` are used correctly | `suggest_lsq_ref_compute(l_sq, nchan)` — cheapest safe grid |
-| `lsq_ref_report` | Reporting convention (`derotate_to_lsq_ref`'s own target reference) | ONLY where chi0 is quoted — a bookkeeping choice, not a computation | `0.0` (this project's thesis convention) as the default; `suggest_lsq_ref_report(l_sq, nchan)` as an explicit opt-in for statistically decorrelated (RM, chi0) uncertainty pairs (Brentjens & de Bruyn 2005-style) |
+| `lsq_ref_compute` | Internal computation reference (`build_rmsf_offset_table`, `compute_dirty_rmbeam_direct`, `get_drm`) | ONLY grid cost (`get_drm`'s bound) — never chi0 precision, once `comp_rm_refined`/`derotate_to_lsq_ref` are used correctly | `get_lsq_ref_compute(..., mode=lsq_ref_compute_mid, ...)` — cheapest safe grid, RECOMMENDED default |
+| `lsq_ref_report` | Reporting convention (`derotate_to_lsq_ref`'s own target reference) | ONLY where chi0 is quoted — a bookkeeping choice, not a computation | `mode=lsq_ref_report_intrinsic` (this project's thesis convention) as the default; `mode=lsq_ref_report_centroid` as an explicit opt-in for statistically decorrelated (RM, chi0) uncertainty pairs (Brentjens & de Bruyn 2005-style) |
 
 These answer different questions and are optimized by different,
 non-interchangeable criteria — confirmed, not just asserted:
-`suggest_lsq_ref_compute` minimizes `max_k|l_sq(k)-lsq_ref_compute|` (a
+`mode=lsq_ref_compute_mid` minimizes `max_k|l_sq(k)-lsq_ref_compute|` (a
 minimax/Chebyshev-centre problem over the two extreme channels only,
-driven by numerical grid-stability, no noise involved); `suggest_
-lsq_ref_report` targets the (weighted) mean specifically to decorrelate a
-jointly-fitted RM and chi0's own statistical uncertainty (a linear-
-regression centering result, driven by noise/covariance, no grid-cost
-involved). They coincide only by coincidence for special cases (a single,
-symmetric, evenly-sampled band) and diverge meaningfully for realistic,
-channel-imbalanced multi-band data (`tests/test_optimal_lsq_ref.f90`'s own
-P+L case: `0.5806` vs `0.3771`/`1.0011`/`0.0626` depending which of the
-four candidates you compute). Neither is "more correct" — pick
-`lsq_ref_compute` for cost, `lsq_ref_report` for what you want to quote,
-independently of each other.
+driven by numerical grid-stability, no noise involved); `mode=
+lsq_ref_report_centroid` targets the (weighted) mean specifically to
+decorrelate a jointly-fitted RM and chi0's own statistical uncertainty (a
+linear-regression centering result, driven by noise/covariance, no
+grid-cost involved). They coincide only by coincidence for special cases
+(a single, symmetric, evenly-sampled band) and diverge meaningfully for
+realistic, channel-imbalanced multi-band data (`tests/
+test_optimal_lsq_ref.f90`'s own P+L case: `0.5806` vs
+`0.3771`/`1.0011`/`0.0626` depending which of the four candidates you
+compute). Neither is "more correct" — pick `lsq_ref_compute` for cost,
+`lsq_ref_report` for what you want to quote, independently of each other.
 
-**The naming is deliberately literal, at the user's own request** (a
-prior round named these `optimal_lsq_ref_midpoint` and
-`lsq_ref_report_centroid`, and `required_drm_nyquist` for the grid-cost
-helper below — inconsistent with each other and not self-explanatory
-about which VALUE each one fills in). Every `suggest_<X>` routine exists
-for exactly one reason: "if you don't know what to set `<X>` to, call
-this and it'll compute a good one for you." All three follow the same
-pattern, so recognizing the prefix is enough to know what a routine
-does, without needing to remember which one uses a midpoint vs. a mean:
+**Interface, after three iterations driven directly by the user's own
+pushback — each caught a real problem, not bikeshedding:**
 
-- Don't know `lsq_ref_compute`? Call `suggest_lsq_ref_compute(l_sq, nchan, lsq_ref_compute)`.
-- Don't know `lsq_ref_report`? Call `suggest_lsq_ref_report(l_sq, nchan, lsq_ref_report)`.
-- Don't know how fine the RM grid needs to be? Call `suggest_drm(l_sq, nchan, lsq_ref_compute, oversample, drm_max)`.
+1. First pass named the two "give me a good value" helpers
+   `optimal_lsq_ref_midpoint` and `lsq_ref_report_centroid` — inconsistent
+   with each other (one prefixed, one suffixed) and not self-explanatory
+   about which VALUE each one filled in.
+2. Second pass tried `suggest_lsq_ref_compute`/`suggest_lsq_ref_report`/
+   `suggest_drm` — one consistent prefix, but "suggest" doesn't convey
+   that the result is actually COMMITTED for the real computation, only
+   that it's advisory — the user's own objection, with real established
+   precedent behind the fix: HDF5's `H5Pget_chunk`/`H5Pset_chunk`, and
+   cuFFT's own `cufftGetSize1d` (vs. `cufftEstimate1d`, its own
+   heuristic-only sibling) both use "Get" specifically for the value
+   that gets committed, not "Suggest"/"Estimate".
+3. Final design, this section's own: `get_lsq_ref_compute`/
+   `get_lsq_ref_report`, each taking a REQUIRED `mode` argument (an
+   `integer, parameter` enum, matching this module's own pre-existing
+   `fftw_forward`/`fftw_estimate` convention) plus an optional
+   `fixed_value` (read only when `mode=..._fixed`) — resolving a THIRD
+   objection along the way: passing a raw number through an optional
+   argument on a "getter" is really a SETTER wearing a getter's name. The
+   fix: a getter only ever computes/derives; a caller who wants a
+   specific number they chose themselves just writes ordinary Fortran
+   (`lsq_ref_compute = 0.734_sp`) — no module call needed at all, exactly
+   how `niter`/`gain` already work. The getters exist only for values
+   worth deriving: named, meaningful conventions (`..._intrinsic`,
+   `..._centroid`) or simple derived statistics (`..._min`/`..._max`/
+   `..._mid`) — plus `..._fixed` for symmetry/self-documentation
+   (`call get_lsq_ref_report(l_sq, nchan, mode=lsq_ref_report_fixed,
+   lsq_ref_report=x, fixed_value=0.734_sp)` reads more clearly at the
+   call site than a bare assignment, even though it does the same thing).
 
-Nothing is mandatory — every one of these is optional; pick your own
-value for any of the three if you have a specific reason to.
+Call sites use explicit `mode=`/keyword-argument syntax throughout (the
+user's own explicit style request) — every `tests/*.f90` call reads
+self-documenting, e.g. `call get_lsq_ref_compute(l_sq, nchan,
+mode=lsq_ref_compute_mid, lsq_ref_compute=lsq_ref_compute)`.
+
+Recognized modes (each set is its own independent `integer, parameter`
+namespace — `lsq_ref_compute_mid=1` and `lsq_ref_report_intrinsic=1` do
+NOT collide, they're never compared cross-set):
+
+| `get_lsq_ref_compute`'s modes | `get_lsq_ref_report`'s modes |
+|---|---|
+| `lsq_ref_compute_mid` (=1, RECOMMENDED DEFAULT) | `lsq_ref_report_intrinsic` (=1, default) |
+| `lsq_ref_compute_intrinsic` | `lsq_ref_report_centroid` |
+| `lsq_ref_compute_centroid` | `lsq_ref_report_min` |
+| `lsq_ref_compute_min` | `lsq_ref_report_max` |
+| `lsq_ref_compute_max` | `lsq_ref_report_mid` |
+| `lsq_ref_compute_fixed` (+ `fixed_value`) | `lsq_ref_report_fixed` (+ `fixed_value`) |
+
+Extensible by design (the user's own framing): a new mode is just one
+more named constant plus one more `case` branch, nothing structural.
 
 **Reading a component's own precise RM/chi0 (not the restored map):**
 always use `clean_complex`'s own `comp_rm_refined(j)` for the RM value,
@@ -234,19 +271,41 @@ remains correct for its own separate uses — visual inspection, and
 integrating an EXTENDED feature's total flux (`window_flux`) — just not
 for a single component's own precise RM/phase.
 
+**There is no raw `dRM` input anywhere in this module's API, by design**
+— the user's own explicit simplification, after asking directly "why is
+Nyquist even an option?": `lsq_ref_compute`/`lsq_ref_report` are genuine
+free choices with no wrong answer, but sampling below the stability bound
+is a CORRECTNESS failure, not a preference, so the only knob `get_drm`
+exposes is `oversample`, a multiplier ALWAYS applied on top of the
+mandatory floor — asking `get_drm` for an unsafe `dRM` is architecturally
+impossible, not just discouraged.
+
+`oversample`'s own floor is ENFORCED, not advisory, and is `2`, not the
+bare 2-point Nyquist value of `1` — root-caused empirically (`tests/
+test_drm_floor.f90`, `tests/test_drm_floor_enforcement.f90`), not assumed:
+`oversample=1` does NOT diverge (residual power stays small in every
+scenario checked) but recovers a WRONG chi0, not just an imprecise one —
+a single point source (RM=50, chi0=0.3 rad, band-mean `lsq_ref_compute`)
+came back at chi0=-0.025 rad, while `oversample=2` already recovered
+0.3002 rad (matching `oversample=15`'s own 0.3000 to float32 rounding).
+`get_drm` stops with a clear error if asked for `oversample<2` — checked
+on one scenario only (single point source, no noise), so treat `2` as a
+floor with real safety margin built in, not a knife-edge value tuned to
+just this case. Default when `oversample` is omitted: `4` (the user's own
+suggestion), giving further margin at a fraction of `oversample=15`'s own
+grid cost (`nrm=80` vs `nrm=297` in the tested scenario).
+
 **The two same-named "oversample" parameters are unrelated — do not
 confuse them:**
 
 | Where | Controls | Cost if increased |
 |---|---|---|
-| `suggest_drm`'s `oversample` | The OUTER RM-grid's own fineness relative to the bare stability floor (`nrm`, hence the size of every `nrm`-length array in `clean_complex`) | Expensive — scales the whole grid |
+| `get_drm`'s `oversample` | The OUTER RM-grid's own fineness relative to the bare stability floor (`nrm`, hence the size of every `nrm`-length array in `clean_complex`) | Expensive — scales the whole grid |
 | `build_rmsf_offset_table`'s `oversample` | The INTERNAL 1D RMSF lookup table's own fineness relative to the outer grid's `dRM` | Cheap — a 1D table built once, independent of `nrm` |
 
-Defaults used throughout this project's own tests: `15` for the former
-(empirically validated — matched the fine-grid convergence trajectory;
-not rigorously proven tight, a reasonable conservative starting point,
-not a derived constant), `20` for the latter (comfortably cheap
-regardless of value).
+Defaults used throughout this project's own tests: `4` for the former
+(the enforced floor is `2`; see above), `20` for the latter (comfortably
+cheap regardless of value).
 
 **CLEAN loop parameters (`niter`, `gain`, `thresh`):** `gain=0.1` is the
 conventional Hogbom choice, no reason found to deviate. `thresh` needs a
@@ -956,6 +1015,72 @@ from direct user pushback:**
    today, not pending a future addition as the old comment implied.
    Only a genuinely graduated (non-0/1) weight, if this project ever
    adopts one, would require the formula itself to change.
+
+**Addendum — a third naming pass (`suggest_*` → `get_*`, mode-based
+interface) and the oversample-floor finding, from continued direct user
+pushback:**
+
+1. **`suggest_lsq_ref_compute`/`suggest_lsq_ref_report`/`suggest_drm`
+   renamed to `get_lsq_ref_compute`/`get_lsq_ref_report`/`get_drm`.** The
+   user's objection: "suggest" doesn't make clear the value is actually
+   committed for the real work, only offered as advice. Checked
+   established precedent rather than picking a word by feel: HDF5's own
+   `H5Pget_chunk`/`H5Pset_chunk` get/set convention for tunable
+   parameters, and cuFFT's own `cufftGetSize1d` (the committed answer)
+   vs. `cufftEstimate1d` (a quick heuristic) — "Get" is the established
+   choice for a value that gets used, not merely suggested.
+2. **Dropped the earlier "optional `requested=` override" design
+   entirely** — a second objection, equally valid: passing a raw number
+   through an optional argument on something named `get_` is really a
+   SETTER wearing a getter's name. Resolution: a getter now only ever
+   computes/derives a value; a caller who wants a specific number they
+   already know just writes it directly in their own code
+   (`lsq_ref_compute = 0.734_sp`) — no module call needed, exactly how
+   `niter`/`gain` already work, and no ambiguity about what "get" means.
+3. **Introduced a `mode` argument (a required `integer, parameter` enum,
+   matching this module's own pre-existing `fftw_forward`/`fftw_estimate`
+   convention) plus an optional `fixed_value`**, after the user asked
+   directly how to let a caller choose between a qualitative/statistical
+   convention (`min_lsq`, `max_lsq`, `centroid`, `mid`, `intrinsic`) and
+   an arbitrary fixed number, through one uniform interface. `fixed_value`
+   is read only when `mode=..._fixed`, enforced with a clear runtime stop
+   if missing — the same "refuse loudly" convention already used
+   elsewhere in this project. Naming clarified along the way: Fortran's
+   `parameter` attribute (a fixed, compile-time-constant integer, never
+   assigned to at runtime) is a completely different concept from
+   "parameter" meaning "function argument" in general programming usage —
+   worth spelling out explicitly, since this was a genuine, reasonable
+   point of confusion, not a design flaw.
+4. **`get_drm` redesigned around the user's own simpler idea: no raw
+   `dRM` input at all, only `oversample`, always applied on top of a
+   mandatory, ENFORCED floor** ("why is Nyquist even an option? Should we
+   not ever undersample?"). This directly motivated finding the REAL
+   floor empirically rather than assuming bare Nyquist (`oversample=1`)
+   was safe: it is NOT — `tests/test_drm_floor.f90` shows `oversample=1`
+   recovers a wrong chi0 (not merely imprecise), while `oversample=2`
+   already matches `oversample=15`'s own precision. Floor enforced at `2`;
+   default `4` if `oversample` is omitted (the user's own suggested
+   number, confirmed reasonable by this check). `tests/test_drm_floor_
+   enforcement.f90` confirms `get_drm` actually stops (nonzero exit) for
+   `oversample<2`, wired into `run_tests.sh` section 27 with intentionally
+   INVERTED pass logic (a nonzero exit is the correct, expected outcome
+   for that one test — a genuine, deliberate exception to this suite's
+   own PASS/FAIL convention, documented as such at the call site so it
+   isn't mistaken for an oversight later).
+5. **`lsq_ref_compute_mid` established as the explicit, documented
+   RECOMMENDED DEFAULT** (the user's own instruction) — `get_lsq_ref_
+   compute`'s own doc comment now states plainly, with both halves of the
+   claim verified rather than asserted: harmless for accuracy (chi0 is
+   provably decoupled from `lsq_ref_compute` choice once `comp_rm_refined`
+   is used) and actively smart for cost (the same minimax proof as
+   before). The other five modes remain available for experimentation or
+   matching an external convention, at no safety cost, since `get_drm`
+   enforces its own floor against whatever `lsq_ref_compute` value
+   actually results, regardless of which mode produced it.
+
+Full regression: 78/78 (up from 74/74: two new test programs, `tests/
+test_drm_floor.f90` and `tests/test_drm_floor_enforcement.f90`, sections
+26/27).
 
 ### T2 (not yet detailed — standalone tool consuming T1, scoped from
 ### design discussion above, numbering/scope to firm up once started)
