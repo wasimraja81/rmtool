@@ -10,7 +10,7 @@ complex CLEAN, Gaussian restore) against REAL dirty AMP/PHA cubes
 `rm_synthesis` itself writes, rather than only the synthetic spectra its
 own unit test programs built in memory. Full design rationale, decisions
 recorded with the user, and ticket-by-ticket verification evidence lives
-in `planning/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T3) — this entry is
+in `planning/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T4) — this entry is
 a summary, not a replacement for that record.
 
 ### Added — `rmclean_cubes` standalone tool (ticket T2)
@@ -155,6 +155,60 @@ a summary, not a replacement for that record.
   RM, ~0.1-0.2% amplitude error, ~0.05° intrinsic-angle error, across
   both the native and an explicitly-derotated `lsq_ref_compute`; 1-thread
   vs. 4-thread and cache-big/zero/small runs all bit-identical.
+
+### Added — memory-budgeted, threaded block I/O for `rmclean_cubes` (ticket T4)
+- `rmclean_cubes` moves off "whole-cube-in-memory" onto the SAME
+  scheme `rm_synthesis` already uses in production: spatial tiles
+  (`tile_ra`/`tile_dec`, RA-strips-first auto policy budgeted by
+  `mem_frac_ram`), parallel readonly chunked tile reads
+  (`io_read_threads`), raw-stream-write tile output bypassing CFITSIO
+  (`io_write_threads`), and pthread-based double-buffered write-behind
+  (`io_overlap`) — same key names/semantics as `rm_synthesis`,
+  generalized from its 2 named AMP/PHA outputs to `rmclean_cubes`'s 2
+  inputs + 6 outputs (CLEAN/RESID/RESTORED x AMP/PHA). The mask cube
+  and its mask-pattern -> RMSF-table cache deliberately stay
+  whole-cube-resident (tiny relative to the float cubes; the cache
+  needs one global pre-scan before any pixel is CLEANed).
+- Found and root-caused, not assumed: a forced small-tile run differs
+  numerically (not just byte-for-byte) from the default single-tile
+  run — confirmed to be `gfortran -O3 -march=native`'s own
+  floating-point reassociation of `clean_complex`'s tiered-refinement
+  threshold comparison (T3c), sensitive to the runtime memory alignment
+  of its own stack arguments, which genuinely differs between tile
+  sizes; bit-identical at `-O0`. Not a tiling bug — the regression test
+  (`tests/check_tile_consistency.py`) therefore compares with tolerance
+  (AMP), not byte-identity, unlike the purely linear reproject_cubes/
+  convolve_cubes.
+
+### Fixed
+- Concurrent `open(newunit=...)` from different OpenMP threads (each
+  opening the same output file path for its own disjoint byte range)
+  intermittently produced a corrupted output cube — fixed with fixed,
+  pre-assigned per-thread unit numbers instead.
+- **This system's installed libcfitsio's `FTGHAD` writes only the lower
+  32 bits of its 3 output arguments**, leaving an `integer(kind=8)`
+  receiving variable's upper 32 bits at whatever was already there —
+  confirmed with a minimal standalone reproducer outside this codebase.
+  Caused an intermittent (stack-content-dependent), roughly-50%-of-runs
+  wrong byte offset in `rmclean_cubes`'s own `io_write_threads>1` path.
+  Fixed by zero-initializing the 3 receiving variables immediately
+  before every `FTGHAD` call — in `rmclean_cubes.f90` AND in
+  `rm_synthesis.f90`'s own pre-existing `io_write_threads` FTGHAD call,
+  which has the identical latent exposure (never observed to misbehave
+  there only because its receiving variables happen to land in
+  zero-initialized static storage on this platform/compiler, not the
+  stack — incidental, not guaranteed).
+
+### Verification
+- Full regression 93/93 (`tests/run_tests.sh` section 29): forced
+  small-tile run (tolerance comparison + known-source RM recovery),
+  `io_read_threads=1,2,4` (bit-identical), `io_write_threads=1,2,4`
+  (bit-identical, 5 reps each — the FTGHAD bug was probabilistic, so a
+  single pass would not have reliably caught it), `io_overlap=y` alone
+  (bit-identical, 5 reps) and combined with forced small tiles +
+  `io_read_threads=3` + `io_write_threads=3` together (bit-identical,
+  5 reps) — the actual combined stress case, not each mechanism only
+  in isolation.
 
 ## [5.0] - `5.0-rc.1` tagged on `develop`; real-scale validation pending before `main`
 

@@ -141,7 +141,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
 - **[planning/ENCAPSULATION_REFACTOR_PLAN.md](planning/ENCAPSULATION_REFACTOR_PLAN.md)** — Encapsulation refactor plan: config/tile-planner/IO-orchestration derived types, ticket-by-ticket (T0-T5, all adopted)
 - **[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)** — Multi-band Faraday tomography plan: config schema, frequency merge, cross-band geometry/resolution matching (`reproject_cubes`/`convolve_cubes`/`match_cubes`), beam-metadata propagation, ticket-by-ticket (T0-T14, all adopted)
-- **[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)** — RM-CLEAN integration plan: core algorithm module (`rmclean_mod`), standalone tool (`rmclean_cubes`), mask-pattern caching, OpenMP parallelism, ticket-by-ticket (T0-T2, all adopted; GPU explicitly deferred)
+- **[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)** — RM-CLEAN integration plan: core algorithm module (`rmclean_mod`), standalone tool (`rmclean_cubes`), mask-pattern caching, OpenMP parallelism, model-based peak refinement, memory-budgeted threaded block I/O, ticket-by-ticket (T0-T4, all adopted; GPU explicitly deferred)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
@@ -719,7 +719,9 @@ bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
   maskfile=out.MASK.CUBE.FITS outfile=out threshold=0.01
 # writes out.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS; --help for the
 # full option list (niter/gain, min_samples_per_fwhm, refine_nsigma,
-# lsq_ref_compute_mode/lsq_ref_report_mode, mask_pattern_cache_max)
+# lsq_ref_compute_mode/lsq_ref_report_mode, mask_pattern_cache_max,
+# mem_frac_ram/tile_ra/tile_dec/tile_auto, io_read_threads,
+# io_write_threads, io_overlap)
 ```
 
 This tool cannot resample the RM axis — it's fixed by whatever `CDELT3`
@@ -739,6 +741,15 @@ sharing one RMSF table across every pixel with the same valid-channel
 set, rather than rebuilding it per pixel. GPU support is explicitly
 deferred to a later, separate effort.
 
+Memory-budgeted, threaded block I/O (ticket T4) is the same scheme
+`rm_synthesis` already uses: spatial tiles sized by `mem_frac_ram`
+(`tile_ra`/`tile_dec`/`tile_auto`), parallel readonly chunked tile
+reads (`io_read_threads`), raw-stream-write tile output bypassing
+CFITSIO (`io_write_threads`), and pthread-based double-buffered
+write-behind (`io_overlap`) — so a cube far larger than available RAM
+CLEANs in bounded memory, not just `rm_synthesis`'s own dirty-cube
+synthesis step.
+
 `rm_synthesis` itself can build its dirty AMP/PHA cube at a
 computationally cheaper phase reference than the default (`lsq_ref_mode=
 mid|centroid|min|max|fixed`, default `zero` — this project's own
@@ -748,7 +759,7 @@ explicitly); whichever reference is actually used is recorded in a new
 
 Full design detail and verification evidence are documented in
 [planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)
-(tickets T0-T3c) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
+(tickets T0-T4) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
 header comments.
 
 ## Project Structure

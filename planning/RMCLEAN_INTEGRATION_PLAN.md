@@ -8,10 +8,13 @@ tool `rmclean_cubes` + per-pixel mask-pattern caching + OpenMP
 parallelism), T2b (`rm_synthesis`'s own `lsq_ref_mode`), T3
 (model-based matched-filter peak refinement, replacing
 `peak_interp_parabolic`'s own complex-value step), T3b (Gate 0 recast
-as an RM-resolution criterion, `min_samples_per_fwhm`), and T3c (tiered
+as an RM-resolution criterion, `min_samples_per_fwhm`), T3c (tiered
 fast-path refinement with data-driven `refine_nsigma` escalation --
 superseding the originally-sketched coarse-to-fine idea, and closing
-T3's own performance gap) all done and verified -- see each ticket's
+T3's own performance gap), and T4 (memory-budgeted, threaded block I/O
+-- `plan_rmclean_tile`/`io_read_threads`/`io_write_threads`/
+`io_overlap`, the same scheme `rm_synthesis` already uses in
+production) all done and verified -- see each ticket's
 own Evidence section below. GPU support for RM-CLEAN is explicitly
 deferred to a later, separate effort (decision 6 below); everything
 here is OpenMP-CPU-only by design.**
@@ -1412,6 +1415,148 @@ correct tool for its remaining jobs (T3c's own internal search-density
 sizing, and `rm_synthesis`-side grid planning for anyone who wants
 carrier-resolved dirty cubes); only `rmclean_cubes`'s gate stopped
 using it.
+
+### T4 — memory-budgeted, threaded block I/O for `rmclean_cubes`
+
+`rmclean_cubes` was "Stage A" (T2's own scope): whole-cube-in-memory,
+correct but unbounded in RAM, with no throughput mechanisms for
+production-scale cubes. T4 ports the SAME scheme `rm_synthesis` already
+uses in production (`plan_tile`/`io_read_threads`/`io_write_threads`/
+`io_overlap` in `rm_synthesis_mod.f90`/`rm_synthesis.f90`), adapted from
+rm_synthesis's 2 named pixel-cube outputs (AMP/PHA) to `rmclean_cubes`'s
+2 inputs + 6 outputs (CLEAN/RESID/RESTORED x AMP/PHA), done as four
+independently-tested sub-tickets, T4a-T4d, in order. All work is in
+`src/rmclean_cubes.f90` only (`rmclean_mod`/`src/rmclean.f90` untouched).
+
+**Deliberate divergence (not an oversight):** the mask cube + FNV-hash
+mask-pattern -> `rmsf_table_t` cache stay whole-cube-resident, not
+tiled -- the cache needs one global pre-scan across the whole image
+before any pixel is CLEANed (pixels anywhere can share a table), unlike
+rm_synthesis's own per-tile mask. Tiny relative to the float cubes (1
+byte/voxel x `nchan` vs. 4 bytes/voxel x `nrm` x 8 arrays), so keeping
+it resident costs little.
+
+**T4a (core tile geometry):** `plan_rmclean_tile` ports `plan_tile`'s
+RA-strips-first auto-tiling + safety-shrink policy verbatim (same
+`mem_frac_ram`/`tile_ra`/`tile_dec`/`tile_auto` key names/defaults),
+budgeted against rmclean_cubes' own per-tile-pixel cost (2 input + 6
+output RM-depth arrays, `4*8*nrm` bytes/pixel). Read/compute/write per
+tile mirrors reproject_cubes.f90's own 3-phase cadence (this ticket's
+own first phase, before any of T4b-d's threading lands on top).
+`read_amp_pha_tile`/`open_output_cube`/`write_output_tile`/
+`close_output_cube` replace the old whole-cube `read_cube`/
+`write_output_cube`; `clean_one_pixel` gained a tile-local
+`(ix_l,iy_l)` + tile-origin `(ix0,iy0)` signature to address the
+now-tiled float cubes locally while still addressing the
+whole-cube-resident mask/cache globally.
+
+**Real finding, not anticipated:** comparing a forced small-tile run
+against the default (single-tile) run showed small but genuine
+numerical differences (~1e-4 in AMP, larger in PHA at near-zero AMP).
+Root-caused, not assumed: bit-identical at `-O0` (no
+auto-vectorization) across the same two tile configurations, confirmed
+directly by rebuilding both configurations at `-O0` and diffing --
+`gfortran -O3 -march=native`'s auto-vectorization reassociates
+`clean_complex`'s own tiered-refinement threshold comparison
+(T3c) differently depending on the runtime memory alignment of its
+stack-allocated arguments, which genuinely differs between tile sizes
+(different automatic-array footprints in the enclosing call frames) even
+though every value going INTO `clean_complex` is bit-identical (verified
+directly by instrumenting `clean_one_pixel`). Not a tiling logic bug --
+a pre-existing floating-point-reassociation characteristic of the
+optimized build that T4a's own tile-shape change was simply the first
+thing to expose (the previous test suite never compared two runs that
+processed pixels in a different order). Consequence: T4a's own
+regression test (`tests/check_tile_consistency.py`) compares with a
+tolerance (AMP atol 1e-2, PHA atol 0.05 rad only where AMP clears a
+floor), not byte-identity -- the right standard for an iterative,
+threshold-branching algorithm, unlike the purely linear resampling
+`reproject_cubes`/`convolve_cubes` compare byte-identically.
+
+**T4b (`io_read_threads`):** `split_range_rmclean` (same base/rem
+convention as `split_channels_across_threads`) splits a tile's own
+`nrm` range across `io_read_threads_eff` threads, each opening its OWN
+readonly `FTOPEN` handle (300+t/400+t unit numbers) and reading its own
+disjoint RM-slice via `FTGSVE` -- safe because readonly opens are
+exempt from the same-file handle-aliasing hazard read-write handles hit
+(see T4c). Verified bit-identical to the serial baseline at
+`io_read_threads=1,2,4`.
+
+**T4c (`io_write_threads`):** ports `write_rm_chunk_raw`
+(`write_rm_chunk_raw_rmclean`) + `host_is_big_endian`/
+`swap_bytes_r4_inplace` verbatim -- raw stream writes at computed byte
+offsets, bypassing CFITSIO's `ftpsse` for the pixel data entirely,
+since N CFITSIO handles opened read-write on the same file alias onto
+one shared internal buffer (confirmed via rm_synthesis's own T4
+postmortem). `open_output_cube` fetches each output's data-start byte
+offset via `FTGHAD` once and closes the CFITSIO handle immediately
+(the T6 lesson: closing late risks a stale internal buffer flush over
+raw-written bytes).
+
+**Two real, non-obvious bugs found and fixed while validating T4c**
+(both caught by repeated-run stress testing, not a single pass --
+the first only manifested probabilistically):
+
+1. Concurrent `open(newunit=...)` calls from different OpenMP threads
+   (each opening the SAME output file path for its own disjoint byte
+   range) intermittently produced a corrupted/all-zero output cube.
+   Fixed by using fixed, pre-assigned per-thread unit numbers
+   (500+t/600+t) instead of letting the runtime allocate one via
+   `newunit=` at OPEN time -- gfortran/libgfortran's own free-unit
+   bookkeeping is not documented as safe against concurrent allocation.
+2. **This system's installed libcfitsio's `FTGHAD` writes only the
+   LOWER 32 bits of its 3 output arguments**, leaving the upper 32 bits
+   of an `integer(kind=8)` receiving variable completely untouched --
+   confirmed with a minimal standalone reproducer entirely outside this
+   codebase (a bare `FTINIT`/`FTPHPR`/`FTGHAD` program: initializing the
+   receiving variables to `-1_8` before the call reproducibly yields
+   `datastart = -2^32`; initializing to `0_8` first yields the correct
+   value). `open_output_cube`'s local `headstart`/`local_datastart`/
+   `dataend` are automatic (stack) variables with no guaranteed initial
+   value, so this showed up as a genuinely intermittent (stack-content-
+   dependent) wrong byte offset roughly half the time. Fixed by
+   zero-initializing all 3 immediately before every `FTGHAD` call.
+   **`rm_synthesis.f90`'s own `FTGHAD` call (io_write_threads' own
+   original implementation) has the exact same latent exposure** --
+   never observed to misbehave there only because its receiving
+   variables are main-program-scope locals that happen to land in
+   zero-initialized static storage on this platform/compiler (not the
+   stack), which is incidental storage-class behaviour, not a
+   guarantee. Fixed there too, same zero-init, confirmed with the full
+   regression suite still green afterward. Verified via 20 repeated
+   `io_write_threads=4` runs post-fix (0 failures; the same loop
+   pre-fix failed roughly half the time) -- `tests/run_tests.sh`'s own
+   T4c section repeats this check 5x per thread count rather than
+   trusting one pass, given the bug's own probabilistic nature.
+
+**T4d (`io_overlap`):** ports the pthread interface bindings
+(`c_pthread_create`/`c_pthread_join`) and double-buffer/dispatch
+machinery (`tile_write_job_t`, `tile_write_dispatch_async`,
+`tile_write_thread_entry`, `do_tile_write`) from
+`rm_synthesis_mod.f90`, generalizing `tile_write_job_t`'s named
+`unit_amp`/`unit_pha` fields to a 3-pair array (`re_ptr(3)`/`im_ptr(3)`,
+addressing clean/resid/restored in a fixed order, each written via the
+already-existing, already-tested `write_output_tile`). The two join
+rules ported exactly as rm_synthesis has them (both load-bearing, not
+stylistic): buffer-reuse join (before repopulating slot `cur_slot`,
+join that slot's own prior pending write) and handle-safety join
+(before dispatching ANY new write, join BOTH slots unconditionally
+first, since all 6 output files' handles are shared across slots
+regardless of which slot is being written). Output-tile storage is
+double-buffered via a trailing slot dimension (`clean_re_buf(:,:,:,2)`
+etc.) with `clean_re_tile` etc. as POINTERs re-targeted at
+`cur_slot+1` every tile, rather than rm_synthesis's own named `_s0`/
+`_s1` array pairs. Verified bit-identical to `io_overlap=n` (5 reps),
+and — the real gate — the FULL combined stress case (forced small
+non-full-width tiles + `io_read_threads=3` + `io_write_threads=3` +
+`io_overlap=y` together, not each mechanism only in isolation) bit-
+identical to the small-tile-only reference (5 reps).
+
+**Evidence:** `tests/run_tests.sh` section 29 (rmclean_cubes end-to-end)
+grew four new checks (T4a small-tile tolerance comparison, T4b
+`io_read_threads` sweep, T4c `io_write_threads` sweep x5 reps, T4d
+`io_overlap` alone x5 reps + the combined stress case x5 reps) — full
+suite 93/93 green.
 
 ### T-future — Bandwidth-depolarization in RM-CLEAN
 

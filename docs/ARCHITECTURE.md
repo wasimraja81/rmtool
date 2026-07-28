@@ -377,6 +377,49 @@ compares full AMP/PHA/MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR output
 bit-for-bit between `io_write_threads=1` and `=4` specifically because a
 mid-write `iostat` check would not have caught this class of bug.
 
+#### `rmclean_cubes` shares this same scheme (ticket T4)
+
+`rmclean_cubes` (`src/rmclean_cubes.f90`) ports this whole mechanism —
+tile geometry, `io_read_threads`, `io_write_threads`, `io_overlap` —
+generalized from `rm_synthesis`'s 2 named pixel-cube outputs (AMP/PHA)
+to `rmclean_cubes`'s 2 inputs + 6 outputs (CLEAN/RESID/RESTORED x
+AMP/PHA). Full design/evidence in
+`planning/RMCLEAN_INTEGRATION_PLAN.md` T4a-T4d. Two things found while
+validating that port are worth recording here since they bear directly
+on this section's own mechanism, not just on `rmclean_cubes`:
+
+- **`FTGHAD` output-argument truncation.** On this project's own build/
+  deployment platform, the installed libcfitsio's `FTGHAD` writes only
+  the *lower 32 bits* of its 3 output arguments (`headstart`/
+  `datastart`/`dataend`), leaving an `integer(kind=8)` receiving
+  variable's upper 32 bits completely untouched — confirmed with a
+  minimal standalone reproducer (bare `FTINIT`/`FTPHPR`/`FTGHAD`,
+  nothing else): initializing the receiving variables to `-1_8` before
+  the call reproducibly yields `datastart = -2^32`; initializing to
+  `0_8` first yields the correct value. `rm_synthesis.f90`'s own
+  `datastart_amp`/`datastart_pha`/`io_wpar_headstart`/`io_wpar_dataend`
+  (declared just above, in "Parallel write handle setup") happen to
+  land in zero-initialized static storage on this platform/compiler
+  (main-program-scope locals, not stack), which is why this call site
+  was never observed to misbehave — but that is incidental
+  storage-class behaviour, not a guarantee CFITSIO or the Fortran
+  wrapper actually makes. Both call sites (here and in
+  `rmclean_cubes.f90`'s own `open_output_cube`) now zero-initialize all
+  3 variables immediately before every `FTGHAD` call, rather than
+  continuing to rely on it.
+- **Concurrent `newunit=` allocation.** `rmclean_cubes`'s own raw-write
+  path originally used `open(newunit=u,...)` per thread per chunk,
+  mirroring `write_rm_chunk_raw`'s own convention above — but concurrent
+  calls from different OpenMP threads (each opening the SAME output
+  file path for its own disjoint byte range) intermittently produced a
+  corrupted/all-zero output cube. gfortran/libgfortran's own free-unit
+  bookkeeping is not documented as safe against concurrent allocation
+  from multiple threads. Fixed in `rmclean_cubes.f90` by using fixed,
+  pre-assigned per-thread unit numbers instead of `newunit=`. Not
+  independently confirmed either way for `rm_synthesis.f90`'s own
+  `write_rm_chunk_raw` (unchanged here) — flagged as a follow-up worth
+  checking if `io_write_threads>1` is ever seen to misbehave there.
+
 #### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
 
 Compute threads and IO threads are constrained by different resources:

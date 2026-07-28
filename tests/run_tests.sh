@@ -1822,6 +1822,172 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
             fail "rmclean_cubes: run failed (see $rmc_log)"
         fi
 
+        # T4a: memory-budgeted tiling -- forcing many small, non-full-width
+        # tiles (tile_ra/tile_dec well below the image size, so both the
+        # RA-subdivided and multi-row-per-tile paths get exercised) must
+        # agree with the default (auto, single whole-image tile) run.
+        # NOT byte-identical -- see check_tile_consistency.py's own module
+        # docstring for why (a real, pre-existing -O3 -march=native
+        # floating-point reassociation effect in clean_complex's own
+        # tiered-refinement threshold decision, confirmed via -O0 rebuild;
+        # not a tiling logic bug).
+        rmc_tiled="$OUT_DIR/rmc_cleaned_tiled"
+        rmc_tiled_log="$OUT_DIR/rmclean_cubes_tiled_run.log"
+        if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
+                outfile="$rmc_tiled" threshold=0.01 niter=200 gain=0.1 \
+                tile_auto=n tile_ra=3 tile_dec=5 \
+                > "$rmc_tiled_log" 2>&1; then
+            pass "rmclean_cubes: ran to completion with forced small (3x5) tiles"
+            if grep -q "Tile plan: tile_ra x tile_dec = 3 x 5" "$rmc_tiled_log"; then
+                pass "rmclean_cubes: forced tile geometry took effect"
+            else
+                fail "rmclean_cubes: forced tile_ra/tile_dec not reflected in tile plan (see $rmc_tiled_log)"
+            fi
+            if python3 "$TESTS_DIR/check_tile_consistency.py" "$rmc_out" "$rmc_tiled"; then
+                pass "rmclean_cubes: small-tile output numerically agrees with default (single-tile) output"
+            else
+                fail "rmclean_cubes: small-tile output disagrees with default output beyond tolerance"
+            fi
+            if python3 "$TESTS_DIR/check_rm_peak.py" \
+                    "${rmc_tiled}.RESTORED.AMP.RMCUBE.FITS" "$TRUTH"; then
+                pass "rmclean_cubes: small-tile RESTORED.AMP recovers both known point sources' RM"
+            else
+                fail "rmclean_cubes: small-tile RESTORED.AMP peak RM check failed"
+            fi
+        else
+            fail "rmclean_cubes: forced small-tile run failed (see $rmc_tiled_log)"
+        fi
+
+        # T4b: io_read_threads -- parallel readonly chunked tile reads must
+        # be BYTE-IDENTICAL to the default (default tile geometry is
+        # unchanged here, only the read parallelism, so none of T4a's own
+        # floating-point-reassociation caveat applies).
+        rt_ok=1
+        for rt in 1 2 4; do
+            rmc_rt="$OUT_DIR/rmc_rt${rt}"
+            rmc_rt_log="$OUT_DIR/rmclean_cubes_rt${rt}_run.log"
+            if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                    phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                    maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
+                    outfile="$rmc_rt" threshold=0.01 niter=200 gain=0.1 \
+                    io_read_threads=$rt > "$rmc_rt_log" 2>&1; then
+                for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                              RESTORED.AMP RESTORED.PHA; do
+                    if ! cmp -s "${rmc_out}.${suffix}.RMCUBE.FITS" \
+                                "${rmc_rt}.${suffix}.RMCUBE.FITS"; then
+                        rt_ok=0
+                        fail "rmclean_cubes: io_read_threads=$rt differs from io_read_threads=1 on $suffix"
+                    fi
+                done
+            else
+                rt_ok=0
+                fail "rmclean_cubes: io_read_threads=$rt run failed (see $rmc_rt_log)"
+            fi
+        done
+        [[ "$rt_ok" -eq 1 ]] && \
+            pass "rmclean_cubes: io_read_threads=1,2,4 all bit-identical to the default run"
+
+        # T4c: io_write_threads -- raw stream writes bypassing CFITSIO must
+        # be BYTE-IDENTICAL to the default (FTPSSE) write path. Repeated 5x
+        # at io_write_threads=4: this path previously had a genuine,
+        # PROBABILISTIC bug (FTGHAD's 3 output arguments come back with
+        # their upper 32 bits UNTOUCHED by this system's installed
+        # libcfitsio -- a real Fortran-wrapper/library ABI truncation,
+        # confirmed with a minimal standalone reproducer outside this
+        # codebase entirely -- so an uninitialized receiving variable's
+        # leftover stack garbage in the upper bits produced an
+        # intermittent, wildly wrong byte offset roughly half the time).
+        # Fixed by zero-initializing those 3 variables immediately before
+        # every FTGHAD call (open_output_cube's own comment has the full
+        # story); a single run would not reliably have caught the
+        # original bug, so this repeats the check rather than trusting
+        # one pass.
+        wt_ok=1
+        for wt in 1 2 4; do
+            for rep in 1 2 3 4 5; do
+                rmc_wt="$OUT_DIR/rmc_wt${wt}_${rep}"
+                rmc_wt_log="$OUT_DIR/rmclean_cubes_wt${wt}_${rep}_run.log"
+                if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                        phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                        maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
+                        outfile="$rmc_wt" threshold=0.01 niter=200 gain=0.1 \
+                        io_write_threads=$wt > "$rmc_wt_log" 2>&1; then
+                    for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                                  RESTORED.AMP RESTORED.PHA; do
+                        if ! cmp -s "${rmc_out}.${suffix}.RMCUBE.FITS" \
+                                    "${rmc_wt}.${suffix}.RMCUBE.FITS"; then
+                            wt_ok=0
+                            fail "rmclean_cubes: io_write_threads=$wt (rep $rep) differs from io_write_threads=1 on $suffix"
+                        fi
+                    done
+                else
+                    wt_ok=0
+                    fail "rmclean_cubes: io_write_threads=$wt (rep $rep) run failed (see $rmc_wt_log)"
+                fi
+            done
+        done
+        [[ "$wt_ok" -eq 1 ]] && \
+            pass "rmclean_cubes: io_write_threads=1,2,4 all bit-identical to the default run (5 reps each)"
+
+        # T4d: io_overlap -- background-thread tile writes must be
+        # BYTE-IDENTICAL to the default (inline write) path, both alone
+        # and combined with forced small tiles + io_read_threads +
+        # io_write_threads together (the combined stress case actually
+        # exercised, not just each mechanism in isolation).
+        rmc_ov_log="$OUT_DIR/rmclean_cubes_ov_run.log"
+        ov_ok=1
+        for rep in 1 2 3 4 5; do
+            rmc_ov="$OUT_DIR/rmc_ov${rep}"
+            if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                    phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                    maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
+                    outfile="$rmc_ov" threshold=0.01 niter=200 gain=0.1 \
+                    io_overlap=y > "$rmc_ov_log" 2>&1; then
+                for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                              RESTORED.AMP RESTORED.PHA; do
+                    if ! cmp -s "${rmc_out}.${suffix}.RMCUBE.FITS" \
+                                "${rmc_ov}.${suffix}.RMCUBE.FITS"; then
+                        ov_ok=0
+                        fail "rmclean_cubes: io_overlap=y (rep $rep) differs from io_overlap=n on $suffix"
+                    fi
+                done
+            else
+                ov_ok=0
+                fail "rmclean_cubes: io_overlap=y (rep $rep) run failed (see $rmc_ov_log)"
+            fi
+        done
+        [[ "$ov_ok" -eq 1 ]] && \
+            pass "rmclean_cubes: io_overlap=y bit-identical to io_overlap=n (5 reps)"
+
+        rmc_combo_log="$OUT_DIR/rmclean_cubes_combo_run.log"
+        combo_ok=1
+        for rep in 1 2 3 4 5; do
+            rmc_combo="$OUT_DIR/rmc_combo${rep}"
+            if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                    phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                    maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
+                    outfile="$rmc_combo" threshold=0.01 niter=200 gain=0.1 \
+                    tile_auto=n tile_ra=3 tile_dec=5 io_read_threads=3 \
+                    io_write_threads=3 io_overlap=y \
+                    > "$rmc_combo_log" 2>&1; then
+                for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                              RESTORED.AMP RESTORED.PHA; do
+                    if ! cmp -s "${rmc_tiled}.${suffix}.RMCUBE.FITS" \
+                                "${rmc_combo}.${suffix}.RMCUBE.FITS"; then
+                        combo_ok=0
+                        fail "rmclean_cubes: combined small-tile+io_read_threads+io_write_threads+io_overlap (rep $rep) differs from small-tile-only on $suffix"
+                    fi
+                done
+            else
+                combo_ok=0
+                fail "rmclean_cubes: combined stress run (rep $rep) failed (see $rmc_combo_log)"
+            fi
+        done
+        [[ "$combo_ok" -eq 1 ]] && \
+            pass "rmclean_cubes: combined small-tile+io_read_threads+io_write_threads+io_overlap bit-identical to small-tile-only (5 reps)"
+
         # Mask-pattern cache correctness: a deliberately varied mask (many
         # distinct per-pixel valid-channel patterns, forcing both cache
         # hits and the mask_pattern_cache_max overflow fallback) must give

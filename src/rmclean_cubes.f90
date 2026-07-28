@@ -93,7 +93,10 @@
 ! tolerances -- see that ticket's own verification plan).
 program rmclean_cubes
    use, intrinsic :: iso_fortran_env, only: sp => real32, dp => real64
+   use, intrinsic :: iso_c_binding, only: c_int, c_long, c_ptr, c_funptr,&
+   &c_null_ptr, c_funloc, c_loc, c_f_pointer
    use rmclean_mod
+   use omp_lib, only: omp_get_max_threads
    implicit none
 
    character(len=512) :: ampfile, phafile, maskfile, outfile
@@ -111,6 +114,26 @@ program rmclean_cubes
    logical :: have_lsq_ref_compute_value
    real(sp) :: lsq_ref_compute_value
 
+   ! --- T4a: tile geometry (planning/RMCLEAN_INTEGRATION_PLAN.md T4) ---
+   ! Same scheme, same key names/defaults, as rm_synthesis's own plan_tile
+   ! (rm_synthesis_mod.f90) -- see plan_rmclean_tile's own comment for why
+   ! (RA-strips-first, mem_frac_ram-budgeted, safety-shrink). tile_ra/
+   ! tile_dec here double as BOTH the config-requested override (0 = auto,
+   ! read by parse_args) AND, after plan_rmclean_tile runs, the actual
+   ! planned tile size every subsequent tile in the main loop allocates
+   ! against (the max size; the last tile in each direction may use less).
+   integer :: tile_ra, tile_dec
+   logical :: tile_auto
+   real(sp) :: mem_frac_ram
+
+   ! --- T4b: io_read_threads (planning/RMCLEAN_INTEGRATION_PLAN.md T4) ---
+   ! Same scheme/key name/clamping convention as rm_synthesis's own
+   ! io_read_threads: each thread opens its OWN readonly CFITSIO handle
+   ! (safe -- readonly opens are exempt from the same-file handle-aliasing
+   ! hazard read-write handles hit, see io_write_threads/T4c's own
+   ! comment) and reads its own disjoint RM-slice of the tile.
+   integer :: io_read_threads, io_read_threads_eff
+
    integer :: status
    integer :: nx, ny, nrm, nchan
    real(dp) :: cdelt3_amp, crval3_amp
@@ -124,12 +147,111 @@ program rmclean_cubes
    logical :: have_lsqref_keyword
    real(sp), allocatable :: rm_samp(:)
 
-   real(sp), allocatable :: re_cube(:,:,:), im_cube(:,:,:)
+   ! mask_cube stays whole-cube-resident (T4's own top-of-file comment on
+   ! this deliberate divergence from rm_synthesis's per-tile mask): tiny
+   ! relative to the float cubes, and build_mask_pattern_cache needs one
+   ! global pre-scan before any tile is CLEANed.
    integer(kind=1), allocatable :: mask_cube(:,:,:)
 
-   real(sp), allocatable :: clean_re_cube(:,:,:), clean_im_cube(:,:,:)
-   real(sp), allocatable :: resid_re_cube(:,:,:), resid_im_cube(:,:,:)
-   real(sp), allocatable :: restored_re_cube(:,:,:), restored_im_cube(:,:,:)
+   ! T4a: per-tile input buffers, allocated ONCE at the planned
+   ! (tile_ra,tile_dec,nrm) max size and reused across every tile -- a
+   ! tile at the image's own right/bottom edge just uses a (tx,ty,:)
+   ! subrange of this same storage (tx<=tile_ra, ty<=tile_dec), same
+   ! convention reproject_cubes.f90's own block_data_in/out use for a
+   ! short final block. Never double-buffered (T4d's own comment on the
+   ! write_job/_buf arrays below): once a tile's compute step has consumed
+   ! re_tile/im_tile, nothing later in that tile's own pipeline needs
+   ! them again, so the next tile's read can safely reuse the same
+   ! storage immediately -- unlike the OUTPUT arrays below, which a
+   ! still-in-flight background write may still be reading.
+   real(sp), allocatable :: re_tile(:,:,:), im_tile(:,:,:)
+
+   ! T4d: output-tile storage is double-buffered (io_overlap) -- 2
+   ! physical copies (trailing dimension, 1-based slot 1/2) of each of
+   ! the 6 output arrays, with clean_re_tile etc as POINTERs re-targeted
+   ! at slot cur_slot+1 every tile (same _s0/_s1 ping-pong concept as
+   ! rm_synthesis.f90's own p_tile_arr/phi_tile_arr, generalized here to
+   ! a trailing array dimension instead of named pairs, and to 6 outputs
+   ! instead of rm_synthesis's 2). With io_overlap=n, cur_slot is always
+   ! 0 and this costs one extra (unused) physical copy of each array --
+   ! negligible next to a whole tile's own float-cube footprint, and
+   ! avoids a separate no-overlap code path entirely.
+   real(sp), allocatable, target :: clean_re_buf(:,:,:,:), clean_im_buf(:,:,:,:)
+   real(sp), allocatable, target :: resid_re_buf(:,:,:,:), resid_im_buf(:,:,:,:)
+   real(sp), allocatable, target :: restored_re_buf(:,:,:,:), restored_im_buf(:,:,:,:)
+   real(sp), pointer :: clean_re_tile(:,:,:) => null(), clean_im_tile(:,:,:) => null()
+   real(sp), pointer :: resid_re_tile(:,:,:) => null(), resid_im_tile(:,:,:) => null()
+   real(sp), pointer :: restored_re_tile(:,:,:) => null(), restored_im_tile(:,:,:) => null()
+
+   integer :: ix_tile_beg, iy_tile_beg, tx, ty
+
+   ! --- T4d: io_overlap (planning/RMCLEAN_INTEGRATION_PLAN.md T4) ---
+   ! Same scheme as rm_synthesis's own io_overlap: a raw POSIX thread (not
+   ! an OpenMP task -- see tile_write_job_t's own comment for why) runs
+   ! one tile's write while the NEXT tile's read/compute proceeds using
+   ! the other buffer slot.
+   logical :: io_overlap
+   integer :: tile_seq, cur_slot
+   integer(c_long) :: write_thread_id(0:1)
+   logical :: write_pending(0:1) = .false.
+   logical :: write_dispatched_ok
+
+   ! One pointer per output array a job needs to write, wrapped in a
+   ! derived type since Fortran has no array-of-pointers primitive.
+   type :: tile_ptr_t
+      real(sp), pointer :: p(:,:,:) => null()
+   end type tile_ptr_t
+
+   ! Asynchronous tile-write job -- see rm_synthesis_mod.f90's own
+   ! tile_write_job_t for the full "why a pthread, not an omp task"
+   ! rationale (identical here: keeping read/compute's own `!$omp
+   ! parallel do` regions completely undisturbed by the write's own
+   ! lifetime, which must be able to outlive them). re_ptr/im_ptr(k),
+   ! k=1..3, address (clean,resid,restored) in that fixed order --
+   ! do_tile_write pairs each with out_unit/out_path/out_datastart
+   ! (idx_clean_amp,idx_clean_pha)/(idx_resid_amp,idx_resid_pha)/
+   ! (idx_restored_amp,idx_restored_pha) by the same fixed order.
+   type :: tile_write_job_t
+      integer :: ix_tile_beg = 0, iy_tile_beg = 0, tx = 0, ty = 0
+      type(tile_ptr_t) :: re_ptr(3), im_ptr(3)
+   end type tile_write_job_t
+   ! target+save: must remain valid (untouched, undeallocated) from
+   ! dispatch until tile_write_join returns for that slot -- see
+   ! tile_write_dispatch_async's own comment.
+   type(tile_write_job_t), target, save :: write_job(0:1)
+
+   interface
+      function c_pthread_create(thread, attr, start_routine, arg)&
+      &bind(C, name="pthread_create") result(rc)
+         import :: c_int, c_long, c_ptr, c_funptr
+         integer(c_long) :: thread
+         type(c_ptr), value :: attr
+         type(c_funptr), value :: start_routine
+         type(c_ptr), value :: arg
+         integer(c_int) :: rc
+      end function c_pthread_create
+
+      function c_pthread_join(thread, retval)&
+      &bind(C, name="pthread_join") result(rc)
+         import :: c_int, c_long, c_ptr
+         integer(c_long), value :: thread
+         type(c_ptr), value :: retval
+         integer(c_int) :: rc
+      end function c_pthread_join
+   end interface
+
+   ! --- T4c: output-cube bookkeeping, generalized to n_outputs=6 (rather
+   ! than rm_synthesis's own 2 named AMP/PHA fields) since rmclean_cubes
+   ! writes CLEAN/RESID/RESTORED x AMP/PHA. Index convention below.
+   integer, parameter :: n_outputs = 6
+   integer, parameter :: idx_clean_amp = 1, idx_clean_pha = 2
+   integer, parameter :: idx_resid_amp = 3, idx_resid_pha = 4
+   integer, parameter :: idx_restored_amp = 5, idx_restored_pha = 6
+   integer :: out_unit(n_outputs)
+   character(len=600) :: out_path(n_outputs)
+   integer(kind=8) :: out_datastart(n_outputs)
+   logical :: out_is_open(n_outputs)
+   integer :: io_write_threads, io_write_threads_eff
 
    integer :: ix, iy, k
    integer(kind=8) :: restore_plan_fwd, restore_plan_bwd
@@ -242,43 +364,179 @@ program rmclean_cubes
    endif
    write(*,'(A,F0.6,A)') 'Restoring beam FWHM = ', fwhm_rm, ' rad/m^2'
 
-   call read_cube(ampfile, phafile, nx, ny, nrm, re_cube, im_cube, status)
-   if (status.ne.0) stop 1
    call read_mask_cube(maskfile, nx, ny, nchan, mask_cube, status)
    if (status.ne.0) stop 1
-
-   allocate(clean_re_cube(nx,ny,nrm), clean_im_cube(nx,ny,nrm))
-   allocate(resid_re_cube(nx,ny,nrm), resid_im_cube(nx,ny,nrm))
-   allocate(restored_re_cube(nx,ny,nrm), restored_im_cube(nx,ny,nrm))
 
    call plan_fourier_interp(nrm, nrm, restore_plan_fwd, restore_plan_bwd)
 
    call build_mask_pattern_cache()
 
+   call plan_rmclean_tile()
+
+   ! T4b: same clamp convention as rm_synthesis's own io_read_threads --
+   ! never more threads than OMP has, never more than there are RM planes
+   ! to split across them (a tile's own nrm, not the outer tile count).
+   io_read_threads_eff = max(1, min(io_read_threads, omp_get_max_threads()))
+   io_read_threads_eff = min(io_read_threads_eff, nrm)
+   if (io_read_threads.gt.io_read_threads_eff) then
+      write(*,'(A,I0,A,I0)') 'WARNING: io_read_threads=', io_read_threads,&
+      &' clamped to ', io_read_threads_eff
+   endif
+
+   ! T4c: same clamp convention as io_read_threads_eff above.
+   io_write_threads_eff = max(1, min(io_write_threads, omp_get_max_threads()))
+   io_write_threads_eff = min(io_write_threads_eff, nrm)
+   if (io_write_threads.gt.io_write_threads_eff) then
+      write(*,'(A,I0,A,I0)') 'WARNING: io_write_threads=', io_write_threads,&
+      &' clamped to ', io_write_threads_eff
+   endif
+
+   allocate(re_tile(tile_ra,tile_dec,nrm), im_tile(tile_ra,tile_dec,nrm))
+   allocate(clean_re_buf(tile_ra,tile_dec,nrm,2), clean_im_buf(tile_ra,tile_dec,nrm,2))
+   allocate(resid_re_buf(tile_ra,tile_dec,nrm,2), resid_im_buf(tile_ra,tile_dec,nrm,2))
+   allocate(restored_re_buf(tile_ra,tile_dec,nrm,2), restored_im_buf(tile_ra,tile_dec,nrm,2))
+
+   ! Fixed, distinct unit numbers, chosen by the caller (FTINIT takes the
+   ! unit as an INPUT, unlike a handle CFITSIO fills in) -- disjoint from
+   ! every other unit this program uses (213/214 tile reads, 227 the
+   ! transient header-copy src_unit inside open_output_cube itself).
+   out_unit(idx_clean_amp) = 221
+   out_unit(idx_clean_pha) = 222
+   out_unit(idx_resid_amp) = 223
+   out_unit(idx_resid_pha) = 224
+   out_unit(idx_restored_amp) = 225
+   out_unit(idx_restored_pha) = 226
+
+   call open_output_cube(ampfile, trim(outfile)//'.CLEAN.AMP.RMCUBE.FITS',&
+   &nx, ny, nrm, idx_clean_amp, status)
+   if (status.ne.0) stop 1
+   call open_output_cube(ampfile, trim(outfile)//'.CLEAN.PHA.RMCUBE.FITS',&
+   &nx, ny, nrm, idx_clean_pha, status)
+   if (status.ne.0) stop 1
+   call open_output_cube(ampfile, trim(outfile)//'.RESID.AMP.RMCUBE.FITS',&
+   &nx, ny, nrm, idx_resid_amp, status)
+   if (status.ne.0) stop 1
+   call open_output_cube(ampfile, trim(outfile)//'.RESID.PHA.RMCUBE.FITS',&
+   &nx, ny, nrm, idx_resid_pha, status)
+   if (status.ne.0) stop 1
+   call open_output_cube(ampfile, trim(outfile)//'.RESTORED.AMP.RMCUBE.FITS',&
+   &nx, ny, nrm, idx_restored_amp, status)
+   if (status.ne.0) stop 1
+   call open_output_cube(ampfile, trim(outfile)//'.RESTORED.PHA.RMCUBE.FITS',&
+   &nx, ny, nrm, idx_restored_pha, status)
+   if (status.ne.0) stop 1
+
+   ! T4a/T4d: sequential tiles, each a strict read (single-threaded or T4b
+   ! io_read_threads-parallel) / compute (OpenMP-parallel across the
+   ! tile's own pixels) / write (inline, or -- io_overlap=y -- on a
+   ! background thread while the NEXT tile's read/compute proceeds)
+   ! sequence -- see plan_rmclean_tile's own comment and this ticket's
+   ! own top-of-file/planning-doc rationale for why this shape (spatial
+   ! tile, full RM depth) rather than reproject_cubes.f90's own
+   ! depth-plane blocking.
    n_pixels_done = 0
-   !$omp parallel do collapse(2) schedule(dynamic) default(shared) private(ix,iy)
-   do iy = 1, ny
-      do ix = 1, nx
-         call clean_one_pixel(ix, iy)
+   tile_seq = 0
+   iy_tile_beg = 1
+   do while (iy_tile_beg.le.ny)
+      ty = min(tile_dec, ny-iy_tile_beg+1)
+      ix_tile_beg = 1
+      do while (ix_tile_beg.le.nx)
+         tx = min(tile_ra, nx-ix_tile_beg+1)
+
+         ! T4d buffer-reuse join: slot cur_slot is about to be (re)written
+         ! by this tile's own compute step; if the write from two tiles
+         ! ago (the last user of this same slot) is still in flight, join
+         ! it now -- the one synchronisation point that makes the double
+         ! buffering safe. With io_overlap=n, write_pending is never set,
+         ! so this is a no-op (see tile_write_job_t's own comment).
+         cur_slot = mod(tile_seq, 2)
+         tile_seq = tile_seq + 1
+         if (io_overlap .and. write_pending(cur_slot)) then
+            call tile_write_join(write_thread_id(cur_slot))
+            write_pending(cur_slot) = .false.
+         endif
+         clean_re_tile => clean_re_buf(:,:,:,cur_slot+1)
+         clean_im_tile => clean_im_buf(:,:,:,cur_slot+1)
+         resid_re_tile => resid_re_buf(:,:,:,cur_slot+1)
+         resid_im_tile => resid_im_buf(:,:,:,cur_slot+1)
+         restored_re_tile => restored_re_buf(:,:,:,cur_slot+1)
+         restored_im_tile => restored_im_buf(:,:,:,cur_slot+1)
+
+         call read_amp_pha_tile(ampfile, phafile, ix_tile_beg, iy_tile_beg,&
+         &tx, ty, re_tile(1:tx,1:ty,:), im_tile(1:tx,1:ty,:), status)
+         if (status.ne.0) stop 1
+
+         !$omp parallel do collapse(2) schedule(dynamic) default(shared) private(ix,iy)
+         do iy = 1, ty
+            do ix = 1, tx
+               call clean_one_pixel(ix, iy, ix_tile_beg, iy_tile_beg)
+            enddo
+         enddo
+         !$omp end parallel do
+
+         write_job(cur_slot)%ix_tile_beg = ix_tile_beg
+         write_job(cur_slot)%iy_tile_beg = iy_tile_beg
+         write_job(cur_slot)%tx = tx
+         write_job(cur_slot)%ty = ty
+         write_job(cur_slot)%re_ptr(1)%p => clean_re_tile(1:tx,1:ty,:)
+         write_job(cur_slot)%im_ptr(1)%p => clean_im_tile(1:tx,1:ty,:)
+         write_job(cur_slot)%re_ptr(2)%p => resid_re_tile(1:tx,1:ty,:)
+         write_job(cur_slot)%im_ptr(2)%p => resid_im_tile(1:tx,1:ty,:)
+         write_job(cur_slot)%re_ptr(3)%p => restored_re_tile(1:tx,1:ty,:)
+         write_job(cur_slot)%im_ptr(3)%p => restored_im_tile(1:tx,1:ty,:)
+
+         if (io_overlap) then
+            ! T4d handle-safety join: before any NEW write is dispatched,
+            ! whichever write is currently outstanding (either slot) is
+            ! joined first, unconditionally -- all 6 output files' CFITSIO/
+            ! raw-write handles are shared across slots regardless of
+            ! which slot is being written, so the per-slot join above only
+            ! guards buffer reuse (2 tiles apart); it does NOT guarantee
+            ! the *previous* tile's write (a different slot) has finished.
+            ! Ported directly from rm_synthesis.f90's own identical rule
+            ! (see its own comment for the SIGSEGV this prevents).
+            if (write_pending(0)) then
+               call tile_write_join(write_thread_id(0))
+               write_pending(0) = .false.
+            endif
+            if (write_pending(1)) then
+               call tile_write_join(write_thread_id(1))
+               write_pending(1) = .false.
+            endif
+            call tile_write_dispatch_async(write_job(cur_slot),&
+            &write_thread_id(cur_slot), write_dispatched_ok)
+            write_pending(cur_slot) = write_dispatched_ok
+         else
+            call do_tile_write(write_job(cur_slot))
+         endif
+
+         ix_tile_beg = ix_tile_beg + tx
       enddo
+      iy_tile_beg = iy_tile_beg + ty
    enddo
-   !$omp end parallel do
    write(*,'(A,I0,A)') 'CLEANed ', n_pixels_done, ' pixels.'
+
+   ! Join any tile writes still in flight -- at most the last two tiles'
+   ! writes can reach here undispatched-for-join (each slot's write is
+   ! only joined when that slot is reused two tiles later, so the final
+   ! tile, and the one before it in the other slot, never gets that
+   ! second chance).
+   if (io_overlap) then
+      if (write_pending(0)) then
+         call tile_write_join(write_thread_id(0))
+         write_pending(0) = .false.
+      endif
+      if (write_pending(1)) then
+         call tile_write_join(write_thread_id(1))
+         write_pending(1) = .false.
+      endif
+   endif
 
    call destroy_fourier_interp_plan(restore_plan_fwd, restore_plan_bwd)
 
-   call write_output_cube(ampfile, trim(outfile)//'.CLEAN.AMP.RMCUBE.FITS',&
-   &trim(outfile)//'.CLEAN.PHA.RMCUBE.FITS', nx, ny, nrm, clean_re_cube,&
-   &clean_im_cube, status)
-   if (status.ne.0) stop 1
-   call write_output_cube(ampfile, trim(outfile)//'.RESID.AMP.RMCUBE.FITS',&
-   &trim(outfile)//'.RESID.PHA.RMCUBE.FITS', nx, ny, nrm, resid_re_cube,&
-   &resid_im_cube, status)
-   if (status.ne.0) stop 1
-   call write_output_cube(ampfile, trim(outfile)//'.RESTORED.AMP.RMCUBE.FITS',&
-   &trim(outfile)//'.RESTORED.PHA.RMCUBE.FITS', nx, ny, nrm,&
-   &restored_re_cube, restored_im_cube, status)
-   if (status.ne.0) stop 1
+   do k = 1, n_outputs
+      call close_output_cube(k)
+   enddo
 
    write(*,'(A)') 'OK: rmclean_cubes complete.'
 
@@ -312,6 +570,13 @@ contains
       have_lsq_ref_compute_value = .false.
       lsq_ref_compute_value = 0.0_sp
       mask_pattern_cache_max = 4096
+      tile_ra = 0
+      tile_dec = 0
+      tile_auto = .true.
+      mem_frac_ram = 0.25_sp
+      io_read_threads = 1
+      io_write_threads = 1
+      io_overlap = .false.
       have_cfgfile = .false.
       seen_ampfile = .false.
       seen_phafile = .false.
@@ -505,6 +770,45 @@ contains
             status = -1
             return
          endif
+      case ('mem_frac_ram')
+         read(val, *, iostat=ios) mem_frac_ram
+         if (ios.ne.0 .or. mem_frac_ram.le.0.0_sp .or. mem_frac_ram.gt.0.95_sp) then
+            write(*,*) 'ERROR: mem_frac_ram must be > 0 and <= 0.95'
+            status = -1
+            return
+         endif
+      case ('tile_ra')
+         read(val, *, iostat=ios) tile_ra
+         if (ios.ne.0 .or. tile_ra.lt.0) then
+            write(*,*) 'ERROR: tile_ra must be a non-negative integer'
+            status = -1
+            return
+         endif
+      case ('tile_dec')
+         read(val, *, iostat=ios) tile_dec
+         if (ios.ne.0 .or. tile_dec.lt.0) then
+            write(*,*) 'ERROR: tile_dec must be a non-negative integer'
+            status = -1
+            return
+         endif
+      case ('tile_auto')
+         tile_auto = flag_from_value_rmclean(val)
+      case ('io_read_threads')
+         read(val, *, iostat=ios) io_read_threads
+         if (ios.ne.0 .or. io_read_threads.lt.1) then
+            write(*,*) 'ERROR: io_read_threads must be an integer >= 1'
+            status = -1
+            return
+         endif
+      case ('io_write_threads')
+         read(val, *, iostat=ios) io_write_threads
+         if (ios.ne.0 .or. io_write_threads.lt.1) then
+            write(*,*) 'ERROR: io_write_threads must be an integer >= 1'
+            status = -1
+            return
+         endif
+      case ('io_overlap')
+         io_overlap = flag_from_value_rmclean(val)
       case default
          write(*,*) 'ERROR: unrecognised key "', key, '"'
          status = -1
@@ -558,7 +862,9 @@ contains
       &'|mid|fixed] [lsq_ref_report_value=<v>]'
       write(*,'(A)') '    [lsq_ref_compute_mode=native|zero|centroid|min'//&
       &'|max|mid|fixed] [lsq_ref_compute_value=<v>]'
-      write(*,'(A)') '    [mask_pattern_cache_max=<n>]'
+      write(*,'(A)') '    [mask_pattern_cache_max=<n>] [mem_frac_ram=<f>]'//&
+      &' [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]'//&
+      &' [io_read_threads=<n>] [io_write_threads=<n>] [io_overlap=y|n]'
       write(*,'(A)') '   or: rmclean_cubes --config <cfgfile>'
       write(*,'(A)') '   or: rmclean_cubes --help | -h'
       write(*,'(A)') ''
@@ -606,6 +912,35 @@ contains
       &' many DISTINCT patterns, additional patterns fall back to a'//&
       &' one-off table per pixel (safety valve, not a correctness'//&
       &' issue -- just loses the reuse benefit).'
+      write(*,'(A)') 'mem_frac_ram (default 0.25): fraction of total'//&
+      &' system RAM budgeted for one tile''s own read+compute+write'//&
+      &' working set (2 input + 6 output RM-depth arrays per pixel) --'//&
+      &' same scheme/key name as rm_synthesis''s own mem_frac_ram'//&
+      &' (planning ticket T4).'
+      write(*,'(A)') 'tile_ra/tile_dec (default 0/0, i.e. auto): manual'//&
+      &' tile size override (pixels); ignored unless tile_auto=n. Auto'//&
+      &' policy (tile_auto=y, the default) packs full-RA Dec strips --'//&
+      &' tile_ra=nx, as many Dec rows as mem_frac_ram allows -- falling'//&
+      &' back to RA-subdivided single rows only if a single full-RA row'//&
+      &' does not fit; same policy as rm_synthesis''s own plan_tile.'
+      write(*,'(A)') 'tile_auto (default y): y = ignore tile_ra/tile_dec'//&
+      &' and derive them from mem_frac_ram; n = use tile_ra/tile_dec as'//&
+      &' given (still clamped to the image size).'
+      write(*,'(A)') 'io_read_threads (default 1): parallel readonly'//&
+      &' chunked reads of each tile''s AMP/PHA RM-depth range -- same'//&
+      &' scheme as rm_synthesis''s own io_read_threads; clamped to'//&
+      &' min(io_read_threads, OMP thread count, tile''s own nrm).'
+      write(*,'(A)') 'io_write_threads (default 1): parallel chunked'//&
+      &' writes of each tile''s 6 output cubes -- same scheme as'//&
+      &' rm_synthesis''s own io_write_threads: >1 switches to raw'//&
+      &' stream writes at computed byte offsets, bypassing CFITSIO''s'//&
+      &' own ftpsse for the pixel data (concurrent CFITSIO read-write'//&
+      &' handles on one file are unsafe -- see write_output_tile''s own'//&
+      &' comment); clamped like io_read_threads.'
+      write(*,'(A)') 'io_overlap (default n): y = write each tile''s 6'//&
+      &' output cubes on a background thread while the NEXT tile''s'//&
+      &' read/compute proceeds -- same scheme as rm_synthesis''s own'//&
+      &' io_overlap; works with any io_write_threads setting.'
    end subroutine print_usage
 
    subroutine cfg_split_key_value(raw_line, key, val, has_kv)
@@ -643,6 +978,118 @@ contains
       val = token(eqpos+1:)
       has_kv = .true.
    end subroutine split_cli_kv
+
+   function flag_from_value_rmclean(val) result(flag)
+      !! Same convention as rm_synthesis_mod.f90's own flag_from_value:
+      !! first non-blank character '1'/'y'/'Y'/'t'/'T' -> true, anything
+      !! else (including blank) -> false.
+      character(len=*), intent(in) :: val
+      logical :: flag
+      character(len=64) :: t
+      integer :: i
+
+      t = adjustl(val)
+      do i = 1, len_trim(t)
+         t(i:i) = achar(iachar(t(i:i)) - merge(32, 0, t(i:i).ge.'A'.and.t(i:i).le.'Z'))
+      enddo
+      flag = .false.
+      if (len_trim(t).eq.0) return
+      if (t(1:1).eq.'1' .or. t(1:1).eq.'y' .or. t(1:1).eq.'t') flag = .true.
+   end function flag_from_value_rmclean
+
+   subroutine get_mem_total_kb(mem_total_kb)
+      !! Total system RAM in kB, from /proc/meminfo's MemTotal -- verbatim
+      !! adaptation of reproject_cubes.f90's own get_mem_total_kb (itself
+      !! matching rm_synthesis_mod.f90's own tile planner exactly): budget
+      !! against TOTAL RAM (deterministic tile size for a given cube/
+      !! mem_frac_ram, reproducible across runs) rather than instantaneous
+      !! free RAM. 4 GiB fallback if /proc/meminfo can't be read.
+      integer(kind=8), intent(out) :: mem_total_kb
+      integer :: mem_unit, ios_mem
+      character(len=128) :: mem_line
+      integer(kind=8) :: mem_kb_tmp
+
+      mem_total_kb = 0_8
+      open(newunit=mem_unit, file='/proc/meminfo', status='old', iostat=ios_mem)
+      if (ios_mem.eq.0) then
+         do
+            read(mem_unit, '(A)', iostat=ios_mem) mem_line
+            if (ios_mem.ne.0) exit
+            if (index(mem_line, 'MemTotal:').eq.1) then
+               read(mem_line(index(mem_line,':')+1:), *, iostat=ios_mem) mem_kb_tmp
+               if (ios_mem.eq.0) mem_total_kb = mem_kb_tmp
+               exit
+            endif
+         enddo
+         close(mem_unit)
+      endif
+      if (mem_total_kb.le.0_8) mem_total_kb = 4194304_8
+   end subroutine get_mem_total_kb
+
+   subroutine plan_rmclean_tile()
+      !! T4a (planning/RMCLEAN_INTEGRATION_PLAN.md): sets tile_ra/tile_dec,
+      !! same RA-strips-first auto-tiling + safety-shrink policy as
+      !! rm_synthesis_mod.f90's own plan_tile (rm_synthesis_mod.f90:
+      !! 3200-3247), applied to rmclean_cubes' own per-tile-pixel byte
+      !! budget: 2 input arrays (re,im) + 6 output arrays (clean/resid/
+      !! restored re,im), each 4*nrm bytes/pixel (io_overlap's own
+      !! doubling, once T4d lands, is added on top of this same budget,
+      !! not computed here). RA (NAXIS1) is the contiguous axis on disk
+      !! (FTGSVE/FTPSSE's own natural layout, same reasoning as
+      !! reproject_cubes.f90's own tiling comment) -- keeping tile_ra=nx
+      !! and packing Dec rows makes every tile read/write one contiguous
+      !! run per RM-plane; only an extremely wide image (a single full-RA
+      !! Dec row exceeding the budget) falls back to subdividing RA.
+      integer(kind=8) :: mem_total_kb, bytes_per_tile_pixel, mem_safe_bytes
+      integer(kind=8) :: tile_pixels_max, image_pixels_total, tile_bytes_est
+
+      bytes_per_tile_pixel = int(4,8) * int(8,8) * int(nrm,8)
+      call get_mem_total_kb(mem_total_kb)
+      mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) *&
+      &1024.0d0, 8)
+      if (mem_safe_bytes.le.bytes_per_tile_pixel) mem_safe_bytes = bytes_per_tile_pixel
+      tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel
+      if (tile_pixels_max.lt.1_8) tile_pixels_max = 1_8
+      image_pixels_total = int(nx,8) * int(ny,8)
+
+      if (tile_auto .or. tile_ra.le.0 .or. tile_dec.le.0) then
+         if (tile_pixels_max.ge.image_pixels_total) then
+            tile_ra = nx
+            tile_dec = ny
+         else if (tile_pixels_max.ge.int(nx,8)) then
+            tile_ra = nx
+            tile_dec = int(tile_pixels_max / int(nx,8))
+            if (tile_dec.lt.1) tile_dec = 1
+            if (tile_dec.gt.ny) tile_dec = ny
+         else
+            tile_dec = 1
+            tile_ra = int(tile_pixels_max)
+            if (tile_ra.lt.1) tile_ra = 1
+            if (tile_ra.gt.nx) tile_ra = nx
+         endif
+      else
+         tile_ra = max(1, min(tile_ra, nx))
+         tile_dec = max(1, min(tile_dec, ny))
+      endif
+
+      ! Safety shrink: reduce Dec rows first (keep full RA contiguous);
+      ! only shrink RA once the strip is already a single Dec row -- same
+      ! order as rm_synthesis_mod.f90's own plan_tile.
+      tile_bytes_est = int(tile_ra,8) * int(tile_dec,8) * bytes_per_tile_pixel
+      do while (tile_bytes_est.gt.mem_safe_bytes .and.&
+      &(tile_ra.gt.1 .or. tile_dec.gt.1))
+         if (tile_dec.gt.1) then
+            tile_dec = max(1, tile_dec/2)
+         else
+            tile_ra = max(1, tile_ra/2)
+         endif
+         tile_bytes_est = int(tile_ra,8) * int(tile_dec,8) * bytes_per_tile_pixel
+      enddo
+
+      write(*,'(A,I0,A,I0,A,I0,A,I0,A)') 'Tile plan: tile_ra x tile_dec = ',&
+      &tile_ra, ' x ', tile_dec, ' px (image ', nx, ' x ', ny,&
+      &' px, mem_frac_ram budget).'
+   end subroutine plan_rmclean_tile
 
    subroutine read_chanfreq(filename, l_sq_out, band_id_out, nchan_out, status)
       !! Read maskfile's own CHANFREQ binary table (rm_synthesis.f90:
@@ -876,64 +1323,141 @@ contains
       end select
    end function lsq_ref_compute_mode_to_int
 
-   subroutine read_cube(ampfile, phafile, nx_in, ny_in, nrm_in, re_out,&
+   subroutine split_range_rmclean(n_total, n_threads, base, rem)
+      !! Same convention as rm_synthesis_mod.f90's own
+      !! split_channels_across_threads: n_threads threads each get `base`
+      !! items, the first `rem` of them get one extra, covering n_total
+      !! exactly with contiguous, disjoint ranges.
+      integer, intent(in) :: n_total, n_threads
+      integer, intent(out) :: base, rem
+      base = n_total / n_threads
+      rem = mod(n_total, n_threads)
+   end subroutine split_range_rmclean
+
+   subroutine read_amp_pha_tile(ampfile, phafile, ix0, iy0, tx, ty, re_out,&
    &im_out, status)
-      !! Whole-cube read (Stage A -- see this file's own top comment):
-      !! amp/pha -> re/im, matching rm_synthesis's own p_tile_arr=sqrt(re^2
-      !! +im^2)/phi_tile_arr=atan2(im,re) forward convention exactly
-      !! (rm_synthesis_mod.f90:1462-1465, its own output_mode=0/
-      !! ap_angle_mode=0 branch -- the default this program assumes,
-      !! since ampfile/phafile are always the AMP/PHA pair by this
-      !! program's own required config keys): re=amp*cos(pha),
-      !! im=amp*sin(pha).
+      !! T4a/T4b: reads one tile's AMP/PHA subregion (full RM depth,
+      !! [ix0:ix0+tx-1, iy0:iy0+ty-1, 1:nrm]) via FTGSVE, converts to
+      !! re/im -- same amp*cos(pha)/amp*sin(pha) forward convention the
+      !! old whole-cube read_cube used (matching rm_synthesis's own
+      !! p_tile_arr=sqrt(re^2+im^2)/phi_tile_arr=atan2(im,re) convention,
+      !! rm_synthesis_mod.f90:1462-1465). Always-natural axis order (this
+      !! program's own AMP/PHA cubes are always plain NAXIS=3 with
+      !! axis1=RA,axis2=Dec,axis3=RM -- no reproject_cubes-style
+      !! axis-order permutation needed).
+      !!
+      !! T4b: when io_read_threads_eff>1, the tile's own RM range is split
+      !! (split_range_rmclean, same base/rem convention as rm_synthesis's
+      !! own split_channels_across_threads) across that many threads, each
+      !! opening its OWN readonly FTOPEN handle (distinct unit numbers,
+      !! 300+t/400+t) and reading its own disjoint RM-slice via FTGSVE --
+      !! safe because readonly CFITSIO opens on the same file are exempt
+      !! from the same-file handle-aliasing hazard that makes concurrent
+      !! READ-WRITE handles on one file unsafe (see write_output_tile's
+      !! own T4c comment, and rm_synthesis's own io_read_threads, which
+      !! this is a direct port of).
       character(len=*), intent(in) :: ampfile, phafile
-      integer, intent(in) :: nx_in, ny_in, nrm_in
-      real(sp), allocatable, intent(out) :: re_out(:,:,:), im_out(:,:,:)
+      integer, intent(in) :: ix0, iy0, tx, ty
+      real(sp), intent(out) :: re_out(tx,ty,nrm), im_out(tx,ty,nrm)
       integer, intent(out) :: status
-      integer :: unit, blocksize, fitsstat
-      logical :: anyflag
-      real(sp), allocatable :: amp_cube(:,:,:), pha_cube(:,:,:)
+      integer :: group
+      integer :: base_chan, rem_chan, ith, rm_beg, rm_len
+      integer :: status_par
 
       status = 0
-      allocate(amp_cube(nx_in,ny_in,nrm_in), pha_cube(nx_in,ny_in,nrm_in))
+      status_par = 0
+      group = 1
+      call split_range_rmclean(nrm, io_read_threads_eff, base_chan, rem_chan)
+
+      !$omp parallel do schedule(static) default(shared)&
+      !$omp& private(ith,rm_beg,rm_len) num_threads(io_read_threads_eff)
+      do ith = 0, io_read_threads_eff-1
+         if (ith.lt.rem_chan) then
+            rm_len = base_chan + 1
+            rm_beg = ith*(base_chan+1) + 1
+         else
+            rm_len = base_chan
+            rm_beg = rem_chan*(base_chan+1) + (ith-rem_chan)*base_chan + 1
+         endif
+         if (rm_len.gt.0) then
+            call read_amp_pha_chunk(ampfile, phafile, ix0, iy0, tx, ty,&
+            &rm_beg, rm_len, ith, re_out(:,:,rm_beg:rm_beg+rm_len-1),&
+            &im_out(:,:,rm_beg:rm_beg+rm_len-1), status_par)
+         endif
+      enddo
+      !$omp end parallel do
+      if (status_par.ne.0) status = -1
+   end subroutine read_amp_pha_tile
+
+   subroutine read_amp_pha_chunk(ampfile, phafile, ix0, iy0, tx, ty,&
+   &rm_beg, rm_len, thread_id, re_out, im_out, status_par)
+      !! One io_read_threads worker's own disjoint RM-chunk of one tile --
+      !! see read_amp_pha_tile's own comment. Unit numbers 300+thread_id/
+      !! 400+thread_id: disjoint per thread and from every other unit this
+      !! program uses (213/214 unused once io_read_threads_eff>1 callers
+      !! always go through here; 221-227 the output-side units).
+      character(len=*), intent(in) :: ampfile, phafile
+      integer, intent(in) :: ix0, iy0, tx, ty, rm_beg, rm_len, thread_id
+      real(sp), intent(out) :: re_out(tx,ty,rm_len), im_out(tx,ty,rm_len)
+      integer, intent(inout) :: status_par
+      integer :: unit, blocksize, fitsstat, group
+      integer :: fpixel(3), lpixel(3), incs(3), naxes_full(3)
+      logical :: anyflag
+      real(sp), allocatable :: amp_chunk(:,:,:), pha_chunk(:,:,:)
+
+      allocate(amp_chunk(tx,ty,rm_len), pha_chunk(tx,ty,rm_len))
+      group = 1
+      naxes_full = (/ nx, ny, nrm /)
+      fpixel = (/ ix0, iy0, rm_beg /)
+      lpixel = (/ ix0+tx-1, iy0+ty-1, rm_beg+rm_len-1 /)
+      incs = (/ 1, 1, 1 /)
 
       fitsstat = 0
-      unit = 213
+      unit = 300 + thread_id
       call FTOPEN(unit, trim(ampfile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(ampfile)
-         status = -1
+         !$omp atomic write
+         status_par = -1
+         deallocate(amp_chunk, pha_chunk)
          return
       endif
-      call FTGPVE(unit, 1, 1, nx_in*ny_in*nrm_in, 0.0_sp, amp_cube, anyflag, fitsstat)
+      call FTGSVE(unit, group, 3, naxes_full, fpixel, lpixel, incs, 0.0_sp,&
+      &amp_chunk, anyflag, fitsstat)
       call FTCLOS(unit, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: failed to read data from: ', trim(ampfile)
-         status = -1
+         write(*,*) 'ERROR: failed to read tile data from: ', trim(ampfile)
+         !$omp atomic write
+         status_par = -1
+         deallocate(amp_chunk, pha_chunk)
          return
       endif
 
       fitsstat = 0
-      unit = 214
+      unit = 400 + thread_id
       call FTOPEN(unit, trim(phafile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(phafile)
-         status = -1
+         !$omp atomic write
+         status_par = -1
+         deallocate(amp_chunk, pha_chunk)
          return
       endif
-      call FTGPVE(unit, 1, 1, nx_in*ny_in*nrm_in, 0.0_sp, pha_cube, anyflag, fitsstat)
+      call FTGSVE(unit, group, 3, naxes_full, fpixel, lpixel, incs, 0.0_sp,&
+      &pha_chunk, anyflag, fitsstat)
       call FTCLOS(unit, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: failed to read data from: ', trim(phafile)
-         status = -1
+         write(*,*) 'ERROR: failed to read tile data from: ', trim(phafile)
+         !$omp atomic write
+         status_par = -1
+         deallocate(amp_chunk, pha_chunk)
          return
       endif
 
-      allocate(re_out(nx_in,ny_in,nrm_in), im_out(nx_in,ny_in,nrm_in))
-      re_out = amp_cube*cos(pha_cube)
-      im_out = amp_cube*sin(pha_cube)
-      deallocate(amp_cube, pha_cube)
-   end subroutine read_cube
+      re_out = amp_chunk*cos(pha_chunk)
+      im_out = amp_chunk*sin(pha_chunk)
+      deallocate(amp_chunk, pha_chunk)
+   end subroutine read_amp_pha_chunk
 
    subroutine read_mask_cube(filename, nx_in, ny_in, nchan_in, mask_out, status)
       character(len=*), intent(in) :: filename
@@ -962,26 +1486,43 @@ contains
       endif
    end subroutine read_mask_cube
 
-   subroutine write_output_cube(template_file, amp_outname, pha_outname,&
-   &nx_in, ny_in, nrm_in, re_in, im_in, status)
-      !! re/im -> amp/pha (inverse of read_cube's own forward convention),
-      !! header copied verbatim from template_file (always ampfile: same
+   subroutine open_output_cube(template_file, outname, nx_in, ny_in, nrm_in,&
+   &idx, status)
+      !! T4a/T4c: creates outname and writes its header ONLY (no pixel
+      !! data -- that now comes tile-by-tile via write_output_tile below,
+      !! since the whole cube is never resident in memory at once).
+      !! Header copied verbatim from template_file (always ampfile: same
       !! WCS on every axis, since this program never resamples anything --
       !! Gate 0 validates the existing RM grid rather than changing it).
-      character(len=*), intent(in) :: template_file, amp_outname, pha_outname
+      !!
+      !! T4c: if io_write_threads_eff==1, leaves out_unit(idx) OPEN -- the
+      !! caller keeps it open across the whole tile loop and closes it
+      !! itself via close_output_cube once every tile has been written; a
+      !! still-empty (never-written) FITS data segment is a well-defined
+      !! intermediate state that later FTPSSE subset writes fill in. If
+      !! io_write_threads_eff>1, fetches this HDU's pixel-data byte offset
+      !! (FTGHAD) into out_datastart(idx) and closes the handle
+      !! IMMEDIATELY -- this FTCLOS is what makes CFITSIO actually define/
+      !! flush the HDU to its full declared NAXIS extent on disk (ported
+      !! lesson from rm_synthesis.f90's own T6 postmortem: closing late
+      !! risks CFITSIO flushing a stale internal buffer over raw-written
+      !! bytes at ffclos time, since CFITSIO has no idea the raw writes
+      !! happened; closing right after FTGHAD makes that race impossible
+      !! rather than merely unlikely, and only after this close is the
+      !! file's on-disk size guaranteed to already span every byte offset
+      !! write_output_tile's raw-write path will ever compute).
+      character(len=*), intent(in) :: template_file, outname
       integer, intent(in) :: nx_in, ny_in, nrm_in
-      real(sp), intent(in) :: re_in(nx_in,ny_in,nrm_in), im_in(nx_in,ny_in,nrm_in)
+      integer, intent(in) :: idx
       integer, intent(out) :: status
-      integer :: src_unit, amp_unit, pha_unit, fitsstat, blocksize
+      integer :: src_unit, fitsstat, blocksize
       integer :: naxes_out(3)
       logical :: simple, extend
-      real(sp), allocatable :: amp_cube(:,:,:), pha_cube(:,:,:)
+      integer(kind=8) :: headstart, dataend, local_datastart
+      integer :: local_unit
 
       status = 0
-      allocate(amp_cube(nx_in,ny_in,nrm_in), pha_cube(nx_in,ny_in,nrm_in))
-      amp_cube = sqrt(re_in**2 + im_in**2)
-      pha_cube = atan2(im_in, re_in)
-
+      out_path(idx) = outname
       naxes_out(1) = nx_in
       naxes_out(2) = ny_in
       naxes_out(3) = nrm_in
@@ -989,68 +1530,355 @@ contains
       extend = .false.
 
       fitsstat = 0
-      src_unit = 216
+      src_unit = 227
       call FTOPEN(src_unit, trim(template_file), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(template_file)
          status = -1
-         deallocate(amp_cube, pha_cube)
          return
       endif
 
-      ! FTINIT fails (nonzero fitsstat) if amp_outname already exists on
-      ! disk -- checked and bailed out on IMMEDIATELY, before any further
-      ! CFITSIO call on amp_unit: every call after a failed FTINIT
+      ! FTINIT fails (nonzero fitsstat) if outname already exists on disk
+      ! -- checked and bailed out on IMMEDIATELY, before any further
+      ! CFITSIO call on out_unit(idx): every call after a failed FTINIT
       ! operates on a unit CFITSIO never actually set up, which is not a
       ! clean no-op but undefined behaviour (confirmed directly: this
       ! previously crashed with a SIGSEGV inside CFITSIO when an output
-      ! file from an earlier run was left on disk -- tests/run_tests.sh's
-      ! own section 28 must therefore also clean up its own rmc_* outputs
-      ! before each run, which it now does).
+      ! file from an earlier run was left on disk -- tests/run_tests.sh
+      ! must therefore also clean up its own rmc_* outputs before each
+      ! run, which it does).
       fitsstat = 0
-      amp_unit = 217
-      call FTINIT(amp_unit, trim(amp_outname), blocksize, fitsstat)
+      call FTINIT(out_unit(idx), trim(outname), blocksize, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: cannot create (already exists?): ', trim(amp_outname)
+         write(*,*) 'ERROR: cannot create (already exists?): ', trim(outname)
          status = -1
          call FTCLOS(src_unit, fitsstat)
-         deallocate(amp_cube, pha_cube)
          return
       endif
-      call FTPHPR(amp_unit, simple, -32, 3, naxes_out, 0, 1, extend, fitsstat)
-      call copy_generic_header_rmclean(src_unit, amp_unit, status)
-      call FTPPRE(amp_unit, 1, 1, nx_in*ny_in*nrm_in, amp_cube, fitsstat)
-      call FTCLOS(amp_unit, fitsstat)
+      call FTPHPR(out_unit(idx), simple, -32, 3, naxes_out, 0, 1, extend, fitsstat)
+      call copy_generic_header_rmclean(src_unit, out_unit(idx), status)
       if (fitsstat.ne.0 .or. status.ne.0) then
-         write(*,*) 'ERROR: failed to write: ', trim(amp_outname)
+         write(*,*) 'ERROR: failed to write header for: ', trim(outname)
          status = -1
          call FTCLOS(src_unit, fitsstat)
-         deallocate(amp_cube, pha_cube)
          return
       endif
-
-      fitsstat = 0
-      pha_unit = 218
-      call FTINIT(pha_unit, trim(pha_outname), blocksize, fitsstat)
-      if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: cannot create (already exists?): ', trim(pha_outname)
-         status = -1
-         call FTCLOS(src_unit, fitsstat)
-         deallocate(amp_cube, pha_cube)
-         return
-      endif
-      call FTPHPR(pha_unit, simple, -32, 3, naxes_out, 0, 1, extend, fitsstat)
-      call copy_generic_header_rmclean(src_unit, pha_unit, status)
-      call FTPPRE(pha_unit, 1, 1, nx_in*ny_in*nrm_in, pha_cube, fitsstat)
-      call FTCLOS(pha_unit, fitsstat)
-      if (fitsstat.ne.0 .or. status.ne.0) then
-         write(*,*) 'ERROR: failed to write: ', trim(pha_outname)
-         status = -1
-      endif
-
       call FTCLOS(src_unit, fitsstat)
-      deallocate(amp_cube, pha_cube)
-   end subroutine write_output_cube
+
+      out_is_open(idx) = .true.
+      if (io_write_threads_eff.gt.1) then
+         fitsstat = 0
+         local_unit = out_unit(idx)
+         ! Zero-init before the call: this system's installed libcfitsio
+         ! FTGHAD writes only the LOWER 32 bits of its 3 output arguments
+         ! (a genuine Fortran-wrapper/library ABI truncation, confirmed
+         ! directly with a minimal standalone reproducer -- the upper 32
+         ! bits of an integer(kind=8) receiving variable are left
+         ! completely untouched by the call). Leaving them at whatever an
+         ! uninitialized automatic variable happens to contain produced a
+         ! real, intermittent (stack-content-dependent) corrupted
+         ! out_datastart and a genuinely wrong CLEAN.AMP output --
+         ! zero-initializing first makes the untouched upper bits always
+         ! read back as zero, which is exactly correct for any offset
+         ! that (like every FITS header offset in practice) fits in 32
+         ! bits.
+         headstart = 0_8
+         local_datastart = 0_8
+         dataend = 0_8
+         call FTGHAD(local_unit, headstart, local_datastart, dataend, fitsstat)
+         out_datastart(idx) = local_datastart
+         if (fitsstat.ne.0) then
+            write(*,*) 'ERROR: FTGHAD (data-start offset) failed for: ', trim(outname)
+            status = -1
+            return
+         endif
+         fitsstat = 0
+         call FTCLOS(out_unit(idx), fitsstat)
+         out_is_open(idx) = .false.
+      endif
+   end subroutine open_output_cube
+
+   subroutine write_output_tile(idx_amp, idx_pha, nx_in, ny_in, nrm_in,&
+   &ix0, iy0, tx, ty, re_in, im_in, status)
+      !! T4a/T4c: re/im -> amp/pha (inverse of read_amp_pha_tile's own
+      !! forward convention). io_write_threads_eff==1 (default): written
+      !! via FTPSSE (subset write) at this tile's own [ix0:ix0+tx-1,
+      !! iy0:iy0+ty-1, 1:nrm_in] window into the already-open
+      !! out_unit(idx_amp/idx_pha) (opened once by open_output_cube,
+      !! closed once by close_output_cube after every tile has been
+      !! written). io_write_threads_eff>1: this tile's own nrm_in range is
+      !! split (split_range_rmclean) across that many threads, each
+      !! writing its own disjoint RM-chunk via write_rm_chunk_raw_rmclean
+      !! -- raw stream writes at computed byte offsets, bypassing
+      !! CFITSIO's ftpsse for the pixel data entirely, since N CFITSIO
+      !! handles opened read-write on the SAME file alias onto one shared
+      !! internal buffer (cfitsio's own fits_already_open() contract) and
+      !! concurrent writes through them corrupt it -- confirmed by
+      !! rm_synthesis's own T4 postmortem (real SIGSEGV in memmove inside
+      !! libcfitsio), which is why io_write_threads>1 never opens extra
+      !! CFITSIO handles at all (see open_output_cube's own early-close).
+      integer, intent(in) :: idx_amp, idx_pha
+      integer, intent(in) :: nx_in, ny_in, nrm_in, ix0, iy0, tx, ty
+      real(sp), intent(in) :: re_in(tx,ty,nrm_in), im_in(tx,ty,nrm_in)
+      integer, intent(out) :: status
+      integer :: fitsstat
+      integer :: naxes_out(3), fpixel(3), lpixel(3)
+      integer :: base_chan, rem_chan, ith, rm_beg, rm_len
+      real(sp), allocatable :: amp_tile(:,:,:), pha_tile(:,:,:)
+
+      status = 0
+      allocate(amp_tile(tx,ty,nrm_in), pha_tile(tx,ty,nrm_in))
+      amp_tile = sqrt(re_in**2 + im_in**2)
+      pha_tile = atan2(im_in, re_in)
+
+      if (io_write_threads_eff.le.1) then
+         naxes_out = (/ nx_in, ny_in, nrm_in /)
+         fpixel = (/ ix0, iy0, 1 /)
+         lpixel = (/ ix0+tx-1, iy0+ty-1, nrm_in /)
+
+         fitsstat = 0
+         call FTPSSE(out_unit(idx_amp), 1, 3, naxes_out, fpixel, lpixel,&
+         &amp_tile, fitsstat)
+         if (fitsstat.ne.0) then
+            write(*,*) 'ERROR: failed to write AMP tile at (', ix0, ',', iy0, ')'
+            status = -1
+         endif
+         fitsstat = 0
+         call FTPSSE(out_unit(idx_pha), 1, 3, naxes_out, fpixel, lpixel,&
+         &pha_tile, fitsstat)
+         if (fitsstat.ne.0) then
+            write(*,*) 'ERROR: failed to write PHA tile at (', ix0, ',', iy0, ')'
+            status = -1
+         endif
+      else
+         call split_range_rmclean(nrm_in, io_write_threads_eff, base_chan, rem_chan)
+         !$omp parallel do schedule(static) default(shared)&
+         !$omp& private(ith,rm_beg,rm_len) num_threads(io_write_threads_eff)
+         do ith = 0, io_write_threads_eff-1
+            if (ith.lt.rem_chan) then
+               rm_len = base_chan + 1
+               rm_beg = ith*(base_chan+1) + 1
+            else
+               rm_len = base_chan
+               rm_beg = rem_chan*(base_chan+1) + (ith-rem_chan)*base_chan + 1
+            endif
+            if (rm_len.gt.0) then
+               ! 500+ith/600+ith: fixed, disjoint per-thread unit numbers
+               ! for the AMP/PHA raw writers -- see write_rm_chunk_raw_
+               ! rmclean's own comment for why these are pre-assigned
+               ! rather than left to newunit=.
+               call write_rm_chunk_raw_rmclean(out_path(idx_amp),&
+               &out_datastart(idx_amp), nx_in, ny_in, ix0, ix0+tx-1,&
+               &iy0, iy0+ty-1, rm_beg, rm_beg+rm_len-1, 500+ith,&
+               &amp_tile(:,:,rm_beg:rm_beg+rm_len-1))
+               call write_rm_chunk_raw_rmclean(out_path(idx_pha),&
+               &out_datastart(idx_pha), nx_in, ny_in, ix0, ix0+tx-1,&
+               &iy0, iy0+ty-1, rm_beg, rm_beg+rm_len-1, 600+ith,&
+               &pha_tile(:,:,rm_beg:rm_beg+rm_len-1))
+            endif
+         enddo
+         !$omp end parallel do
+      endif
+      deallocate(amp_tile, pha_tile)
+   end subroutine write_output_tile
+
+   subroutine do_tile_write(job)
+      !! T4d: the actual "write one tile's 6 output cubes" payload --
+      !! callable either inline (io_overlap=n) or as a pthread entry
+      !! point's own payload (io_overlap=y); identical logic either way,
+      !! so output is bit-for-bit the same regardless of which mode
+      !! dispatched it (same invariant as rm_synthesis_mod.f90's own
+      !! do_tile_write). Just calls the already-existing, already-tested
+      !! write_output_tile (T4a/T4c) three times -- once per (clean,
+      !! resid, restored) pair -- using this job's own tile geometry and
+      !! the 6 output-array pointers it was populated with. Any write
+      !! failure is reported (write_output_tile's own error prints) but
+      !! not propagated as a return status: once dispatched onto a
+      !! background thread, there is no synchronous caller left to hand a
+      !! status to -- same convention rm_synthesis's own do_tile_write
+      !! uses (log the error, don't silently drop the write, don't try to
+      !! halt the program from a background thread).
+      type(tile_write_job_t), intent(inout) :: job
+      integer :: status_local
+
+      call write_output_tile(idx_clean_amp, idx_clean_pha, nx, ny, nrm,&
+      &job%ix_tile_beg, job%iy_tile_beg, job%tx, job%ty,&
+      &job%re_ptr(1)%p, job%im_ptr(1)%p, status_local)
+      call write_output_tile(idx_resid_amp, idx_resid_pha, nx, ny, nrm,&
+      &job%ix_tile_beg, job%iy_tile_beg, job%tx, job%ty,&
+      &job%re_ptr(2)%p, job%im_ptr(2)%p, status_local)
+      call write_output_tile(idx_restored_amp, idx_restored_pha, nx, ny, nrm,&
+      &job%ix_tile_beg, job%iy_tile_beg, job%tx, job%ty,&
+      &job%re_ptr(3)%p, job%im_ptr(3)%p, status_local)
+   end subroutine do_tile_write
+
+   function tile_write_thread_entry(arg) bind(C) result(res)
+      !! pthread start routine. Unpacks the opaque context pointer back
+      !! into the tile_write_job_t it was created from (same process,
+      !! same build, so the round-trip through c_loc/c_f_pointer is safe
+      !! even though tile_write_job_t is not a bind(C) type) and runs the
+      !! write. Verbatim port of rm_synthesis_mod.f90's own
+      !! tile_write_thread_entry.
+      type(c_ptr), value :: arg
+      type(c_ptr) :: res
+      type(tile_write_job_t), pointer :: job
+
+      call c_f_pointer(arg, job)
+      call do_tile_write(job)
+      res = c_null_ptr
+   end function tile_write_thread_entry
+
+   subroutine tile_write_dispatch_async(job, thread_id, dispatched)
+      !! Launches do_tile_write(job) on a background pthread. `job` must
+      !! have the TARGET attribute at the call site (write_job(0:1)'s own
+      !! declaration) and must remain valid -- untouched and
+      !! undeallocated -- until tile_write_join(thread_id) has returned.
+      !! On pthread_create failure this runs the write synchronously right
+      !! here instead (safe fallback: a write is never silently dropped),
+      !! and reports dispatched=.false. so the caller knows there is
+      !! nothing to join later. Verbatim port of rm_synthesis_mod.f90's
+      !! own tile_write_dispatch_async.
+      type(tile_write_job_t), intent(inout), target :: job
+      integer(c_long), intent(out) :: thread_id
+      logical, intent(out) :: dispatched
+      integer(c_int) :: rc
+
+      rc = c_pthread_create(thread_id, c_null_ptr,&
+      &c_funloc(tile_write_thread_entry), c_loc(job))
+      if (rc.ne.0_c_int) then
+         write(*,*) 'WARNING: pthread_create failed for async tile write;'//&
+         &' running inline'
+         call do_tile_write(job)
+         dispatched = .false.
+      else
+         dispatched = .true.
+      endif
+   end subroutine tile_write_dispatch_async
+
+   subroutine tile_write_join(thread_id)
+      integer(c_long), intent(in) :: thread_id
+      integer(c_int) :: rc
+      rc = c_pthread_join(thread_id, c_null_ptr)
+   end subroutine tile_write_join
+
+   subroutine close_output_cube(idx)
+      integer, intent(in) :: idx
+      integer :: fitsstat
+      if (.not. out_is_open(idx)) return
+      fitsstat = 0
+      call FTCLOS(out_unit(idx), fitsstat)
+      out_is_open(idx) = .false.
+   end subroutine close_output_cube
+
+   logical function host_is_big_endian_rmclean() result(is_be)
+      !! Verbatim port of rm_synthesis_mod.f90's own host_is_big_endian --
+      !! see there for the full rationale (FITS mandates big-endian; every
+      !! realistic deployment target is little-endian, so this is a
+      !! runtime check rather than a hard-coded assumption to stay
+      !! correct, not just fast, on a big-endian host).
+      integer(kind=4) :: probe
+      integer(kind=1) :: bytes(4)
+      probe = 1_4
+      bytes = transfer(probe, bytes)
+      is_be = (bytes(1).eq.0_1)
+   end function host_is_big_endian_rmclean
+
+   subroutine swap_bytes_r4_inplace_rmclean(buf, n)
+      !! Verbatim port of rm_synthesis_mod.f90's own swap_bytes_r4_inplace.
+      integer(kind=8), intent(in) :: n
+      real(sp), intent(inout) :: buf(n)
+      integer(kind=8) :: i
+      integer(kind=1) :: b(4), t
+      do i = 1_8, n
+         b = transfer(buf(i), b)
+         t = b(1); b(1) = b(4); b(4) = t
+         t = b(2); b(2) = b(3); b(3) = t
+         buf(i) = transfer(b, buf(i))
+      enddo
+   end subroutine swap_bytes_r4_inplace_rmclean
+
+   subroutine write_rm_chunk_raw_rmclean(file_path, datastart, nx_out,&
+   &ny_out, ix_out_beg, ix_out_end, iy_out_beg, iy_out_end, rm_beg,&
+   &rm_end, unit_no, data)
+      !! Adaptation of rm_synthesis_mod.f90's own write_rm_chunk_raw --
+      !! see there for the full byte-offset-math/two-write-pattern/
+      !! endianness rationale. Writes one contiguous RM-bin range
+      !! [rm_beg,rm_end] of one tile's output data directly to disk via
+      !! plain Fortran stream I/O, bypassing CFITSIO's ftpsse for the
+      !! pixel data entirely (see write_output_tile's own comment for
+      !! why).
+      !!
+      !! Deviates from rm_synthesis's own `open(newunit=u,...)` in one
+      !! respect: unit_no is a FIXED, caller-assigned number (disjoint per
+      !! concurrent writer, see write_output_tile's own comment) rather
+      !! than letting the runtime pick one via newunit= at OPEN time.
+      !! Found empirically, not assumed: concurrent `newunit=` calls from
+      !! separate OpenMP threads (each opening the SAME file path, for its
+      !! own disjoint byte range) intermittently produced an all-zero
+      !! output cube -- gfortran/libgfortran's own free-unit-number
+      !! bookkeeping is not documented as safe against concurrent
+      !! allocation, and a race there (two threads handed the same
+      !! "unique" unit) would explain one thread's file state silently
+      !! clobbering another's. Pre-assigned, disjoint unit numbers per
+      !! writer sidestep that allocation race entirely rather than relying
+      !! on it being fixed/absent in a given gfortran version.
+      character(len=*), intent(in) :: file_path
+      integer(kind=8), intent(in) :: datastart
+      integer, intent(in) :: nx_out, ny_out
+      integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
+      integer, intent(in) :: rm_beg, rm_end, unit_no
+      real(sp), intent(in) :: data(*)
+
+      integer :: u, ios
+      logical :: full_width, need_swap
+      integer(kind=8) :: row_len, n_rows, plane_elems, plane_stride
+      integer(kind=8) :: irm, iy_local, mem_off, byte_pos
+      real(sp), allocatable :: plane_buf(:)
+
+      full_width = (ix_out_beg.eq.1 .and. ix_out_end.eq.nx_out)
+      need_swap = .not. host_is_big_endian_rmclean()
+      row_len = int(ix_out_end-ix_out_beg+1, 8)
+      n_rows = int(iy_out_end-iy_out_beg+1, 8)
+      plane_elems = row_len * n_rows
+      plane_stride = int(nx_out, 8) * int(ny_out, 8)
+
+      u = unit_no
+      open(unit=u, file=trim(file_path), access='stream',&
+      &form='unformatted', status='old', action='write', iostat=ios)
+      if (ios.ne.0) then
+         write(*,*) 'ERROR: write_rm_chunk_raw_rmclean: failed to open ',&
+         &trim(file_path)
+         return
+      endif
+
+      allocate(plane_buf(plane_elems))
+      mem_off = 1_8
+      do irm = int(rm_beg,8), int(rm_end,8)
+         plane_buf = data(mem_off:mem_off+plane_elems-1_8)
+         if (need_swap) call swap_bytes_r4_inplace_rmclean(plane_buf, plane_elems)
+
+         if (full_width) then
+            byte_pos = datastart + (irm-1_8)*plane_stride*4_8&
+            &+ int(iy_out_beg-1,8)*int(nx_out,8)*4_8 + 1_8
+            write(u, pos=byte_pos, iostat=ios) plane_buf
+            if (ios.ne.0) write(*,*) 'ERROR: write_rm_chunk_raw_rmclean:'//&
+            &' write failed (full-width) for ', trim(file_path)
+         else
+            do iy_local = 0_8, n_rows-1_8
+               byte_pos = datastart + (irm-1_8)*plane_stride*4_8&
+               &+ (int(iy_out_beg,8)-1_8+iy_local)*int(nx_out,8)*4_8&
+               &+ int(ix_out_beg-1,8)*4_8 + 1_8
+               write(u, pos=byte_pos, iostat=ios)&
+               &plane_buf(iy_local*row_len+1_8:iy_local*row_len+row_len)
+               if (ios.ne.0) write(*,*) 'ERROR: write_rm_chunk_raw_rmclean:'//&
+               &' write failed (row) for ', trim(file_path)
+            enddo
+         endif
+         mem_off = mem_off + plane_elems
+      enddo
+      deallocate(plane_buf)
+      close(u)
+   end subroutine write_rm_chunk_raw_rmclean
 
    subroutine copy_generic_header_rmclean(src_unit, dst_unit, status)
       !! Verbatim adaptation of convolve_cubes.f90's own
@@ -1233,20 +2061,29 @@ contains
       endif
    end subroutine build_mask_pattern_cache
 
-   subroutine clean_one_pixel(ix_p, iy_p)
+   subroutine clean_one_pixel(ix_l, iy_l, ix0, iy0)
       !! One pixel's full CLEAN+restore, called from the main program's
-      !! own `!$omp parallel do` over (ix,iy). Every array declared here
-      !! is a genuine LOCAL (automatic per-call) variable -- Fortran
-      !! gives each concurrent call its own independent storage for
-      !! these, with no `save` and no module-level state written here,
-      !! so this subroutine is thread-safe purely by construction, no
-      !! explicit `private()` bookkeeping needed for them. Everything
-      !! this subroutine reads via host association (re_cube, mask_cube,
-      !! rm_samp, l_sq, cache_entries/cache_buckets, restore_plan_fwd/
-      !! bwd, ...) is READ-ONLY here; every array it WRITES (the 6
-      !! output cubes) is written only at (ix_p,iy_p,:), a disjoint
-      !! location per call -- no race either way.
-      integer, intent(in) :: ix_p, iy_p
+      !! own per-tile `!$omp parallel do` over the tile's own local
+      !! (ix_l,iy_l) in [1,tx]x[1,ty]. (ix0,iy0) is the tile's own origin
+      !! (ix_tile_beg,iy_tile_beg) so this subroutine can address the
+      !! still-whole-cube-resident mask_cube/pattern cache at their GLOBAL
+      !! pixel position (ix_g,iy_g) while reading/writing the tile-local
+      !! re_tile/im_tile/clean_*_tile/resid_*_tile/restored_*_tile arrays
+      !! at their LOCAL position -- see this file's own top comment on why
+      !! the mask stays whole-cube-resident while the float cubes are now
+      !! tiled (T4a). Every array declared here is a genuine LOCAL
+      !! (automatic per-call) variable -- Fortran gives each concurrent
+      !! call its own independent storage for these, with no `save` and
+      !! no module-level state written here, so this subroutine is
+      !! thread-safe purely by construction, no explicit `private()`
+      !! bookkeeping needed for them. Everything this subroutine reads via
+      !! host association (re_tile, mask_cube, rm_samp, l_sq, cache_
+      !! entries/cache_buckets, restore_plan_fwd/bwd, ...) is READ-ONLY
+      !! here; every array it WRITES (the 6 tile-output arrays) is written
+      !! only at (ix_l,iy_l,:), a disjoint location per call -- no race
+      !! either way.
+      integer, intent(in) :: ix_l, iy_l, ix0, iy0
+      integer :: ix_g, iy_g
       integer :: nvalid_p, n_iter_used_p, k_p, entry_idx_p
       integer, allocatable :: valid_idx_p(:)
       real(sp), allocatable :: l_sq_valid_p(:)
@@ -1258,10 +2095,13 @@ contains
       type(rmsf_table_t) :: throwaway_table
       logical :: used_throwaway
 
+      ix_g = ix0 + ix_l - 1
+      iy_g = iy0 + iy_l - 1
+
       nvalid_p = 0
       allocate(valid_idx_p(nchan), l_sq_valid_p(nchan))
       do k_p = 1, nchan
-         if (mask_cube(ix_p,iy_p,k_p).ne.0) then
+         if (mask_cube(ix_g,iy_g,k_p).ne.0) then
             nvalid_p = nvalid_p + 1
             valid_idx_p(nvalid_p) = k_p
          endif
@@ -1274,12 +2114,12 @@ contains
          ! straight through to every output, matching rm_synthesis's own
          ! bad-pixel policy rather than inventing a table for an empty
          ! channel set.
-         clean_re_cube(ix_p,iy_p,:) = re_cube(ix_p,iy_p,:)
-         clean_im_cube(ix_p,iy_p,:) = im_cube(ix_p,iy_p,:)
-         resid_re_cube(ix_p,iy_p,:) = re_cube(ix_p,iy_p,:)
-         resid_im_cube(ix_p,iy_p,:) = im_cube(ix_p,iy_p,:)
-         restored_re_cube(ix_p,iy_p,:) = re_cube(ix_p,iy_p,:)
-         restored_im_cube(ix_p,iy_p,:) = im_cube(ix_p,iy_p,:)
+         clean_re_tile(ix_l,iy_l,:) = re_tile(ix_l,iy_l,:)
+         clean_im_tile(ix_l,iy_l,:) = im_tile(ix_l,iy_l,:)
+         resid_re_tile(ix_l,iy_l,:) = re_tile(ix_l,iy_l,:)
+         resid_im_tile(ix_l,iy_l,:) = im_tile(ix_l,iy_l,:)
+         restored_re_tile(ix_l,iy_l,:) = re_tile(ix_l,iy_l,:)
+         restored_im_tile(ix_l,iy_l,:) = im_tile(ix_l,iy_l,:)
          deallocate(valid_idx_p, l_sq_valid_p)
          return
       endif
@@ -1291,7 +2131,7 @@ contains
       ! build the SUBTRACTION beam.
       l_sq_valid_p(1:nvalid_p) = l_sq(valid_idx_p(1:nvalid_p))
 
-      call cache_lookup_readonly(mask_cube(ix_p,iy_p,:), entry_idx_p)
+      call cache_lookup_readonly(mask_cube(ix_g,iy_g,:), entry_idx_p)
       used_throwaway = (entry_idx_p.eq.0)
       if (used_throwaway) then
          call build_rmsf_offset_table(l_sq_valid_p(1:nvalid_p), nvalid_p,&
@@ -1299,8 +2139,8 @@ contains
          &table_oversample, throwaway_table)
       endif
 
-      dirty_re_p = re_cube(ix_p,iy_p,:)
-      dirty_im_p = im_cube(ix_p,iy_p,:)
+      dirty_re_p = re_tile(ix_l,iy_l,:)
+      dirty_im_p = im_tile(ix_l,iy_l,:)
 
       if (lsq_ref_compute.ne.lsq_ref_native) then
          ! Exact, lossless phase rotation of the ALREADY-SAMPLED dirty
@@ -1345,12 +2185,12 @@ contains
          &restored_im_p)
       endif
 
-      clean_re_cube(ix_p,iy_p,:) = comp_re_p
-      clean_im_cube(ix_p,iy_p,:) = comp_im_p
-      resid_re_cube(ix_p,iy_p,:) = resid_re_p
-      resid_im_cube(ix_p,iy_p,:) = resid_im_p
-      restored_re_cube(ix_p,iy_p,:) = restored_re_p
-      restored_im_cube(ix_p,iy_p,:) = restored_im_p
+      clean_re_tile(ix_l,iy_l,:) = comp_re_p
+      clean_im_tile(ix_l,iy_l,:) = comp_im_p
+      resid_re_tile(ix_l,iy_l,:) = resid_re_p
+      resid_im_tile(ix_l,iy_l,:) = resid_im_p
+      restored_re_tile(ix_l,iy_l,:) = restored_re_p
+      restored_im_tile(ix_l,iy_l,:) = restored_im_p
 
       deallocate(valid_idx_p, l_sq_valid_p)
       !$omp atomic
