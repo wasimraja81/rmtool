@@ -98,20 +98,24 @@ brew install cfitsio
 # From source: https://heasarc.gsfc.nasa.gov/fitsio/
 ```
 
-### Starlink AST and FFTW3 (only needed for `reproject_cubes`/`convolve_cubes`/`match_cubes`)
+### Starlink AST and FFTW3 (only needed for `reproject_cubes`/`convolve_cubes`/`match_cubes`/`rmclean_cubes`)
 The main `rm_synthesis` build needs only gfortran + CFITSIO above.
-`reproject_cubes`, `convolve_cubes`, and `match_cubes` (which consolidates
+`reproject_cubes`, `convolve_cubes`, `match_cubes` (which consolidates
 the other two, with an option to chain them through memory with no
-intermediate FITS file) are independent standalone tools (own binaries,
-own build targets, not linked into `rm_synthesis`) with their own extra
+intermediate FITS file), and `rmclean_cubes` (standalone RM-CLEAN,
+driving `rmclean_mod` against real dirty AMP/PHA cubes `rm_synthesis`
+itself wrote) are independent standalone tools (own binaries, own build
+targets, not linked into `rm_synthesis`) with their own extra
 dependencies:
 ```bash
 # Debian/Ubuntu
 sudo apt-get install libstarlink-ast-dev libstarlink-ast-err9 \
     libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev
 ```
-Both packaged into `docker/dockerfile` already, if building via the
-container is easier than installing these directly.
+`rmclean_cubes` needs only FFTW3 + CFITSIO from the above (no Starlink
+AST dependency -- it never resamples anything). Both packaged into
+`docker/dockerfile` already, if building via the container is easier
+than installing these directly.
 
 ## Build Targets
 
@@ -122,6 +126,7 @@ container is easier than installing these directly.
 | `make reproject_cubes` | Build the cross-band sky-grid alignment tool (`bin/reproject_cubes`) |
 | `make convolve_cubes` | Build the cross-band resolution-matching tool (`bin/convolve_cubes`) |
 | `make match_cubes` | Build the consolidated reproject+convolve tool, chainable through memory (`bin/match_cubes`) |
+| `make rmclean_cubes` | Build the standalone RM-CLEAN tool (`bin/rmclean_cubes`) |
 | `make clean` | Remove build artifacts |
 | `make install` | Install to /usr/local/bin |
 | `make uninstall` | Remove installation |
@@ -141,16 +146,20 @@ rmtool/
 │   ├── gaussft.f90               # gaussft_mod: beam-matching convolution (pure)
 │   ├── commonbeam.f90            # commonbeam_mod: smallest common beam
 │   ├── convolve_cubes.f90        # Standalone: cross-band resolution matching
-│   └── match_cubes.f90           # Standalone: reproject_cubes + convolve_cubes
-│                                  # consolidated, chainable through memory
+│   ├── match_cubes.f90           # Standalone: reproject_cubes + convolve_cubes
+│   │                              # consolidated, chainable through memory
+│   ├── rmclean.f90               # rmclean_mod: RM-CLEAN core (pure computation)
+│   └── rmclean_cubes.f90         # Standalone: RM-CLEAN driven against real
+│                                  # dirty AMP/PHA cubes rm_synthesis wrote
 ├── build/                        # Build artifacts (Makefile)
 │   ├── modules/                  # Compiled .mod files
 │   ├── reproject_cubes/          # reproject_cubes' own build artifacts
 │   ├── convolve_cubes/           # convolve_cubes' own build artifacts
 │   ├── match_cubes/              # match_cubes' own build artifacts
+│   ├── rmclean_cubes/            # rmclean_cubes' own build artifacts
 │   └── *.o                       # Object files
 ├── bin/                          # Final executables (rm_synthesis, reproject_cubes,
-│                                  # convolve_cubes, match_cubes)
+│                                  # convolve_cubes, match_cubes, rmclean_cubes)
 ├── Makefile                      # Simple build
 ├── build.sh                      # Quick build script
 └── cfg/                          # Configuration files, incl. example_beamLog.txt/.csv

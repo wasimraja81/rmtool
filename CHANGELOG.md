@@ -2,6 +2,160 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased] - RM-CLEAN integration
+
+RM-CLEAN made practically usable end-to-end: a new standalone tool,
+`rmclean_cubes`, drives the existing `rmclean_mod` core (Högbom-style
+complex CLEAN, Gaussian restore) against REAL dirty AMP/PHA cubes
+`rm_synthesis` itself writes, rather than only the synthetic spectra its
+own unit test programs built in memory. Full design rationale, decisions
+recorded with the user, and ticket-by-ticket verification evidence lives
+in `planning/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T3) — this entry is
+a summary, not a replacement for that record.
+
+### Added — `rmclean_cubes` standalone tool (ticket T2)
+- New standalone program `src/rmclean_cubes.f90` (own Makefile target
+  `make rmclean_cubes`, `bin/rmclean_cubes`), following
+  `reproject_cubes`/`convolve_cubes`'s own conventions (own key=value/
+  `--config` parser, `--help`, own Makefile block, wired into
+  `scripts/make_all.sh` and `docker/dockerfile`).
+- **Gate 0**: since this tool cannot resample the RM axis (`CDELT3`/`nrm`
+  are fixed by whatever `rm_synthesis` already wrote), it validates the
+  existing grid against `get_drm`'s own sampling bound instead — refuses
+  to proceed (clear error) rather than silently CLEANing on an
+  undersampled grid.
+- `lsq_ref_compute` (this tool's own RMSF-table/CLEAN reference) is a
+  free, independent choice (`lsq_ref_compute_mode=native|zero|mid|
+  centroid|min|max|fixed`), applied via an exact `derotate_to_lsq_ref`
+  phase rotation of the already-sampled dirty spectrum — no accuracy
+  cost, though also no compute-cost benefit once the RM grid already
+  exists (that benefit only applies upstream, at `rm_synthesis`'s own
+  new `lsq_ref_mode`, below). Gate 0 always validates against the
+  cube's own actual reference (`lsq_ref_native`, read from a new
+  `LSQREF` header keyword — see below), never against this choice.
+- **Mask-pattern cache**: pixels sharing the same valid-channel mask
+  pattern share one RMSF table, built once during a serial pre-scan and
+  looked up via a hash-bucketed (open-addressing, collision-safe) table
+  for O(1) amortized lookup; capped at `mask_pattern_cache_max` (default
+  4096) distinct patterns, with a one-off throwaway table past the cap.
+- **OpenMP parallelism**: one thread per pixel (embarrassingly parallel
+  along the RM axis); verified bit-identical output across thread
+  counts and across cache configurations (generous/disabled/overflowing).
+- `restore_fwhm`, `threshold`/`niter`/`gain`/`oversample`/
+  `table_oversample`, `lsq_ref_report_mode`/`_value` round out the config
+  surface; `--help` documents all of it.
+
+### Added — `rm_synthesis`'s own configurable phase reference (ticket T2b)
+- New `lsq_ref_mode` (`zero`|`mid`|`centroid`|`min`|`max`|`fixed`, plus
+  `lsq_ref_fixed_value`) config keys, mirroring `rmclean_mod`'s own
+  `get_lsq_ref_compute` mode+value strategy (duplicated logic, not a new
+  module dependency — this module is the older, heavily
+  production-tested core). Default `zero` preserves every existing cfg
+  file's behaviour exactly, unaffected unless set explicitly.
+- The actual phase reference used is now recorded on both AMP/PHA cubes
+  as a new `LSQREF` header keyword, so `rmclean_cubes` (or any other
+  downstream reader) never has to assume a value; falls back to 0.0
+  (this project's historical convention) with a printed warning for
+  cubes written before this keyword existed.
+
+### Added — model-based matched-filter peak refinement (ticket T3)
+- `clean_complex`'s own sub-pixel peak refinement no longer fits a local
+  parabola directly through the raw, stored `Re`/`Im` samples
+  (`peak_interp_parabolic`'s old role) — that fit was only valid if the
+  RM axis already satisfied `get_drm`'s demanding `max_offset`-based
+  bound (real numbers, thesis P-band: ~22-44x oversampling relative to
+  resolution `fwhm` at `lsq_ref=0`), because those samples carry a fast,
+  `lsq_ref`-dependent carrier a low-order local fit can't resolve.
+- New `rmsf_point_direct` (exact, O(nchan), single-offset RMSF
+  evaluation) and `refine_peak_matched_filter` (a local matched-filter
+  search against that exact model, using only the nearest stored coarse
+  samples as anchors) replace it. The RMSF is analytically known from
+  channel λ² alone — no raw per-channel data needed — so this removes
+  the outer grid's dependence on `get_drm`'s bound entirely; only
+  ordinary resolution-level sampling is needed now.
+- Landed in 3 independently-tested phases (isolated validation, additive
+  new subroutines, then the `clean_complex` swap), each gated on its own
+  passing test, per the project's "validate all claims before
+  production" policy. `clean_complex`'s own signature gained
+  `l_sq`/`nchan`/`lsq_ref_compute` (needed by the new refinement, not by
+  the old parabola) — updated at all 5 call sites.
+- A real, measured performance cost was found and addressed during
+  validation: the first working tuning (5 anchors, 200 samples/carrier-
+  cycle) took `rmclean_cubes` from sub-second to ~1m40s on a 1024-pixel
+  test cube. Retuned with evidence (3 vs. 5 anchors were bit-identical
+  in every noiseless test; the real failure boundary was found ~7-8
+  samples/cycle, with 50/cycle chosen as a checked >=6x margin): ~31.6s
+  on the same cube (~3.2x). Flagged to the user as not fully closed —
+  a coarse-to-fine two-stage search (ticket T3c, not yet started) should
+  close the remaining gap for genuinely large cubes.
+### Added — tiered peak refinement + resolution-based Gate 0 (tickets T3b/T3c)
+- `refine_peak_matched_filter` is now TIERED (T3c, designed jointly with
+  the user): a cheap fast path runs every CLEAN iteration — peak
+  location from the log-magnitude parabola, complex amplitude solved
+  closed-form against the ≥2 nearest stored anchors at that fixed
+  location — and its leftover misfit doubles as a self-consistency
+  diagnostic (deliberately NOT a single-point division, which always
+  "fits" and can never signal a wrong location). Only when that misfit
+  exceeds `nsigma × noise_rms` (noise: the same per-iteration
+  `rms_about_mean` the stopping criterion already uses) does the full
+  T3 local search run for that iteration. `nsigma` is user-facing
+  (`nsigma_refine` optional argument on `clean_complex`,
+  `refine_nsigma=` key on `rmclean_cubes`, default 3.0, confirmed
+  against a deterministic noisy test scenario). Search constants
+  re-anchored physically (statistic oscillates at 2× the carrier rate;
+  `m_floor` cut 100→20, tied to `table_oversample`'s own sub-cell
+  meaning). Measured: the 1024-pixel test cube went 31.6s → **0.46s**
+  (~217x faster than T3's first working version), sources recovered
+  unchanged.
+- `rmclean_cubes`' Gate 0 recast (T3b) as a pure RM-RESOLUTION
+  criterion: `|CDELT3| ≤ fwhm/min_samples_per_fwhm` (fwhm from
+  `compute_rmsf_fwhm_multiband`, `lsq_ref`-independent; always the
+  data's own fwhm, never the `restore_fwhm` override). New
+  `min_samples_per_fwhm=` key (default 2, hard floor 1) replaces the
+  retired carrier-based `oversample=` key. Verified both directions
+  (real cube passes; CDELT3 forged coarse is refused at default,
+  accepted at the floor).
+- A real input-contract boundary found by the suite itself: at a
+  band-centroid reference the carrier and resolution scales coincide,
+  so `test_drm_floor.f90`'s `oversample=1` case is 0.5 samples/fwhm —
+  below resolution Nyquist, outside the new contract — and the tiered
+  default correctly cannot be relied on there (the sidelobe-dominated
+  early-iteration rms makes escalation too lenient to catch it). The
+  test now expects failure again with the NEW reason documented
+  (sub-resolution input — exactly what Gate 0 refuses in production),
+  and its `oversample=2` (1 sample/fwhm) case confirms the default-2
+  gate carries genuine margin. `get_drm` itself is unchanged — still
+  correct for its remaining jobs (T3c's internal search sizing,
+  `rm_synthesis`-side grid planning).
+
+### Fixed
+- Two stale doc comments (`src/rmclean.f90`, `tests/thesis_scenario_
+  rmclean.f90`) incorrectly claimed `rm_synthesis_mod.f90`'s own
+  `extract_general_setup` references the band's own mean λ² — it is, and
+  always was, unconditionally at `lambda_sq=0`.
+- A real robustness bug in `rmclean_cubes` found via testing, not
+  inspection: `FTOPEN`/`FTINIT` return status was not checked before
+  subsequent CFITSIO calls in `read_cube`/`read_mask_cube`/
+  `write_output_cube` — a failed open/create (e.g. re-running the tool
+  without cleaning up a previous run's own output files) left later
+  calls operating on a CFITSIO unit that was never actually set up,
+  reproduced as a real SIGSEGV. Fixed by checking status immediately
+  after every `FTOPEN`/`FTINIT` and bailing out cleanly.
+
+### Verification
+- Full regression 85/85 (`tests/run_tests.sh` sections 23-29 cover all
+  of T1/T2/T2b/T3): section 28, `RM-CLEAN matched-filter peak
+  refinement`, validates the new subroutines against 2 independent
+  point-source scenarios at 4 sampling densities each; section 29,
+  `rmclean_cubes` end-to-end against a real `lsq_ref_mode=mid` cube,
+  covering the `LSQREF` header round-trip, Gate 0, both known injected
+  point sources recovered via `check_rm_peak.py`, and mask-pattern cache
+  correctness.
+- Manually verified: known injected point sources recovered with exact
+  RM, ~0.1-0.2% amplitude error, ~0.05° intrinsic-angle error, across
+  both the native and an explicitly-derotated `lsq_ref_compute`; 1-thread
+  vs. 4-thread and cache-big/zero/small runs all bit-identical.
+
 ## [5.0] - `5.0-rc.1` tagged on `develop`; real-scale validation pending before `main`
 
 Multi-band Faraday tomography milestone — by far the largest single body

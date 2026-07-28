@@ -2,12 +2,19 @@
 
 Branch: `rmclean-integration` (from `develop`)
 
-**Status: T0 (MASK.CUBE.FITS per-channel frequency/band table) and T1
-(RM-CLEAN core algorithm module, `src/rmclean.f90`) done and verified.
-T2 (standalone tool + per-pixel mask-pattern caching) scoped from design
-discussion but not yet implemented; expect numbering/scope to firm up
-once started, per this project's own convention of writing a ticket's
-Evidence section only once its own work is done.**
+**Status: T0 (MASK.CUBE.FITS per-channel frequency/band table), T1
+(RM-CLEAN core algorithm module, `src/rmclean.f90`), T2 (standalone
+tool `rmclean_cubes` + per-pixel mask-pattern caching + OpenMP
+parallelism), T2b (`rm_synthesis`'s own `lsq_ref_mode`), T3
+(model-based matched-filter peak refinement, replacing
+`peak_interp_parabolic`'s own complex-value step), T3b (Gate 0 recast
+as an RM-resolution criterion, `min_samples_per_fwhm`), and T3c (tiered
+fast-path refinement with data-driven `refine_nsigma` escalation --
+superseding the originally-sketched coarse-to-fine idea, and closing
+T3's own performance gap) all done and verified -- see each ticket's
+own Evidence section below. GPU support for RM-CLEAN is explicitly
+deferred to a later, separate effort (decision 6 below); everything
+here is OpenMP-CPU-only by design.**
 
 ## Context
 
@@ -1082,13 +1089,329 @@ Full regression: 78/78 (up from 74/74: two new test programs, `tests/
 test_drm_floor.f90` and `tests/test_drm_floor_enforcement.f90`, sections
 26/27).
 
-### T2 (not yet detailed — standalone tool consuming T1, scoped from
-### design discussion above, numbering/scope to firm up once started)
+### T2 — `rmclean_cubes`: standalone RM-CLEAN tool + mask-pattern cache + OpenMP
 
-- Per-pixel mask-pattern pre-scan + pattern-keyed offset-table cache
-  (decision 10), consuming T0's new per-channel table.
-- Standalone tool wiring: CLI/config schema, own binary/build target,
-  consuming existing dirty AMP/PHA cubes (decision 11).
+New standalone program, `src/rmclean_cubes.f90` (own Makefile target
+`make rmclean_cubes`, `bin/rmclean_cubes`, wired into `scripts/
+make_all.sh` and `docker/dockerfile`), driving `rmclean_mod`'s already-
+hardened API (T1) against a REAL dirty AMP/PHA cube pair `rm_synthesis`
+itself wrote, plus its `.MASK.CUBE.FITS`/`CHANFREQ` table (T0). Follows
+`reproject_cubes.f90`/`convolve_cubes.f90`'s own standalone-tool
+conventions (own key=value/`--config` parser, `--help`, own Makefile
+block).
+
+1. **Gate 0 (no re-gridding)**: this tool cannot resample the RM axis --
+   `CDELT3`/`nrm` are fixed by whatever `rm_synthesis` already wrote.
+   Before any CLEAN work, `get_drm(l_sq, nchan, lsq_ref_native, drm_
+   required, oversample)` is compared against the cube's own `CDELT3`;
+   refuses to proceed (clear error, nonzero exit) if the existing grid
+   is too coarse. Uses the FULL per-run channel list (not any one
+   pixel's own valid subset) — conservative and safe, since dropping
+   channels only ever reduces `get_drm`'s own bound.
+
+2. **`lsq_ref_native` vs `lsq_ref_compute` — a real design correction
+   made during implementation** (the user pushed back directly: "even if
+   the dirty cubes are at lsq=0, shouldn't we be able to RM-clean at any
+   computationally favourable lsq_ref?"): `lsq_ref_native` is the
+   reference the cube was ACTUALLY built at (read from its own new
+   `LSQREF` header keyword -- see T2b below -- falling back to 0.0, with
+   a printed warning, for cubes written before that keyword existed).
+   Gate 0 always validates against `lsq_ref_native` specifically (sampling
+   adequacy is a property of how the data was generated). `lsq_ref_
+   compute` (this tool's OWN RMSF-table/CLEAN reference) is a fully free,
+   independent choice (`lsq_ref_compute_mode=native|zero|mid|centroid|
+   min|max|fixed`, default `native`), applied via `derotate_to_lsq_ref`
+   -- an exact, lossless phase rotation of the already-sampled dirty
+   spectrum (verified `|P|`-invariant, T1's own `test_rmclean_lsqref_
+   flex.f90`), so choosing a non-native value costs nothing in accuracy.
+   It also saves nothing in compute once the RM grid already exists
+   (`build_rmsf_offset_table`/`clean_complex`/`restore_clean`'s own cost
+   depends only on `nrm`/`niter`/`table_oversample`) -- the grid-size win
+   a favourable reference buys only applies UPSTREAM, at `rm_synthesis`'s
+   own `lsq_ref_mode` (T2b), not here.
+
+3. **Mask-pattern pre-scan + hash-bucketed `rmsf_table_t` cache**
+   (decision 10): `build_mask_pattern_cache` scans the full mask cube
+   ONCE, serially, before any parallel region; canonicalizes each
+   pixel's own valid-channel bit pattern (the mask row itself, already
+   0/1 bytes -- no further packing needed), hashes it (64-bit FNV-1a),
+   and builds ONE `rmsf_table_t` per DISTINCT pattern via an open-
+   addressing (linear-probing) hash-bucket table for O(1) amortized
+   lookup -- a plain linear scan across cache entries was rejected as
+   too slow for large pixel counts. Collision-safe: every lookup does a
+   full byte-for-byte pattern compare on a hash match, never trusts the
+   hash alone. Capped at `mask_pattern_cache_max` (default 4096)
+   distinct patterns; past the cap, a pixel falls back to a one-off
+   throwaway table (safety valve, not a correctness issue). Verified:
+   `mask_pattern_cache_max=4096` (744 distinct patterns cached) vs `=0`
+   (every pixel a throwaway) vs `=50` (mixed hit+overflow) all produce
+   BIT-IDENTICAL output on a synthetic cube with 744 distinct per-pixel
+   masking patterns (`tests/run_tests.sh` section 28).
+
+4. **OpenMP parallelism**: one `!$omp parallel do collapse(2) schedule(
+   dynamic)` over `(ix,iy)`, calling `clean_one_pixel` per pixel. Every
+   per-pixel scratch array (`dirty_re_p`, `comp_re_p`, etc.) is a genuine
+   LOCAL automatic variable inside that subroutine — thread-safe purely
+   by Fortran's own call-stack semantics, no explicit `private()`
+   bookkeeping needed for them. The shared FFTW restore plan (built ONCE
+   outside the parallel region) and the mask-pattern cache (fully built
+   serially beforehand) are both read-only inside the parallel region.
+   Verified: `OMP_NUM_THREADS=1` vs `=4` produce BIT-IDENTICAL output on
+   the same test cube.
+
+5. **A real robustness bug found and fixed via testing, not by
+   inspection**: `write_output_cube`/`read_cube`/`read_mask_cube`
+   originally called `FTGPVE`/`FTGPVB`/`FTPHPR` immediately after
+   `FTOPEN`/`FTINIT` WITHOUT checking the returned status first -- if
+   the underlying call failed (e.g. `FTINIT` refusing to create a file
+   that already exists on disk, exactly what happens re-running this
+   tool without cleaning up a previous run's own outputs), every
+   subsequent CFITSIO call operated on a unit CFITSIO never actually set
+   up: not a clean no-op but undefined behaviour, reproduced as a real
+   SIGSEGV. Fixed by checking status immediately after every `FTOPEN`/
+   `FTINIT` and bailing out cleanly. Caught by `tests/run_tests.sh`
+   itself segfaulting on a second consecutive run (stale output files
+   from the first run) -- section 28 now also cleans up its own `rmc_*`
+   outputs up front, and the fix itself is a genuine correctness
+   improvement independent of the test.
+
+### T2b — `rm_synthesis`'s own `lsq_ref_mode` option
+
+Added alongside T2 (the user: "instead of hard coding lsq=0, we should
+add flexible option for rmsynthesis - following the same strategy as in
+rmclean"). `rm_synthesis_mod.f90`'s `extract_general_setup` was
+unconditionally at `lambda_sq=0` (Finding A, confirmed directly: its own
+`phi_tmp=omega*t(kk)` used raw `L_sq`, no subtraction). Now: `cfg%lsq_ref_
+mode` (`zero`|`mid`|`centroid`|`min`|`max`|`fixed`) + `cfg%lsq_ref_fixed_
+value`, resolved once via a new `compute_lsq_ref` function (duplicated
+from, not `use`-coupled to, `rmclean_mod`'s own `get_lsq_ref_compute` --
+this module is the older, heavily production-tested core; the newer,
+algorithm-specific `rmclean_mod` should not become a hard dependency of
+it). Baked into `extract_general_setup`'s own `cos_arr`/`sin_arr`
+template construction (`phi_tmp = omega*(t(kk)-lsq_ref)`) -- the ONLY
+call site (`rm_synthesis.f90:2178`), so every downstream consumer
+(`extract_general`'s own dot products) automatically inherits whichever
+reference was chosen, no other code changes needed. The actual value
+used is recorded in a new `LSQREF` header keyword on both AMP/PHA cubes,
+so `rmclean_cubes` (T2) never has to assume one. Default `zero` preserves
+every existing cfg file's behaviour exactly (verified: full 78-test
+suite unchanged before this addition, still green after).
+
+Full regression after T2+T2b: 84/84 (up from 78/78 — new section 28,
+`rmclean_cubes` end-to-end against a real `lsq_ref_mode=mid` cube: LSQREF
+header round-trip, Gate 0, both known point sources recovered via
+`check_rm_peak.py`, mask-pattern cache correctness).
+
+### T3 — model-based matched-filter peak refinement
+
+Grew out of an extended dialogue with the user pressure-testing T2's own
+Gate 0: why does `get_drm` demand ~22-44x oversampling relative to
+`fwhm` at `lsq_ref=0` (real numbers, thesis P-band, `nu_c=300 MHz`,
+`dnu=30 MHz`, 61 channels: `dRM(oversample=4)=0.356 rad/m^2` against
+`fwhm=7.826 rad/m^2`)? Root cause, derived and then verified against the
+actual code: `clean_complex`'s own `peak_interp_parabolic` fits the CLEAN
+peak's complex value (`re_at_peak`/`im_at_peak`) via a local parabola
+fit **directly through the raw, stored `Re`/`Im` samples** -- and those
+samples carry a fast, `lsq_ref`-dependent carrier (`R(Δ)` decomposes into
+a slow, `lsq_ref`-independent envelope times a unit-modulus carrier at
+`max_offset = maxₖ|l_sq(k)-lsq_ref|`), so a local low-order fit to them is
+only valid if the OUTER grid already satisfies that same demanding bound.
+The peak's *location* step (a separate parabola on log-magnitude) was
+never the problem -- magnitude carries no carrier.
+
+**The fix**: since `R(Δ)` is analytically known exactly, at any offset,
+from `l_sq` alone (no raw per-channel Q/U data needed), replace the
+raw-sample parabola with a local matched-filter search: for a fine grid
+of trial offsets spanning `[rm_samp(imax)-drm, rm_samp(imax)+drm]`, fit
+the one-complex-unknown amplitude `A = Σⱼconj(R(Δⱼ))·dataⱼ / Σⱼ|R(Δⱼ)|²`
+against the 3 nearest *stored* coarse samples, keeping the trial that
+maximizes `|Σⱼconj(R)·data|²/Σⱼ|R|²`. Two new subroutines, `rmsf_point_
+direct` (O(nchan), single-offset exact `R(Δ)` -- NOT `compute_dirty_
+rmbeam_direct`, which needs pre-built `cos_arr`/`sin_arr` templates and
+always loops over the full output array even for one point) and
+`refine_peak_matched_filter` (the search itself), both in `src/
+rmclean.f90`.
+
+**Landed in 3 independently-tested phases, per the user's own explicit
+"validate all claims before production" policy**:
+- Phase 0 (`tests/test_matched_filter_refine.f90`, zero production code
+  touched): free-standing prototype, validated against 2 independent
+  point-source scenarios (`RM=50/chi0=0.3` and `RM=-27.3/chi0=-1.1`) at
+  4 sampling densities each, including sampling far below `get_drm`'s
+  own floor. Found and fixed a real sub-issue along the way: the LOCAL
+  search grid's own density must ALSO track `max_offset` (not a fixed
+  constant) -- a coarse discrete search over `R(Δ)`, itself
+  fast-oscillating, can lock onto the wrong nearby local maximum of an
+  oscillatory objective (confirmed directly: chi0 error vs. search
+  density was non-monotonic in [40,400], only converging reliably past
+  ~500 with the original nanchor=5 config).
+- Phase 1: ported into `rmclean_mod` as new, additive public
+  subroutines; `clean_complex` itself still 100% unchanged; promoted
+  test wired into `tests/run_tests.sh` (calls the production
+  subroutines directly, confirmed identical to the validated prototype).
+- Phase 2: swapped `clean_complex`'s own internals (`peak_interp_
+  parabolic` call + `re_at_peak`/`im_at_peak` derivation replaced by one
+  `refine_peak_matched_filter` call; nothing else in the Hogbom loop
+  changed). Required a signature change (`clean_complex` now takes
+  `l_sq`/`nchan`/`lsq_ref_compute`, needed by the refinement step but not
+  by the old parabola) -- updated at all 5 call sites (`tests/thesis_
+  scenario_rmclean.f90`, `tests/test_drm_floor.f90`, `tests/test_rmclean_
+  lsqref_flex.f90`, `src/rmclean_cubes.f90`'s 2 call sites).
+
+**A genuine, expected consequence, not a regression**: `tests/test_drm_
+floor.f90` was originally written to demonstrate `peak_interp_parabolic`'s
+own Nyquist-floor requirement (`oversample=1` gives a confidently WRONG
+chi0). Since T3 removes that specific requirement, `oversample=1` now
+ALSO passes -- through the FULL Hogbom CLEAN loop, not just Phase 0's
+isolated check. The test's own expectation was inverted (documented in
+its own updated header) rather than treated as a failure -- direct,
+additional confirmation of the fix, at real production code, not just
+the prototype.
+
+**A real, measured performance cost, found and partially addressed**:
+first working version (5 anchors, 200 samples/carrier-cycle,
+empirically-generous but never load-tested) took `rmclean_cubes` from
+sub-second to ~1m40s on a 32x32/1024-pixel test cube (niter=200) -- niter
+x npixels calls to a per-call-cheap routine still add up in aggregate.
+Retuned with evidence: 3 vs 5 anchors gave BIT-IDENTICAL results in
+every noiseless scenario checked (the 2 extra anchors add no
+discriminating power); a direct sweep against both Phase-0 scenarios
+found the actual failure boundary at ~7-8 samples/cycle -- 50/cycle
+(chosen) is a checked >=6x margin above that boundary, not a guess.
+Result: 1m40s -> 31.6s on the same test cube (~3.2x), full 8-check
+Phase-0 harness and full regression suite still green at the new
+settings. **Not fully closed**: 31.6s for 1024 pixels does not scale to
+a real million-pixel cube (~8+ hours extrapolated) -- flagged explicitly
+to the user as a follow-on ticket (T3c: a coarse-to-fine two-stage
+search -- coarse pass at enough points/cycle to avoid aliasing between
+carrier cycles, fine pass only within the winning cycle -- should cut
+cost from O(M) to roughly O(sqrt(M)), but needs its own validation cycle
+before landing, not rushed into this same ticket).
+
+Full regression after T3: run via `tests/run_tests.sh` (new section 28,
+`RM-CLEAN matched-filter peak refinement`, ahead of the renumbered
+`rmclean_cubes` section 29); all RM-CLEAN sections (23-29) and the
+pre-existing full suite green at the retuned settings.
+
+### T3c — tiered fast-path refinement (supersedes the coarse-to-fine sketch)
+
+The design came out of an extended clarification dialogue with the user
+that also caught two real defects in T3's first implementation along
+the way: (a) the search window was `+/-drm` around the discrete peak
+when `+/-drm/2` is all the true peak can occupy (the discrete maximum
+bin is at most half a cell from the true peak, else a neighbour would
+have won) -- fixed, halving the search for free; (b) the search-density
+constants (`samples_per_cycle=50`/`m_floor=100`) were empirically swept
+but not physically anchored -- the user's requirement: "choose them
+based on real physical considerations, not arbitrarily."
+
+**The tiered design (the user's own, refined jointly):**
+
+- **Fast path, runs every call**: peak LOCATION from the log-magnitude
+  parabola (`peak_interp_parabolic`'s own location step -- sound at
+  resolution-level sampling, magnitude carries no carrier). At that
+  FIXED location, the one-complex-unknown amplitude is solved
+  closed-form against the (up to 3) nearest stored anchors -- the same
+  matched-filter formula as the search's inner step, shared via one
+  internal `eval_trial` helper so the tiers cannot drift apart
+  numerically. Crucially this is NOT a single-point division (an
+  explicitly rejected earlier design): a single-anchor division always
+  "fits" perfectly (2 unknowns, 2 equations) and can never signal a
+  wrong location; the >=2-anchor fixed-location fit is over-determined,
+  so its LEFTOVER misfit is a genuine self-consistency diagnostic.
+- **Escalation criterion (data-driven, user's own choice)**: accept the
+  fast path when `sqrt(leftover/nanchor) <= nsigma * noise_rms`, with
+  `noise_rms` the same per-iteration `rms_about_mean` estimate
+  `clean_complex`'s own stopping criterion already uses (no separate
+  estimator), and `nsigma` a user-facing knob (`nsigma_refine` optional
+  argument on `clean_complex`, `refine_nsigma=` config key on
+  `rmclean_cubes`), default 3.0 -- a conventional n-sigma cut,
+  confirmed against the test program's own noisy scenario rather than
+  only asserted. Beyond threshold: the full T3 local search runs for
+  that iteration, unchanged.
+- **Physically-anchored search constants** (replacing the arbitrary
+  values): the search samples the matched-filter STATISTIC, whose
+  fastest oscillation is TWICE the carrier rate (squared magnitude
+  doubles frequency), carrier rate set by `max_offset` exactly as in
+  `get_drm` -- so `cycles_in_window = 2*window*max_offset/pi`, at 50
+  samples per statistic cycle (validated margin ~12x above the
+  empirically-located wrong-local-maximum failure boundary of ~4 per
+  statistic cycle). `m_floor` cut from 100 to 20, now tied to
+  `table_oversample`'s own default meaning elsewhere in this project
+  ("how finely to resolve within one native grid cell") rather than
+  being an independent invented constant.
+
+**Evidence** (`tests/test_matched_filter_refine.f90`, rewritten for the
+tiers -- per scenario x density it now checks the forced-search path
+(`nsigma=-1`), the forced-fast path (`nsigma=huge`), and the tiered
+default (`nsigma=3`), all against truth, plus two dedicated mechanics
+checks and a noisy-default check):
+
+- The fast path ALONE is already accurate on clean single-component
+  data even at `fwhm/2` sampling (chi0 error ~0.01 rad) -- the
+  parabola's LOCATION was never the weak point of the old method, its
+  raw-sample complex-value fit was; location + model-anchored
+  closed-form amplitude is enough.
+- Tier mechanics, same threshold and claimed noise floor, only the data
+  differing: clean single component -> fast path ACCEPTED (no search);
+  two blended components ~0.8 fwhm apart -> escalation FIRED. Both
+  confirmed.
+- Noisy single component (deterministic LCG noise, sigma=2% of
+  amplitude) at default `nsigma=3`: recovery within tolerance, fast
+  path taken.
+- **Performance, measured**: `rmclean_cubes` on the same 1024-pixel
+  test cube (niter=200) -- ~1m40s (T3 first working version) -> 31.6s
+  (T3 retuned) -> **0.46s (T3c tiered)**, with recovered source
+  RM/amplitude/chi0 unchanged against truth. The originally-sketched
+  coarse-to-fine two-stage search is superseded: the fast path skips
+  the search entirely on the (overwhelmingly common) clean iterations
+  rather than making it cheaper, and the full search remains, exact
+  and unchanged, where the data genuinely needs it.
+- **A real input-contract boundary, found by the regression suite, not
+  by design**: `tests/test_drm_floor.f90`'s own `oversample=1` case
+  (band-CENTROID reference) failed again under the tiered default
+  after passing under T3's pure search. Root-caused, not papered over:
+  at a centroid reference `max_offset ~= span/2`, so the carrier and
+  RESOLUTION scales coincide -- `samples/fwhm = oversample/2`, and
+  `oversample=1` is only 0.5 samples/fwhm, BELOW resolution Nyquist,
+  i.e. outside the very input contract T3b's Gate 0 enforces. The fast
+  path's log-magnitude location step has nothing valid to work with on
+  such a grid, and early iterations' sidelobe-dominated rms makes the
+  escalation criterion too lenient to catch the miss (the pure search,
+  being phase-sensitive across the whole +/-dRM/2 window, happened to
+  survive it). The test was updated to expect failure again -- with its
+  doc comment now stating the NEW reason (sub-resolution input, the
+  exact failure mode Gate 0 exists to refuse) rather than the old
+  carrier/parabola reason -- and its `oversample=2` case (1 sample/
+  fwhm: above Gate 0's hard floor, below its default 2) confirmed
+  still recovering correctly, evidence the default carries genuine
+  margin. Module-level contract made explicit by this: `clean_complex`
+  requires resolution-adequate input; `rmclean_cubes`' Gate 0 is what
+  guarantees it in production.
+
+### T3b — Gate 0 recast as an RM-resolution criterion
+
+`rmclean_cubes`'s Gate 0 no longer validates against `get_drm`'s
+`max_offset`-based (carrier-driven, `lsq_ref`-dependent) bound -- with
+T3/T3c in `clean_complex`, the stored grid never needs to resolve the
+fast Re/Im carrier at all. The gate now enforces the one requirement
+that genuinely remains: `|CDELT3| <= fwhm/min_samples_per_fwhm`, with
+`fwhm` from `compute_rmsf_fwhm_multiband` -- an `lsq_ref`-INDEPENDENT
+quantity set by the lambda^2 span alone (always the DATA's own fwhm,
+never the `restore_fwhm` override, which only shapes the restoring
+beam). New config key `min_samples_per_fwhm` (default 2.0, hard floor
+1.0) replaces the retired `oversample=` key entirely. Verified both
+ways manually: the real test cube (`CDELT3=0.5`, `fwhm=11.41`, ~22.8
+samples/fwhm) passes; the same cube with `CDELT3` forged to 8.0 is
+refused at the default (needs `<=5.71`) and accepted at
+`min_samples_per_fwhm=1` (needs `<=11.41`) -- and the AMP/PHA
+geometry-consistency check was confirmed to fire before Gate 0 when
+only one of the pair is altered. `get_drm` itself (and its
+`oversample>=2` floor) is UNCHANGED at the module level -- still the
+correct tool for its remaining jobs (T3c's own internal search-density
+sizing, and `rm_synthesis`-side grid planning for anyone who wants
+carrier-resolved dirty cubes); only `rmclean_cubes`'s gate stopped
+using it.
 
 ### T-future — Bandwidth-depolarization in RM-CLEAN
 

@@ -18,6 +18,7 @@ module rmclean_mod
    public :: plan_fourier_interp, destroy_fourier_interp_plan, fourier_interp_complex
    public :: rmsf_table_t, build_rmsf_offset_table, destroy_rmsf_offset_table
    public :: compute_dirty_rmbeam_direct, compute_dirty_rmbeam
+   public :: rmsf_point_direct, refine_peak_matched_filter
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
    public :: get_drm, derotate_to_lsq_ref
@@ -352,10 +353,15 @@ contains
       !! rmsf_table_t's own comment holds for ANY fixed reference point,
       !! not specifically the mean), and different callers legitimately
       !! want different choices: rm_synthesis_mod.f90's own
-      !! extract_general_setup references to the mean (numerically
-      !! smaller phase arguments across a whole run); the user's own
-      !! thesis codebase references to lambda_sq=0 (no subtraction at
-      !! all). Whatever the caller passes here MUST match whatever
+      !! extract_general_setup is UNCONDITIONALLY at lambda_sq=0 (its own
+      !! phi_tmp=omega*t(kk) uses raw L_sq, no mean subtraction anywhere
+      !! -- confirmed directly at rm_synthesis_mod.f90:675-791), matching
+      !! the user's own thesis codebase exactly; this module's own
+      !! get_lsq_ref_compute(mode=centroid) is the real example of a
+      !! mean-style reference in this codebase -- a caller's CHOICE for
+      !! compute cost (numerically smaller phase arguments), not
+      !! something rm_synthesis's own dirty-map construction already
+      !! does. Whatever the caller passes here MUST match whatever
       !! reference point was used to construct cos_arr/sin_arr AND the
       !! caller's own dirty-map/injected-data phase convention -- a
       !! mismatch here does not break the amplitude in a broad "noisy"
@@ -482,8 +488,241 @@ contains
       end do
    end subroutine compute_dirty_rmbeam
 
-   subroutine clean_complex(rm_samp, nrm, dirty_re, dirty_im, table, niter,&
-   &gain, thresh, comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
+   subroutine rmsf_point_direct(l_sq, nchan, lsq_ref_compute, delta, re_val, im_val)
+      !! Lightweight, single-offset EXACT evaluation of R(delta) --
+      !! O(nchan), no template arrays needed (unlike
+      !! compute_dirty_rmbeam_direct above, which requires pre-built
+      !! cos_arr/sin_arr sized (maxrm,maxchan) and always loops over nrm
+      !! output points even for nrm=1). The same closed-form sum
+      !! build_rmsf_offset_table's own fill loop already uses per
+      !! fine-grid point, factored out here for reuse in a LOCAL search
+      !! context (refine_peak_matched_filter below) where only a handful
+      !! of offsets are needed per call, not a whole fine table.
+      !! planning/RMCLEAN_INTEGRATION_PLAN.md ticket T3.
+      integer, intent(in) :: nchan
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute, delta
+      real(sp), intent(out) :: re_val, im_val
+      real(dp) :: phase_k
+
+      phase_k = -2.0_dp*real(delta, dp)
+      re_val = real(sum(cos(phase_k*(real(l_sq, dp)-real(lsq_ref_compute, dp))))/&
+      &real(nchan, dp), sp)
+      im_val = real(sum(sin(phase_k*(real(l_sq, dp)-real(lsq_ref_compute, dp))))/&
+      &real(nchan, dp), sp)
+   end subroutine rmsf_point_direct
+
+   subroutine refine_peak_matched_filter(l_sq, nchan, lsq_ref_compute, rm_samp,&
+   &nrm, resid_re, resid_im, imax, drm, noise_rms, nsigma, peak_loc,&
+   &re_at_peak, im_at_peak, used_search)
+      !! Replaces peak_interp_parabolic's OWN role for the CLEAN peak's
+      !! complex value (planning/RMCLEAN_INTEGRATION_PLAN.md ticket T3,
+      !! validated in isolation first via tests/test_matched_filter_
+      !! refine.f90 before being ported here; TIERED fast-path design
+      !! added in T3c, from a design discussion with the user).
+      !! peak_interp_parabolic's OWN complex-value step fit a parabola
+      !! directly through the raw, carrier-bearing stored Re/Im samples
+      !! -- valid only if the OUTER grid already satisfied get_drm's own
+      !! max_offset-based bound (~22-44x oversampling relative to fwhm
+      !! at lsq_ref=0, thesis P-band numbers). This subroutine removes
+      !! that dependency entirely: it never interpolates the stored
+      !! samples at all, only evaluates the EXACTLY-known R(delta)
+      !! (rmsf_point_direct above, computable from l_sq alone, no raw
+      !! per-channel data needed) against the (up to 3) nearest STORED
+      !! coarse samples ("anchors" -- the only real measurements in
+      !! play; everything else is exact calculation).
+      !!
+      !! TIERED (T3c): two paths, cheap-first with a data-driven
+      !! escalation criterion (the user's own design):
+      !!
+      !! FAST PATH (runs every call): take the peak LOCATION from the
+      !! log-magnitude parabola (peak_interp_parabolic's own location
+      !! step -- sound at resolution-level sampling, since magnitude
+      !! carries no fast carrier; its own vertex formula guarantees
+      !! |offset|<=0.5 whenever the centre bin is the discrete maximum,
+      !! which index_absmax guarantees here). At that FIXED location,
+      !! solve the one-complex-unknown amplitude A that best explains
+      !! the anchors, closed-form (linear least squares / matched
+      !! filtering):
+      !!   A = sum_j(conj(R(delta_j))*data(j)) / sum_j(|R(delta_j)|^2)
+      !! then measure the LEFTOVER misfit, sqrt(sum_j|data_j -
+      !! A*R(delta_j)|^2 / nanchor), and compare it against
+      !! nsigma*noise_rms (noise_rms: the caller's own data-driven noise
+      !! estimate -- clean_complex passes its own per-iteration
+      !! rms_about_mean of the residual amplitude). Within threshold:
+      !! accept, done -- O(3*nchan) total, no search. This is NOT a
+      !! division against a single sample (a rejected earlier design):
+      !! a single-anchor division always "fits" perfectly (2 unknowns, 2
+      !! equations) and so can never signal that the assumed location
+      !! was wrong; fitting >=2 anchors at a FIXED location is
+      !! over-determined, and its leftover misfit is a genuine
+      !! self-consistency diagnostic -- small means the single-component
+      !! model at the parabola's location really does explain the
+      !! measurements, large means it doesn't (poor location, blended
+      !! components, ...) and the answer should not be trusted.
+      !!
+      !! FULL SEARCH (escalation, only when the fast path's leftover
+      !! misfit exceeds nsigma*noise_rms): try m_search+1 trial
+      !! locations spanning [rm_samp(imax)-drm/2, rm_samp(imax)+drm/2]
+      !! (the discrete maximum bin can be at most half a cell from the
+      !! true peak, else a neighbour would have won), solving the same
+      !! closed-form A at each and keeping the trial that maximizes the
+      !! matched-filter statistic |sum_j(conj(R)*data)|^2/sum_j(|R|^2)
+      !! (equivalently: minimizes the leftover misfit). No closed-form
+      !! exists for the best location itself -- the fit statistic is a
+      !! sum of per-channel sinusoids at different rates, a function
+      !! class with no algebraic solution for its own extrema -- hence a
+      !! bounded discrete search, not algebra.
+      !!
+      !! used_search reports which path produced the answer (fast=.false.)
+      !! -- exposed so tests can verify each tier fires when it should,
+      !! and so a caller can log escalation statistics.
+      !!
+      !! Search density (m_search), physically derived (the user's own
+      !! requirement -- no arbitrary constants): the search samples the
+      !! matched-filter statistic, whose fastest oscillation is TWICE
+      !! the carrier rate (the statistic is a squared magnitude --
+      !! squaring doubles frequency), carrier rate itself set by
+      !! max_offset exactly as in get_drm's own outer-grid formula. So
+      !! cycles_in_window = 2 * window_width * max_offset / pi
+      !! (window_width=drm), sampled at samples_per_cycle=50 per
+      !! statistic cycle -- an empirically validated margin (direct
+      !! sweep, tests/test_matched_filter_refine.f90's scenarios: the
+      !! failure boundary where the search locks onto a wrong local
+      !! maximum sits at ~4 samples per statistic cycle; 50 is a
+      !! checked ~12x margin, and the same per-trial spacing validated
+      !! for T3's original full-window version, re-expressed for the
+      !! halved window). m_floor=20 covers the near-zero-cycles case
+      !! (lsq_ref close to max_offset: nothing oscillates, but the
+      !! search still needs sub-cell resolution for the location) --
+      !! 20 points across one cell, deliberately matching
+      !! table_oversample's own default meaning elsewhere in this
+      !! project ("how finely to resolve within one native grid cell"),
+      !! not an independent invented constant.
+      integer, intent(in) :: nchan, nrm, imax
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute, rm_samp(nrm)
+      real(sp), intent(in) :: resid_re(nrm), resid_im(nrm), drm
+      real(sp), intent(in) :: noise_rms, nsigma
+      real(sp), intent(out) :: peak_loc, re_at_peak, im_at_peak
+      logical, intent(out) :: used_search
+
+      integer, parameter :: samples_per_cycle = 50, m_floor = 20
+      real(dp), parameter :: pi_dp = 3.14159265358979_dp
+      integer :: j0, j1, nanchor, jj, kk, m_search
+      integer :: anchor_idx(3)
+      real(sp) :: trial_loc, max_offset, cycles_in_window
+      real(sp) :: peak_offset, re_dummy, im_dummy, fast_loc
+      real(dp) :: num_re, num_im, den, stat_val, best_stat
+      real(dp) :: a_re, a_im, best_a_re, best_a_im, best_loc
+      real(dp) :: sum_dd, leftover
+
+      j0 = max(1, imax-1)
+      j1 = min(nrm, imax+1)
+      nanchor = j1-j0+1
+      do jj = 1, nanchor
+         anchor_idx(jj) = j0+jj-1
+      end do
+      sum_dd = 0.0_dp
+      do jj = 1, nanchor
+         sum_dd = sum_dd + real(resid_re(anchor_idx(jj)), dp)**2 +&
+         &real(resid_im(anchor_idx(jj)), dp)**2
+      end do
+
+      ! --- FAST PATH: parabola location + closed-form amplitude ---
+      if (imax > 1 .and. imax < nrm) then
+         call peak_interp_parabolic(resid_re, resid_im, nrm, imax,&
+         &peak_offset, re_dummy, im_dummy)
+      else
+         peak_offset = 0.0_sp
+      endif
+      fast_loc = rm_samp(imax) + peak_offset*drm
+
+      call eval_trial(fast_loc, num_re, num_im, den, a_re, a_im, stat_val)
+      if (den > 0.0_dp) then
+         ! leftover misfit = sum|D|^2 - |sum(conj(R)D)|^2/sum|R|^2, the
+         ! exact least-squares residual of the fit (never negative up to
+         ! rounding -- clamped for the sqrt).
+         leftover = max(0.0_dp, sum_dd - stat_val)
+         if (real(sqrt(leftover/real(nanchor, dp)), sp) <=&
+         &nsigma*max(noise_rms, 0.0_sp)) then
+            peak_loc = fast_loc
+            re_at_peak = real(a_re, sp)
+            im_at_peak = real(a_im, sp)
+            used_search = .false.
+            return
+         endif
+      endif
+
+      ! --- FULL SEARCH (escalation) ---
+      used_search = .true.
+      max_offset = maxval(abs(l_sq - lsq_ref_compute))
+      cycles_in_window = real(2.0_dp*real(drm, dp)*real(max_offset, dp)/pi_dp, sp)
+      m_search = max(m_floor, ceiling(cycles_in_window*real(samples_per_cycle, sp)))
+
+      best_stat = -1.0_dp
+      best_loc = real(rm_samp(imax), dp)
+      best_a_re = real(resid_re(imax), dp)
+      best_a_im = real(resid_im(imax), dp)
+
+      do kk = 0, m_search
+         trial_loc = rm_samp(imax) - 0.5_sp*drm + real(kk, sp)*drm/real(m_search, sp)
+         call eval_trial(trial_loc, num_re, num_im, den, a_re, a_im, stat_val)
+         if (den > 0.0_dp) then
+            if (stat_val > best_stat) then
+               best_stat = stat_val
+               best_loc = real(trial_loc, dp)
+               best_a_re = a_re
+               best_a_im = a_im
+            endif
+         endif
+      end do
+
+      peak_loc = real(best_loc, sp)
+      re_at_peak = real(best_a_re, sp)
+      im_at_peak = real(best_a_im, sp)
+
+   contains
+
+      subroutine eval_trial(loc, num_re_o, num_im_o, den_o, a_re_o, a_im_o, stat_o)
+         !! One trial location's closed-form fit against the anchors:
+         !! the matched-filter numerator/denominator, the best-fit
+         !! complex amplitude, and the fit statistic |num|^2/den (whose
+         !! maximization over trials == leftover-misfit minimization).
+         !! Shared by the fast path (one call, at the parabola's
+         !! location) and the full search (one call per trial) so the
+         !! two tiers cannot drift apart numerically.
+         real(sp), intent(in) :: loc
+         real(dp), intent(out) :: num_re_o, num_im_o, den_o, a_re_o, a_im_o, stat_o
+         real(sp) :: re_r_l, im_r_l
+         integer :: jj_l
+
+         num_re_o = 0.0_dp
+         num_im_o = 0.0_dp
+         den_o = 0.0_dp
+         do jj_l = 1, nanchor
+            call rmsf_point_direct(l_sq, nchan, lsq_ref_compute,&
+            &rm_samp(anchor_idx(jj_l))-loc, re_r_l, im_r_l)
+            num_re_o = num_re_o + real(re_r_l, dp)*real(resid_re(anchor_idx(jj_l)), dp) +&
+            &real(im_r_l, dp)*real(resid_im(anchor_idx(jj_l)), dp)
+            num_im_o = num_im_o + real(re_r_l, dp)*real(resid_im(anchor_idx(jj_l)), dp) -&
+            &real(im_r_l, dp)*real(resid_re(anchor_idx(jj_l)), dp)
+            den_o = den_o + real(re_r_l, dp)**2 + real(im_r_l, dp)**2
+         end do
+         if (den_o > 0.0_dp) then
+            a_re_o = num_re_o/den_o
+            a_im_o = num_im_o/den_o
+            stat_o = (num_re_o**2+num_im_o**2)/den_o
+         else
+            a_re_o = 0.0_dp
+            a_im_o = 0.0_dp
+            stat_o = -1.0_dp
+         endif
+      end subroutine eval_trial
+
+   end subroutine refine_peak_matched_filter
+
+   subroutine clean_complex(l_sq, nchan, lsq_ref_compute, rm_samp, nrm,&
+   &dirty_re, dirty_im, table, niter, gain, thresh, comp_re, comp_im,&
+   &resid_re, resid_im, n_iter_used, comp_rm_refined, nsigma_refine)
       !! Hogbom-style complex CLEAN on the dirty FDF (dirty_re/dirty_im),
       !! against its own RM-dependent dirty beam (rmsf_table_t). Ported
       !! from rm_clean.f, modernized, with planning/
@@ -532,32 +771,38 @@ contains
       !! comp_rm_refined(nrm): per-bin FLUX-WEIGHTED sub-pixel RM location
       !! -- added at the user's own request, root-causing a real chi0-
       !! precision gap. Every iteration already computes a precise
-      !! sub-pixel peak_loc (via peak_interp_parabolic, used correctly to
-      !! build the right beam for subtraction) -- but that information was
-      !! previously DISCARDED once the component got filed into its
-      !! integer grid bin imax, leaving comp_re/comp_im accurate in
-      !! amplitude and phase but silently tied to whatever grid point imax
-      !! happens to be, which can be biased up to half a grid cell (dRM/2)
-      !! away from the true continuous location -- harmless for reading
-      !! amplitude/phase off comp_re/comp_im directly (both already
-      !! correctly flux-and-phase-weighted across iterations), but a real
-      !! problem for anything that needs the RM value itself precisely,
-      !! e.g. derotate_to_lsq_ref's own chi0 = 0.5*phase_val -
-      !! RM_found*lsq_ref_compute (whose precision scales directly with RM_found's
-      !! own). Confirmed empirically: reading chi0 off a coarse grid's own
-      !! (perfectly clean, symmetric, but grid-centred) restored profile
-      !! gave a ~0.22 rad error at a band-centroid lsq_ref_compute reference;
-      !! using this flux-weighted comp_rm_refined instead, at the SAME
-      !! coarse grid, gave chi0 exactly matching the true value (0.0000
-      !! rad error) -- confirming the actual bottleneck was never
-      !! insufficient global grid resolution or interpolation quality, but
-      !! this discarded bookkeeping. Per-bin (not just for the single
-      !! dominant component) so this stays correct for multi-component
-      !! scenarios too (e.g. a point source AND a separate resolved
-      !! feature, as in tests/thesis_scenario_rmclean.f90's own scenario).
-      !! Bins that never receive any component flux fall back to their own
-      !! rm_samp(j) (moot, since comp_re/comp_im are exactly zero there
-      !! too, but keeps this array always well-defined, no NaN/garbage).
+      !! sub-pixel peak_loc (via refine_peak_matched_filter as of ticket
+      !! T3 -- see that subroutine's own doc comment; originally
+      !! peak_interp_parabolic, superseded because its OWN complex-value
+      !! step required the outer grid to satisfy get_drm's demanding
+      !! max_offset-based bound, not just resolution-level adequacy) --
+      !! but that location information was previously DISCARDED once the
+      !! component got filed into its integer grid bin imax, leaving
+      !! comp_re/comp_im accurate in amplitude and phase but silently tied
+      !! to whatever grid point imax happens to be, which can be biased up
+      !! to half a grid cell (dRM/2) away from the true continuous
+      !! location -- harmless for reading amplitude/phase off comp_re/
+      !! comp_im directly (both already correctly flux-and-phase-weighted
+      !! across iterations), but a real problem for anything that needs
+      !! the RM value itself precisely, e.g. derotate_to_lsq_ref's own
+      !! chi0 = 0.5*phase_val - RM_found*lsq_ref_compute (whose precision
+      !! scales directly with RM_found's own). Confirmed empirically:
+      !! reading chi0 off a coarse grid's own (perfectly clean, symmetric,
+      !! but grid-centred) restored profile gave a ~0.22 rad error at a
+      !! band-centroid lsq_ref_compute reference; using this flux-weighted
+      !! comp_rm_refined instead, at the SAME coarse grid, gave chi0
+      !! exactly matching the true value (0.0000 rad error) -- confirming
+      !! the actual bottleneck was never insufficient global grid
+      !! resolution or interpolation quality, but this discarded
+      !! bookkeeping. Per-bin (not just for the single dominant component)
+      !! so this stays correct for multi-component scenarios too (e.g. a
+      !! point source AND a separate resolved feature, as in tests/
+      !! thesis_scenario_rmclean.f90's own scenario). Bins that never
+      !! receive any component flux fall back to their own rm_samp(j)
+      !! (moot, since comp_re/comp_im are exactly zero there too, but
+      !! keeps this array always well-defined, no NaN/garbage).
+      integer, intent(in) :: nchan
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute
       type(rmsf_table_t), intent(in) :: table
       integer, intent(in) :: nrm, niter
       real(sp), intent(in) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
@@ -566,11 +811,22 @@ contains
       real(sp), intent(out) :: resid_re(nrm), resid_im(nrm)
       integer, intent(out) :: n_iter_used
       real(sp), intent(out) :: comp_rm_refined(nrm)
+      ! nsigma_refine: escalation threshold for refine_peak_matched_
+      ! filter's own tiered design (T3c, see that subroutine's doc
+      ! comment): the fast fixed-location fit is accepted when its
+      ! leftover misfit is within nsigma_refine * (this iteration's own
+      ! data-driven noise estimate, rms_val below); beyond that, the
+      ! full local search runs instead. Optional; default 3.0 (a
+      ! conventional n-sigma consistency cut, confirmed against tests/
+      ! test_matched_filter_refine.f90's own noisy scenario rather than
+      ! only asserted -- see that test).
+      real(sp), intent(in), optional :: nsigma_refine
 
       real(sp) :: resid_re_snap(nrm), resid_im_snap(nrm)
       real(sp) :: resid_amp(nrm), re_beam(nrm), im_beam(nrm)
       real(sp) :: avg_abs, rms_val, peak_val, peak_loc, phase_val
-      real(sp) :: peak_offset, re_at_peak, im_at_peak, frac, dRM
+      real(sp) :: re_at_peak, im_at_peak, frac, dRM, nsig
+      logical :: used_search
       ! Accumulator state, kept in double precision internally -- see
       ! this subroutine's own top-of-file precision note: EVERY other
       ! numerically-delicate part of this module (the offset table,
@@ -607,6 +863,8 @@ contains
       rmloc_wsum = 0.0_dp
       rmloc_wloc = 0.0_dp
       dRM = rm_samp(2) - rm_samp(1)
+      nsig = 3.0_sp
+      if (present(nsigma_refine)) nsig = nsigma_refine
 
       do iter = 1, niter
          n_iter_used = iter
@@ -620,19 +878,19 @@ contains
          call rms_about_mean(resid_amp, nrm, rms_val)
          call index_absmax(resid_amp, nrm, imax, avg_abs)
 
-         if (imax > 1 .and. imax < nrm) then
-            call peak_interp_parabolic(resid_re_snap, resid_im_snap, nrm, imax,&
-            &peak_offset, re_at_peak, im_at_peak)
-         else
-            ! Sampled peak is on the domain edge -- no neighbour on one
-            ! side to fit a parabola through; the sampled bin is already
-            ! the best available estimate (same edge policy as the
-            ! original quad_interp.f).
-            peak_offset = 0.0_sp
-            re_at_peak = resid_re_snap(imax)
-            im_at_peak = resid_im_snap(imax)
-         endif
-         peak_loc = rm_samp(imax) + peak_offset*dRM
+         ! T3/T3c: refine_peak_matched_filter replaces peak_interp_
+         ! parabolic's own role here (see this subroutine's own
+         ! comp_rm_refined doc comment above, and refine_peak_matched_
+         ! filter's own doc comment for the tiered fast-path/search
+         ! design). It handles domain-edge imax internally (no separate
+         ! edge-case branch needed here, unlike the old parabola, which
+         ! could not fit through a missing neighbour). rms_val doubles as
+         ! the data-driven noise estimate for the tier's own escalation
+         ! criterion -- the same per-iteration quantity the stopping
+         ! criterion below already uses, not a separate estimator.
+         call refine_peak_matched_filter(l_sq, nchan, lsq_ref_compute,&
+         &rm_samp, nrm, resid_re_snap, resid_im_snap, imax, dRM,&
+         &rms_val, nsig, peak_loc, re_at_peak, im_at_peak, used_search)
          peak_val = sqrt(re_at_peak**2 + im_at_peak**2)
          phase_val = atan2(im_at_peak, re_at_peak)
 
@@ -838,6 +1096,18 @@ contains
       !! value). Default (if oversample is omitted): 4, giving further
       !! margin above the floor at a fraction of oversample=15's own grid
       !! cost (nrm=80 vs nrm=297 in the tested P-band scenario).
+      !!
+      !! UPDATE (planning/RMCLEAN_INTEGRATION_PLAN.md ticket T3): the
+      !! root cause above -- peak_interp_parabolic's own local parabola
+      !! fit through the raw, carrier-bearing samples -- has since been
+      !! replaced (refine_peak_matched_filter, used by clean_complex as
+      !! of T3). tests/test_drm_floor.f90 now confirms oversample=1 (and
+      !! coarser) ALSO recovers correct chi0 through the full CLEAN loop
+      !! -- this floor's own ORIGINAL justification (this comment, above)
+      !! no longer describes what clean_complex actually needs. The
+      !! enforcement below is UNCHANGED for now regardless (Gate 0's own
+      !! conservative floor, planning ticket T3b, not yet revisited) --
+      !! this is a documentation note about WHY, not a behaviour change.
       integer, intent(in) :: nchan
       real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute
       real(sp), intent(out) :: drm

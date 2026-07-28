@@ -289,6 +289,31 @@ $(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbea
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
 	@echo "✓ Executable created: $@"
 
+# rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
+# rmclean.f90, pure computation, no FITS I/O of its own -- mirrors
+# gaussft_mod/commonbeam_mod's own split) against real dirty AMP/PHA
+# cubes rm_synthesis itself wrote. planning/RMCLEAN_INTEGRATION_PLAN.md
+# T2. Needs FFTW_LIBS (rmclean_mod's own restore/interp FFTW calls) plus
+# CFITSIO_LIB -- no AST dependency, this tool never resamples anything.
+RMCLEAN_CUBES_BINDIR ?= bin
+RMCLEAN_CUBES_BUILDDIR := build/rmclean_cubes
+RMCLEAN_CUBES_EXECUTABLE := $(RMCLEAN_CUBES_BINDIR)/rmclean_cubes
+
+rmclean_cubes: $(RMCLEAN_CUBES_EXECUTABLE)
+
+$(RMCLEAN_CUBES_BUILDDIR):
+	@mkdir -p $(RMCLEAN_CUBES_BUILDDIR)
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o: $(SRCDIR)/rmclean.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o: $(SRCDIR)/rmclean_cubes.f90 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(RMCLEAN_CUBES_BUILDDIR) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_EXECUTABLE): $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
+	@echo "✓ Executable created: $@"
+
 install: $(EXECUTABLE)
 	@install -d /usr/local/bin
 	@install -m 755 $(EXECUTABLE) /usr/local/bin/

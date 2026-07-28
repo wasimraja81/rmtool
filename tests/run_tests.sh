@@ -238,6 +238,7 @@ mkdir -p "$OUT_DIR"
 # Clean previous test outputs (binary refuses to overwrite)
 rm -f "$OUT_DIR"/serial.*.FITS "$OUT_DIR"/omp.*.FITS "$OUT_DIR"/gpu.*.FITS
 rm -f "$OUT_DIR"/mb_match.*.FITS "$OUT_DIR"/mb_mismatch.*.FITS "$OUT_DIR"/mb_lenmismatch.*.FITS
+rm -f "$OUT_DIR"/rmc_*.FITS
 rm -f "$OUT_DIR"/*.timing.csv
 rm -f "$OUT_DIR"/*.cfg "$OUT_DIR"/*.log
 
@@ -1721,6 +1722,166 @@ if [[ -f "$rmclean_o" ]]; then
     fi
 else
     skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN get_drm enforcement test"
+fi
+
+# ---------------------------------------------------------------------------
+# 28. RM-CLEAN matched-filter peak refinement (planning/
+#     RMCLEAN_INTEGRATION_PLAN.md T3, T3-Phase 1): validates
+#     refine_peak_matched_filter/rmsf_point_direct against
+#     peak_interp_parabolic across two independent point-source
+#     scenarios and 4 sampling densities, including deliberately coarse
+#     (resolution-only, get_drm-refusing) grids where peak_interp_
+#     parabolic is known to fail. clean_complex itself is NOT yet
+#     modified at this point (T3-Phase 2) -- this section only proves
+#     the new subroutines behave correctly in isolation.
+# ---------------------------------------------------------------------------
+section "28. RM-CLEAN matched-filter peak refinement (T3)"
+
+mfr_bin="$RMCLEAN_BUILD_DIR/test_matched_filter_refine"
+mfr_log="$OUT_DIR/test_matched_filter_refine.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_matched_filter_refine.f90" "$rmclean_o" \
+            -o "$mfr_bin" -lfftw3 2>"$OUT_DIR/rmclean_mfr_build.log"; then
+        if "$mfr_bin" > "$mfr_log" 2>&1; then
+            while IFS= read -r line; do
+                if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then
+                    echo "  $line"
+                fi
+            done < "$mfr_log"
+            if grep -q "^\[PASS\] test_matched_filter_refine" "$mfr_log"; then
+                pass "RM-CLEAN matched-filter peak refinement: all checks passed"
+            else
+                fail "RM-CLEAN matched-filter peak refinement: one or more checks failed (see $mfr_log)"
+            fi
+        else
+            fail "RM-CLEAN matched-filter peak refinement: program exited non-zero (see $mfr_log)"
+        fi
+    else
+        fail "RM-CLEAN matched-filter peak refinement: build failed (see $OUT_DIR/rmclean_mfr_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN matched-filter peak refinement test"
+fi
+
+# ---------------------------------------------------------------------------
+# 29. rmclean_cubes: standalone RM-CLEAN tool driven against a REAL
+#     rm_synthesis dirty AMP/PHA/MASK cube (planning/
+#     RMCLEAN_INTEGRATION_PLAN.md T2) -- built via its own Makefile
+#     target (`make rmclean_cubes`), not the ad hoc gfortran calls
+#     sections 22-28 use for rmclean_mod's own unit tests. Also exercises
+#     rm_synthesis's own lsq_ref_mode option (this section's own T2
+#     follow-up): a cube built with lsq_ref_mode=mid must carry a
+#     nonzero LSQREF header rmclean_cubes reads back correctly.
+# ---------------------------------------------------------------------------
+section "29. rmclean_cubes: end-to-end against a real dirty cube (T2)"
+
+if make rmclean_cubes > "$OUT_DIR/rmclean_cubes_build.log" 2>&1; then
+    pass "rmclean_cubes: build succeeded"
+
+    rmc_lsqref_cfg=$(make_cfg "rmc_lsqref" "0" "lsq_ref_mode = mid")
+    rmc_lsqref_log="$OUT_DIR/rmc_lsqref_rmsynth.log"
+    rmc_lsqref_amp="$OUT_DIR/rmc_lsqref.AMP.RMCUBE.FITS"
+    if run_binary "$BIN_SERIAL" "$rmc_lsqref_cfg" "$rmc_lsqref_log"; then
+        lsqref_val=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('$rmc_lsqref_amp').get('LSQREF'))
+")
+        if python3 -c "
+import sys
+v = float('$lsqref_val') if '$lsqref_val' != 'None' else None
+sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
+"; then
+            pass "rm_synthesis lsq_ref_mode=mid: LSQREF header written and nonzero ($lsqref_val)"
+        else
+            fail "rm_synthesis lsq_ref_mode=mid: LSQREF header missing or zero (got '$lsqref_val')"
+        fi
+
+        rmc_out="$OUT_DIR/rmc_cleaned"
+        rmc_log="$OUT_DIR/rmclean_cubes_run.log"
+        if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
+                outfile="$rmc_out" threshold=0.01 niter=200 gain=0.1 \
+                > "$rmc_log" 2>&1; then
+            pass "rmclean_cubes: ran to completion on a real lsq_ref_mode=mid cube"
+            if grep -q "^Gate 0 OK" "$rmc_log"; then
+                pass "rmclean_cubes: Gate 0 validated the existing RM grid"
+            else
+                fail "rmclean_cubes: Gate 0 pass marker missing (see $rmc_log)"
+            fi
+            if python3 "$TESTS_DIR/check_rm_peak.py" \
+                    "${rmc_out}.RESTORED.AMP.RMCUBE.FITS" "$TRUTH"; then
+                pass "rmclean_cubes: RESTORED.AMP recovers both known point sources' RM"
+            else
+                fail "rmclean_cubes: RESTORED.AMP peak RM check failed"
+            fi
+        else
+            fail "rmclean_cubes: run failed (see $rmc_log)"
+        fi
+
+        # Mask-pattern cache correctness: a deliberately varied mask (many
+        # distinct per-pixel valid-channel patterns, forcing both cache
+        # hits and the mask_pattern_cache_max overflow fallback) must give
+        # BIT-IDENTICAL output whether the cache is generous or disabled
+        # entirely (mask_pattern_cache_max=0 -- every pixel a one-off
+        # throwaway table) -- the cache is purely a reuse optimization,
+        # never allowed to change the result.
+        rmc_varied_mask="$OUT_DIR/rmc_varied.MASK.CUBE.FITS"
+        python3 - "$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" "$rmc_varied_mask" <<'PYEOF'
+import sys
+import numpy as np
+from astropy.io import fits
+
+src, dst = sys.argv[1], sys.argv[2]
+with fits.open(src) as hdul:
+    rng = np.random.default_rng(7)
+    data = hdul[0].data
+    nchan, ny, nx = data.shape
+    for iy in range(ny):
+        for ix in range(nx):
+            nflip = rng.integers(0, 5)
+            if nflip > 0:
+                chans = rng.choice(nchan, size=nflip, replace=False)
+                data[chans, iy, ix] = 0
+    # Preserve the CHANFREQ binary table extension (rmclean_cubes reads
+    # it for per-channel L_sq) -- only the primary array's data is
+    # perturbed above, in place.
+    hdul.writeto(dst, overwrite=True)
+PYEOF
+        rmc_cache_big="$OUT_DIR/rmc_cache_big"
+        rmc_cache_zero="$OUT_DIR/rmc_cache_zero"
+        if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                maskfile="$rmc_varied_mask" outfile="$rmc_cache_big" \
+                threshold=0.01 niter=200 gain=0.1 mask_pattern_cache_max=4096 \
+                > "$OUT_DIR/rmc_cache_big.log" 2>&1 && \
+           bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                maskfile="$rmc_varied_mask" outfile="$rmc_cache_zero" \
+                threshold=0.01 niter=200 gain=0.1 mask_pattern_cache_max=0 \
+                > "$OUT_DIR/rmc_cache_zero.log" 2>&1; then
+            cache_ok=1
+            for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                          RESTORED.AMP RESTORED.PHA; do
+                if ! cmp -s "${rmc_cache_big}.${suffix}.RMCUBE.FITS" \
+                            "${rmc_cache_zero}.${suffix}.RMCUBE.FITS"; then
+                    cache_ok=0
+                    fail "rmclean_cubes: cache vs no-cache differ on $suffix"
+                fi
+            done
+            [[ "$cache_ok" -eq 1 ]] && \
+                pass "rmclean_cubes: mask-pattern cache (generous) bit-identical to cache disabled"
+        else
+            fail "rmclean_cubes: mask-pattern cache comparison run(s) failed"
+        fi
+    else
+        fail "rm_synthesis (lsq_ref_mode=mid, for rmclean_cubes test): run failed (see $rmc_lsqref_log)"
+    fi
+else
+    fail "rmclean_cubes: build failed (see $OUT_DIR/rmclean_cubes_build.log)"
 fi
 
 # ---------------------------------------------------------------------------

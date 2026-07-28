@@ -78,6 +78,14 @@ RUN make convolve_cubes
 # once, ends up at bin/match_cubes.
 RUN make match_cubes
 
+# rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
+# rmclean.f90) against real dirty AMP/PHA cubes rm_synthesis itself wrote
+# (planning/RMCLEAN_INTEGRATION_PLAN.md T2) -- needs FFTW3 (already
+# installed above for convolve_cubes) plus CFITSIO, no AST dependency
+# (this tool never resamples anything). Built once, ends up at
+# bin/rmclean_cubes.
+RUN make rmclean_cubes
+
 # plot_tile_async_swimlane.py: symlinked into bin/ (not copied) so there's
 # one source of truth -- editing scripts/plot_tile_async_swimlane.py in a
 # later image layer or a bind-mounted dev checkout is still what actually

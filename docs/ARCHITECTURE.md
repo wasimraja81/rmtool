@@ -50,9 +50,31 @@ below for the architecture, and
   maintenance-cost-for-zero-regression-risk tradeoff (see its own header
   comment and T13 in the plan doc).
 
+### RM-CLEAN
+Standalone tool, own binary, independent of the Core Runtime build graph --
+post-processes a REAL dirty AMP/PHA cube `rm_synthesis` itself wrote. See
+[planning/RMCLEAN_INTEGRATION_PLAN.md](../planning/RMCLEAN_INTEGRATION_PLAN.md)
+(tickets T0-T2) for full design/verification detail.
+- `src/rmclean.f90` (`rmclean_mod`): pure computation, no FITS I/O of its
+  own -- Högbom-style complex CLEAN, Gaussian restore, RMSF/dirty-beam
+  construction, the `lsq_ref_compute`/`lsq_ref_report` reference-choice
+  API, and the enforced Nyquist-type `get_drm` sampling floor.
+- `src/rmclean_cubes.f90`: standalone driver -- reads a dirty AMP/PHA pair
+  plus `.MASK.CUBE.FITS`/`CHANFREQ`, validates the existing RM grid
+  against `get_drm` rather than resampling it (Gate 0), CLEANs every
+  pixel in an OpenMP-parallel loop (one thread per pixel) backed by a
+  hash-bucketed cache sharing one RMSF table across pixels with the same
+  valid-channel mask pattern, and writes CLEAN/RESID/RESTORED AMP/PHA
+  cubes. GPU support is explicitly deferred to a later, separate effort.
+- `rm_synthesis` itself can build its own dirty cube at a computationally
+  cheaper phase reference (`lsq_ref_mode=`), recording whichever
+  reference was actually used in a new `LSQREF` header keyword so
+  `rmclean_cubes` never has to assume one.
+
 ### Build and Delivery
 - `Makefile`: primary development build matrix (OMP/GPU variants), plus
-  independent `reproject_cubes`/`convolve_cubes`/`match_cubes` targets.
+  independent `reproject_cubes`/`convolve_cubes`/`match_cubes`/
+  `rmclean_cubes` targets.
 - `docker/`: container build and release helpers.
 
 ### Configuration and Operations

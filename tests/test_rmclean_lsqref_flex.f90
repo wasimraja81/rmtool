@@ -210,8 +210,9 @@ contains
       call compute_rmsf_fwhm(lsq_in, nchan, fwhm_rm)
       call plan_fourier_interp(nrm_l, nrm_l, plan_fwd, plan_bwd)
 
-      call clean_complex(rm, nrm_l, dirty_re, dirty_im, table, 500, 0.1_sp,&
-      &1.0e-4_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
+      call clean_complex(lsq_in, nchan, lsq_ref_compute, rm, nrm_l, dirty_re,&
+      &dirty_im, table, 500, 0.1_sp, 1.0e-4_sp, comp_re, comp_im, resid_re,&
+      &resid_im, n_iter_used, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
       out_amp = sqrt(out_re**2 + out_im**2)

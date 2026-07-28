@@ -229,10 +229,13 @@ contains
       !! Direct DFT dirty tomograph. Phase-referenced to lambda_sq=0 (NO
       !! subtraction of any mean/reference lambda^2), per the user's own
       !! explicit instruction, matching their own thesis codebase's
-      !! convention exactly -- NOT rm_synthesis_mod.f90's own
-      !! extract_general_setup convention (which references to the
-      !! band's own mean lambda^2, for numerically smaller phase
-      !! arguments across a whole production run). Must stay consistent
+      !! convention exactly -- and ALSO matching rm_synthesis_mod.f90's
+      !! own extract_general_setup convention, which is itself
+      !! unconditionally at lambda_sq=0 (confirmed directly at
+      !! rm_synthesis_mod.f90:675-791: its own phi_tmp=omega*t(kk) uses
+      !! raw L_sq, no mean subtraction anywhere) -- this test's own
+      !! convention is not a deliberate divergence from rm_synthesis's,
+      !! it is the same convention. Must stay consistent
       !! with sky_model_qu's own convention (also raw l_sq, no
       !! subtraction) and with whatever lsq_ref is passed into
       !! build_rmsf_offset_table/compute_dirty_rmbeam_direct below (0.0
@@ -400,8 +403,9 @@ contains
       endif
       call plan_fourier_interp(nrm_l, nrm_l, plan_fwd, plan_bwd)
 
-      call clean_complex(rm, nrm_l, dirty_re, dirty_im, table, 1000, 0.1_sp,&
-      &0.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
+      call clean_complex(l_sq, nchan, 0.0_sp, rm, nrm_l, dirty_re, dirty_im,&
+      &table, 1000, 0.1_sp, 0.0_sp, comp_re, comp_im, resid_re, resid_im,&
+      &n_iter_used, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
       out_amp = sqrt(out_re**2 + out_im**2)

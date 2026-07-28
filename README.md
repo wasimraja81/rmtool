@@ -141,6 +141,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 - **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
 - **[planning/ENCAPSULATION_REFACTOR_PLAN.md](planning/ENCAPSULATION_REFACTOR_PLAN.md)** — Encapsulation refactor plan: config/tile-planner/IO-orchestration derived types, ticket-by-ticket (T0-T5, all adopted)
 - **[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)** — Multi-band Faraday tomography plan: config schema, frequency merge, cross-band geometry/resolution matching (`reproject_cubes`/`convolve_cubes`/`match_cubes`), beam-metadata propagation, ticket-by-ticket (T0-T14, all adopted)
+- **[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)** — RM-CLEAN integration plan: core algorithm module (`rmclean_mod`), standalone tool (`rmclean_cubes`), mask-pattern caching, OpenMP parallelism, ticket-by-ticket (T0-T2, all adopted; GPU explicitly deferred)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
@@ -705,6 +706,51 @@ modules (`src/gaussft.f90`, `src/commonbeam.f90`) are documented in
 [planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 (tickets T10-T14) and in each source file's own header comment.
 
+## RM-CLEAN
+
+`rmclean_cubes` — standalone RM-CLEAN (Högbom-style deconvolution),
+driving `rmclean_mod` (`src/rmclean.f90`, pure computation, no FITS I/O
+of its own) against a real dirty AMP/PHA cube pair `rm_synthesis` itself
+wrote, plus its `.MASK.CUBE.FITS`/`CHANFREQ` table:
+
+```bash
+make rmclean_cubes
+bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
+  maskfile=out.MASK.CUBE.FITS outfile=out threshold=0.01
+# writes out.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS; --help for the
+# full option list (niter/gain, min_samples_per_fwhm, refine_nsigma,
+# lsq_ref_compute_mode/lsq_ref_report_mode, mask_pattern_cache_max)
+```
+
+This tool cannot resample the RM axis — it's fixed by whatever `CDELT3`
+`rm_synthesis` already wrote — so it validates the existing grid instead
+(Gate 0: refuses to proceed if the grid doesn't resolve the RMSF fwhm at
+`min_samples_per_fwhm`, default 2) rather than silently producing a
+wrong answer. Notably, the dirty cube only needs ordinary
+resolution-level sampling — CLEAN's own sub-pixel peak refinement fits
+against the analytically-known RMSF model rather than interpolating the
+stored samples, so no finer (`lsq_ref`-dependent) sampling of the RM
+axis is required, and a cheap model-consistency fast path handles the
+common case with a full local search reserved for iterations whose
+misfit exceeds `refine_nsigma` × the data-driven noise estimate.
+Per-pixel work is parallelized over OpenMP (one thread per pixel,
+embarrassingly parallel along the RM axis), with a mask-pattern cache
+sharing one RMSF table across every pixel with the same valid-channel
+set, rather than rebuilding it per pixel. GPU support is explicitly
+deferred to a later, separate effort.
+
+`rm_synthesis` itself can build its dirty AMP/PHA cube at a
+computationally cheaper phase reference than the default (`lsq_ref_mode=
+mid|centroid|min|max|fixed`, default `zero` — this project's own
+historical thesis-matching convention, unaffected unless set
+explicitly); whichever reference is actually used is recorded in a new
+`LSQREF` header keyword so `rmclean_cubes` never has to assume one.
+
+Full design detail and verification evidence are documented in
+[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)
+(tickets T0-T3c) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
+header comments.
+
 ## Project Structure
 
 ```
@@ -724,6 +770,10 @@ rmtool/
 │   ├── match_cubes.f90        Standalone: reproject_cubes + convolve_cubes consolidated,
 │   │                          chained through memory (own binary; neither of the above
 │   │                          two is modified/shared -- adapts their logic instead)
+│   ├── rmclean.f90            rmclean_mod: RM-CLEAN core (Högbom deconvolution), pure
+│   │                          computation, no FITS I/O of its own
+│   ├── rmclean_cubes.f90      Standalone: RM-CLEAN driven against real dirty AMP/PHA
+│   │                          cubes rm_synthesis wrote (own binary)
 │   └── legacy/                Older standalone FITS utilities, not part of the build
 ├── cfg/                        Configuration files, examples, and ARCHIVED/ (63 historical configs);
 │                                example_beamLog.txt/.csv for convolve_cubes' ASCII beam format

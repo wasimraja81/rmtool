@@ -1,19 +1,43 @@
 program test_drm_floor
-   !! Demonstrates WHY get_drm's own enforced floor is oversample>=2, not
-   !! the bare 2-point Nyquist value of 1 -- the empirical evidence
-   !! get_drm's own doc comment cites, made into a real, re-runnable
-   !! regression check rather than a frozen number in a comment. Added
-   !! after the user's own simpler redesign request: instead of letting a
-   !! caller specify dRM directly, expose ONLY an oversampling factor
-   !! (always applied on top of the mandatory Nyquist-type floor), so
-   !! undersampling is architecturally impossible -- this test confirms
-   !! the floor is set in the right place.
+   !! HISTORY (planning/RMCLEAN_INTEGRATION_PLAN.md tickets T3/T3b/T3c):
+   !! this test ORIGINALLY demonstrated why get_drm's enforced floor was
+   !! oversample>=2 (peak_interp_parabolic's raw-sample complex-value
+   !! fit genuinely needed that carrier-resolving margin). After T3's
+   !! pure-search refinement landed, the oversample=1 case briefly
+   !! PASSED (the phase-sensitive search finds the peak even here).
+   !! With T3c's tiered default it fails AGAIN -- and correctly so, for
+   !! a NEW, different reason this test now documents:
    !!
-   !! Since get_drm now correctly REFUSES oversample<2 (tests/
-   !! test_drm_floor_enforcement.f90 checks that refusal directly), the
-   !! unsafe (oversample=1) case here is computed by hand, bypassing
-   !! get_drm deliberately, purely to demonstrate what the enforcement is
-   !! protecting against -- not a suggested usage pattern.
+   !! At this test's own BAND-CENTROID reference, max_offset ~= span/2,
+   !! so the carrier scale and the RESOLUTION scale coincide:
+   !! samples-per-fwhm = oversample/2 exactly. oversample=1 therefore
+   !! means HALF a sample per RMSF fwhm -- below RESOLUTION Nyquist,
+   !! i.e. below the input contract T3b's own Gate 0 enforces
+   !! (min_samples_per_fwhm>=1 hard floor, default 2): the discrete
+   !! peak bin and its neighbours no longer reliably trace the RMSF
+   !! main lobe, so the tiered fast path's log-magnitude location step
+   !! has nothing valid to work with, and (early iterations'
+   !! sidelobe-dominated rms making the escalation criterion lenient)
+   !! its miss is not caught. Such grids are OUT OF CONTRACT --
+   !! rmclean_cubes' own Gate 0 refuses them up front; this module-level
+   !! test confirms the failure mode is real, not hypothetical, which
+   !! is exactly why that gate exists. (The genuinely-coarse-but-
+   !! IN-contract regime -- resolution-adequate grids far below the old
+   !! carrier bound, e.g. fwhm/2 at lsq_ref=0 -- is covered thoroughly
+   !! by tests/test_matched_filter_refine.f90; at THIS test's centroid
+   !! reference that regime doesn't exist, since the two bounds
+   !! coincide.)
+   !!
+   !! oversample=2 here = 1 sample per fwhm: below Gate 0's DEFAULT
+   !! (2/fwhm) but above its hard floor (1/fwhm) -- and confirmed to
+   !! still recover chi0 correctly in this noiseless scenario, which is
+   !! evidence the default-2 carries genuine safety margin rather than
+   !! sitting on the edge.
+   !!
+   !! get_drm itself STILL refuses oversample<2 unchanged (tests/
+   !! test_drm_floor_enforcement.f90 checks that refusal directly). The
+   !! oversample=1 case here is still computed BY HAND, bypassing
+   !! get_drm, exactly as before.
    !!
    !! Sky model: single Faraday-thin point source, RM=50 rad/m^2,
    !! amplitude=10 Jy/(rad/m^2), intrinsic angle chi0=0.3 rad (nonzero,
@@ -44,24 +68,30 @@ program test_drm_floor
    &lsq_ref_compute=lsq_ref_compute)
    call inject(l_sq, nchan, q, u)
 
-   ! Unsafe: oversample=1 (bare Nyquist), computed BY HAND since get_drm
-   ! itself now correctly refuses this -- see this file's own top comment.
+   ! oversample=1 at THIS centroid reference = 0.5 samples/fwhm --
+   ! below RESOLUTION Nyquist, out of the T3b input contract entirely
+   ! (see this file's own top comment). Computed BY HAND since get_drm
+   ! itself refuses it.
    call run_case_raw_oversample(l_sq, nchan, lsq_ref_compute, q, u, 1.0_sp, chi0_at_oversample_1)
-   ! Safe: oversample=2, get_drm's own enforced floor, via the real API.
+   ! oversample=2 (= 1 sample/fwhm here), get_drm's own enforced floor,
+   ! via the real API.
    call run_case(l_sq, nchan, lsq_ref_compute, q, u, 2.0_sp, chi0_at_oversample_2)
 
    write(*,'(A)') '===================================================='
-   write(*,'(A,F0.4,A,F0.4,A)') 'oversample=1 (bare Nyquist, computed by hand): chi0=',&
+   write(*,'(A,F0.4,A,F0.4,A)') 'oversample=1 (0.5 samples/fwhm, by hand): chi0=',&
    &chi0_at_oversample_1, ' rad (true=', chi0_true, ' rad)'
-   write(*,'(A,F0.4,A,F0.4,A)') 'oversample=2 (get_drm''s own enforced floor): chi0=',&
+   write(*,'(A,F0.4,A,F0.4,A)') 'oversample=2 (1 sample/fwhm, get_drm floor): chi0=',&
    &chi0_at_oversample_2, ' rad (true=', chi0_true, ' rad)'
    write(*,'(A)') '===================================================='
 
    call check(abs(chi0_at_oversample_1-chi0_true) > 0.1_sp,&
-   &'oversample=1 (bare Nyquist) gives a WRONG chi0 (>0.1 rad off) -- this is'&
-   &//' exactly what get_drm''s own floor=2 protects against', all_pass)
+   &'oversample=1 (0.5 samples/fwhm: below RESOLUTION Nyquist, out of the'&
+   &//' T3b input contract) gives a WRONG chi0 -- the real failure mode'&
+   &//' Gate 0''s min_samples_per_fwhm floor exists to refuse', all_pass)
    call check(abs(chi0_at_oversample_2-chi0_true) <= 0.02_sp,&
-   &'oversample=2 (get_drm''s own enforced floor) already recovers chi0 correctly', all_pass)
+   &'oversample=2 (1 sample/fwhm: above Gate 0''s hard floor, below its'&
+   &//' default) still recovers chi0 correctly -- the default-2 margin is'&
+   &//' genuine margin, not the edge', all_pass)
 
    if (all_pass) then
       write(*,'(A)') '[PASS] test_drm_floor: all checks passed'
@@ -153,8 +183,9 @@ contains
          dirty_im(j) = (dot_product(q_in, s_tmpl) + dot_product(u_in, c_tmpl))/real(n, sp)
       end do
       call build_rmsf_offset_table(lsq_in, n, lsq_ref, rm(nrm_l)-rm(1), drm, 20, table)
-      call clean_complex(rm, nrm_l, dirty_re, dirty_im, table, 500, 0.1_sp, 1.0e-4_sp,&
-      &comp_re, comp_im, resid_re, resid_im, n_iter_used, comp_rm_refined)
+      call clean_complex(lsq_in, n, lsq_ref, rm, nrm_l, dirty_re, dirty_im,&
+      &table, 500, 0.1_sp, 1.0e-4_sp, comp_re, comp_im, resid_re, resid_im,&
+      &n_iter_used, comp_rm_refined)
       comp_amp = sqrt(comp_re**2+comp_im**2)
       ipeak = 1
       do j = 1, nrm_l
