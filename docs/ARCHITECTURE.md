@@ -415,10 +415,14 @@ on this section's own mechanism, not just on `rmclean_cubes`:
   corrupted/all-zero output cube. gfortran/libgfortran's own free-unit
   bookkeeping is not documented as safe against concurrent allocation
   from multiple threads. Fixed in `rmclean_cubes.f90` by using fixed,
-  pre-assigned per-thread unit numbers instead of `newunit=`. Not
-  independently confirmed either way for `rm_synthesis.f90`'s own
-  `write_rm_chunk_raw` (unchanged here) — flagged as a follow-up worth
-  checking if `io_write_threads>1` is ever seen to misbehave there.
+  pre-assigned per-thread unit numbers instead of `newunit=` —
+  **and, since the exact same pattern is used here, `write_rm_chunk_raw`
+  above now takes a caller-assigned `unit_no` too** (700+thread/
+  800+thread for the AMP/PHA raw writers in `do_tile_write`'s own two
+  call sites, disjoint from the parallel-read ranges 200+/300+/400+/500+
+  and the multi-band per-band range 600+2*iband). 15 repeated
+  `io_write_threads=4` runs post-fix, 0 mismatches; full regression
+  suite green.
 
 #### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
 
