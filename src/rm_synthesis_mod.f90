@@ -13,6 +13,7 @@ module rm_synthesis_mod
 
   private
   public :: extract_general_setup, extract_general, extract_general_ri
+  public :: compute_lsq_ref
   public :: extract_general_w, extract_general_ri_w
   public :: prepare_gpu_data, prepare_cpu_data, tile_extract_gpu_rm_blocked
   public :: cubestat_tail_quantile_maps
@@ -165,6 +166,20 @@ module rm_synthesis_mod
     integer(int32) :: nrm_out_par = 100, use_auto_rm_range = 1
     ! Output format
     integer(int32) :: output_mode = 0, ap_angle_mode = 0
+    ! Phase reference lambda^2 for the dirty AMP/PHA cube's own phase
+    ! convention -- mode+fixed_value, mirroring rmclean_mod's own
+    ! get_lsq_ref_compute strategy (src/rmclean.f90; duplicated here, not
+    ! `use`d, matching this project's standalone-module convention: see
+    ! compute_lsq_ref below). Default 'zero' preserves this project's
+    ! historical thesis-matching convention (lsq_ref=0, no subtraction)
+    ! exactly -- every existing cfg file is unaffected by this option's
+    ! addition. See planning/RMCLEAN_INTEGRATION_PLAN.md for why a
+    ! caller might prefer 'mid' instead: it lets RM-CLEAN's own Gate 0
+    ! validate against a MUCH coarser CDELT3 for the same oversample,
+    ! since get_drm's bound is set by max_k|l_sq(k)-lsq_ref|, minimized
+    ! by centring lsq_ref between the data's own extremes.
+    character(len=16) :: lsq_ref_mode = 'zero'
+    real(sp) :: lsq_ref_fixed_value = 0.0_sp
     ! Masking & optional outputs
     character(len=272) :: mask_cube_file = ' ', mask_input_cube_file = ' '
     character(len=272) :: mask_trust_mode = 'safe'
@@ -672,17 +687,69 @@ contains
     close(csv_unit)
   end subroutine write_timing_csv_line
 
-  subroutine extract_general_setup(t, npts, fac, beg_rm, end_rm, nout, nu, cos_arr, sin_arr, maxout, maxpts, use_auto_rm_range, ofac)
+  function compute_lsq_ref(l_sq, n, mode, fixed_value) result(lsq_ref)
+    !! The phase-reference lambda^2 used to build extract_general_setup's
+    !! own cos_arr/sin_arr templates -- mode+fixed_value, mirroring
+    !! rmclean_mod's own get_lsq_ref_compute (src/rmclean.f90) exactly:
+    !! duplicated here rather than `use rmclean_mod`, since this module is
+    !! the older, heavily production-tested core and rmclean_mod is a
+    !! newer, algorithm-specific add-on -- adding a hard dependency in
+    !! this direction would be backwards (this project's own convention
+    !! elsewhere is that small standalone tools/modules duplicate rather
+    !! than couple, e.g. gaussft_mod/commonbeam_mod/rmclean_mod each avoid
+    !! cross-module coupling for exactly this reason).
+    !! 'zero' (default): lsq_ref=0, this project's historical
+    !! thesis-matching convention, no subtraction at all.
+    !! 'mid': (min(l_sq)+max(l_sq))/2 -- minimizes RM-CLEAN's own get_drm
+    !! bound (see that routine's own doc comment for the Chebyshev-centre
+    !! derivation); recommended if the dirty cube will be RM-CLEANed
+    !! afterward and a coarser CDELT3/faster CLEAN is wanted.
+    !! 'centroid': channel-count-weighted mean.
+    !! 'min'/'max': the data's own extremes.
+    !! 'fixed': fixed_value, required (and validated at cfg-parse time --
+    !! see read_cfg_keyval's own lsq_ref_mode='fixed' check) whenever this
+    !! mode is selected.
+    integer(int32), intent(in) :: n
+    real(sp), intent(in) :: l_sq(n)
+    character(len=*), intent(in) :: mode
+    real(sp), intent(in) :: fixed_value
+    real(sp) :: lsq_ref
+
+    select case (trim(mode))
+    case ('zero')
+      lsq_ref = 0.0_sp
+    case ('mid')
+      lsq_ref = 0.5_sp*(minval(l_sq) + maxval(l_sq))
+    case ('centroid')
+      lsq_ref = sum(l_sq)/real(n, sp)
+    case ('min')
+      lsq_ref = minval(l_sq)
+    case ('max')
+      lsq_ref = maxval(l_sq)
+    case ('fixed')
+      lsq_ref = fixed_value
+    case default
+      write(*,*) 'FATAL: compute_lsq_ref: unrecognized mode: ', trim(mode)
+      stop 1
+    end select
+  end function compute_lsq_ref
+
+  subroutine extract_general_setup(t, npts, fac, beg_rm, end_rm, nout, nu, cos_arr, sin_arr, maxout, maxpts, use_auto_rm_range, ofac, lsq_ref)
     !! Pre-compute sine and cosine templates for RM-extraction
     !! This avoids redundant trig calculations across multiple pixels
     !! use_auto_rm_range: 1=derive beg/end/nrm from data, 0=use user beg/end
     !! nout is final output depth and should be nrm * ofac
     !! See: extract_general_setup.f for original implementation
-    
+    !! lsq_ref: phase-reference lambda^2, from compute_lsq_ref above --
+    !! baked into the template here (phi_tmp uses t(kk)-lsq_ref, not raw
+    !! t(kk)), so every downstream caller (extract_general's own dot
+    !! products against cos_arr/sin_arr) automatically inherits whichever
+    !! reference was chosen with no further code changes needed.
+
     implicit none
     integer(int32), intent(in) :: npts, nout, maxout, maxpts, use_auto_rm_range
     integer(int32), intent(in) :: ofac
-    real(sp), intent(in) :: t(*), fac, beg_rm, end_rm
+    real(sp), intent(in) :: t(*), fac, beg_rm, end_rm, lsq_ref
     real(sp), intent(out) :: nu(*)
     real(sp), intent(out) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
     
@@ -782,7 +849,7 @@ contains
     do i = 1, nout
       omega = 2.0_sp * nu(i)
       do kk = 1, npts
-        phi_tmp = omega * t(kk)
+        phi_tmp = omega * (t(kk) - lsq_ref)
         cos_arr(kk, i) = cos(phi_tmp)
         sin_arr(kk, i) = -sin(phi_tmp)
       end do
@@ -1760,6 +1827,8 @@ contains
     logical :: seen_use_auto_rm_range
     logical :: seen_output_mode
     logical :: seen_ap_angle_mode
+    logical :: seen_lsq_ref_mode
+    logical :: seen_lsq_ref_fixed_value
     logical :: seen_mask_cube_file, seen_mask_input_cube_file
     logical :: seen_mask_trust_mode
     logical :: seen_write_mask_output, seen_write_nvalid_output
@@ -1831,6 +1900,8 @@ contains
     seen_use_auto_rm_range = .false.
     seen_output_mode = .false.
     seen_ap_angle_mode = .false.
+    seen_lsq_ref_mode = .false.
+    seen_lsq_ref_fixed_value = .false.
     seen_mask_cube_file = .false.
     seen_mask_input_cube_file = .false.
     seen_mask_trust_mode = .false.
@@ -2466,6 +2537,39 @@ contains
           close(unit_cfg)
           return
         end select
+      case ('lsq_ref_mode')
+        if (seen_lsq_ref_mode) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': lsq_ref_mode'
+          status = -239
+          close(unit_cfg)
+          return
+        end if
+        seen_lsq_ref_mode = .true.
+        select case (trim(lower_ascii(val)))
+        case ('zero', 'mid', 'centroid', 'min', 'max', 'fixed')
+          cfg%lsq_ref_mode = trim(lower_ascii(val))
+        case default
+          write(*,*) 'Invalid lsq_ref_mode at cfg line ', line_no
+          write(*,*) 'Allowed values: zero, mid, centroid, min, max, fixed'
+          status = -240
+          close(unit_cfg)
+          return
+        end select
+      case ('lsq_ref_fixed_value')
+        if (seen_lsq_ref_fixed_value) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': lsq_ref_fixed_value'
+          status = -241
+          close(unit_cfg)
+          return
+        end if
+        seen_lsq_ref_fixed_value = .true.
+        read(val, *, iostat=ios) cfg%lsq_ref_fixed_value
+        if (ios /= 0) then
+          write(*,*) 'Invalid lsq_ref_fixed_value at cfg line ', line_no
+          status = -242
+          close(unit_cfg)
+          return
+        end if
       case ('mask_cube_file')
         if (seen_mask_cube_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_cube_file'
@@ -2705,6 +2809,11 @@ contains
     if (status == 0 .and. cfg%output_mode /= 0 .and. cfg%output_mode /= 1) then
       write(*,*) 'Invalid output_mode: expected ap or ri'
       status = -170
+    end if
+    if (status == 0 .and. trim(cfg%lsq_ref_mode) == 'fixed' .and.&
+    &.not. seen_lsq_ref_fixed_value) then
+      write(*,*) 'lsq_ref_mode=fixed requires lsq_ref_fixed_value to be set'
+      status = -243
     end if
     if (status == 0 .and. cfg%ofac < 1) then
       write(*,*) 'Invalid ofac: expected >= 1'

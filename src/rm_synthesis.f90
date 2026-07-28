@@ -241,6 +241,7 @@ character(len=64) :: ctype
 character(len=72) :: comment
 real(dp) cval,cdelt, pi
 real(sp) cpix, dRM
+real(sp) lsq_ref_used
 
  ! Multi-beam input passthrough (CASAMBM/BEAMS extension) -- see the
  ! header-writing block's own comment for the full reasoning.
@@ -2175,9 +2176,17 @@ allocate(sin_arr(nz_out, nrm_out))
 
  ! Pre-compute templates for ALL nz_out channels (good and bad)
  ! Bad channels have valid cos/sin but won't be used (masked by wts_tile=0 in DFT)
+ ! lsq_ref_used: computed once from the FULL (all-bands-appended) L_sq
+ ! array via cfg%lsq_ref_mode/cfg%lsq_ref_fixed_value, baked into
+ ! extract_general_setup's own cos_arr/sin_arr templates below, and
+ ! recorded verbatim into the AMP/PHA header's own LSQREF keyword further
+ ! down so a downstream tool (e.g. rmclean_cubes) never has to assume a
+ ! value.
+lsq_ref_used = compute_lsq_ref(L_sq, nz_out, cfg%lsq_ref_mode,&
+&cfg%lsq_ref_fixed_value)
 call extract_general_setup(L_sq, nz_out, cfg%fac, cfg%beg_rm, cfg%end_rm,&
 &nrm_out, RM, cos_arr, sin_arr, nrm_out, nz_out,&
-&cfg%use_auto_rm_range, cfg%ofac)
+&cfg%use_auto_rm_range, cfg%ofac, lsq_ref_used)
 dRM = (RM(nrm_out) - RM(1))/real(nrm_out - 1)
 open(77,file='sampled_RM.txt',status='unknown')
 write(77,*)"# ofac: ",cfg%ofac
@@ -2796,6 +2805,18 @@ call ftpkyd(41,'crpix3',1.0d0,decimals,'Reference pixel',status)
 call ftpkyd(42,'crpix3',1.0d0,decimals,'Reference pixel',status)
 call ftpkyd(41,'cdelt3',dble(dRM),decimals,'RM spacing',status)
 call ftpkyd(42,'cdelt3',dble(dRM),decimals,'RM spacing',status)
+ ! LSQREF: the phase-reference lambda^2 (m^2) actually used to build
+ ! this cube's own dirty AMP/PHA phase convention (cfg%lsq_ref_mode/
+ ! cfg%lsq_ref_fixed_value via compute_lsq_ref, baked into
+ ! extract_general_setup's own cos_arr/sin_arr templates) -- recorded so
+ ! a downstream tool (e.g. rmclean_cubes) never has to assume 0.0.
+ ! Absent on cubes written before this keyword existed; such a reader
+ ! should fall back to 0.0, this project's own historical convention
+ ! (and this option's own default).
+call ftpkyd(41,'lsqref',dble(lsq_ref_used),decimals,&
+&'Phase reference lambda^2 (m^2)',status)
+call ftpkyd(42,'lsqref',dble(lsq_ref_used),decimals,&
+&'Phase reference lambda^2 (m^2)',status)
 if(out_mask_open)then
    call ftpkys(43,'ctype3','FREQ',&
    &'Frequency axis',status)
