@@ -13,11 +13,23 @@ even though every value going INTO clean_complex is bit-identical (verified
 directly, planning/RMCLEAN_INTEGRATION_PLAN.md ticket T4a). Confirmed this
 is a real, pre-existing floating-point reassociation effect (not a tiling
 logic bug): the SAME two tile configurations produce byte-identical output
-when built at -O0 (no auto-vectorization). AMP is the physically meaningful
-quantity here and differs by <1e-3 in practice; PHA at near-zero AMP is
+when built at -O0 (no auto-vectorization). PHA at near-zero AMP is
 mathematically ill-conditioned (atan2 of a near-zero complex number is
 hypersensitive to tiny perturbations) and is therefore only compared where
 AMP clears a floor.
+
+DEFAULT amp_atol=5e-4 is anchored to the fixture's own noise floor, not
+a round number: tests/data/truth.json's own noise_sigma=0.01 (per-
+channel Q/U), 200 channels -> dirty/restored AMP's own median pixel
+value is ~8e-4-1.5e-3 (measured directly, not assumed). The observed
+worst-case diff across all 6 output cubes and every tile/thread
+configuration tested is 1.7e-4 (CLEAN.AMP) -- 5e-4 gives ~3x margin
+over that observed worst case while staying BELOW the noise floor, so
+a genuine future regression corrupting noise-level pixels by more than
+the fixture's own measurement noise would still be caught (the
+original 1e-2, anchored to the CLEAN stopping threshold rather than
+the noise floor, was ~12x looser than the noise floor itself and would
+not have caught that).
 """
 import sys
 from pathlib import Path
@@ -48,10 +60,10 @@ def compare_pair(base, other, suffix, amp_atol, pha_atol, amp_floor):
 def main():
     if len(sys.argv) < 3:
         print("Usage: check_tile_consistency.py <base_outfile> <other_outfile> "
-              "[amp_atol=1e-2] [pha_atol=0.05] [amp_floor=1e-2]")
+              "[amp_atol=5e-4] [pha_atol=0.05] [amp_floor=1e-2]")
         sys.exit(1)
     base, other = sys.argv[1], sys.argv[2]
-    amp_atol = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-2
+    amp_atol = float(sys.argv[3]) if len(sys.argv) > 3 else 5e-4
     pha_atol = float(sys.argv[4]) if len(sys.argv) > 4 else 0.05
     amp_floor = float(sys.argv[5]) if len(sys.argv) > 5 else 1e-2
 
