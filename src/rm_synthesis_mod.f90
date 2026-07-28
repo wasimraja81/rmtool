@@ -3678,7 +3678,7 @@ contains
 
   subroutine write_rm_chunk_raw(file_path, datastart, nx_out, ny_out,&
        &ix_out_beg, ix_out_end, iy_out_beg, iy_out_end,&
-       &rm_beg, rm_end, unit_no, data)
+       &rm_beg, rm_end, data)
     !! Writes one contiguous RM-bin range [rm_beg,rm_end] of one tile's
     !! output data directly to disk, bypassing CFITSIO's ftpsse for the
     !! pixel data entirely -- see the module-level comment above for why.
@@ -3717,19 +3717,6 @@ contains
     integer, intent(in) :: nx_out, ny_out
     integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
     integer, intent(in) :: rm_beg, rm_end
-    integer, intent(in) :: unit_no
-      !! Fixed, caller-assigned unit (disjoint per concurrent writer --
-      !! see do_tile_write's own call sites), NOT newunit=. Found
-      !! empirically while porting this routine to rmclean_cubes.f90
-      !! (planning/RMCLEAN_INTEGRATION_PLAN.md ticket T4c): concurrent
-      !! open(newunit=...) calls from separate OpenMP threads, each
-      !! opening the SAME file path for its own disjoint byte range,
-      !! intermittently produced a corrupted/all-zero output cube --
-      !! gfortran/libgfortran's own free-unit-number bookkeeping is not
-      !! documented as safe against concurrent allocation from multiple
-      !! threads. A fixed, pre-assigned unit per writer sidesteps that
-      !! allocation race entirely rather than relying on it being fixed/
-      !! absent in a given gfortran version.
     real(sp), intent(in) :: data(:)
       !! This thread's contiguous (x,y,rm) chunk: nx_tile*ny_tile reals
       !! per RM-plane, planes back-to-back -- exactly how p_tile_arr/
@@ -3750,11 +3737,31 @@ contains
     plane_stride = int(nx_out, kind=int64) * int(ny_out, kind=int64)
 
     ! status='old' because CFITSIO has already created and header-written
-    ! this file before any raw write is ever dispatched. Unit is the
-    ! caller-assigned unit_no (see its own comment above), not newunit=.
-    u = unit_no
-    open(unit=u, file=trim(file_path), access='stream',&
+    ! this file before any raw write is ever dispatched.
+    !
+    ! newunit=, guarded by a named critical section: the Fortran standard
+    ! does not guarantee ANY I/O statement -- open() included, newunit=
+    ! or not -- is safe to call concurrently without explicit
+    ! synchronization. Confirmed the hard way: this call is reached
+    ! concurrently (once per io_write_threads worker, each opening the
+    ! SAME file path for its own disjoint byte range) from do_tile_write's
+    ! own `!$omp parallel do`, and a first attempt at fixing a real,
+    ! observed corruption here (planning/RMCLEAN_INTEGRATION_PLAN.md
+    ! ticket T4c) used fixed, pre-assigned per-thread unit numbers instead
+    ! -- which fixed the observed race but only by manual, cross-file
+    ! bookkeeping (every other unit-number range in this codebase has to
+    ! stay disjoint from it by inspection, not by anything the compiler or
+    ! runtime enforces). This critical section makes unit allocation
+    ! itself atomic instead: genuinely unique (real newunit= semantics,
+    ! no manual range to maintain), while the actual write below still
+    ! runs fully in parallel per thread -- only the brief "grab a unit"
+    ! step is serialized, not the I/O itself. Named (not a bare `!$omp
+    ! critical`) so it doesn't share a lock with unrelated critical
+    ! sections elsewhere in this module (e.g. logger_write_lock).
+    !$omp critical (raw_write_open_lock)
+    open(newunit=u, file=trim(file_path), access='stream',&
     &form='unformatted', status='old', action='write', iostat=ios)
+    !$omp end critical (raw_write_open_lock)
     if(ios .ne. 0)then
       call log_message('error','tile_write',&
       &'write_rm_chunk_raw: failed to open '//trim(file_path))
@@ -3960,21 +3967,15 @@ contains
           wpar_buf_off = wpar_rm_off_k * &
           &int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64) + 1_int64
 
-          ! 700+wpar_k/800+wpar_k: fixed, disjoint per-thread unit numbers
-          ! for the AMP/PHA raw writers (see write_rm_chunk_raw's own
-          ! comment for why these are pre-assigned rather than left to
-          ! newunit=) -- disjoint from the parallel-READ unit ranges
-          ! (200+/300+/400+/500+ above) and from the multi-band per-band
-          ! Q/U range (600+2*iband).
           call write_rm_chunk_raw(job%path_amp, job%datastart_amp,&
           &job%naxes_out(1), job%naxes_out(2),&
           &job%ix_out_beg, job%ix_out_end, job%iy_out_beg, job%iy_out_end,&
-          &wpar_rm_beg, wpar_rm_end, 700+wpar_k, job%p_tile_arr(wpar_buf_off:))
+          &wpar_rm_beg, wpar_rm_end, job%p_tile_arr(wpar_buf_off:))
 
           call write_rm_chunk_raw(job%path_pha, job%datastart_pha,&
           &job%naxes_out(1), job%naxes_out(2),&
           &job%ix_out_beg, job%ix_out_end, job%iy_out_beg, job%iy_out_end,&
-          &wpar_rm_beg, wpar_rm_end, 800+wpar_k, job%phi_tile_arr(wpar_buf_off:))
+          &wpar_rm_beg, wpar_rm_end, job%phi_tile_arr(wpar_buf_off:))
        enddo
 !$omp end parallel do
     endif

@@ -1499,11 +1499,23 @@ the first only manifested probabilistically):
 
 1. Concurrent `open(newunit=...)` calls from different OpenMP threads
    (each opening the SAME output file path for its own disjoint byte
-   range) intermittently produced a corrupted/all-zero output cube.
-   Fixed by using fixed, pre-assigned per-thread unit numbers
-   (500+t/600+t) instead of letting the runtime allocate one via
-   `newunit=` at OPEN time -- gfortran/libgfortran's own free-unit
-   bookkeeping is not documented as safe against concurrent allocation.
+   range) intermittently produced a corrupted/all-zero output cube --
+   the Fortran standard does not guarantee any I/O statement is safe to
+   call concurrently without explicit synchronization, so this was an
+   unsynchronized use of a construct never promised thread-safe, not a
+   gfortran-specific defect. First fix: fixed, pre-assigned per-thread
+   unit numbers instead of `newunit=` -- worked, but only via manual
+   cross-file bookkeeping (every other unit-number range in the file
+   has to stay disjoint from it by inspection). Superseded (per the
+   user's own explicit follow-up request) by wrapping just the
+   `open(newunit=u,...)` call itself in a named
+   `!$omp critical (raw_write_open_lock)` -- genuinely unique real
+   `newunit=` semantics, no manual range to maintain, only the brief
+   allocation step serialized (the write/close per thread still runs
+   fully in parallel). Same fix applied to `rm_synthesis_mod.f90`'s own
+   `write_rm_chunk_raw` (io_write_threads' original implementation,
+   which has the identical pattern). 20 repeated `io_write_threads=4`
+   runs against each tool post-fix, 0 mismatches.
 2. **This system's installed libcfitsio's `FTGHAD` writes only the
    LOWER 32 bits of its 3 output arguments**, leaving the upper 32 bits
    of an `integer(kind=8)` receiving variable completely untouched --

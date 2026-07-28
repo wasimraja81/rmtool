@@ -1663,17 +1663,13 @@ contains
                rm_beg = rem_chan*(base_chan+1) + (ith-rem_chan)*base_chan + 1
             endif
             if (rm_len.gt.0) then
-               ! 500+ith/600+ith: fixed, disjoint per-thread unit numbers
-               ! for the AMP/PHA raw writers -- see write_rm_chunk_raw_
-               ! rmclean's own comment for why these are pre-assigned
-               ! rather than left to newunit=.
                call write_rm_chunk_raw_rmclean(out_path(idx_amp),&
                &out_datastart(idx_amp), nx_in, ny_in, ix0, ix0+tx-1,&
-               &iy0, iy0+ty-1, rm_beg, rm_beg+rm_len-1, 500+ith,&
+               &iy0, iy0+ty-1, rm_beg, rm_beg+rm_len-1,&
                &amp_tile(:,:,rm_beg:rm_beg+rm_len-1))
                call write_rm_chunk_raw_rmclean(out_path(idx_pha),&
                &out_datastart(idx_pha), nx_in, ny_in, ix0, ix0+tx-1,&
-               &iy0, iy0+ty-1, rm_beg, rm_beg+rm_len-1, 600+ith,&
+               &iy0, iy0+ty-1, rm_beg, rm_beg+rm_len-1,&
                &pha_tile(:,:,rm_beg:rm_beg+rm_len-1))
             endif
          enddo
@@ -1799,7 +1795,7 @@ contains
 
    subroutine write_rm_chunk_raw_rmclean(file_path, datastart, nx_out,&
    &ny_out, ix_out_beg, ix_out_end, iy_out_beg, iy_out_end, rm_beg,&
-   &rm_end, unit_no, data)
+   &rm_end, data)
       !! Adaptation of rm_synthesis_mod.f90's own write_rm_chunk_raw --
       !! see there for the full byte-offset-math/two-write-pattern/
       !! endianness rationale. Writes one contiguous RM-bin range
@@ -1808,25 +1804,27 @@ contains
       !! pixel data entirely (see write_output_tile's own comment for
       !! why).
       !!
-      !! Deviates from rm_synthesis's own `open(newunit=u,...)` in one
-      !! respect: unit_no is a FIXED, caller-assigned number (disjoint per
-      !! concurrent writer, see write_output_tile's own comment) rather
-      !! than letting the runtime pick one via newunit= at OPEN time.
-      !! Found empirically, not assumed: concurrent `newunit=` calls from
-      !! separate OpenMP threads (each opening the SAME file path, for its
-      !! own disjoint byte range) intermittently produced an all-zero
-      !! output cube -- gfortran/libgfortran's own free-unit-number
-      !! bookkeeping is not documented as safe against concurrent
-      !! allocation, and a race there (two threads handed the same
-      !! "unique" unit) would explain one thread's file state silently
-      !! clobbering another's. Pre-assigned, disjoint unit numbers per
-      !! writer sidestep that allocation race entirely rather than relying
-      !! on it being fixed/absent in a given gfortran version.
+      !! This routine is reached concurrently (once per io_write_threads
+      !! worker, each opening the SAME file path for its own disjoint
+      !! byte range) from write_output_tile's own `!$omp parallel do`.
+      !! The Fortran standard does not guarantee any I/O statement --
+      !! open() included, newunit= or not -- is safe to call concurrently
+      !! without explicit synchronization; a first attempt at fixing a
+      !! real, observed corruption here used fixed, pre-assigned
+      !! per-thread unit numbers instead, which fixed it but only via
+      !! manual, cross-file bookkeeping (every other unit-number range in
+      !! this codebase has to stay disjoint from it by inspection, not
+      !! anything the compiler/runtime enforces). The named critical
+      !! section below makes unit allocation itself atomic instead:
+      !! genuinely unique (real newunit= semantics, no manual range to
+      !! maintain), while the write itself below still runs fully in
+      !! parallel per thread -- only the brief "grab a unit" step is
+      !! serialized.
       character(len=*), intent(in) :: file_path
       integer(kind=8), intent(in) :: datastart
       integer, intent(in) :: nx_out, ny_out
       integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
-      integer, intent(in) :: rm_beg, rm_end, unit_no
+      integer, intent(in) :: rm_beg, rm_end
       real(sp), intent(in) :: data(*)
 
       integer :: u, ios
@@ -1842,9 +1840,10 @@ contains
       plane_elems = row_len * n_rows
       plane_stride = int(nx_out, 8) * int(ny_out, 8)
 
-      u = unit_no
-      open(unit=u, file=trim(file_path), access='stream',&
+      !$omp critical (raw_write_open_lock)
+      open(newunit=u, file=trim(file_path), access='stream',&
       &form='unformatted', status='old', action='write', iostat=ios)
+      !$omp end critical (raw_write_open_lock)
       if (ios.ne.0) then
          write(*,*) 'ERROR: write_rm_chunk_raw_rmclean: failed to open ',&
          &trim(file_path)

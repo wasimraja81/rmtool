@@ -283,7 +283,7 @@ Parallel (io_write_threads=N):
 |---|---|
 | Decomposition axis | RM (slowest axis in output cube) |
 | Output files parallelised | AMP cube and PHA cube |
-| Mechanism (N>1) | Independent `newunit=` STREAM units, one `open`/`write`/`close` cycle per thread per RM-chunk, byte position computed from `datastart + pixel_offset*4` |
+| Mechanism (N>1) | `newunit=` STREAM units (allocation itself serialized via a named `!$omp critical`, see below), one `open`/`write`/`close` cycle per thread per RM-chunk, byte position computed from `datastart + pixel_offset*4` |
 | 2D map outputs (NVALID, MASK, cubestat) | Remain serial via `ftpsse`/`ftpssb`/`ftpssi` — negligible cost |
 
 For `io_write_threads=1` (default): a single `ftpsse` call per tile through
@@ -408,21 +408,32 @@ on this section's own mechanism, not just on `rmclean_cubes`:
   3 variables immediately before every `FTGHAD` call, rather than
   continuing to rely on it.
 - **Concurrent `newunit=` allocation.** `rmclean_cubes`'s own raw-write
-  path originally used `open(newunit=u,...)` per thread per chunk,
+  path originally used plain `open(newunit=u,...)` per thread per chunk,
   mirroring `write_rm_chunk_raw`'s own convention above — but concurrent
   calls from different OpenMP threads (each opening the SAME output
   file path for its own disjoint byte range) intermittently produced a
-  corrupted/all-zero output cube. gfortran/libgfortran's own free-unit
-  bookkeeping is not documented as safe against concurrent allocation
-  from multiple threads. Fixed in `rmclean_cubes.f90` by using fixed,
-  pre-assigned per-thread unit numbers instead of `newunit=` —
-  **and, since the exact same pattern is used here, `write_rm_chunk_raw`
-  above now takes a caller-assigned `unit_no` too** (700+thread/
-  800+thread for the AMP/PHA raw writers in `do_tile_write`'s own two
-  call sites, disjoint from the parallel-read ranges 200+/300+/400+/500+
-  and the multi-band per-band range 600+2*iband). 15 repeated
-  `io_write_threads=4` runs post-fix, 0 mismatches; full regression
-  suite green.
+  corrupted/all-zero output cube. Root cause, precisely stated: the
+  Fortran standard does not guarantee ANY I/O statement — `open()`
+  included, `newunit=` or not — is safe to call concurrently without
+  explicit synchronization; this was simply an unsynchronized use of a
+  construct the standard never promised was thread-safe, not a
+  gfortran-specific defect. A first fix used fixed, pre-assigned
+  per-thread unit numbers instead of `newunit=` in both files — this
+  worked (removes the race by construction, no shared allocation state
+  to race on) but only via manual, cross-file bookkeeping: every other
+  unit-number range in each file has to stay disjoint from it by
+  inspection, nothing the compiler or runtime enforces, so a future
+  addition elsewhere could silently collide. **Superseded** by wrapping
+  just the `open(newunit=u,...)` call itself in a named
+  `!$omp critical (raw_write_open_lock)` in both `write_rm_chunk_raw`
+  (here) and `rmclean_cubes.f90`'s own `write_rm_chunk_raw_rmclean` —
+  genuinely unique, real `newunit=` semantics, no manual range to
+  maintain, and only the brief unit-allocation step is serialized (the
+  write/close for each thread still runs fully in parallel afterward).
+  Named, not a bare `!$omp critical`, so it doesn't share a lock with
+  unrelated critical sections elsewhere (e.g. `logger_write_lock`). 20
+  repeated `io_write_threads=4` runs against each tool post-fix, 0
+  mismatches; full regression suite green.
 
 #### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
 

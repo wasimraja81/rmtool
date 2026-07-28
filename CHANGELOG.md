@@ -183,8 +183,15 @@ a summary, not a replacement for that record.
 ### Fixed
 - Concurrent `open(newunit=...)` from different OpenMP threads (each
   opening the same output file path for its own disjoint byte range)
-  intermittently produced a corrupted output cube — fixed with fixed,
-  pre-assigned per-thread unit numbers instead.
+  intermittently produced a corrupted output cube — the Fortran
+  standard does not guarantee any I/O statement is safe to call
+  concurrently without explicit synchronization. Fixed (in both
+  `rmclean_cubes.f90` and `rm_synthesis_mod.f90`'s own
+  `write_rm_chunk_raw`, which has the identical pattern) by wrapping
+  just the `open(newunit=...)` call in a named `!$omp critical` —
+  genuinely unique, no manual unit-range bookkeeping to maintain,
+  only the brief allocation step serialized. 20 repeated
+  `io_write_threads=4` runs against each tool, 0 mismatches.
 - **This system's installed libcfitsio's `FTGHAD` writes only the lower
   32 bits of its 3 output arguments**, leaving an `integer(kind=8)`
   receiving variable's upper 32 bits at whatever was already there —
