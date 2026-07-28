@@ -3646,6 +3646,20 @@ endif
  ! arithmetic, with CFITSIO never touched concurrently.
 par_wunit_amp = 41
 par_wunit_pha = 42
+! Zero-init before every FTGHAD call: this system's installed libcfitsio
+! writes only the LOWER 32 bits of FTGHAD's 3 output arguments (a real
+! Fortran-wrapper/library ABI truncation, confirmed with a minimal
+! standalone reproducer outside this codebase -- see rmclean_cubes.f90's
+! own open_output_cube for the full story and the ticket this was found
+! under, planning/RMCLEAN_INTEGRATION_PLAN.md T4c). These particular
+! variables happen to already be zero here (main-program-scope locals
+! land in zero-initialized static storage on this platform/compiler, not
+! the stack), which is why this call site was never actually observed to
+! misbehave -- but that is incidental storage-class behaviour, not a
+! guarantee, so init explicitly rather than continue to rely on it.
+io_wpar_headstart = 0_int64
+datastart_amp = 0_int64
+io_wpar_dataend = 0_int64
 status = 0
 call ftghad(par_wunit_amp,io_wpar_headstart,datastart_amp,io_wpar_dataend,status)
 if(status.gt.0)then
@@ -3653,6 +3667,9 @@ if(status.gt.0)then
    call printerror(status)
    stop
 endif
+io_wpar_headstart = 0_int64
+datastart_pha = 0_int64
+io_wpar_dataend = 0_int64
 status = 0
 call ftghad(par_wunit_pha,io_wpar_headstart,datastart_pha,io_wpar_dataend,status)
 if(status.gt.0)then
