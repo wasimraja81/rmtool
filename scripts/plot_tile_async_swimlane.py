@@ -45,10 +45,20 @@ GPU_SYNC_RE = re.compile(r"^gpu (send|recv)$")
 BYTES_RE = re.compile(r"bytes=(?P<bytes>\d+)")
 
 THREAD_CPU_RE = re.compile(
-    r"thread_timing\s+stage=cpu_extract\s+event=(?P<event>start|done)\s+"
-    r"tid=(?P<tid>\d+)\s+rm_block=(?P<rm_block>\d+)\s+nrm_now=(?P<nrm_now>\d+)"
+    r"thread_timing\s+stage=(?P<stage>\w+)\s+event=(?P<event>start|done)\s+"
+    r"tid=(?P<tid>\d+)\s+"
+    r"(?:rm_block=(?P<rm_block>\d+)\s+nrm_now=(?P<nrm_now>\d+)"
+    r"|block=(?P<block>\d+)\s+unit_count=(?P<unit_count>\d+))"
     r"(?:\s+dur_ms=(?P<dur_ms>[0-9]+\.[0-9]+))?"
 )
+# rm_synthesis_mod.f90's own 'thread_timing stage=cpu_extract ... rm_block=
+# ... nrm_now=...' convention and convolve_cubes.f90/match_cubes.f90/
+# reproject_cubes.f90/rmclean_cubes.f90's own logging_mod.f90-based
+# 'thread_timing stage=<convolve|resample|clean> ... block=... unit_count=
+# ...' convention are just two field-name spellings of the same shape (a
+# per-thread, per-work-unit start/done pair) -- both alternatives above
+# feed the same rm_block/nrm_now attributes downstream so one code path
+# (build_cpu_thread_intervals) handles either.
 
 
 @dataclass(frozen=True)
@@ -72,6 +82,7 @@ class ThreadInterval:
     nrm_now: int
     start: datetime
     end: datetime
+    stage: str = "cpu_extract"
     dur_ms: Optional[float] = None
 
 
@@ -207,6 +218,8 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
             if cat == "tile_thread":
                 mt = THREAD_CPU_RE.search(msg)
                 if mt:
+                    sub = mt.group("rm_block") or mt.group("block")
+                    slot = mt.group("nrm_now") or mt.group("unit_count")
                     events.append(
                         Event(
                             ts=ts,
@@ -214,9 +227,9 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
                             tid=tid,
                             message=msg,
                             label=mt.group("event"),
-                            sub=int(mt.group("rm_block")),
-                            kind="cpu_extract",
-                            slot=int(mt.group("nrm_now")),
+                            sub=int(sub),
+                            kind=mt.group("stage"),
+                            slot=int(slot),
                         )
                     )
 
@@ -225,19 +238,35 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
     return events, run_starts
 
 
-def build_cpu_thread_intervals(events: List[Event]) -> List[ThreadInterval]:
-    starts: Dict[Tuple[int, int, int], List[datetime]] = {}
+def build_cpu_thread_intervals(
+    events: List[Event], stage_filter: Optional[str] = None
+) -> List[ThreadInterval]:
+    """Pairs thread_timing start/done events into per-thread intervals.
+
+    stage_filter restricts to one named stage (e.g. "convolve", "resample",
+    "clean", or rm_synthesis's own "cpu_extract") -- needed because a
+    single log can contain more than one stage's thread_timing lines
+    (e.g. match_cubes stages=both emits both "convolve" and "resample"),
+    and mixing them would pair a "convolve" start with a "resample" done
+    if they happened to share the same (tid, sub, slot) by coincidence.
+    stage is included in the pairing key regardless, so this is a belt-
+    and-suspenders filter -- pass None to keep every stage present (the
+    original single-stage rm_synthesis behaviour).
+    """
+    starts: Dict[Tuple[int, int, int, str], List[datetime]] = {}
     intervals: List[ThreadInterval] = []
 
     for ev in events:
-        if ev.category != "tile_thread" or ev.kind != "cpu_extract":
+        if ev.category != "tile_thread":
+            continue
+        if stage_filter is not None and ev.kind != stage_filter:
             continue
         if ev.sub is None or ev.slot is None:
             continue
 
         m = THREAD_CPU_RE.search(ev.message)
         dur_ms = float(m.group("dur_ms")) if (m and m.group("dur_ms")) else None
-        key = (ev.tid, ev.sub, ev.slot)
+        key = (ev.tid, ev.sub, ev.slot, ev.kind)
 
         if ev.label == "start":
             starts.setdefault(key, []).append(ev.ts)
@@ -253,6 +282,7 @@ def build_cpu_thread_intervals(events: List[Event]) -> List[ThreadInterval]:
                             nrm_now=ev.slot,
                             start=st,
                             end=ev.ts,
+                            stage=ev.kind or "cpu_extract",
                             dur_ms=dur_ms,
                         )
                     )
@@ -472,6 +502,9 @@ def plot_cpu_thread_timeline(
     if not thread_intervals:
         raise ValueError("No CPU thread intervals available to plot")
 
+    stages_present = sorted(set(iv.stage for iv in thread_intervals))
+    stage_label = "+".join(stages_present)
+
     all_start = [iv.start for iv in thread_intervals] + [iv.start for iv in io_intervals] + [iv.start for iv in cpu_stage_intervals]
     all_end = [iv.end for iv in thread_intervals] + [iv.end for iv in io_intervals] + [iv.end for iv in cpu_stage_intervals]
     t0 = min(all_start)
@@ -592,7 +625,7 @@ def plot_cpu_thread_timeline(
         plt.Rectangle((0, 0), 1, 1, color="#e97827", ec="black", lw=0.45),
         plt.Rectangle((0, 0), 1, 1, color="#f0be64", ec="black", lw=0.45, hatch="////"),
     ]
-    labels = ["cpu_extract rm_block odd", "cpu_extract rm_block even"]
+    labels = [f"{stage_label} block odd", f"{stage_label} block even"]
     if io_intervals:
         handles.extend(
             [
@@ -1370,6 +1403,20 @@ def main() -> int:
         default="absolute",
         help="X-axis mode: absolute wall-clock or relative seconds since run start",
     )
+    parser.add_argument(
+        "--thread-stage",
+        default=None,
+        help=(
+            "Restrict per-thread timing (thread_timing stage=...) to one "
+            "named stage -- e.g. convolve, resample, clean (convolve_cubes/"
+            "match_cubes/reproject_cubes/rmclean_cubes), or cpu_extract "
+            "(rm_synthesis). Needed when a single log mixes more than one "
+            "stage's thread_timing lines (e.g. match_cubes stages=both logs "
+            "both convolve and resample) -- generate one plot per stage by "
+            "invoking this script once per --thread-stage value. Omit to "
+            "include every stage present (fine when only one is)."
+        ),
+    )
     args = parser.parse_args()
 
     log_path = Path(args.log)
@@ -1383,7 +1430,7 @@ def main() -> int:
     run_events = select_run(runs, args.run)
     intervals = build_intervals(run_events)
     cpu_stage_intervals = build_cpu_stage_intervals(run_events)
-    thread_intervals = build_cpu_thread_intervals(run_events)
+    thread_intervals = build_cpu_thread_intervals(run_events, stage_filter=args.thread_stage)
     phase_rows = build_phase_rows(run_events)
 
     gpu_enabled_hint = any(
