@@ -98,6 +98,9 @@ concurrency, or hardware-specific tuning.
 - **Cross-band preprocessing toolchain** — `reproject_cubes` (grid alignment)
   and `convolve_cubes` (common angular resolution) prepare mismatched bands
   for a multi-band run; see [Multi-Band Preprocessing Toolchain](#multi-band-preprocessing-toolchain) below
+- **End-to-end pipeline script** — `scripts/run_pipeline.sh` chains
+  match → rm_synthesis → rmclean from one cfg, with full run provenance;
+  see [End-to-End Pipeline](#end-to-end-pipeline) below
 
 ## Quick Start
 
@@ -682,6 +685,22 @@ a multi-band run:
    `reproject_cubes` and `convolve_cubes` are unaffected and remain fully
    independent for anyone who only needs one stage.
 
+**Skip-if-already-matched:** all three tools check each input file
+individually against the already-computed target grid/beam before
+processing it, and skip (no output written, original file used as-is)
+any input that's already effectively identical to what its own output
+would have been — tight tolerances (~1e-9 for CRVAL/CDELT/rotation,
+~1e-6 for BMAJ/BMIN/BPA), never a "close enough" fuzzy match, so a
+false skip can't silently misalign downstream RM synthesis. Every
+output path is checked for pre-existence *before* any processing
+starts — a stray file left over from an earlier run always aborts the
+run rather than being silently reused or overwritten. `match_cubes`
+additionally accepts `manifest=<path>`, writing one tab-separated
+`<infile> SKIPPED|PROCESSED <effective_path>` line per input once all
+processing completes — the machine-readable record `scripts/
+run_pipeline.sh` reads to chain match's own output into `rm_synthesis`
+without ever having to guess an outcome from filesystem state.
+
 Typical order for a genuinely mismatched multi-band dataset: convolve
 (match resolution, across all bands together in one call) → reproject
 (align grids) → `rm_synthesis` (multi-band RM synthesis on the now
@@ -717,12 +736,26 @@ wrote, plus its `.MASK.CUBE.FITS`/`CHANFREQ` table:
 make rmclean_cubes
 bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
   maskfile=out.MASK.CUBE.FITS outfile=out threshold=0.01
-# writes out.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS; --help for the
-# full option list (niter/gain, min_samples_per_fwhm, refine_nsigma,
-# lsq_ref_compute_mode/lsq_ref_report_mode, mask_pattern_cache_max,
-# mem_frac_ram/tile_ra/tile_dec/tile_auto, io_read_threads,
-# io_write_threads, io_overlap)
+# or threshold=10mJy (converted against the AMP cube's own BUNIT), or
+# threshold_snr=5.0 (CLEAN stops at 5x an auto-estimated noise floor --
+# see below); writes out.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS;
+# --help for the full option list (niter/gain, min_samples_per_fwhm,
+# refine_nsigma, lsq_ref_compute_mode/lsq_ref_report_mode,
+# mask_pattern_cache_max, mem_frac_ram/tile_ra/tile_dec/tile_auto,
+# io_read_threads, io_write_threads, io_overlap)
 ```
+
+`threshold` accepts either an absolute value (native AMP-cube units, or
+converted from a `Jy`/`mJy`/`uJy` suffix with no space, e.g. `10mJy`), or
+`threshold_snr=<N>` as a mutually-exclusive alternative — CLEAN then
+stops at `N` × an auto-estimated noise floor: the median of the lowest
+`noise_percentile` (default 0.15) fraction of bins from `noise_nlos`
+(default 500) random spatial pixels' own full dirty AMP spectra. A real
+source is a narrow peak in an otherwise noise-dominated RM spectrum, so
+any given sightline's own lowest-amplitude bins are overwhelmingly noise
+regardless of whether that sightline happens to contain a source —
+`noise_seed` (default 20250101) keeps the estimate reproducible run to
+run.
 
 This tool cannot resample the RM axis — it's fixed by whatever `CDELT3`
 `rm_synthesis` already wrote — so it validates the existing grid instead
@@ -761,6 +794,53 @@ Full design detail and verification evidence are documented in
 [planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)
 (tickets T0-T4) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
 header comments.
+
+## End-to-End Pipeline
+
+`scripts/run_pipeline.sh` chains `match_cubes` → `rm_synthesis` →
+`rmclean_cubes` (any leading/trailing subset via `stages=`) from one small
+orchestration cfg, driven by `cfg/pipeline-example.cfg` (fully annotated
+template):
+
+```bash
+scripts/run_pipeline.sh --help          # full option list, read this first
+scripts/run_pipeline.sh cfg/pipeline-example.cfg
+```
+
+It invents no new algorithmic options — every stage tool keeps its own
+complete, independently-tested cfg/CLI interface (`rmsynth_cfg_template`/
+`rmclean_cfg_template` point at a real, hand-written cfg for that tool;
+every key in it except the path-shaped ones the pipeline itself must
+chain — `path`/`infileQ`/`infileU`/`outfile` for `rm_synthesis`,
+`ampfile`/`phafile`/`maskfile`/`outfile` for `rmclean_cubes` — is used
+exactly as written). The orchestrator's only job is chaining those
+path-shaped values between stages and driving execution in the right
+order with the right CPU thread pinning (reusing `scratch/
+run_rmsynthesis_test.sh`'s own `OMP_PROC_BIND=close`/`OMP_PLACES=cores`
+convention for the `rmsynth` stage).
+
+**Stage chaining**: when `match` runs, its own manifest (`manifest=`,
+see above) — never filesystem state — determines which file
+(`match_cubes`' own output, or the original input if it was skipped)
+feeds `rm_synthesis`'s `infileQ`/`infileU`. Q and U bands are always
+combined into one `match_cubes` call (not run per-polarization), since
+that's the only way to guarantee both land on the identical output
+grid/beam by construction — see the script's own header comment for
+why running them separately risks a mismatch.
+
+**Provenance**: every run leaves records in `<outdir>/<run_name>.
+provenance/` — a copy of the pipeline cfg used, the fully-substituted
+per-stage cfgs actually fed to each tool, the match manifest, every
+external command actually invoked, each stage's own full stdout+stderr,
+and a `run_summary.txt` with per-stage timing and final output paths.
+This directory is shared across repeated runs of the same
+`outdir`/`run_name` (each run's own files are timestamp-tagged, so
+they simply accumulate rather than collide) — it's metadata
+scaffolding, not a data output, so its own pre-existence never blocks a
+run. The actual DATA outputs (every cube each stage tool writes) are
+what's protected: each is checked for pre-existence before that stage
+runs, and the whole pipeline aborts rather than silently deleting or
+overwriting a prior run's real result.
 
 ## Project Structure
 
