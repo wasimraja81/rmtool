@@ -2050,6 +2050,400 @@ else
     fail "rmclean_cubes: build failed (see $OUT_DIR/rmclean_cubes_build.log)"
 fi
 
+section "30. match_cubes: skip-if-already-matched (planning-doc ticket)"
+
+if make match_cubes > "$OUT_DIR/match_cubes_build.log" 2>&1; then
+    pass "match_cubes: build succeeded"
+
+    mc_ref="$OUT_DIR/mc_skip_ref.Q.FITSCUBE"
+    mc_shifted="$OUT_DIR/mc_skip_shifted.Q.FITSCUBE"
+    cp tests/data/TEST.Q.FITSCUBE "$mc_ref"
+    python3 - "$mc_ref" "$mc_shifted" <<'PYEOF'
+import sys
+import shutil
+from astropy.io import fits
+shutil.copy(sys.argv[1], sys.argv[2])
+with fits.open(sys.argv[2], mode="update") as hdul:
+    hdul[0].header["CRVAL1"] = float(hdul[0].header["CRVAL1"]) + 0.05
+    hdul.flush()
+PYEOF
+
+    # --- Positive: reffile=itself already matches -> skip, no output,
+    # manifest says SKIPPED ---
+    rm -f "${mc_ref}_REPROJ.FITS" "$OUT_DIR/mc_manifest_pos.txt"
+    mc_pos_log="$OUT_DIR/mc_skip_positive.log"
+    if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
+            infiles="$mc_ref" manifest="$OUT_DIR/mc_manifest_pos.txt" \
+            > "$mc_pos_log" 2>&1; then
+        if [[ -f "${mc_ref}_REPROJ.FITS" ]]; then
+            fail "match_cubes: positive skip test wrote an output file (should have skipped)"
+        elif ! grep -q "^SKIP: $mc_ref " "$mc_pos_log"; then
+            fail "match_cubes: positive skip test missing SKIP: message (see $mc_pos_log)"
+        elif ! grep -qP "^${mc_ref}\tSKIPPED\t${mc_ref}$" "$OUT_DIR/mc_manifest_pos.txt"; then
+            fail "match_cubes: positive skip test manifest missing/wrong SKIPPED line"
+        else
+            pass "match_cubes: already-matching input skipped (no output, manifest correct)"
+        fi
+    else
+        fail "match_cubes: positive skip test run failed (see $mc_pos_log)"
+    fi
+
+    # --- Negative: genuinely offset CRVAL -> processed as normal,
+    # manifest says PROCESSED ---
+    rm -f "${mc_shifted}_REPROJ.FITS" "$OUT_DIR/mc_manifest_neg.txt"
+    mc_neg_log="$OUT_DIR/mc_skip_negative.log"
+    if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
+            infiles="$mc_shifted" manifest="$OUT_DIR/mc_manifest_neg.txt" \
+            > "$mc_neg_log" 2>&1; then
+        if [[ ! -s "${mc_shifted}_REPROJ.FITS" ]]; then
+            fail "match_cubes: negative skip test did not write the expected output"
+        elif ! grep -qP "^${mc_shifted}\tPROCESSED\t${mc_shifted}_REPROJ.FITS$" "$OUT_DIR/mc_manifest_neg.txt"; then
+            fail "match_cubes: negative skip test manifest missing/wrong PROCESSED line"
+        else
+            pass "match_cubes: genuinely mismatched input processed as normal (regression guard)"
+        fi
+    else
+        fail "match_cubes: negative skip test run failed (see $mc_neg_log)"
+    fi
+
+    # --- Safety: a pre-existing output path always aborts the whole run,
+    # regardless of what this run's own skip decision would have been
+    # (never silently reused or overwritten -- also the regression guard
+    # for the clobber-mode FTINIT bugfix: this is exactly the "run twice
+    # without cleanup" scenario that previously silently overwrote) ---
+    mc_stale_out_log="$OUT_DIR/mc_skip_stale_output.log"
+    rm -f "$OUT_DIR/mc_manifest_stale1.txt"
+    if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
+            infiles="$mc_shifted" manifest="$OUT_DIR/mc_manifest_stale1.txt" \
+            > "$mc_stale_out_log" 2>&1; then
+        fail "match_cubes: rerun with a pre-existing output should have aborted, but succeeded"
+    elif grep -q "already exists, refusing to proceed" "$mc_stale_out_log"; then
+        pass "match_cubes: pre-existing output path aborts the run (clobber-bug regression guard)"
+    else
+        fail "match_cubes: rerun aborted but not with the expected message (see $mc_stale_out_log)"
+    fi
+
+    # --- Safety: a pre-existing manifest path always aborts the whole
+    # run too ---
+    rm -f "${mc_shifted}_REPROJ.FITS"
+    mc_stale_manifest_log="$OUT_DIR/mc_skip_stale_manifest.log"
+    if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
+            infiles="$mc_shifted" manifest="$OUT_DIR/mc_manifest_neg.txt" \
+            > "$mc_stale_manifest_log" 2>&1; then
+        fail "match_cubes: rerun with a pre-existing manifest should have aborted, but succeeded"
+    elif grep -q "manifest already exists" "$mc_stale_manifest_log"; then
+        pass "match_cubes: pre-existing manifest path aborts the run"
+    else
+        fail "match_cubes: manifest rerun aborted but not with the expected message (see $mc_stale_manifest_log)"
+    fi
+else
+    fail "match_cubes: build failed (see $OUT_DIR/match_cubes_build.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# 31. rmclean_cubes: threshold unit conversion + threshold_snr auto noise
+#     floor (planning-doc ticket, requested alongside the pipeline suite).
+#     Reuses section 29's own rmc_lsqref_amp/PHA/MASK cube trio -- a real
+#     dirty cube with known BUNIT, no need to rebuild one here.
+# ---------------------------------------------------------------------------
+section "31. rmclean_cubes: threshold units (Jy/mJy/uJy) + threshold_snr auto noise floor"
+
+if [[ -s "$rmc_lsqref_amp" ]]; then
+    rmc_pha="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS"
+    rmc_mask="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS"
+
+    # --- Unit conversion: threshold=10mJy must resolve to the same
+    # native-unit value as a hand-computed conversion from the cube's own
+    # BUNIT, not just "some number" -- verified against the actual header,
+    # not a hardcoded assumption about what BUNIT is. ---
+    rmc_expected_mjy=$(python3 -c "
+from astropy.io import fits
+bunit = fits.getheader('$rmc_lsqref_amp').get('BUNIT', 'Jy').split('/')[0].strip().lower()
+scale = {'jy': 1.0, 'mjy': 1.0e-3, 'ujy': 1.0e-6}.get(bunit, 1.0)
+s = f'{10.0 * 1.0e-3 / scale:.6f}'
+# Fortran's F0.6 edit descriptor omits the leading zero before the
+# decimal point (e.g. '.010000', not '0.010000') -- match that here.
+print(s[1:] if s.startswith('0.') else s)
+")
+    rmc_unit_out="$OUT_DIR/rmc_thresh_unit"
+    rmc_unit_log="$OUT_DIR/rmc_thresh_unit.log"
+    rm -f "${rmc_unit_out}".*.RMCUBE.FITS
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
+            maskfile="$rmc_mask" outfile="$rmc_unit_out" threshold=10mJy \
+            niter=200 gain=0.1 > "$rmc_unit_log" 2>&1; then
+        if grep -qF -- "-> $rmc_expected_mjy (native AMP-cube units" "$rmc_unit_log"; then
+            pass "rmclean_cubes: threshold=10mJy converts to the expected native-unit value ($rmc_expected_mjy)"
+        else
+            fail "rmclean_cubes: threshold=10mJy did not convert to the expected native-unit value $rmc_expected_mjy (see $rmc_unit_log)"
+        fi
+    else
+        fail "rmclean_cubes: threshold=10mJy run failed (see $rmc_unit_log)"
+    fi
+
+    # --- threshold_snr: auto noise-floor estimation runs to completion
+    # and is reproducible (same noise_seed -> bit-identical derived
+    # threshold across two separate runs). ---
+    rmc_snr_out1="$OUT_DIR/rmc_thresh_snr1"
+    rmc_snr_out2="$OUT_DIR/rmc_thresh_snr2"
+    rmc_snr_log1="$OUT_DIR/rmc_thresh_snr1.log"
+    rmc_snr_log2="$OUT_DIR/rmc_thresh_snr2.log"
+    rm -f "${rmc_snr_out1}".*.RMCUBE.FITS "${rmc_snr_out2}".*.RMCUBE.FITS
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
+            maskfile="$rmc_mask" outfile="$rmc_snr_out1" threshold_snr=5.0 \
+            niter=200 gain=0.1 > "$rmc_snr_log1" 2>&1 && \
+       bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
+            maskfile="$rmc_mask" outfile="$rmc_snr_out2" threshold_snr=5.0 \
+            niter=200 gain=0.1 > "$rmc_snr_log2" 2>&1; then
+        if [[ -s "${rmc_snr_out1}.RESTORED.AMP.RMCUBE.FITS" ]] && \
+           grep -q "threshold_snr: auto noise floor" "$rmc_snr_log1"; then
+            pass "rmclean_cubes: threshold_snr auto noise-floor mode ran to completion"
+        else
+            fail "rmclean_cubes: threshold_snr run did not produce expected output/log (see $rmc_snr_log1)"
+        fi
+        snr_thresh1=$(grep -oP '(?<=-> threshold = )[0-9.]+' "$rmc_snr_log1")
+        snr_thresh2=$(grep -oP '(?<=-> threshold = )[0-9.]+' "$rmc_snr_log2")
+        if [[ -n "$snr_thresh1" && "$snr_thresh1" == "$snr_thresh2" ]]; then
+            pass "rmclean_cubes: threshold_snr auto noise floor is reproducible (same noise_seed -> same threshold, $snr_thresh1)"
+        else
+            fail "rmclean_cubes: threshold_snr not reproducible across identical runs ('$snr_thresh1' vs '$snr_thresh2')"
+        fi
+    else
+        fail "rmclean_cubes: threshold_snr run(s) failed (see $rmc_snr_log1 / $rmc_snr_log2)"
+    fi
+
+    # --- Safety: mutually exclusive, and at least one required ---
+    rmc_both_log="$OUT_DIR/rmc_thresh_both.log"
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
+            maskfile="$rmc_mask" outfile="$OUT_DIR/rmc_thresh_both" \
+            threshold=0.01 threshold_snr=5.0 > "$rmc_both_log" 2>&1; then
+        fail "rmclean_cubes: threshold= and threshold_snr= together should have been refused, but succeeded"
+    elif grep -q "specify exactly one of threshold= or threshold_snr=" "$rmc_both_log"; then
+        pass "rmclean_cubes: threshold= and threshold_snr= together is refused"
+    else
+        fail "rmclean_cubes: threshold=+threshold_snr= rejection had the wrong message (see $rmc_both_log)"
+    fi
+
+    rmc_neither_log="$OUT_DIR/rmc_thresh_neither.log"
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
+            maskfile="$rmc_mask" outfile="$OUT_DIR/rmc_thresh_neither" \
+            > "$rmc_neither_log" 2>&1; then
+        fail "rmclean_cubes: omitting both threshold= and threshold_snr= should have been refused, but succeeded"
+    elif grep -q "threshold= or threshold_snr= is required" "$rmc_neither_log"; then
+        pass "rmclean_cubes: omitting both threshold= and threshold_snr= is refused"
+    else
+        fail "rmclean_cubes: missing-threshold rejection had the wrong message (see $rmc_neither_log)"
+    fi
+
+    rmc_badunit_log="$OUT_DIR/rmc_thresh_badunit.log"
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
+            maskfile="$rmc_mask" outfile="$OUT_DIR/rmc_thresh_badunit" \
+            threshold=10Foo > "$rmc_badunit_log" 2>&1; then
+        fail "rmclean_cubes: threshold=10Foo (unrecognised unit) should have been refused, but succeeded"
+    elif grep -q "threshold must be a number" "$rmc_badunit_log"; then
+        pass "rmclean_cubes: unrecognised threshold unit is refused"
+    else
+        fail "rmclean_cubes: bad-unit rejection had the wrong message (see $rmc_badunit_log)"
+    fi
+else
+    fail "rmclean_cubes: threshold-unit tests skipped, section 29's own rmc_lsqref_amp cube is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# 32. gaussft_mod: FFT-friendly padding (found via the real Jennifer e2e
+#     run -- 4501x4501 = 7 x 643, 643 prime, made convolve_cubes/
+#     match_cubes' own convolution step ~2x slower than necessary; see
+#     next_fast_fft_size's own comment in src/gaussft.f90).
+# ---------------------------------------------------------------------------
+section "32. gaussft_mod: FFT-friendly padding (next_fast_fft_size)"
+
+gfp_bin="$OUT_DIR/test_gaussft_padding"
+gfp_log="$OUT_DIR/test_gaussft_padding.log"
+if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+        -O3 -fopenmp -J"$OUT_DIR" \
+        src/gaussft.f90 "$TESTS_DIR/test_gaussft_padding.f90" \
+        -o "$gfp_bin" -lfftw3 2>"$OUT_DIR/gaussft_padding_build.log"; then
+    if "$gfp_bin" > "$gfp_log" 2>&1; then
+        while IFS= read -r line; do
+            if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then
+                echo "  $line"
+            fi
+        done < "$gfp_log"
+        if grep -q "^\[PASS\] test_gaussft_padding" "$gfp_log"; then
+            pass "gaussft_mod FFT padding: all checks passed"
+        else
+            fail "gaussft_mod FFT padding: one or more checks failed (see $gfp_log)"
+        fi
+    else
+        fail "gaussft_mod FFT padding: program exited non-zero (see $gfp_log)"
+    fi
+else
+    fail "gaussft_mod FFT padding: build failed (see $OUT_DIR/gaussft_padding_build.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# 33. convolve_cubes: io_overlap bit-identical to io_overlap=n (planning-
+#     doc ticket, added alongside the FFT padding fix -- same real
+#     Jennifer e2e run found convolve's own block write fully serial
+#     with compute, ~44s/block dead time on real storage).
+# ---------------------------------------------------------------------------
+section "33. convolve_cubes: io_overlap bit-identical to io_overlap=n"
+
+if [[ -x bin/convolve_cubes ]]; then
+    iob_beamfile="$OUT_DIR/iob_beamlog.txt"
+    awk 'BEGIN { for (i=1;i<=200;i++) print i, 10.0, 10.0, 0.0 }' > "$iob_beamfile"
+
+    iob_src="$OUT_DIR/iob_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$iob_src"
+
+    iob_off_out="${iob_src}_off.CONV.FITS"
+    iob_on_out="${iob_src}_on.CONV.FITS"
+    rm -f "$iob_off_out" "$iob_on_out"
+
+    iob_off_log="$OUT_DIR/convolve_io_overlap_off.log"
+    iob_on_log="$OUT_DIR/convolve_io_overlap_on.log"
+
+    if bin/convolve_cubes infiles="$iob_src" beamfiles="$iob_beamfile" \
+            outsuffix="_off.CONV.FITS" target_bmaj=20.0 target_bmin=20.0 \
+            target_bpa=0.0 mem_frac_ram=0.1 io_overlap=n \
+            > "$iob_off_log" 2>&1 && \
+       bin/convolve_cubes infiles="$iob_src" beamfiles="$iob_beamfile" \
+            outsuffix="_on.CONV.FITS" target_bmaj=20.0 target_bmin=20.0 \
+            target_bpa=0.0 mem_frac_ram=0.1 io_overlap=y \
+            > "$iob_on_log" 2>&1; then
+        if [[ -s "$iob_off_out" && -s "$iob_on_out" ]] && \
+           cmp -s "$iob_off_out" "$iob_on_out"; then
+            pass "convolve_cubes: io_overlap=y bit-identical to io_overlap=n"
+        else
+            fail "convolve_cubes: io_overlap=y output differs from io_overlap=n (see $iob_off_log / $iob_on_log)"
+        fi
+    else
+        fail "convolve_cubes: io_overlap on/off run(s) failed (see $iob_off_log / $iob_on_log)"
+    fi
+else
+    skip "bin/convolve_cubes not built; skipping io_overlap bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 34. match_cubes: io_overlap bit-identical to io_overlap=n (stages=
+#     convolve -- process_one_file_restricted's own separate port of the
+#     same io_overlap mechanism convolve_cubes.f90 uses).
+# ---------------------------------------------------------------------------
+section "34. match_cubes: io_overlap bit-identical to io_overlap=n (stages=convolve)"
+
+if [[ -x bin/match_cubes ]]; then
+    mciob_beamfile="$OUT_DIR/mciob_beamlog.txt"
+    awk 'BEGIN { for (i=1;i<=200;i++) print i, 10.0, 10.0, 0.0 }' > "$mciob_beamfile"
+
+    mciob_src="$OUT_DIR/mciob_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mciob_src"
+
+    mciob_off_out="${mciob_src}_off.MATCHED.FITS"
+    mciob_on_out="${mciob_src}_on.MATCHED.FITS"
+    rm -f "$mciob_off_out" "$mciob_on_out"
+
+    mciob_off_log="$OUT_DIR/match_io_overlap_off.log"
+    mciob_on_log="$OUT_DIR/match_io_overlap_on.log"
+
+    if bin/match_cubes stages=convolve infiles="$mciob_src" \
+            beamfiles="$mciob_beamfile" outsuffix="_off.MATCHED.FITS" \
+            target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 \
+            mem_frac_ram=0.1 io_overlap=n > "$mciob_off_log" 2>&1 && \
+       bin/match_cubes stages=convolve infiles="$mciob_src" \
+            beamfiles="$mciob_beamfile" outsuffix="_on.MATCHED.FITS" \
+            target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 \
+            mem_frac_ram=0.1 io_overlap=y > "$mciob_on_log" 2>&1; then
+        if [[ -s "$mciob_off_out" && -s "$mciob_on_out" ]] && \
+           cmp -s "$mciob_off_out" "$mciob_on_out"; then
+            pass "match_cubes: io_overlap=y bit-identical to io_overlap=n (stages=convolve)"
+        else
+            fail "match_cubes: io_overlap=y output differs from io_overlap=n (see $mciob_off_log / $mciob_on_log)"
+        fi
+    else
+        fail "match_cubes: io_overlap on/off run(s) failed (see $mciob_off_log / $mciob_on_log)"
+    fi
+else
+    skip "bin/match_cubes not built; skipping io_overlap bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 35. reproject_cubes: io_overlap bit-identical to io_overlap=n (planning-
+#     doc ticket, added alongside the same fix in convolve_cubes.f90/
+#     match_cubes.f90 -- "do not forget reprojection").
+# ---------------------------------------------------------------------------
+section "35. reproject_cubes: io_overlap bit-identical to io_overlap=n"
+
+if [[ -x bin/reproject_cubes ]]; then
+    rcio_ref="$DATA_DIR/TEST.Q.FITSCUBE"
+    rcio_src="$OUT_DIR/rcio_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$rcio_src"
+
+    rcio_off_out="${rcio_src}_off.FITS"
+    rcio_on_out="${rcio_src}_on.FITS"
+    rm -f "${rcio_src}_REPROJ.FITS" "$rcio_off_out" "$rcio_on_out"
+
+    rcio_off_log="$OUT_DIR/reproject_io_overlap_off.log"
+    rcio_on_log="$OUT_DIR/reproject_io_overlap_on.log"
+
+    if bin/reproject_cubes mode=reference reffile="$rcio_ref" \
+            infiles="$rcio_src" mem_frac_ram=0.1 io_overlap=n \
+            > "$rcio_off_log" 2>&1; then
+        mv "${rcio_src}_REPROJ.FITS" "$rcio_off_out"
+    fi
+    if bin/reproject_cubes mode=reference reffile="$rcio_ref" \
+            infiles="$rcio_src" mem_frac_ram=0.1 io_overlap=y \
+            > "$rcio_on_log" 2>&1; then
+        mv "${rcio_src}_REPROJ.FITS" "$rcio_on_out"
+    fi
+
+    if [[ -s "$rcio_off_out" && -s "$rcio_on_out" ]] && \
+       cmp -s "$rcio_off_out" "$rcio_on_out"; then
+        pass "reproject_cubes: io_overlap=y bit-identical to io_overlap=n"
+    else
+        fail "reproject_cubes: io_overlap=y output differs from (or is missing vs) io_overlap=n (see $rcio_off_log / $rcio_on_log)"
+    fi
+else
+    skip "bin/reproject_cubes not built; skipping io_overlap bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 36. match_cubes: io_overlap bit-identical to io_overlap=n (stages=
+#     reproject -- process_one_file_general's own separate port).
+# ---------------------------------------------------------------------------
+section "36. match_cubes: io_overlap bit-identical to io_overlap=n (stages=reproject)"
+
+if [[ -x bin/match_cubes ]]; then
+    mcrio_ref="$DATA_DIR/TEST.Q.FITSCUBE"
+    mcrio_src="$OUT_DIR/mcrio_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$mcrio_src"
+
+    mcrio_off_out="${mcrio_src}_off.FITS"
+    mcrio_on_out="${mcrio_src}_on.FITS"
+    rm -f "${mcrio_src}_REPROJ.FITS" "$mcrio_off_out" "$mcrio_on_out"
+
+    mcrio_off_log="$OUT_DIR/match_reproject_io_overlap_off.log"
+    mcrio_on_log="$OUT_DIR/match_reproject_io_overlap_on.log"
+
+    if bin/match_cubes stages=reproject footprint_mode=reference \
+            reffile="$mcrio_ref" infiles="$mcrio_src" outsuffix="_REPROJ.FITS" \
+            mem_frac_ram=0.1 io_overlap=n > "$mcrio_off_log" 2>&1; then
+        mv "${mcrio_src}_REPROJ.FITS" "$mcrio_off_out"
+    fi
+    if bin/match_cubes stages=reproject footprint_mode=reference \
+            reffile="$mcrio_ref" infiles="$mcrio_src" outsuffix="_REPROJ.FITS" \
+            mem_frac_ram=0.1 io_overlap=y > "$mcrio_on_log" 2>&1; then
+        mv "${mcrio_src}_REPROJ.FITS" "$mcrio_on_out"
+    fi
+
+    if [[ -s "$mcrio_off_out" && -s "$mcrio_on_out" ]] && \
+       cmp -s "$mcrio_off_out" "$mcrio_on_out"; then
+        pass "match_cubes: io_overlap=y bit-identical to io_overlap=n (stages=reproject)"
+    else
+        fail "match_cubes: io_overlap=y output differs from (or is missing vs) io_overlap=n (see $mcrio_off_log / $mcrio_on_log)"
+    fi
+else
+    skip "bin/match_cubes not built; skipping io_overlap bit-identical test"
+fi
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

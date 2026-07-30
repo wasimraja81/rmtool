@@ -92,11 +92,86 @@
 ! argument-error path, same convention as reproject_cubes.f90).
 program convolve_cubes
    use, intrinsic :: iso_fortran_env, only: dp => real64
+   use, intrinsic :: iso_c_binding, only: c_int, c_long, c_ptr, c_funptr,&
+   &c_null_ptr, c_funloc, c_loc, c_f_pointer
+   use logging_mod
+   use fitsio_unit_mod
    implicit none
+
+   ! --- Logging & timing (planning-doc ticket, same convention as rm_
+   ! synthesis's own log_level/timing_enabled/log_output_file, ported via
+   ! the shared logging_mod rather than rm_synthesis_mod.f90 directly --
+   ! see logging_mod.f90's own header comment for why). Stage names used
+   ! below: startup, header, block_read, block_convolve, block_write,
+   ! finalize.
+   character(len=16) :: log_level
+   logical :: timing_enabled
+   character(len=272) :: log_output_file
 
    integer, parameter :: max_axes = 10
    integer, parameter :: max_inputs = 50
    integer, parameter :: max_channels = 20000
+   ! Hard ceiling on elements-per-block (nx*ny*block_planes), independent
+   ! of mem_frac_ram: CFITSIO's own Fortran wrapper (FTGSVE/FTPSSE) takes
+   ! a default-INTEGER element count, so a single call describing more
+   ! than 2^31-1 elements would silently wrap/misbehave on a real
+   ! full-size image with a generous mem_frac_ram. 2e9 leaves comfortable
+   ! headroom under 2,147,483,647 for ANY nx/ny, not just today's real
+   ! 4501x4501 Jennifer cube -- this clamp activates (shrinks
+   ! block_planes below what mem_frac_ram alone would allow) only for
+   ! genuinely huge images/generous mem_frac_ram combinations; ordinary
+   ! runs never notice it.
+   integer(kind=8), parameter :: max_elements_per_block = 2000000000_8
+
+   ! --- io_overlap: background-thread block write (planning-doc ticket)
+   ! --- see write_convolved_file's own comment for the single-writer-
+   ! at-a-time design rationale. block_write_job_t is fully self-
+   ! contained (unlike rmclean_cubes.f90's own tile_write_job_t, which
+   ! leans on host association to program-level nx/ny/out_unit etc.)
+   ! because here the block loop lives inside write_convolved_file, a
+   ! subroutine called once per input file with its own LOCAL nx/ny/
+   ! out_unit/naxes -- not program-level state a sibling procedure could
+   ! reach by host association alone.
+   type :: block_write_job_t
+      integer :: out_unit = 0, naxis = 0, sky1 = 0, sky2 = 0, freq_axis = 0
+      integer :: naxes(max_axes) = 0
+      integer :: chan_start = 0, chan_len = 0, nx = 0, ny = 0
+      real, pointer :: data(:,:,:) => null()
+   end type block_write_job_t
+   ! target+save: must remain valid (untouched, undeallocated) from
+   ! dispatch until block_write_join returns -- see
+   ! block_write_dispatch_async's own comment. One instance reused
+   ! across every input file (convolve_cubes processes files strictly
+   ! one after another, never concurrently, so this is never shared
+   ! across two in-flight files).
+   type(block_write_job_t), target, save :: write_job
+   integer(c_long) :: write_thread_id = 0
+   logical :: write_pending = .false.
+   ! Set by do_block_write on a write failure -- read back by
+   ! write_convolved_file right after block_write_join returns (pthread_
+   ! join's own synchronization makes this safe to read then, without
+   ! needing an atomic: the background thread has already fully exited).
+   logical :: write_failed = .false.
+
+   interface
+      function c_pthread_create(thread, attr, start_routine, arg)&
+      &bind(C, name="pthread_create") result(rc)
+         import :: c_int, c_long, c_ptr, c_funptr
+         integer(c_long) :: thread
+         type(c_ptr), value :: attr
+         type(c_funptr), value :: start_routine
+         type(c_ptr), value :: arg
+         integer(c_int) :: rc
+      end function c_pthread_create
+
+      function c_pthread_join(thread, retval)&
+      &bind(C, name="pthread_join") result(rc)
+         import :: c_int, c_long, c_ptr
+         integer(c_long), value :: thread
+         type(c_ptr), value :: retval
+         integer(c_int) :: rc
+      end function c_pthread_join
+   end interface
 
    character(len=512) :: infiles(max_inputs), beamfiles(max_inputs)
    integer :: n_inputs
@@ -108,6 +183,19 @@ program convolve_cubes
    real(dp) :: max_common_bmaj
    logical :: have_max_common_bmaj
    real :: mem_frac_ram
+   ! io_overlap (default n): background-thread block write, overlapped
+   ! with the NEXT block's read+convolve -- same scheme/key name as rm_
+   ! synthesis/rmclean_cubes' own io_overlap (planning-doc ticket, added
+   ! after the real ~46GB Jennifer end-to-end run measured convolve's own
+   ! write I/O -- a real disk, 150MB/s measured -- as fully serial with
+   ! compute, ~44s/block of dead time). See write_convolved_file's own
+   ! comment for why this is a single-writer-at-a-time design (block_out
+   ! is double-buffered so read+compute for the NEXT block can proceed
+   ! immediately, but only one background write is ever in flight on
+   ! out_unit at a time -- concurrent CFITSIO handle use from two threads
+   ! is unsafe, same hazard rm_synthesis_mod.f90's own io_write_threads
+   ! doc comment describes).
+   logical :: io_overlap
    integer :: npts
    real(dp) :: khachiyan_tol
 
@@ -123,6 +211,10 @@ program convolve_cubes
    real(dp), allocatable :: bmaj_f(:,:), bmin_f(:,:), bpa_f(:,:)
    logical, allocatable :: isbad_f(:,:)
 
+   ! --- Skip-if-already-matched (planning-doc ticket, same logic as
+   ! match_cubes.f90's own -- see there for the full rationale) ---
+   logical :: needs_processing(max_inputs), out_exists
+
    real(dp), allocatable :: pool_bmaj(:), pool_bmin(:), pool_bpa(:)
    integer :: n_pool
    real(dp) :: common_bmaj, common_bmin, common_bpa
@@ -130,6 +222,13 @@ program convolve_cubes
 
    call parse_args(status)
    if (status.ne.0) stop 1
+
+   call init_logging(log_level, timing_enabled, log_output_file, status)
+   if (status.ne.0) then
+      write(*,*) 'ERROR: cannot open log_output_file: ', trim(log_output_file)
+      stop 1
+   endif
+   call log_message('info', 'startup', 'convolve_cubes run started')
 
    allocate(bmaj_f(max_inputs, max_channels), bmin_f(max_inputs, max_channels))
    allocate(bpa_f(max_inputs, max_channels), isbad_f(max_inputs, max_channels))
@@ -210,21 +309,48 @@ program convolve_cubes
       endif
    endif
 
+   ! === Skip-if-already-matched pre-flight (planning-doc ticket) ===
+   ! Same scheme as match_cubes.f90's own (see there for the full
+   ! rationale): every safety check and skip decision for the WHOLE
+   ! batch happens up front, before any file is processed, so a bad run
+   ! (a stale output already on disk) fails fast. A pre-existing output
+   ! path is always refused, never silently reused or overwritten,
+   ! regardless of what this run's own skip decision would have been.
    do i = 1, n_inputs
-      call write_convolved_file(infiles(i), trim(infiles(i))//trim(outsuffix),&
+      inquire(file=trim(strip_fits_ext(infiles(i)))//trim(outsuffix), exist=out_exists)
+      if (out_exists) then
+         write(*,*) 'ERROR: output path already exists, refusing to proceed'//&
+         &' (stale output from a previous run? remove it first): ',&
+         &trim(strip_fits_ext(infiles(i)))//trim(outsuffix)
+         stop 1
+      endif
+      needs_processing(i) = .not. beam_matches_target(nfreq_f(i),&
+      &bmaj_f(i,1:nfreq_f(i)), bmin_f(i,1:nfreq_f(i)), bpa_f(i,1:nfreq_f(i)),&
+      &isbad_f(i,1:nfreq_f(i)), common_bmaj, common_bmin, common_bpa)
+      if (.not. needs_processing(i)) then
+         write(*,'(A,A,A)') 'SKIP: ', trim(infiles(i)),&
+         &' already matches the target beam -- no output written, use it directly'
+      endif
+   enddo
+
+   do i = 1, n_inputs
+      if (.not. needs_processing(i)) cycle
+      call write_convolved_file(infiles(i), trim(strip_fits_ext(infiles(i)))//trim(outsuffix),&
       &naxis_f(i), sky1_f(i), sky2_f(i), freq_axis_f(i), naxes_f(i,:),&
       &cdelt1_f(i), cdelt2_f(i), nfreq_f(i), bmaj_f(i,1:nfreq_f(i)),&
       &bmin_f(i,1:nfreq_f(i)), bpa_f(i,1:nfreq_f(i)), isbad_f(i,1:nfreq_f(i)),&
-      &common_bmaj, common_bmin, common_bpa, mem_frac_ram, status)
+      &common_bmaj, common_bmin, common_bpa, mem_frac_ram, io_overlap, status)
       if (status.ne.0) then
          write(*,*) 'ERROR: failed to write convolved output for: ', trim(infiles(i))
          stop 1
       endif
-      write(*,*) 'OK: wrote ', trim(infiles(i))//trim(outsuffix)
+      write(*,*) 'OK: wrote ', trim(strip_fits_ext(infiles(i)))//trim(outsuffix)
    enddo
 
    deallocate(bmaj_f, bmin_f, bpa_f, isbad_f)
    write(*,*) 'OK: all inputs convolved to common resolution.'
+   call timer_report_summary()
+   call log_message('info', 'finalize', 'convolve_cubes run completed')
 
 contains
 
@@ -266,6 +392,82 @@ contains
       &out_bmaj, out_bmin, out_bpa, status)
    end subroutine find_common_beam_wrap
 
+   logical function beam_matches_target(nfreq, bmaj, bmin, bpa, isbad,&
+   &common_bmaj, common_bmin, common_bpa) result(matches)
+      !! Ticket: memory-in-plan-file "match_cubes: skip already-matched
+      !! files". True only if EVERY good channel of this one input
+      !! already has (bmaj,bmin,bpa) equal to the common target beam
+      !! within a tight absolute tolerance -- see this ticket's own
+      !! tolerance rationale (planning doc): "already-processed-
+      !! identically", not "close enough to convolve negligibly". A bad
+      !! (flagged) channel is skipped in this check the same way it's
+      !! skipped everywhere else in this file (write_convolved_file's own
+      !! all-NaN convention for bad channels) -- it carries no beam
+      !! information either way.
+      integer, intent(in) :: nfreq
+      real(dp), intent(in) :: bmaj(nfreq), bmin(nfreq), bpa(nfreq)
+      logical, intent(in) :: isbad(nfreq)
+      real(dp), intent(in) :: common_bmaj, common_bmin, common_bpa
+      real(dp), parameter :: tol_beam = 1.0d-6
+      integer :: k
+
+      matches = .true.
+      do k = 1, nfreq
+         if (isbad(k)) cycle
+         if (abs(bmaj(k)-common_bmaj).gt.tol_beam .or.&
+         &abs(bmin(k)-common_bmin).gt.tol_beam .or.&
+         &abs(bpa(k)-common_bpa).gt.tol_beam) then
+            matches = .false.
+            return
+         endif
+      enddo
+   end function beam_matches_target
+
+   function flag_from_value_convolve(val) result(flag)
+      !! Same convention as rm_synthesis_mod.f90's own flag_from_value:
+      !! first non-blank character '1'/'y'/'Y'/'t'/'T' -> true, anything
+      !! else (including blank) -> false.
+      character(len=*), intent(in) :: val
+      logical :: flag
+      character(len=64) :: t
+      integer :: i
+
+      t = adjustl(val)
+      do i = 1, len_trim(t)
+         t(i:i) = achar(iachar(t(i:i)) + merge(32, 0, t(i:i).ge.'A'.and.t(i:i).le.'Z'))
+      enddo
+      flag = .false.
+      if (len_trim(t).eq.0) return
+      if (t(1:1).eq.'1' .or. t(1:1).eq.'y' .or. t(1:1).eq.'t') flag = .true.
+   end function flag_from_value_convolve
+
+   function strip_fits_ext(filename) result(base)
+      !! Output-name helper: infile with a trailing ".fits"/".FITS" (case-
+      !! insensitive) removed, so outsuffix lands where a human expects it
+      !! -- e.g. "cutout-stokesQ.fits" + outsuffix "_CONV.FITS" gives
+      !! "cutout-stokesQ_CONV.FITS", not the double-extension "cutout-
+      !! stokesQ.fits_CONV.FITS" this used to produce by simply
+      !! concatenating outsuffix onto the raw infile string. A filename
+      !! that does NOT end in .fits (this project's own test fixtures use
+      !! .FITSCUBE, a different extension entirely) is returned unchanged
+      !! -- deliberately narrow (exactly ".fits", not every conceivable
+      !! FITS extension) so this never surprises an existing caller.
+      character(len=*), intent(in) :: filename
+      character(len=len(filename)) :: base
+      character(len=5) :: tail
+      integer :: n, i
+
+      base = filename
+      n = len_trim(filename)
+      if (n.lt.5) return
+      tail = filename(n-4:n)
+      do i = 1, 5
+         tail(i:i) = achar(iachar(tail(i:i)) +&
+         &merge(32, 0, tail(i:i).ge.'A'.and.tail(i:i).le.'Z'))
+      enddo
+      if (tail.eq.'.fits') base = filename(1:n-5)
+   end function strip_fits_ext
+
    subroutine parse_args(status)
       integer, intent(out) :: status
       character(len=512) :: this_arg, cli_key, cli_val, cfgfile
@@ -285,6 +487,10 @@ contains
       have_max_common_bmaj = .false.
       max_common_bmaj = 0.0d0
       mem_frac_ram = 0.25
+      io_overlap = .false.
+      log_level = 'info'
+      timing_enabled = .false.
+      log_output_file = ' '
       npts = 2000
       khachiyan_tol = 1.0d-5
       raw_infiles = ' '
@@ -434,6 +640,14 @@ contains
             status = -1
             return
          endif
+      case ('io_overlap')
+         io_overlap = flag_from_value_convolve(val)
+      case ('log_level')
+         log_level = trim(val)
+      case ('timing_enabled')
+         timing_enabled = flag_from_value_logging(val)
+      case ('log_output_file')
+         log_output_file = trim(val)
       case ('npts')
          read(val, *, iostat=ios) npts
          if (ios.ne.0) then
@@ -698,11 +912,11 @@ contains
 
       status = 0
       fitsstat = 0
-      unit = 200
-      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(filename)
          status = -1
+         call free_fits_unit(unit)
          return
       endif
 
@@ -710,7 +924,7 @@ contains
       if (fitsstat.ne.0 .or. naxis.lt.2 .or. naxis.gt.max_axes) then
          write(*,*) 'ERROR: bad or missing NAXIS in: ', trim(filename)
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
@@ -725,7 +939,7 @@ contains
          if (fitsstat.ne.0) then
             write(*,*) 'ERROR: missing NAXIS', k, ' in: ', trim(filename)
             status = -1
-            call FTCLOS(unit, fitsstat)
+            call safe_ftclos(unit, fitsstat)
             return
          endif
          fitsstat = 0
@@ -738,7 +952,7 @@ contains
             else
                write(*,*) 'ERROR: more than one RA-like axis in: ', trim(filename)
                status = -1
-               call FTCLOS(unit, fitsstat)
+               call safe_ftclos(unit, fitsstat)
                return
             endif
          else if (ctype(1:3).eq.'DEC') then
@@ -747,7 +961,7 @@ contains
             else
                write(*,*) 'ERROR: more than one DEC-like axis in: ', trim(filename)
                status = -1
-               call FTCLOS(unit, fitsstat)
+               call safe_ftclos(unit, fitsstat)
                return
             endif
          else if (ctype(1:4).eq.'FREQ') then
@@ -758,13 +972,13 @@ contains
       if (sky1.eq.0 .or. sky2.eq.0) then
          write(*,*) 'ERROR: could not identify RA/DEC sky axes in: ', trim(filename)
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
       if (freq_axis.eq.0) then
          write(*,*) 'ERROR: could not identify a FREQ axis in: ', trim(filename)
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
@@ -776,7 +990,7 @@ contains
                &' FREQ axis are supported; run separate slices (e.g. per'//&
                &' Stokes) as separate infiles'
                status = -1
-               call FTCLOS(unit, fitsstat)
+               call safe_ftclos(unit, fitsstat)
                return
             endif
          endif
@@ -788,7 +1002,7 @@ contains
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: missing CDELT for the RA axis in: ', trim(filename)
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
       write(axstr,'(I0)') sky2
@@ -797,17 +1011,17 @@ contains
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: missing CDELT for the DEC axis in: ', trim(filename)
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
       call check_no_rotation(unit, sky1, sky2, filename, status)
       if (status.ne.0) then
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
    end subroutine read_axis_info
 
    subroutine check_no_rotation(unit, sky1, sky2, filename, status)
@@ -921,11 +1135,11 @@ contains
 
       status = 0
       fitsstat = 0
-      unit = 201
-      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(filename)
          status = -1
+         call free_fits_unit(unit)
          return
       endif
 
@@ -935,7 +1149,7 @@ contains
          write(*,*) 'ERROR: no BEAMS binary table extension found in: ',&
          &trim(filename), ' -- pass an ASCII beamfile instead (see --help)'
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
@@ -944,7 +1158,7 @@ contains
       if (fitsstat.ne.0 .or. nrows.lt.1) then
          write(*,*) 'ERROR: could not read row count of BEAMS table in: ', trim(filename)
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
@@ -957,7 +1171,7 @@ contains
          write(*,*) 'ERROR: BEAMS table in ', trim(filename),&
          &' missing one of BMAJ/BMIN/BPA/CHAN columns'
          status = -1
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          return
       endif
 
@@ -967,7 +1181,7 @@ contains
       call FTGCVE(unit, col_bmin, 1, 1, nrows, 0.0, rb_bmin, anyflag, fitsstat)
       call FTGCVE(unit, col_bpa, 1, 1, nrows, 0.0, rb_bpa, anyflag, fitsstat)
       call FTGCVJ(unit, col_chan, 1, 1, nrows, 0, rb_chan, anyflag, fitsstat)
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed reading BEAMS table columns in: ', trim(filename)
          status = -1
@@ -1081,9 +1295,9 @@ contains
 
    subroutine write_convolved_file(infile, outfile, naxis, sky1, sky2,&
    &freq_axis, naxes, cdelt1, cdelt2, nfreq, bmaj_in, bmin_in, bpa_in,&
-   &isbad, tgt_bmaj, tgt_bmin, tgt_bpa, mem_frac_ram, status)
+   &isbad, tgt_bmaj, tgt_bmin, tgt_bpa, mem_frac_ram, io_overlap_l, status)
       use, intrinsic :: ieee_arithmetic
-      use omp_lib, only: omp_get_max_threads
+      use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
       use gaussft_mod, only: plan_convolution, convolve_to_beam, destroy_convolution_plan
       character(len=*), intent(in) :: infile, outfile
       integer, intent(in) :: naxis, sky1, sky2, freq_axis, naxes(max_axes)
@@ -1093,32 +1307,50 @@ contains
       logical, intent(in) :: isbad(nfreq)
       real(dp), intent(in) :: tgt_bmaj, tgt_bmin, tgt_bpa
       real, intent(in) :: mem_frac_ram
+      logical, intent(in) :: io_overlap_l
       integer, intent(out) :: status
 
-      integer :: nx, ny, in_unit, out_unit, fitsstat, blocksize
+      integer :: nx, ny, nx_pad, ny_pad, in_unit, out_unit, fitsstat, blocksize
       logical :: simple, extend
       integer :: naxes_out(max_axes)
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes, block_planes64
       integer :: block_planes, chan_start, chan_len, local_iplane, nthreads
-      real, allocatable :: block_in(:,:,:), block_out(:,:,:)
+      integer :: cur_slot
+      logical :: write_dispatched_ok
+      real, allocatable, target :: block_in(:,:,:), block_out(:,:,:,:)
       real(dp) :: bpa_in_pixel(nfreq), tgt_bpa_pixel
       integer(kind=8) :: plan_fwd, plan_bwd
       integer :: status_par, ich, k
       real(dp) :: dx_deg, dy_deg
       real(dp) :: nanval
-      ! Automatic (stack) arrays sized directly from the dummy arguments
-      ! naxes(sky1)/naxes(sky2) -- NOT from the local nx/ny copies below,
-      ! which aren't assigned until the executable part runs, too late to
-      ! bound a specification-part automatic array. One instance per
-      ! OpenMP thread (see the parallel region's own private() clause),
-      ! needed only because gaussft_mod's convolve_to_beam works in
-      ! real(dp), while block_in/block_out (this file's own I/O buffers)
-      ! are single precision, matching every other block-I/O buffer in
-      ! this project (reproject_cubes.f90's own block_data_in/out).
-      real(dp) :: plane_in(naxes(sky1), naxes(sky2))
-      real(dp) :: plane_out(naxes(sky1), naxes(sky2))
+      ! Per-thread swim-lane instrumentation (planning-doc ticket): one
+      ! 'thread_timing stage=convolve event=start|done' pair per thread
+      ! per block, same convention as rm_synthesis.f90/rm_synthesis_mod.
+      ! f90's own thread_timing lines (see scripts/plot_tile_async_
+      ! swimlane.py) -- gated behind log_level=debug like every other
+      ! debug-level log_message call, no separate flag needed.
+      integer :: iblock, tid_local
+      real(dp) :: t_thread_start, t_thread_elapsed
+      character(len=160) :: thread_msg
+      ! ALLOCATABLE, not automatic/stack -- one instance per OpenMP thread
+      ! (private() clause below), heap-allocated (first touch inside the
+      ! parallel loop) rather than stack-allocated. For a real full-size
+      ! image (e.g. 4501x4501) these are ~160MB EACH in real(dp); as
+      ! automatic arrays they were silently allocated on each OMP worker
+      ! thread's own stack, which is typically only a few MB (OMP_STACKSIZE
+      ! default) -- a guaranteed stack-overflow SIGSEGV, invisible on this
+      ! project's own tiny (32x32) test fixtures but fatal on real
+      ! production-scale data (found via the real ~46GB Jennifer
+      ! end-to-end verification run). Needed only because gaussft_mod's
+      ! convolve_to_beam works in real(dp), while block_in/block_out
+      ! (this file's own I/O buffers) are single precision, matching every
+      ! other block-I/O buffer in this project (reproject_cubes.f90's own
+      ! block_data_in/out).
+      real(dp), allocatable :: plane_in(:,:), plane_out(:,:)
+      real(dp) :: t_stage
 
       status = 0
+      call log_message('info', 'convolve', 'starting: '//trim(infile))
       nx = naxes(sky1)
       ny = naxes(sky2)
       dx_deg = abs(cdelt1)
@@ -1129,21 +1361,29 @@ contains
       call sky_to_pixel_bpa(tgt_bpa, cdelt1, cdelt2, tgt_bpa_pixel)
 
       fitsstat = 0
-      in_unit = 210
-      call FTOPEN(in_unit, trim(infile), 0, blocksize, fitsstat)
+      call safe_ftopen(in_unit, trim(infile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot reopen input for output header: ', trim(infile)
          status = -1
+         call free_fits_unit(in_unit)
          return
       endif
 
-      out_unit = 211
       fitsstat = 0
-      call FTINIT(out_unit, '!'//trim(outfile), blocksize, fitsstat)
+      ! Plain filename (NOT '!'-prefixed): FTINIT fails if outfile already
+      ! exists rather than silently clobbering it. Fixed bug, found while
+      ! implementing match_cubes' own skip-if-already-matched feature
+      ! (planning-doc ticket) and auditing every FTINIT call for the same
+      ! pattern: this call previously used the '!'-prefix CLOBBER
+      ! convention, silently deleting and overwriting a pre-existing
+      ! output with no warning.
+      call safe_ftinit(out_unit, trim(outfile), blocksize, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: cannot create output file: ', trim(outfile)
+         write(*,*) 'ERROR: cannot create output file (already exists?): ',&
+         &trim(outfile)
          status = -1
-         call FTCLOS(in_unit, fitsstat)
+         call safe_ftclos(in_unit, fitsstat)
+         call free_fits_unit(out_unit)
          return
       endif
 
@@ -1161,13 +1401,20 @@ contains
       &'common-resolution position angle (deg)', fitsstat)
       call FTPHIS(out_unit, 'convolve_cubes: convolved from '//trim(infile)//&
       &' to a common resolution', fitsstat)
-      call FTCLOS(in_unit, fitsstat)
+      call safe_ftclos(in_unit, fitsstat)
 
       block_planes64 = 0
       call get_mem_total_kb(mem_total_kb)
-      bytes_per_plane = int(4,8) * int(nx,8) * int(ny,8) * 2_8
+      ! *3 not *2: block_in (1x) + block_out's own 2 double-buffer slots
+      ! (io_overlap's own read+compute/write overlap, see below) --
+      ! budgeted whether or not io_overlap is actually on, so turning it
+      ! on never silently blows past mem_frac_ram.
+      bytes_per_plane = int(4,8) * int(nx,8) * int(ny,8) * 3_8
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) * 1024.0d0, 8)
       block_planes64 = max(1_8, mem_safe_bytes / bytes_per_plane)
+      block_planes64 = min(block_planes64,&
+      &max_elements_per_block / max(1_8, int(nx,8)*int(ny,8)))
+      block_planes64 = max(1_8, block_planes64)
       block_planes = int(min(block_planes64, int(nfreq,8)))
       if (block_planes.lt.1) block_planes = 1
 
@@ -1181,54 +1428,138 @@ contains
       endif
 
       allocate(block_in(nx, ny, block_planes))
-      allocate(block_out(nx, ny, block_planes))
+      allocate(block_out(nx, ny, block_planes, 0:1))
 
-      call plan_convolution(nx, ny, plan_fwd, plan_bwd)
+      call plan_convolution(nx, ny, plan_fwd, plan_bwd, nx_pad, ny_pad)
+      if (nx_pad.ne.nx .or. ny_pad.ne.ny) then
+         write(*,'(A,I0,A,I0,A,I0,A,I0,A)') 'Convolution FFT padded from ',&
+         &nx, 'x', ny, ' to ', nx_pad, 'x', ny_pad,&
+         &' (next 7-smooth size -- avoids a large-prime-factor slowdown).'
+      endif
 
+      ! io_overlap: block_out is double-buffered (trailing 0:1 slot) so
+      ! the NEXT block's read+compute can proceed into the OTHER slot
+      ! immediately, while THIS block's write runs on a background
+      ! pthread -- but only ONE write is ever in flight on out_unit at a
+      ! time (joined right here, before dispatching the next one): two
+      ! concurrent CFITSIO calls on the SAME handle from different
+      ! threads is unsafe (same hazard rm_synthesis_mod.f90's own
+      ! io_write_threads doc comment describes for read-write handles),
+      ! and this program has no raw-stream-write bypass (unlike rm_
+      ! synthesis/rmclean_cubes' own io_write_threads>1 path) to avoid
+      ! it. This still captures the real win: write(N) overlaps
+      ! read+compute(N+1), which is where the actual dead time was
+      ! (measured directly: ~44s/block write, fully serial with compute,
+      ! on the real Jennifer cube's own storage).
+      cur_slot = 0
+      write_pending = .false.
+      write_failed = .false.
       status_par = 0
       nthreads = max(1, min(omp_get_max_threads(), block_planes))
       chan_start = 1
+      iblock = 0
       do while (chan_start.le.nfreq)
          chan_len = min(block_planes, nfreq - chan_start + 1)
+         iblock = iblock + 1
 
+         call timer_start(t_stage)
          call read_freq_block(infile, naxis, sky1, sky2, freq_axis,&
          &naxes, chan_start, chan_len, nx, ny, block_in(:,:,1:chan_len), status_par)
+         call timer_stop('block_read', t_stage)
          if (status_par.ne.0) exit
 
-         !$omp parallel do num_threads(nthreads) schedule(dynamic)&
-         !$omp& default(none) shared(chan_len, nx, ny, block_in, block_out,&
+         call timer_start(t_stage)
+         !$omp parallel num_threads(nthreads)&
+         !$omp& default(none) shared(chan_len, nx, ny, nx_pad, ny_pad,&
+         !$omp& block_in, block_out, cur_slot,&
          !$omp& isbad, chan_start, plan_fwd, plan_bwd, dx_deg, dy_deg,&
          !$omp& bmaj_in, bmin_in, bpa_in_pixel, tgt_bmaj, tgt_bmin,&
-         !$omp& tgt_bpa_pixel, status_par)&
-         !$omp& private(local_iplane, ich, k, nanval, plane_in, plane_out)
+         !$omp& tgt_bpa_pixel, status_par, iblock)&
+         !$omp& private(local_iplane, ich, k, nanval, plane_in, plane_out,&
+         !$omp& tid_local, t_thread_start, t_thread_elapsed, thread_msg)
+         tid_local = omp_get_thread_num()
+         t_thread_start = omp_get_wtime()
+         write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=convolve event=start tid=',&
+         &tid_local,' block=',iblock,' unit_count=',chan_len
+         call log_message('debug','tile_thread',trim(thread_msg))
+         !$omp do schedule(dynamic)
          do local_iplane = 1, chan_len
             ich = chan_start + local_iplane - 1
             if (isbad(ich)) then
                nanval = ieee_value(1.0_dp, ieee_quiet_nan)
-               block_out(:,:,local_iplane) = real(nanval)
+               block_out(:,:,local_iplane,cur_slot) = real(nanval)
             else
+               if (.not. allocated(plane_in)) allocate(plane_in(nx,ny))
+               if (.not. allocated(plane_out)) allocate(plane_out(nx,ny))
                plane_in = real(block_in(:,:,local_iplane), dp)
                call convolve_to_beam(plan_fwd, plan_bwd,&
-               &plane_in, nx, ny,&
+               &plane_in, nx, ny, nx_pad, ny_pad,&
                &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
                &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
                &tgt_bpa_pixel, plane_out, k)
-               block_out(:,:,local_iplane) = real(plane_out)
+               block_out(:,:,local_iplane,cur_slot) = real(plane_out)
                if (k.ne.0) then
                   !$omp atomic write
                   status_par = -1
                endif
             endif
          enddo
-         !$omp end parallel do
+         !$omp end do
+         t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+         tid_local = omp_get_thread_num()
+         write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=convolve event=done tid=',&
+         &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
+         call log_message('debug','tile_thread',trim(thread_msg))
+         !$omp end parallel
+         call timer_stop('block_convolve', t_stage)
          if (status_par.ne.0) exit
 
-         call write_freq_block(out_unit, naxis, sky1, sky2, freq_axis,&
-         &naxes, chan_start, chan_len, nx, ny, block_out(:,:,1:chan_len), status_par)
-         if (status_par.ne.0) exit
+         call timer_start(t_stage)
+         if (write_pending) then
+            call block_write_join(write_thread_id)
+            write_pending = .false.
+            if (write_failed) then
+               status_par = -1
+               exit
+            endif
+         endif
+         call timer_stop('block_write_join', t_stage)
+         write_job%out_unit = out_unit
+         write_job%naxis = naxis
+         write_job%sky1 = sky1
+         write_job%sky2 = sky2
+         write_job%freq_axis = freq_axis
+         write_job%naxes = naxes
+         write_job%chan_start = chan_start
+         write_job%chan_len = chan_len
+         write_job%nx = nx
+         write_job%ny = ny
+         write_job%data => block_out(:,:,1:chan_len,cur_slot)
+         call timer_start(t_stage)
+         if (io_overlap_l) then
+            call block_write_dispatch_async(write_job, write_thread_id,&
+            &write_dispatched_ok)
+            write_pending = write_dispatched_ok
+         else
+            call do_block_write(write_job)
+            if (write_failed) then
+               status_par = -1
+               exit
+            endif
+         endif
+         call timer_stop('block_write', t_stage)
 
          chan_start = chan_start + chan_len
+         cur_slot = 1 - cur_slot
       enddo
+
+      call timer_start(t_stage)
+      if (write_pending) then
+         call block_write_join(write_thread_id)
+         write_pending = .false.
+         if (write_failed) status_par = -1
+      endif
+      call timer_stop('block_write_join', t_stage)
 
       call destroy_convolution_plan(plan_fwd, plan_bwd)
       deallocate(block_in, block_out)
@@ -1236,7 +1567,7 @@ contains
       if (status_par.ne.0) then
          write(*,*) 'ERROR: failed to convolve/write one or more planes for: ', trim(infile)
          status = -1
-         call FTCLOS(out_unit, fitsstat)
+         call safe_ftclos(out_unit, fitsstat)
          return
       endif
 
@@ -1254,12 +1585,83 @@ contains
       &tgt_bpa, status_par)
       if (status_par.ne.0) then
          status = -1
-         call FTCLOS(out_unit, fitsstat)
+         call safe_ftclos(out_unit, fitsstat)
          return
       endif
 
-      call FTCLOS(out_unit, fitsstat)
+      call safe_ftclos(out_unit, fitsstat)
+      call log_message('info', 'convolve', 'finished: '//trim(infile))
    end subroutine write_convolved_file
+
+   subroutine do_block_write(job)
+      !! T4d-style: the actual "write one block" payload -- callable
+      !! either inline (io_overlap=n) or as a pthread entry point's own
+      !! payload (io_overlap=y); identical logic either way, so output is
+      !! bit-for-bit the same regardless of which mode dispatched it (same
+      !! invariant as rm_synthesis_mod.f90/rmclean_cubes.f90's own
+      !! do_tile_write). Any write failure is reported but not propagated
+      !! as a return status: once dispatched onto a background thread,
+      !! there is no synchronous caller left to hand a status to -- same
+      !! convention rm_synthesis's own do_tile_write uses.
+      type(block_write_job_t), intent(inout) :: job
+      integer :: status_local
+
+      status_local = 0
+      call write_freq_block(job%out_unit, job%naxis, job%sky1, job%sky2,&
+      &job%freq_axis, job%naxes, job%chan_start, job%chan_len, job%nx,&
+      &job%ny, job%data, status_local)
+      if (status_local.ne.0) then
+         write(*,*) 'ERROR: background write failed for channels ',&
+         &job%chan_start, '-', job%chan_start+job%chan_len-1
+         write_failed = .true.
+      endif
+   end subroutine do_block_write
+
+   function block_write_thread_entry(arg) bind(C) result(res)
+      !! pthread start routine. Unpacks the opaque context pointer back
+      !! into the block_write_job_t it was created from (same process,
+      !! same build, so the round-trip through c_loc/c_f_pointer is safe
+      !! even though block_write_job_t is not a bind(C) type).
+      type(c_ptr), value :: arg
+      type(c_ptr) :: res
+      type(block_write_job_t), pointer :: job
+
+      call c_f_pointer(arg, job)
+      call do_block_write(job)
+      res = c_null_ptr
+   end function block_write_thread_entry
+
+   subroutine block_write_dispatch_async(job, thread_id, dispatched)
+      !! Launches do_block_write(job) on a background pthread. `job` must
+      !! have the TARGET attribute at the call site (write_job's own
+      !! declaration) and must remain valid -- untouched and
+      !! undeallocated -- until block_write_join(thread_id) has returned.
+      !! On pthread_create failure this runs the write synchronously right
+      !! here instead (safe fallback: a write is never silently dropped),
+      !! and reports dispatched=.false. so the caller knows there is
+      !! nothing to join later.
+      type(block_write_job_t), intent(inout), target :: job
+      integer(c_long), intent(out) :: thread_id
+      logical, intent(out) :: dispatched
+      integer(c_int) :: rc
+
+      rc = c_pthread_create(thread_id, c_null_ptr,&
+      &c_funloc(block_write_thread_entry), c_loc(job))
+      if (rc.ne.0_c_int) then
+         write(*,*) 'WARNING: pthread_create failed for async block write;'//&
+         &' running inline'
+         call do_block_write(job)
+         dispatched = .false.
+      else
+         dispatched = .true.
+      endif
+   end subroutine block_write_dispatch_async
+
+   subroutine block_write_join(thread_id)
+      integer(c_long), intent(in) :: thread_id
+      integer(c_int) :: rc
+      rc = c_pthread_join(thread_id, c_null_ptr)
+   end subroutine block_write_join
 
    subroutine write_beams_table(unit, nfreq, isbad, tgt_bmaj, tgt_bmin,&
    &tgt_bpa, status)
@@ -1430,10 +1832,9 @@ contains
 
       fitsstat = 0
       blocksize = 1
-      unit = 5100
       group = 1
       badval = ieee_value(badval, ieee_quiet_nan)
-      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
       if (natural_order) then
          call FTGSVE(unit, group, naxis, naxes(1:naxis), fpixels(1:naxis),&
          &lpixels(1:naxis), incs(1:naxis), badval, block_data, anyflg, fitsstat)
@@ -1458,7 +1859,7 @@ contains
          endif
          deallocate(natural_buf)
       endif
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to read block (planes ', chan_start, '-',&
          &chan_start+chan_len-1, ') from ', trim(filename)

@@ -96,13 +96,37 @@ program rmclean_cubes
    use, intrinsic :: iso_c_binding, only: c_int, c_long, c_ptr, c_funptr,&
    &c_null_ptr, c_funloc, c_loc, c_f_pointer
    use rmclean_mod
-   use omp_lib, only: omp_get_max_threads
+   use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
+   use logging_mod
+   use fitsio_unit_mod
    implicit none
+
+   ! --- Logging & timing (planning-doc ticket) -- see convolve_cubes.f90
+   ! /logging_mod.f90's own header comments. Stage names: startup,
+   ! tile_read, tile_compute, tile_write_join, tile_write, finalize.
+   character(len=16) :: log_level
+   logical :: timing_enabled
+   character(len=272) :: log_output_file
 
    character(len=512) :: ampfile, phafile, maskfile, outfile
    integer :: niter
    real(sp) :: gain, threshold
    logical :: have_threshold
+   ! --- threshold unit + threshold_snr (auto noise-floor mode) ---
+   ! threshold= keeps its historical bare-number meaning (native AMP-cube
+   ! flux units, no conversion) for backward compatibility, but now also
+   ! accepts an optional Jy/mJy/uJy suffix (parse_flux_value below),
+   ! converted against the AMP cube's own BUNIT once it's read (resolve_
+   ! threshold, called after read_amp_pha_geometry). threshold_snr is a
+   ! mutually-exclusive alternative: threshold = threshold_snr x an
+   ! auto-estimated noise floor (estimate_noise_floor below) -- exactly
+   ! one of threshold=/threshold_snr= must be given.
+   real(sp) :: threshold_raw_value, threshold_unit_scale
+   logical :: have_threshold_snr
+   real(sp) :: threshold_snr
+   integer :: noise_nlos
+   real(sp) :: noise_percentile
+   integer :: noise_seed
    real(sp) :: min_samples_per_fwhm, refine_nsigma
    integer :: table_oversample
    logical :: have_restore_fwhm
@@ -257,6 +281,15 @@ program rmclean_cubes
    integer(kind=8) :: restore_plan_fwd, restore_plan_bwd
    integer :: n_pixels_done
    integer :: mask_pattern_cache_max
+   real(dp) :: t_stage
+   ! Per-thread swim-lane instrumentation (planning-doc ticket) -- see
+   ! convolve_cubes.f90's own write_convolved_file for the full
+   ! rationale. tile_seq (already an existing running tile counter,
+   ! incremented once per tile before this parallel region) doubles as
+   ! the block index here -- no separate counter needed.
+   integer :: tid_local
+   real(dp) :: t_thread_start, t_thread_elapsed
+   character(len=160) :: thread_msg
 
    ! --- Mask-pattern -> rmsf_table_t cache (planning/RMCLEAN_INTEGRATION_
    ! PLAN.md decision 10) -- built once, serially, by build_mask_pattern_
@@ -274,6 +307,13 @@ program rmclean_cubes
 
    call parse_args(status)
    if (status.ne.0) stop 1
+
+   call init_logging(log_level, timing_enabled, log_output_file, status)
+   if (status.ne.0) then
+      write(*,*) 'ERROR: cannot open log_output_file: ', trim(log_output_file)
+      stop 1
+   endif
+   call log_message('info', 'startup', 'rmclean_cubes run started')
 
    call read_chanfreq(maskfile, l_sq, band_id, nchan, status)
    if (status.ne.0) stop 1
@@ -330,6 +370,9 @@ program rmclean_cubes
    write(*,'(A,F0.6,A,F0.6,A)') 'Gate 0 OK: existing |CDELT3|=',&
    &abs(real(cdelt3_amp, sp)), ' rad/m^2 <= required ', drm_required,&
    &' rad/m^2 (RM-resolution criterion).'
+
+   call resolve_threshold(status)
+   if (status.ne.0) stop 1
 
    allocate(rm_samp(nrm))
    do k = 1, nrm
@@ -396,17 +439,9 @@ program rmclean_cubes
    allocate(resid_re_buf(tile_ra,tile_dec,nrm,2), resid_im_buf(tile_ra,tile_dec,nrm,2))
    allocate(restored_re_buf(tile_ra,tile_dec,nrm,2), restored_im_buf(tile_ra,tile_dec,nrm,2))
 
-   ! Fixed, distinct unit numbers, chosen by the caller (FTINIT takes the
-   ! unit as an INPUT, unlike a handle CFITSIO fills in) -- disjoint from
-   ! every other unit this program uses (213/214 tile reads, 227 the
-   ! transient header-copy src_unit inside open_output_cube itself).
-   out_unit(idx_clean_amp) = 221
-   out_unit(idx_clean_pha) = 222
-   out_unit(idx_resid_amp) = 223
-   out_unit(idx_resid_pha) = 224
-   out_unit(idx_restored_amp) = 225
-   out_unit(idx_restored_pha) = 226
-
+   ! Each out_unit(idx) is assigned its own genuinely distinct CFITSIO
+   ! unit inside open_output_cube itself, via fitsio_unit_mod's
+   ! safe_ftinit (FTGIOU+FTINIT) -- no caller-chosen numbering needed.
    call open_output_cube(ampfile, trim(outfile)//'.CLEAN.AMP.RMCUBE.FITS',&
    &nx, ny, nrm, idx_clean_amp, status)
    if (status.ne.0) stop 1
@@ -451,10 +486,12 @@ program rmclean_cubes
          ! so this is a no-op (see tile_write_job_t's own comment).
          cur_slot = mod(tile_seq, 2)
          tile_seq = tile_seq + 1
+         call timer_start(t_stage)
          if (io_overlap .and. write_pending(cur_slot)) then
             call tile_write_join(write_thread_id(cur_slot))
             write_pending(cur_slot) = .false.
          endif
+         call timer_stop('tile_write_join', t_stage)
          clean_re_tile => clean_re_buf(:,:,:,cur_slot+1)
          clean_im_tile => clean_im_buf(:,:,:,cur_slot+1)
          resid_re_tile => resid_re_buf(:,:,:,cur_slot+1)
@@ -462,17 +499,33 @@ program rmclean_cubes
          restored_re_tile => restored_re_buf(:,:,:,cur_slot+1)
          restored_im_tile => restored_im_buf(:,:,:,cur_slot+1)
 
+         call timer_start(t_stage)
          call read_amp_pha_tile(ampfile, phafile, ix_tile_beg, iy_tile_beg,&
          &tx, ty, re_tile(1:tx,1:ty,:), im_tile(1:tx,1:ty,:), status)
+         call timer_stop('tile_read', t_stage)
          if (status.ne.0) stop 1
 
-         !$omp parallel do collapse(2) schedule(dynamic) default(shared) private(ix,iy)
+         call timer_start(t_stage)
+         !$omp parallel default(shared)&
+         !$omp& private(ix, iy, tid_local, t_thread_start, t_thread_elapsed, thread_msg)
+         tid_local = omp_get_thread_num()
+         t_thread_start = omp_get_wtime()
+         write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=clean event=start tid=',&
+         &tid_local,' block=',tile_seq,' unit_count=',tx*ty
+         call log_message('debug','tile_thread',trim(thread_msg))
+         !$omp do collapse(2) schedule(dynamic)
          do iy = 1, ty
             do ix = 1, tx
                call clean_one_pixel(ix, iy, ix_tile_beg, iy_tile_beg)
             enddo
          enddo
-         !$omp end parallel do
+         !$omp end do
+         t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+         write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=clean event=done tid=',&
+         &tid_local,' block=',tile_seq,' unit_count=',tx*ty,' dur_ms=',t_thread_elapsed
+         call log_message('debug','tile_thread',trim(thread_msg))
+         !$omp end parallel
+         call timer_stop('tile_compute', t_stage)
 
          write_job(cur_slot)%ix_tile_beg = ix_tile_beg
          write_job(cur_slot)%iy_tile_beg = iy_tile_beg
@@ -485,6 +538,7 @@ program rmclean_cubes
          write_job(cur_slot)%re_ptr(3)%p => restored_re_tile(1:tx,1:ty,:)
          write_job(cur_slot)%im_ptr(3)%p => restored_im_tile(1:tx,1:ty,:)
 
+         call timer_start(t_stage)
          if (io_overlap) then
             ! T4d handle-safety join: before any NEW write is dispatched,
             ! whichever write is currently outstanding (either slot) is
@@ -503,12 +557,15 @@ program rmclean_cubes
                call tile_write_join(write_thread_id(1))
                write_pending(1) = .false.
             endif
+            call timer_stop('tile_write_join', t_stage)
+            call timer_start(t_stage)
             call tile_write_dispatch_async(write_job(cur_slot),&
             &write_thread_id(cur_slot), write_dispatched_ok)
             write_pending(cur_slot) = write_dispatched_ok
          else
             call do_tile_write(write_job(cur_slot))
          endif
+         call timer_stop('tile_write', t_stage)
 
          ix_tile_beg = ix_tile_beg + tx
       enddo
@@ -521,6 +578,7 @@ program rmclean_cubes
    ! only joined when that slot is reused two tiles later, so the final
    ! tile, and the one before it in the other slot, never gets that
    ! second chance).
+   call timer_start(t_stage)
    if (io_overlap) then
       if (write_pending(0)) then
          call tile_write_join(write_thread_id(0))
@@ -531,6 +589,7 @@ program rmclean_cubes
          write_pending(1) = .false.
       endif
    endif
+   call timer_stop('tile_write_join', t_stage)
 
    call destroy_fourier_interp_plan(restore_plan_fwd, restore_plan_bwd)
 
@@ -539,6 +598,8 @@ program rmclean_cubes
    enddo
 
    write(*,'(A)') 'OK: rmclean_cubes complete.'
+   call timer_report_summary()
+   call log_message('info', 'finalize', 'rmclean_cubes run completed')
 
 contains
 
@@ -558,6 +619,13 @@ contains
       gain = 0.1_sp
       have_threshold = .false.
       threshold = 0.0_sp
+      threshold_raw_value = 0.0_sp
+      threshold_unit_scale = -1.0_sp
+      have_threshold_snr = .false.
+      threshold_snr = 0.0_sp
+      noise_nlos = 500
+      noise_percentile = 0.15_sp
+      noise_seed = 20250101
       min_samples_per_fwhm = 2.0_sp
       refine_nsigma = 3.0_sp
       table_oversample = 20
@@ -577,6 +645,9 @@ contains
       io_read_threads = 1
       io_write_threads = 1
       io_overlap = .false.
+      log_level = 'info'
+      timing_enabled = .false.
+      log_output_file = ' '
       have_cfgfile = .false.
       seen_ampfile = .false.
       seen_phafile = .false.
@@ -635,9 +706,18 @@ contains
          status = -1
          return
       endif
-      if (.not. have_threshold) then
-         write(*,*) 'ERROR: threshold= is required (CLEAN stopping flux,'//&
-         &' same units as the dirty AMP cube)'
+      if (have_threshold .and. have_threshold_snr) then
+         write(*,*) 'ERROR: specify exactly one of threshold= or'//&
+         &' threshold_snr=, not both'
+         status = -1
+         return
+      endif
+      if (.not. have_threshold .and. .not. have_threshold_snr) then
+         write(*,*) 'ERROR: threshold= or threshold_snr= is required'//&
+         &' (CLEAN stopping flux -- either an absolute value, same'//&
+         &' units as the dirty AMP cube unless suffixed with Jy/mJy/uJy,'//&
+         &' or threshold_snr=<N> to auto-derive N x the cube''s own'//&
+         &' noise floor)'
          status = -1
          return
       endif
@@ -680,13 +760,46 @@ contains
             return
          endif
       case ('threshold')
-         read(val, *, iostat=ios) threshold
+         call parse_flux_value(val, threshold_raw_value,&
+         &threshold_unit_scale, ios)
          if (ios.ne.0) then
-            write(*,*) 'ERROR: threshold must be a number'
+            write(*,*) 'ERROR: threshold must be a number, optionally'//&
+            &' suffixed with a unit (Jy, mJy, or uJy) with no space,'//&
+            &' e.g. threshold=0.01 or threshold=10mJy'
             status = -1
             return
          endif
          have_threshold = .true.
+      case ('threshold_snr')
+         read(val, *, iostat=ios) threshold_snr
+         if (ios.ne.0 .or. threshold_snr.le.0.0_sp) then
+            write(*,*) 'ERROR: threshold_snr must be a positive number'
+            status = -1
+            return
+         endif
+         have_threshold_snr = .true.
+      case ('noise_nlos')
+         read(val, *, iostat=ios) noise_nlos
+         if (ios.ne.0 .or. noise_nlos.lt.1) then
+            write(*,*) 'ERROR: noise_nlos must be a positive integer'
+            status = -1
+            return
+         endif
+      case ('noise_percentile')
+         read(val, *, iostat=ios) noise_percentile
+         if (ios.ne.0 .or. noise_percentile.le.0.0_sp .or.&
+         &noise_percentile.gt.1.0_sp) then
+            write(*,*) 'ERROR: noise_percentile must be in (0,1]'
+            status = -1
+            return
+         endif
+      case ('noise_seed')
+         read(val, *, iostat=ios) noise_seed
+         if (ios.ne.0) then
+            write(*,*) 'ERROR: noise_seed must be an integer'
+            status = -1
+            return
+         endif
       case ('min_samples_per_fwhm')
          read(val, *, iostat=ios) min_samples_per_fwhm
          if (ios.ne.0 .or. min_samples_per_fwhm.lt.1.0_sp) then
@@ -809,6 +922,12 @@ contains
          endif
       case ('io_overlap')
          io_overlap = flag_from_value_rmclean(val)
+      case ('log_level')
+         log_level = trim(val)
+      case ('timing_enabled')
+         timing_enabled = flag_from_value_logging(val)
+      case ('log_output_file')
+         log_output_file = trim(val)
       case default
          write(*,*) 'ERROR: unrecognised key "', key, '"'
          status = -1
@@ -855,7 +974,8 @@ contains
 
    subroutine print_usage()
       write(*,'(A)') 'Usage: rmclean_cubes ampfile=<f> phafile=<f>'//&
-      &' maskfile=<f> outfile=<base> threshold=<t>'
+      &' maskfile=<f> outfile=<base> (threshold=<t> | threshold_snr=<n>)'
+      write(*,'(A)') '    [noise_nlos=<n>] [noise_percentile=<f>] [noise_seed=<n>]'
       write(*,'(A)') '    [niter=<n>] [gain=<g>] [min_samples_per_fwhm=<f>]'//&
       &' [refine_nsigma=<f>] [table_oversample=<n>] [restore_fwhm=<v>]'
       write(*,'(A)') '    [lsq_ref_report_mode=intrinsic|centroid|min|max'//&
@@ -874,9 +994,23 @@ contains
       &' CHANFREQ binary table).'
       write(*,'(A)') 'outfile: base name for the 6 output cubes'//&
       &' (<outfile>.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS).'
-      write(*,'(A)') 'threshold: CLEAN stopping flux, same units as the'//&
-      &' dirty AMP cube (required, no default -- see clean_complex''s own'//&
-      &' doc comment in src/rmclean.f90).'
+      write(*,'(A)') 'threshold: CLEAN stopping flux -- native AMP-cube'//&
+      &' units for a bare number, or convert from Jy/mJy/uJy with no'//&
+      &' space (e.g. threshold=10mJy) against the AMP cube''s own BUNIT.'//&
+      &' Exactly one of threshold=/threshold_snr= is required (see'//&
+      &' clean_complex''s own doc comment in src/rmclean.f90 for how to'//&
+      &' choose an absolute value).'
+      write(*,'(A)') 'threshold_snr: alternative to threshold= -- CLEAN'//&
+      &' stops at threshold_snr x an auto-estimated noise floor. The'//&
+      &' floor is the median of the lowest noise_percentile fraction of'//&
+      &' bins from noise_nlos random spatial pixels'' own full dirty'//&
+      &' AMP spectra (a real source is a narrow peak in an otherwise'//&
+      &' noise-dominated spectrum, so a sightline''s own lowest bins are'//&
+      &' overwhelmingly noise regardless of whether it contains a source).'
+      write(*,'(A)') 'noise_nlos (default 500), noise_percentile (default'//&
+      &' 0.15), noise_seed (default 20250101): tune the threshold_snr'//&
+      &' auto noise-floor estimate above; noise_seed makes it'//&
+      &' reproducible run to run. Ignored when threshold= is used.'
       write(*,'(A)') 'niter (default 500), gain (default 0.1): Hogbom'//&
       &' CLEAN parameters, passed straight to clean_complex.'
       write(*,'(A)') 'min_samples_per_fwhm (default 2, floor 1): Gate 0''s'//&
@@ -997,6 +1131,313 @@ contains
       if (t(1:1).eq.'1' .or. t(1:1).eq.'y' .or. t(1:1).eq.'t') flag = .true.
    end function flag_from_value_rmclean
 
+   subroutine parse_flux_value(val, raw_value, unit_scale, ios)
+      !! Splits a threshold= value into its leading numeric part and an
+      !! optional trailing unit suffix (Jy/mJy/uJy, case-insensitive, no
+      !! space -- e.g. "10mJy", "0.01Jy", or a bare "0.01"). Scans
+      !! BACKWARD from the end of the string while the character is a
+      !! letter -- the boundary between the (purely alphabetic) unit
+      !! suffix and the numeric part is the first non-letter found this
+      !! way, so an exponent's own 'e'/'E' (embedded, never trailing --
+      !! a valid number never ENDS in a bare e/E) is never mistaken for
+      !! part of a unit token. unit_scale is left at its -1.0 sentinel
+      !! (caller-provided default, meaning "no unit given -- use the
+      !! value as-is in the AMP cube's own native units", the historical
+      !! bare-number behaviour) when there is no trailing letter run.
+      character(len=*), intent(in) :: val
+      real(sp), intent(out) :: raw_value
+      real(sp), intent(inout) :: unit_scale
+      integer, intent(out) :: ios
+      character(len=len(val)) :: v
+      character(len=len(val)) :: numeric_part, unit_part
+      integer :: i, nchar_v, unit_len
+      character :: c
+
+      ios = 0
+      raw_value = 0.0_sp
+      v = adjustl(val)
+      nchar_v = len_trim(v)
+      if (nchar_v.eq.0) then
+         ios = -1
+         return
+      endif
+
+      unit_len = 0
+      do i = nchar_v, 1, -1
+         c = v(i:i)
+         if ((c.ge.'a'.and.c.le.'z') .or. (c.ge.'A'.and.c.le.'Z')) then
+            unit_len = unit_len + 1
+         else
+            exit
+         endif
+      enddo
+      if (unit_len.ge.nchar_v) then
+         ios = -1
+         return
+      endif
+
+      numeric_part = v(1:nchar_v-unit_len)
+      read(numeric_part, *, iostat=ios) raw_value
+      if (ios.ne.0) return
+
+      if (unit_len.gt.0) then
+         unit_part = v(nchar_v-unit_len+1:nchar_v)
+         unit_scale = flux_unit_scale(unit_part(1:unit_len), ios)
+      endif
+   end subroutine parse_flux_value
+
+   function flux_unit_scale(unit_str, ios) result(scale)
+      !! Jy-relative scale factor for a recognised flux-unit token
+      !! (case-insensitive). ios is set nonzero for anything else.
+      character(len=*), intent(in) :: unit_str
+      integer, intent(out) :: ios
+      real(sp) :: scale
+      character(len=len(unit_str)) :: u
+      integer :: i
+
+      u = unit_str
+      do i = 1, len_trim(u)
+         u(i:i) = achar(iachar(u(i:i)) + merge(32, 0, u(i:i).ge.'A'.and.u(i:i).le.'Z'))
+      enddo
+      ios = 0
+      select case (trim(u))
+      case ('jy')
+         scale = 1.0_sp
+      case ('mjy')
+         scale = 1.0e-3_sp
+      case ('ujy')
+         scale = 1.0e-6_sp
+      case default
+         scale = 1.0_sp
+         ios = -1
+      end select
+   end function flux_unit_scale
+
+   subroutine read_bunit_keyword(filename, bunit_out, found)
+      !! Reads the AMP cube's own BUNIT keyword (rm_synthesis passes this
+      !! through from the input Q/U cube, rm_synthesis.f90:2953/2958) --
+      !! used to resolve an explicit threshold= unit against the cube's
+      !! OWN native unit, and to sanity-check the auto threshold_snr
+      !! noise-floor mode is comparing like with like. Typical ASKAP-style
+      !! values look like "Jy/beam" -- only the leading flux-unit token
+      !! (up to the first '/', if any) is meaningful for the Jy/mJy/uJy
+      !! scale comparison here; the per-beam/per-pixel denominator is the
+      !! same on both sides of any ratio this program computes, so it is
+      !! read but not otherwise interpreted.
+      character(len=*), intent(in) :: filename
+      character(len=*), intent(out) :: bunit_out
+      logical, intent(out) :: found
+      integer :: unit, blocksize, fitsstat
+      character(len=80) :: comment
+
+      bunit_out = ' '
+      found = .false.
+      fitsstat = 0
+      ! safe_ftopen (fitsio_unit_mod.f90, FTGIOU+FTOPEN) -- FTOPEN
+      ! requires a caller-assigned CFITSIO unit number, it does NOT
+      ! auto-allocate one (no newunit= support, unlike plain Fortran
+      ! open). An uninitialized `unit` here (the original bug, before
+      ! this whole file moved to FTGIOU-based allocation) happened to run
+      ! without visibly failing on the tiny 32x32 test fixture but
+      ! corrupted CFITSIO's internal unit table on a real cube,
+      ! SIGSEGVing deep inside libcfitsio -- found via the real ~46GB
+      ! Jennifer end-to-end run.
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         call free_fits_unit(unit)
+         return
+      endif
+      call FTGKYS(unit, 'BUNIT', bunit_out, comment, fitsstat)
+      if (fitsstat.eq.0) found = .true.
+      fitsstat = 0
+      call safe_ftclos(unit, fitsstat)
+   end subroutine read_bunit_keyword
+
+   subroutine resolve_threshold(status)
+      !! Finalises the module-level `threshold` (the value clean_complex
+      !! actually compares against every pixel's own dirty amplitude) from
+      !! whichever of threshold=/threshold_snr= was given -- called once,
+      !! after read_amp_pha_geometry (nx/ny/nrm known) and before the main
+      !! tile loop. Prints exactly what it resolved to and why, so a run's
+      !! own stdout log (scripts/run_pipeline.sh's provenance capture)
+      !! records the actual number used, not just the cfg's own request.
+      integer, intent(out) :: status
+      character(len=80) :: bunit, bunit_token
+      logical :: have_bunit
+      real(sp) :: native_scale
+      integer :: ios, slash_pos
+      real(sp) :: noise_floor
+
+      status = 0
+      call read_bunit_keyword(ampfile, bunit, have_bunit)
+      native_scale = 1.0_sp
+      if (have_bunit .and. len_trim(bunit).gt.0) then
+         bunit_token = adjustl(bunit)
+         slash_pos = index(bunit_token, '/')
+         if (slash_pos.gt.0) bunit_token = bunit_token(1:slash_pos-1)
+         native_scale = flux_unit_scale(trim(bunit_token), ios)
+         if (ios.ne.0) then
+            write(*,'(A)') 'WARNING: '//trim(ampfile)//' BUNIT="'//&
+            &trim(bunit)//'" not recognised as Jy/mJy/uJy -- assuming Jy'//&
+            &' for threshold-unit conversion and the auto noise floor.'
+            native_scale = 1.0_sp
+         endif
+      else
+         write(*,'(A)') 'WARNING: no BUNIT keyword in '//trim(ampfile)//&
+         &' -- assuming Jy for threshold-unit conversion and the auto'//&
+         &' noise floor.'
+      endif
+
+      if (have_threshold) then
+         if (threshold_unit_scale.gt.0.0_sp) then
+            threshold = threshold_raw_value *&
+            &(threshold_unit_scale/native_scale)
+            write(*,'(A,F0.6,A,F0.6,A)') 'threshold: ', threshold_raw_value,&
+            &' (given unit) -> ', threshold, ' (native AMP-cube units,'//&
+            &' BUNIT="'//trim(bunit)//'").'
+         else
+            threshold = threshold_raw_value
+         endif
+      else
+         call estimate_noise_floor(noise_floor, status)
+         if (status.ne.0) return
+         threshold = threshold_snr * noise_floor
+         write(*,'(A,I0,A,F0.4,A,F0.6,A,F0.6,A)') 'threshold_snr: auto'//&
+         &' noise floor from ', noise_nlos, ' random sightlines,'//&
+         &' lowest ', noise_percentile*100.0_sp, '% of bins = ',&
+         &noise_floor, ' (native units) -> threshold = ', threshold,&
+         &' (native units).'
+      endif
+   end subroutine resolve_threshold
+
+   subroutine estimate_noise_floor(noise_floor, status)
+      !! Auto noise-floor estimate for threshold_snr mode: draws
+      !! noise_nlos random spatial pixels (lines of sight), reads each
+      !! one's own full dirty AMP spectrum (all nrm RM bins), sorts it,
+      !! and pools the lowest noise_percentile fraction of bins from
+      !! EVERY sampled sightline into one big sample -- a real polarised
+      !! source produces one (or a few) narrow peak(s) in an otherwise
+      !! noise-dominated RM spectrum, so the lowest-amplitude bins of any
+      !! given sightline are overwhelmingly noise, not signal, regardless
+      !! of whether that particular sightline happens to contain a real
+      !! source. noise_floor is the MEDIAN of the pooled sample -- robust
+      !! to the rare sightline whose "low" bins are still elevated (e.g.
+      !! a very bright, spectrally broad source) without needing to
+      !! identify or exclude such sightlines individually. A pixel whose
+      !! spectrum is entirely NaN (outside the mask footprint) is
+      !! redrawn, up to a generous cap, rather than counted.
+      real(sp), intent(out) :: noise_floor
+      integer, intent(out) :: status
+      integer, parameter :: max_redraws_factor = 20
+      integer :: unit, blocksize, fitsstat, group
+      integer :: fpixel(3), lpixel(3), incs(3), naxes_full(3)
+      logical :: anyflag
+      real(sp), allocatable :: spectrum(:), pooled(:)
+      integer :: seed_size
+      integer, allocatable :: seed_arr(:)
+      real(sp) :: rx, ry
+      integer :: ix_draw, iy_draw, draws_done, redraws, n_lowbins
+      integer(kind=8) :: pooled_cap, pooled_used
+      integer :: k
+
+      status = 0
+      noise_floor = 0.0_sp
+      n_lowbins = max(1, nint(real(nrm, sp)*noise_percentile))
+      pooled_cap = int(noise_nlos, 8) * int(n_lowbins, 8)
+      allocate(spectrum(nrm), pooled(pooled_cap))
+      pooled_used = 0_8
+
+      call random_seed(size=seed_size)
+      allocate(seed_arr(seed_size))
+      seed_arr = noise_seed
+      call random_seed(put=seed_arr)
+
+      fitsstat = 0
+      call safe_ftopen(unit, trim(ampfile), 0, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot open FITS file for noise estimation: ',&
+         &trim(ampfile)
+         status = -1
+         call free_fits_unit(unit)
+         deallocate(spectrum, pooled, seed_arr)
+         return
+      endif
+      group = 1
+      naxes_full = (/ nx, ny, nrm /)
+      incs = (/ 1, 1, 1 /)
+
+      draws_done = 0
+      redraws = 0
+      do while (draws_done.lt.noise_nlos .and.&
+      &redraws.lt.noise_nlos*max_redraws_factor)
+         call random_number(rx)
+         call random_number(ry)
+         ix_draw = 1 + int(rx*real(nx, sp))
+         iy_draw = 1 + int(ry*real(ny, sp))
+         ix_draw = min(max(ix_draw, 1), nx)
+         iy_draw = min(max(iy_draw, 1), ny)
+
+         fpixel = (/ ix_draw, iy_draw, 1 /)
+         lpixel = (/ ix_draw, iy_draw, nrm /)
+         fitsstat = 0
+         call FTGSVE(unit, group, 3, naxes_full, fpixel, lpixel, incs,&
+         &0.0_sp, spectrum, anyflag, fitsstat)
+         if (fitsstat.ne.0 .or. any(spectrum.ne.spectrum)) then
+            ! all-NaN (masked) sightline, or a read hiccup -- redraw
+            redraws = redraws + 1
+            cycle
+         endif
+
+         call sort_real_inplace_rmclean(spectrum, nrm)
+         do k = 1, n_lowbins
+            pooled_used = pooled_used + 1_8
+            pooled(pooled_used) = spectrum(k)
+         enddo
+         draws_done = draws_done + 1
+      enddo
+      call safe_ftclos(unit, fitsstat)
+      if (draws_done.lt.1) then
+         write(*,*) 'ERROR: threshold_snr auto noise estimation found no'//&
+         &' usable (non-all-NaN) sightlines in ', trim(ampfile)
+         status = -1
+         deallocate(spectrum, pooled, seed_arr)
+         return
+      endif
+      if (draws_done.lt.noise_nlos) then
+         write(*,'(A,I0,A,I0,A)') 'WARNING: threshold_snr auto noise'//&
+         &' estimation only found ', draws_done, ' of ', noise_nlos,&
+         &' requested usable sightlines (cube mostly masked?) --'//&
+         &' proceeding with what was found.'
+      endif
+
+      call sort_real_inplace_rmclean(pooled(1:pooled_used), int(pooled_used))
+      noise_floor = pooled(int((pooled_used+1_8)/2_8))
+      deallocate(spectrum, pooled, seed_arr)
+   end subroutine estimate_noise_floor
+
+   subroutine sort_real_inplace_rmclean(arr, n)
+      !! Plain insertion sort, ascending -- called only on small arrays
+      !! (one pixel's own nrm-length spectrum, or the pooled noise
+      !! sample, at most noise_nlos*nrm elements), so O(n^2) is cheap
+      !! relative to FITS I/O and never appears in the main per-pixel
+      !! CLEAN loop.
+      real(sp), intent(inout) :: arr(*)
+      integer, intent(in) :: n
+      integer :: i, j
+      real(sp) :: key
+
+      do i = 2, n
+         key = arr(i)
+         j = i - 1
+         do while (j.ge.1)
+            if (arr(j).le.key) exit
+            arr(j+1) = arr(j)
+            j = j - 1
+         enddo
+         arr(j+1) = key
+      enddo
+   end subroutine sort_real_inplace_rmclean
+
    subroutine get_mem_total_kb(mem_total_kb)
       !! Total system RAM in kB, from /proc/meminfo's MemTotal -- verbatim
       !! adaptation of reproject_cubes.f90's own get_mem_total_kb (itself
@@ -1116,18 +1557,18 @@ contains
 
       status = 0
       fitsstat = 0
-      unit = 210
-      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(filename)
          status = -1
+         call free_fits_unit(unit)
          return
       endif
 
       call FTMNHD(unit, -1, 'CHANFREQ', 0, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: no CHANFREQ binary table in: ', trim(filename)
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          status = -1
          return
       endif
@@ -1135,7 +1576,7 @@ contains
       if (fitsstat.ne.0 .or. nchan_out.lt.1) then
          write(*,*) 'ERROR: bad or missing NAXIS2 on CHANFREQ table in: ',&
          &trim(filename)
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          status = -1
          return
       endif
@@ -1150,12 +1591,11 @@ contains
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to read CHANFREQ columns from: ', trim(filename)
          deallocate(chan_col, band_col, freq_col)
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          status = -1
          return
       endif
-      call FTCLOS(unit, fitsstat)
-
+      call safe_ftclos(unit, fitsstat)
       allocate(l_sq_out(nchan_out), band_id_out(nchan_out))
       l_sq_out = real((c_velocity_dp*1.0d6/freq_col)**2, sp)
       band_id_out = band_col
@@ -1213,17 +1653,17 @@ contains
 
       status = 0
       fitsstat = 0
-      unit = 211
-      call FTOPEN(unit, trim(ampfile), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(ampfile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(ampfile)
          status = -1
+         call free_fits_unit(unit)
          return
       endif
       call FTGKYJ(unit, 'NAXIS', naxis, comment, fitsstat)
       if (fitsstat.ne.0 .or. naxis.ne.3) then
          write(*,*) 'ERROR: expected NAXIS=3 in: ', trim(ampfile)
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          status = -1
          return
       endif
@@ -1235,18 +1675,17 @@ contains
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: missing NAXIS1/2/3 or CDELT3/CRVAL3 in: ',&
          &trim(ampfile)
-         call FTCLOS(unit, fitsstat)
+         call safe_ftclos(unit, fitsstat)
          status = -1
          return
       endif
-      call FTCLOS(unit, fitsstat)
-
+      call safe_ftclos(unit, fitsstat)
       fitsstat = 0
-      unit = 212
-      call FTOPEN(unit, trim(phafile), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(phafile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(phafile)
          status = -1
+         call free_fits_unit(unit)
          return
       endif
       call FTGKYJ(unit, 'NAXIS1', nx2, comment, fitsstat)
@@ -1254,7 +1693,7 @@ contains
       call FTGKYJ(unit, 'NAXIS3', nrm2, comment, fitsstat)
       call FTGKYD(unit, 'CDELT3', cdelt3_2, comment, fitsstat)
       call FTGKYD(unit, 'CRVAL3', crval3_2, comment, fitsstat)
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0 .or. nx2.ne.nx_out .or. ny2.ne.ny_out .or.&
       &nrm2.ne.nrm_out .or. cdelt3_2.ne.cdelt3_out .or.&
       &crval3_2.ne.crval3_out) then
@@ -1283,9 +1722,11 @@ contains
 
       found = .false.
       fitsstat = 0
-      unit = 219
-      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
-      if (fitsstat.ne.0) return
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         call free_fits_unit(unit)
+         return
+      endif
       fitsstat = 0
       call FTGKYD(unit, 'LSQREF', lsq_ref_dp, comment, fitsstat)
       if (fitsstat.eq.0) then
@@ -1293,7 +1734,7 @@ contains
          lsq_ref_out = real(lsq_ref_dp, sp)
       endif
       fitsstat = 0
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
    end subroutine read_lsqref_keyword
 
    function lsq_ref_compute_mode_to_int(mode_str) result(mode_int)
@@ -1349,13 +1790,18 @@ contains
       !! T4b: when io_read_threads_eff>1, the tile's own RM range is split
       !! (split_range_rmclean, same base/rem convention as rm_synthesis's
       !! own split_channels_across_threads) across that many threads, each
-      !! opening its OWN readonly FTOPEN handle (distinct unit numbers,
-      !! 300+t/400+t) and reading its own disjoint RM-slice via FTGSVE --
-      !! safe because readonly CFITSIO opens on the same file are exempt
-      !! from the same-file handle-aliasing hazard that makes concurrent
-      !! READ-WRITE handles on one file unsafe (see write_output_tile's
-      !! own T4c comment, and rm_synthesis's own io_read_threads, which
-      !! this is a direct port of).
+      !! opening its OWN readonly FTOPEN handle (a genuinely distinct unit
+      !! number from fitsio_unit_mod's safe_ftopen) and reading its own
+      !! disjoint RM-slice via FTGSVE -- safe because readonly CFITSIO
+      !! opens on the same file are exempt from the same-file handle-
+      !! aliasing hazard that makes concurrent READ-WRITE handles on one
+      !! file unsafe (see write_output_tile's own T4c comment, and
+      !! rm_synthesis's own io_read_threads, which this is a direct port
+      !! of). Separately, and regardless of same-file-ness: the actual
+      !! FTOPEN/FTCLOS calls themselves must go through safe_ftopen/
+      !! safe_ftclos, not bare FTOPEN/FTCLOS with only FTGIOU/FTFIOU
+      !! critical-guarded -- see read_amp_pha_chunk's own comment for the
+      !! real SIGSEGV this caught.
       character(len=*), intent(in) :: ampfile, phafile
       integer, intent(in) :: ix0, iy0, tx, ty
       real(sp), intent(out) :: re_out(tx,ty,nrm), im_out(tx,ty,nrm)
@@ -1392,10 +1838,21 @@ contains
    subroutine read_amp_pha_chunk(ampfile, phafile, ix0, iy0, tx, ty,&
    &rm_beg, rm_len, thread_id, re_out, im_out, status_par)
       !! One io_read_threads worker's own disjoint RM-chunk of one tile --
-      !! see read_amp_pha_tile's own comment. Unit numbers 300+thread_id/
-      !! 400+thread_id: disjoint per thread and from every other unit this
-      !! program uses (213/214 unused once io_read_threads_eff>1 callers
-      !! always go through here; 221-227 the output-side units).
+      !! see read_amp_pha_tile's own comment. Each unit comes from
+      !! fitsio_unit_mod's safe_ftopen (FTGIOU+FTOPEN inside one critical
+      !! section, FTCLOS+FTFIOU likewise via safe_ftclos) -- NOT bare
+      !! FTOPEN/FTCLOS with only the unit-number bookkeeping guarded.
+      !! Found the hard way while porting this same fix to
+      !! reproject_cubes.f90's own concurrently-called load_wcs: an
+      !! isolated 8-thread reproducer doing concurrent FTGIOU+FTOPEN+
+      !! (read)+FTCLOS+FTFIOU cycles crashed reliably (SIGSEGV) within a
+      !! few hundred iterations unless FTOPEN/FTCLOS themselves share the
+      !! SAME critical section as FTGIOU/FTFIOU -- their internal
+      !! bookkeeping evidently shares mutable global state. This
+      !! subroutine is the highest-concurrency CFITSIO call site in this
+      !! program (up to io_read_threads_eff threads, every tile), so it
+      !! would have been the first to hit that crash under real
+      !! io_read_threads>1 use.
       character(len=*), intent(in) :: ampfile, phafile
       integer, intent(in) :: ix0, iy0, tx, ty, rm_beg, rm_len, thread_id
       real(sp), intent(out) :: re_out(tx,ty,rm_len), im_out(tx,ty,rm_len)
@@ -1413,18 +1870,18 @@ contains
       incs = (/ 1, 1, 1 /)
 
       fitsstat = 0
-      unit = 300 + thread_id
-      call FTOPEN(unit, trim(ampfile), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(ampfile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(ampfile)
          !$omp atomic write
          status_par = -1
+         call free_fits_unit(unit)
          deallocate(amp_chunk, pha_chunk)
          return
       endif
       call FTGSVE(unit, group, 3, naxes_full, fpixel, lpixel, incs, 0.0_sp,&
       &amp_chunk, anyflag, fitsstat)
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to read tile data from: ', trim(ampfile)
          !$omp atomic write
@@ -1434,18 +1891,18 @@ contains
       endif
 
       fitsstat = 0
-      unit = 400 + thread_id
-      call FTOPEN(unit, trim(phafile), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(phafile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(phafile)
          !$omp atomic write
          status_par = -1
+         call free_fits_unit(unit)
          deallocate(amp_chunk, pha_chunk)
          return
       endif
       call FTGSVE(unit, group, 3, naxes_full, fpixel, lpixel, incs, 0.0_sp,&
       &pha_chunk, anyflag, fitsstat)
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to read tile data from: ', trim(phafile)
          !$omp atomic write
@@ -1470,15 +1927,15 @@ contains
       status = 0
       allocate(mask_out(nx_in,ny_in,nchan_in))
       fitsstat = 0
-      unit = 215
-      call FTOPEN(unit, trim(filename), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(filename)
          status = -1
+         call free_fits_unit(unit)
          return
       endif
       call FTGPVB(unit, 1, 1, nx_in*ny_in*nchan_in, 0_1, mask_out, anyflag, fitsstat)
-      call FTCLOS(unit, fitsstat)
+      call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: failed to read data from: ', trim(filename)
          status = -1
@@ -1530,29 +1987,30 @@ contains
       extend = .false.
 
       fitsstat = 0
-      src_unit = 227
-      call FTOPEN(src_unit, trim(template_file), 0, blocksize, fitsstat)
+      call safe_ftopen(src_unit, trim(template_file), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot open FITS file: ', trim(template_file)
          status = -1
+         call free_fits_unit(src_unit)
          return
       endif
 
-      ! FTINIT fails (nonzero fitsstat) if outname already exists on disk
-      ! -- checked and bailed out on IMMEDIATELY, before any further
-      ! CFITSIO call on out_unit(idx): every call after a failed FTINIT
-      ! operates on a unit CFITSIO never actually set up, which is not a
-      ! clean no-op but undefined behaviour (confirmed directly: this
-      ! previously crashed with a SIGSEGV inside CFITSIO when an output
-      ! file from an earlier run was left on disk -- tests/run_tests.sh
-      ! must therefore also clean up its own rmc_* outputs before each
-      ! run, which it does).
+      ! safe_ftinit's FTINIT fails (nonzero fitsstat) if outname already
+      ! exists on disk -- checked and bailed out on IMMEDIATELY, before
+      ! any further CFITSIO call on out_unit(idx): every call after a
+      ! failed FTINIT operates on a unit CFITSIO never actually set up,
+      ! which is not a clean no-op but undefined behaviour (confirmed
+      ! directly: this previously crashed with a SIGSEGV inside CFITSIO
+      ! when an output file from an earlier run was left on disk --
+      ! tests/run_tests.sh must therefore also clean up its own rmc_*
+      ! outputs before each run, which it does).
       fitsstat = 0
-      call FTINIT(out_unit(idx), trim(outname), blocksize, fitsstat)
+      call safe_ftinit(out_unit(idx), trim(outname), blocksize, fitsstat)
       if (fitsstat.ne.0) then
          write(*,*) 'ERROR: cannot create (already exists?): ', trim(outname)
          status = -1
-         call FTCLOS(src_unit, fitsstat)
+         call safe_ftclos(src_unit, fitsstat)
+         call free_fits_unit(out_unit(idx))
          return
       endif
       call FTPHPR(out_unit(idx), simple, -32, 3, naxes_out, 0, 1, extend, fitsstat)
@@ -1560,11 +2018,10 @@ contains
       if (fitsstat.ne.0 .or. status.ne.0) then
          write(*,*) 'ERROR: failed to write header for: ', trim(outname)
          status = -1
-         call FTCLOS(src_unit, fitsstat)
+         call safe_ftclos(src_unit, fitsstat)
          return
       endif
-      call FTCLOS(src_unit, fitsstat)
-
+      call safe_ftclos(src_unit, fitsstat)
       out_is_open(idx) = .true.
       if (io_write_threads_eff.gt.1) then
          fitsstat = 0
@@ -1590,10 +2047,12 @@ contains
          if (fitsstat.ne.0) then
             write(*,*) 'ERROR: FTGHAD (data-start offset) failed for: ', trim(outname)
             status = -1
+            call safe_ftclos(out_unit(idx), fitsstat)
+            out_is_open(idx) = .false.
             return
          endif
          fitsstat = 0
-         call FTCLOS(out_unit(idx), fitsstat)
+         call safe_ftclos(out_unit(idx), fitsstat)
          out_is_open(idx) = .false.
       endif
    end subroutine open_output_cube
@@ -1762,7 +2221,7 @@ contains
       integer :: fitsstat
       if (.not. out_is_open(idx)) return
       fitsstat = 0
-      call FTCLOS(out_unit(idx), fitsstat)
+      call safe_ftclos(out_unit(idx), fitsstat)
       out_is_open(idx) = .false.
    end subroutine close_output_cube
 

@@ -129,15 +129,24 @@ fi
 if [[ -z "${AP_MODE}" ]]; then AP_MODE="phase"; fi
 if [[ -z "${OUTPUT_MODE}" ]]; then OUTPUT_MODE="ap"; fi
 
-if [[ ! -f "${DATA_PATH}${Q_FILE}" ]]; then
-  echo "[runFile] ERROR: Q cube not found: ${DATA_PATH}${Q_FILE}" >&2
-  exit 1
-fi
+# infileQ/infileU may be a comma list, one entry per band (multi-band
+# tomography cfg schema) -- check each band's own file individually
+# rather than treating the whole list as a single filename.
+IFS=',' read -ra Q_BAND_FILES <<< "${Q_FILE}"
+for qf in "${Q_BAND_FILES[@]}"; do
+  if [[ ! -f "${DATA_PATH}${qf}" ]]; then
+    echo "[runFile] ERROR: Q cube not found: ${DATA_PATH}${qf}" >&2
+    exit 1
+  fi
+done
 
-if [[ ! -f "${DATA_PATH}${U_FILE}" ]]; then
-  echo "[runFile] ERROR: U cube not found: ${DATA_PATH}${U_FILE}" >&2
-  exit 1
-fi
+IFS=',' read -ra U_BAND_FILES <<< "${U_FILE}"
+for uf in "${U_BAND_FILES[@]}"; do
+  if [[ ! -f "${DATA_PATH}${uf}" ]]; then
+    echo "[runFile] ERROR: U cube not found: ${DATA_PATH}${uf}" >&2
+    exit 1
+  fi
+done
 
 if [[ "${OUTPUT_MODE}" == "ri" ]]; then
   OUT_FILE_1="${OUT_BASE}.REAL.RMCUBE.FITS"

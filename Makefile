@@ -204,8 +204,14 @@ reproject_cubes: $(REPROJECT_EXECUTABLE)
 $(REPROJECT_BUILDDIR):
 	@mkdir -p $(REPROJECT_BUILDDIR)
 
-$(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 | $(REPROJECT_BUILDDIR)
+$(REPROJECT_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(REPROJECT_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(REPROJECT_BUILDDIR) -J$(REPROJECT_BUILDDIR) -c $< -o $@
 
 # ast_grf_stub.c: no-op AST GRF (graphics-primitive) callbacks -- the AST
 # shared library references these (its Plot class) but does not define
@@ -214,8 +220,8 @@ $(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 | $(REPRO
 $(REPROJECT_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(REPROJECT_BUILDDIR)
 	$(CC) -O2 -c $< -o $@
 
-$(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
+$(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
 	@echo "✓ Executable created: $@"
 
 # convolve_cubes: standalone common-resolution convolution tool (the
@@ -247,11 +253,17 @@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(CONVOLVE_BUILDDIR)
 $(CONVOLVE_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(CONVOLVE_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
 
-$(CONVOLVE_BUILDDIR)/convolve_cubes.o: $(SRCDIR)/convolve_cubes.f90 $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o | $(CONVOLVE_BUILDDIR)
+$(CONVOLVE_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/convolve_cubes.o: $(SRCDIR)/convolve_cubes.f90 $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o | $(CONVOLVE_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(CONVOLVE_BUILDDIR) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
 
-$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
+$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
 	@echo "✓ Executable created: $@"
 
 # match_cubes: consolidates reproject_cubes and convolve_cubes into one
@@ -279,14 +291,20 @@ $(MATCH_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(MATCH_BUILDDIR)
 $(MATCH_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(MATCH_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
 
-$(MATCH_BUILDDIR)/match_cubes.o: $(SRCDIR)/match_cubes.f90 $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o | $(MATCH_BUILDDIR)
+$(MATCH_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/match_cubes.o: $(SRCDIR)/match_cubes.f90 $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o | $(MATCH_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(MATCH_BUILDDIR) -J$(MATCH_BUILDDIR) -c $< -o $@
 
 $(MATCH_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(MATCH_BUILDDIR)
 	$(CC) -O2 -c $< -o $@
 
-$(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
+$(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
 	@echo "✓ Executable created: $@"
 
 # rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
@@ -307,11 +325,17 @@ $(RMCLEAN_CUBES_BUILDDIR):
 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o: $(SRCDIR)/rmclean.f90 | $(RMCLEAN_CUBES_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
 
-$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o: $(SRCDIR)/rmclean_cubes.f90 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
+$(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o: $(SRCDIR)/rmclean_cubes.f90 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(RMCLEAN_CUBES_BUILDDIR) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
 
-$(RMCLEAN_CUBES_EXECUTABLE): $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS) -lpthread
+$(RMCLEAN_CUBES_EXECUTABLE): $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS) -lpthread
 	@echo "✓ Executable created: $@"
 
 install: $(EXECUTABLE)
