@@ -390,6 +390,7 @@ contains
       type(rmsf_table_t) :: table
       integer(kind=8) :: plan_fwd, plan_bwd
       integer :: n_iter_used, ipeak, j
+      character(len=16) :: stop_reason
 
       call sky_model_qu(l_sq, nchan, q, u)
       call dirty_spectrum(l_sq, nchan, q, u, rm, nrm_l, dirty_re, dirty_im)
@@ -403,9 +404,15 @@ contains
       endif
       call plan_fourier_interp(nrm_l, nrm_l, plan_fwd, plan_bwd)
 
+      ! niter-only (no abs_flux_floor/auto_nsigma): exact match for the
+      ! old thresh=0.0 (letting niter alone govern convergence, this
+      ! scenario's own documented choice for broad Faraday-thick
+      ! features -- see planning/RMCLEAN_INTEGRATION_PLAN.md's own
+      ! "Choosing parameters" section).
       call clean_complex(l_sq, nchan, 0.0_sp, rm, nrm_l, dirty_re, dirty_im,&
-      &table, 1000, 0.1_sp, 0.0_sp, comp_re, comp_im, resid_re, resid_im,&
-      &n_iter_used, comp_rm_refined)
+      &table, 1000, 0.1_sp, fwhm_rm, .false., 0.0_sp, .false., 0.0_sp,&
+      &3.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
+      &stop_reason, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
       out_amp = sqrt(out_re**2 + out_im**2)

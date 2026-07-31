@@ -181,6 +181,7 @@ contains
       logical, intent(inout) :: all_pass_io
 
       integer :: nrm_l, j, ipeak, n_iter_used
+      character(len=16) :: stop_reason
       real(sp), allocatable :: rm(:), dirty_re(:), dirty_im(:)
       real(sp), allocatable :: comp_re(:), comp_im(:), resid_re(:), resid_im(:)
       real(sp), allocatable :: comp_rm_refined(:), comp_amp(:)
@@ -210,9 +211,14 @@ contains
       call compute_rmsf_fwhm(lsq_in, nchan, fwhm_rm)
       call plan_fourier_interp(nrm_l, nrm_l, plan_fwd, plan_bwd)
 
+      ! niter-only (no abs_flux_floor/auto_nsigma): this test validates
+      ! lsq_ref flexibility/chi0 recovery, not the stopping criterion --
+      ! run the full 500 iterations deterministically, same effective
+      ! behavior as the old thresh=1.0e-4 had in this noiseless scenario.
       call clean_complex(lsq_in, nchan, lsq_ref_compute, rm, nrm_l, dirty_re,&
-      &dirty_im, table, 500, 0.1_sp, 1.0e-4_sp, comp_re, comp_im, resid_re,&
-      &resid_im, n_iter_used, comp_rm_refined)
+      &dirty_im, table, 500, 0.1_sp, fwhm_rm, .false., 0.0_sp, .false.,&
+      &0.0_sp, 3.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
+      &stop_reason, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)
       out_amp = sqrt(out_re**2 + out_im**2)

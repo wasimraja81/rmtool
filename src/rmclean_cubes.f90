@@ -94,7 +94,8 @@
 ! tool).
 !
 ! Usage: rmclean_cubes ampfile=<f> phafile=<f> maskfile=<f> outfile=<base>
-!    [niter=<n>] [gain=<g>] threshold=<t>
+!    [niter=<n>] [gain=<g>] [abs_flux_floor=<v>] [auto_nsigma=<n>]
+!    [tail_exclude_nfwhm=<f>]
 !    [lsq_ref_report_mode=intrinsic|centroid|min|max|mid|fixed]
 !    [lsq_ref_report_value=<v>] [min_samples_per_fwhm=<f>]
 !    [refine_nsigma=<f>] [table_oversample=<n>] [restore_fwhm=<v>]
@@ -131,24 +132,48 @@ program rmclean_cubes
 
    character(len=512) :: ampfile, phafile, maskfile, outfile
    integer :: niter
-   real(sp) :: gain, threshold
-   logical :: have_threshold
-   ! --- threshold unit + threshold_snr (auto noise-floor mode) ---
-   ! threshold= keeps its historical bare-number meaning (native AMP-cube
-   ! flux units, no conversion) for backward compatibility, but now also
-   ! accepts an optional Jy/mJy/uJy suffix (parse_flux_value below),
-   ! converted against the AMP cube's own BUNIT once it's read (resolve_
-   ! threshold, called after read_amp_pha_geometry). threshold_snr is a
-   ! mutually-exclusive alternative: threshold = threshold_snr x an
-   ! auto-estimated noise floor (estimate_noise_floor below) -- exactly
-   ! one of threshold=/threshold_snr= must be given.
-   real(sp) :: threshold_raw_value, threshold_unit_scale
-   logical :: have_threshold_snr
-   real(sp) :: threshold_snr
-   integer :: noise_nlos
-   real(sp) :: noise_percentile
-   integer :: noise_seed
+   real(sp) :: gain
+   ! --- CLEAN stopping criteria (planning/RMCLEAN_INTEGRATION_PLAN.md
+   ! T8 -- three independent, unambiguously-named conditions; whichever
+   ! fires first stops CLEAN for that pixel; niter (above) is always the
+   ! hard backstop, the other two are each independently optional and
+   ! MAY be combined (not mutually exclusive -- a real design change
+   ! from the old threshold=/threshold_snr= pair, which required
+   ! exactly one). See clean_complex's own top comment (src/rmclean.f90)
+   ! for the full story on why these were split out of one overloaded,
+   ! always-multiplicative `thresh` parameter that silently broke the
+   ! absolute-flux mode.
+   ! abs_flux_floor=<v>: stop the instant a pixel's own peak amplitude
+   ! drops to/below this literal fixed flux value -- accepts a bare
+   ! number (native AMP-cube units) or a Jy/mJy/uJy suffix, converted
+   ! against the AMP cube's own BUNIT once it's read (resolve_abs_flux_
+   ! floor, called after read_amp_pha_geometry).
+   logical :: have_abs_flux_floor
+   real(sp) :: abs_flux_floor, abs_flux_floor_raw_value, abs_flux_floor_unit_scale
+   ! auto_nsigma=<n>: stop when a pixel's own (peak-avg) drops to/below
+   ! n x that SAME pixel's own RM-tail sigma (estimated once per pixel,
+   ! from its own dirty spectrum, by clean_complex/estimate_tail_sigma --
+   ! not a whole-cube pre-scan, and not recomputed per iteration, unlike
+   ! the old threshold_snr's noise_floor + thresh*rms_val combination).
+   logical :: have_auto_nsigma
+   real(sp) :: auto_nsigma_mult
+   ! tail_exclude_nfwhm (default 3.0): half-width, in units of this
+   ! pixel's own RMSF FWHM, excluded around its own dirty-spectrum peak
+   ! before estimating that pixel's RM-tail sigma for auto_nsigma above.
+   real(sp) :: tail_exclude_nfwhm
    real(sp) :: min_samples_per_fwhm, refine_nsigma
+   ! trace_ix/trace_iy (default 0, disabled): 1-indexed GLOBAL pixel to
+   ! log a full per-iteration CLEAN trend for (peak_val/rms_val/stop
+   ! reason) -- a debugging/tuning aid (planning/RMCLEAN_INTEGRATION_
+   ! PLAN.md, T6-adjacent), not meant for whole-cube production runs.
+   integer :: trace_ix, trace_iy
+   ! log_every (default 50): throttles trace_ix/trace_iy's own per-
+   ! iteration log lines to every log_every-th iteration -- iteration 1
+   ! (the pre-CLEAN dirty-spectrum state, see clean_complex's own
+   ! trace_flux_val comment) and the final iteration are ALWAYS logged
+   ! regardless of log_every, so the trend's start/end points are never
+   ! missed even if log_every doesn't divide n_iter_used.
+   integer :: log_every
    integer :: table_oversample
    logical :: have_restore_fwhm
    real(sp) :: restore_fwhm_override
@@ -237,6 +262,7 @@ program rmclean_cubes
    ! the other buffer slot.
    logical :: io_overlap
    integer :: tile_seq, cur_slot
+   integer :: n_blocks_total
    integer(c_long) :: write_thread_id(0:1)
    logical :: write_pending(0:1) = .false.
    logical :: write_dispatched_ok
@@ -301,6 +327,27 @@ program rmclean_cubes
    integer :: ix, iy, k
    integer(kind=8) :: restore_plan_fwd, restore_plan_bwd
    integer :: n_pixels_done
+   ! Aggregate CLEAN stopping-reason tally (T8, planning/
+   ! RMCLEAN_INTEGRATION_PLAN.md): every CLEANed pixel (nvalid_p>=1 in
+   ! clean_one_pixel) exits clean_complex with one of the 3 named
+   ! stop_reason values ('niter'/'abs_flux'/'auto_nsigma') -- tallied
+   ! here (atomic increments, same pattern as n_pixels_done) and
+   ! reported once at run end, so "why did CLEAN stop" is answered at
+   ! the population level without per-pixel log spam. n_iter_used_sum/
+   ! min/max feed the same summary's mean/range.
+   integer(kind=8) :: n_stopped_niter, n_stopped_abs_flux, n_stopped_auto_nsigma
+   integer(kind=8) :: n_iter_used_sum
+   integer :: n_iter_used_min, n_iter_used_max
+   ! total_cleaned_flux_sum: sum, over every CLEANed pixel, of that
+   ! pixel's own sum(|comp|) across all nrm bins -- how much flux CLEAN
+   ! actually extracted into components, run-wide. peak_residual_*: each
+   ! pixel's own final max(|resid|) (the peak left behind once CLEAN
+   ! stopped), aggregated mean/min/max across pixels -- the population-
+   ! level "how clean is clean" signal the user asked for alongside the
+   ! stop-reason tally above.
+   real(dp) :: total_cleaned_flux_sum
+   real(dp) :: peak_residual_sum
+   real(sp) :: peak_residual_max, peak_residual_min
    integer :: mask_pattern_cache_max
    real(dp) :: t_stage
    ! Per-thread swim-lane instrumentation (planning-doc ticket) -- see
@@ -392,8 +439,14 @@ program rmclean_cubes
    &abs(real(cdelt3_amp, sp)), ' rad/m^2 <= required ', drm_required,&
    &' rad/m^2 (RM-resolution criterion).'
 
-   call resolve_threshold(status)
+   call resolve_abs_flux_floor(status)
    if (status.ne.0) stop 1
+   if (have_auto_nsigma) then
+      write(*,'(A,F0.4,A,F0.4,A)') 'auto_nsigma: enabled, multiplier=',&
+      &auto_nsigma_mult, ', tail_exclude_nfwhm=', tail_exclude_nfwhm,&
+      &' (per-pixel RM-tail sigma, estimated once per pixel from its'//&
+      &' own dirty spectrum -- see estimate_tail_sigma, src/rmclean.f90).'
+   endif
 
    allocate(rm_samp(nrm))
    do k = 1, nrm
@@ -493,6 +546,16 @@ program rmclean_cubes
    ! tile, full RM depth) rather than reproject_cubes.f90's own
    ! depth-plane blocking.
    n_pixels_done = 0
+   n_stopped_niter = 0_8
+   n_stopped_abs_flux = 0_8
+   n_stopped_auto_nsigma = 0_8
+   n_iter_used_sum = 0_8
+   n_iter_used_min = huge(n_iter_used_min)
+   n_iter_used_max = 0
+   total_cleaned_flux_sum = 0.0_dp
+   peak_residual_sum = 0.0_dp
+   peak_residual_max = 0.0_sp
+   peak_residual_min = huge(peak_residual_min)
    tile_seq = 0
    iy_tile_beg = 1
    do while (iy_tile_beg.le.ny)
@@ -550,6 +613,9 @@ program rmclean_cubes
          !$omp end parallel
          call timer_stop('tile_compute', t_stage)
 
+         write(*,'(A,I0,A,I0,A)') 'Block ', tile_seq, ' of ', n_blocks_total,&
+         &' processed.'
+
          write_job(cur_slot)%ix_tile_beg = ix_tile_beg
          write_job(cur_slot)%iy_tile_beg = iy_tile_beg
          write_job(cur_slot)%tx = tx
@@ -595,6 +661,27 @@ program rmclean_cubes
       iy_tile_beg = iy_tile_beg + ty
    enddo
    write(*,'(A,I0,A)') 'CLEANed ', n_pixels_done, ' pixels.'
+   if (n_stopped_niter+n_stopped_abs_flux+n_stopped_auto_nsigma .gt. 0_8) then
+      block
+         real(dp) :: n_total_stopped_dp
+         n_total_stopped_dp = real(n_stopped_niter+n_stopped_abs_flux+&
+         &n_stopped_auto_nsigma, dp)
+         write(*,'(A)') 'CLEAN stop-reason summary:'
+         write(*,'(A,I0,A,F6.2,A)') '  hit niter cap:        ',&
+         &n_stopped_niter, ' (',&
+         &100.0_dp*real(n_stopped_niter,dp)/n_total_stopped_dp, '%)'
+         write(*,'(A,I0,A,F6.2,A)') '  stopped at abs_flux:  ',&
+         &n_stopped_abs_flux, ' (',&
+         &100.0_dp*real(n_stopped_abs_flux,dp)/n_total_stopped_dp, '%)'
+         write(*,'(A,I0,A,F6.2,A)') '  stopped at auto_nsigma:',&
+         &n_stopped_auto_nsigma, ' (',&
+         &100.0_dp*real(n_stopped_auto_nsigma,dp)/n_total_stopped_dp, '%)'
+         write(*,'(A,F0.2,A,I0,A,I0,A,I0,A)') '  n_iter_used: mean=',&
+         &real(n_iter_used_sum,dp)/n_total_stopped_dp,&
+         &' min=', n_iter_used_min, ' max=', n_iter_used_max,&
+         &' (niter cap=', niter, ')'
+      end block
+   endif
 
    ! Join any tile writes still in flight -- at most the last two tiles'
    ! writes can reach here undispatched-for-join (each slot's write is
@@ -640,17 +727,18 @@ contains
       outfile = ' '
       niter = 500
       gain = 0.1_sp
-      have_threshold = .false.
-      threshold = 0.0_sp
-      threshold_raw_value = 0.0_sp
-      threshold_unit_scale = -1.0_sp
-      have_threshold_snr = .false.
-      threshold_snr = 0.0_sp
-      noise_nlos = 500
-      noise_percentile = 0.15_sp
-      noise_seed = 20250101
+      have_abs_flux_floor = .false.
+      abs_flux_floor = 0.0_sp
+      abs_flux_floor_raw_value = 0.0_sp
+      abs_flux_floor_unit_scale = -1.0_sp
+      have_auto_nsigma = .false.
+      auto_nsigma_mult = 0.0_sp
+      tail_exclude_nfwhm = 3.0_sp
       min_samples_per_fwhm = 2.0_sp
       refine_nsigma = 3.0_sp
+      trace_ix = 0
+      trace_iy = 0
+      log_every = 50
       table_oversample = 20
       have_restore_fwhm = .false.
       restore_fwhm_override = 0.0_sp
@@ -729,20 +817,16 @@ contains
          status = -1
          return
       endif
-      if (have_threshold .and. have_threshold_snr) then
-         write(*,*) 'ERROR: specify exactly one of threshold= or'//&
-         &' threshold_snr=, not both'
-         status = -1
-         return
-      endif
-      if (.not. have_threshold .and. .not. have_threshold_snr) then
-         write(*,*) 'ERROR: threshold= or threshold_snr= is required'//&
-         &' (CLEAN stopping flux -- either an absolute value, same'//&
-         &' units as the dirty AMP cube unless suffixed with Jy/mJy/uJy,'//&
-         &' or threshold_snr=<N> to auto-derive N x the cube''s own'//&
-         &' noise floor)'
-         status = -1
-         return
+      ! abs_flux_floor=/auto_nsigma= are independently optional and MAY
+      ! be combined (whichever fires first wins, per-pixel) -- niter is
+      ! always the backstop. Neither given is also valid (niter-only,
+      ! same precedent as the old thresh=0.0 -- see planning/
+      ! RMCLEAN_INTEGRATION_PLAN.md's "Choosing parameters" section) but
+      ! worth flagging, since it's easy to omit both by accident.
+      if (.not.have_abs_flux_floor .and. .not.have_auto_nsigma) then
+         write(*,'(A)') 'NOTE: neither abs_flux_floor= nor auto_nsigma='//&
+         &' given -- CLEAN will run every pixel for the full niter'//&
+         &' iterations with no early stop.'
       endif
    end subroutine parse_args
 
@@ -782,44 +866,29 @@ contains
             status = -1
             return
          endif
-      case ('threshold')
-         call parse_flux_value(val, threshold_raw_value,&
-         &threshold_unit_scale, ios)
+      case ('abs_flux_floor')
+         call parse_flux_value(val, abs_flux_floor_raw_value,&
+         &abs_flux_floor_unit_scale, ios)
          if (ios.ne.0) then
-            write(*,*) 'ERROR: threshold must be a number, optionally'//&
+            write(*,*) 'ERROR: abs_flux_floor must be a number, optionally'//&
             &' suffixed with a unit (Jy, mJy, or uJy) with no space,'//&
-            &' e.g. threshold=0.01 or threshold=10mJy'
+            &' e.g. abs_flux_floor=0.01 or abs_flux_floor=10mJy'
             status = -1
             return
          endif
-         have_threshold = .true.
-      case ('threshold_snr')
-         read(val, *, iostat=ios) threshold_snr
-         if (ios.ne.0 .or. threshold_snr.le.0.0_sp) then
-            write(*,*) 'ERROR: threshold_snr must be a positive number'
+         have_abs_flux_floor = .true.
+      case ('auto_nsigma')
+         read(val, *, iostat=ios) auto_nsigma_mult
+         if (ios.ne.0 .or. auto_nsigma_mult.le.0.0_sp) then
+            write(*,*) 'ERROR: auto_nsigma must be a positive number'
             status = -1
             return
          endif
-         have_threshold_snr = .true.
-      case ('noise_nlos')
-         read(val, *, iostat=ios) noise_nlos
-         if (ios.ne.0 .or. noise_nlos.lt.1) then
-            write(*,*) 'ERROR: noise_nlos must be a positive integer'
-            status = -1
-            return
-         endif
-      case ('noise_percentile')
-         read(val, *, iostat=ios) noise_percentile
-         if (ios.ne.0 .or. noise_percentile.le.0.0_sp .or.&
-         &noise_percentile.gt.1.0_sp) then
-            write(*,*) 'ERROR: noise_percentile must be in (0,1]'
-            status = -1
-            return
-         endif
-      case ('noise_seed')
-         read(val, *, iostat=ios) noise_seed
-         if (ios.ne.0) then
-            write(*,*) 'ERROR: noise_seed must be an integer'
+         have_auto_nsigma = .true.
+      case ('tail_exclude_nfwhm')
+         read(val, *, iostat=ios) tail_exclude_nfwhm
+         if (ios.ne.0 .or. tail_exclude_nfwhm.le.0.0_sp) then
+            write(*,*) 'ERROR: tail_exclude_nfwhm must be a positive number'
             status = -1
             return
          endif
@@ -834,6 +903,27 @@ contains
          read(val, *, iostat=ios) refine_nsigma
          if (ios.ne.0 .or. refine_nsigma.le.0.0_sp) then
             write(*,*) 'ERROR: refine_nsigma must be a positive number'
+            status = -1
+            return
+         endif
+      case ('trace_ix')
+         read(val, *, iostat=ios) trace_ix
+         if (ios.ne.0 .or. trace_ix.lt.0) then
+            write(*,*) 'ERROR: trace_ix must be a non-negative integer'
+            status = -1
+            return
+         endif
+      case ('trace_iy')
+         read(val, *, iostat=ios) trace_iy
+         if (ios.ne.0 .or. trace_iy.lt.0) then
+            write(*,*) 'ERROR: trace_iy must be a non-negative integer'
+            status = -1
+            return
+         endif
+      case ('log_every')
+         read(val, *, iostat=ios) log_every
+         if (ios.ne.0 .or. log_every.lt.1) then
+            write(*,*) 'ERROR: log_every must be a positive integer'
             status = -1
             return
          endif
@@ -997,10 +1087,12 @@ contains
 
    subroutine print_usage()
       write(*,'(A)') 'Usage: rmclean_cubes ampfile=<f> phafile=<f>'//&
-      &' maskfile=<f> outfile=<base> (threshold=<t> | threshold_snr=<n>)'
-      write(*,'(A)') '    [noise_nlos=<n>] [noise_percentile=<f>] [noise_seed=<n>]'
+      &' maskfile=<f> outfile=<base>'
+      write(*,'(A)') '    [abs_flux_floor=<v>] [auto_nsigma=<n>]'//&
+      &' [tail_exclude_nfwhm=<f>]'
       write(*,'(A)') '    [niter=<n>] [gain=<g>] [min_samples_per_fwhm=<f>]'//&
       &' [refine_nsigma=<f>] [table_oversample=<n>] [restore_fwhm=<v>]'
+      write(*,'(A)') '    [trace_ix=<n>] [trace_iy=<n>] [log_every=<n>]'
       write(*,'(A)') '    [lsq_ref_report_mode=intrinsic|centroid|min|max'//&
       &'|mid|fixed] [lsq_ref_report_value=<v>]'
       write(*,'(A)') '    [lsq_ref_compute_mode=native|zero|centroid|min'//&
@@ -1017,23 +1109,32 @@ contains
       &' CHANFREQ binary table).'
       write(*,'(A)') 'outfile: base name for the 6 output cubes'//&
       &' (<outfile>.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS).'
-      write(*,'(A)') 'threshold: CLEAN stopping flux -- native AMP-cube'//&
-      &' units for a bare number, or convert from Jy/mJy/uJy with no'//&
-      &' space (e.g. threshold=10mJy) against the AMP cube''s own BUNIT.'//&
-      &' Exactly one of threshold=/threshold_snr= is required (see'//&
-      &' clean_complex''s own doc comment in src/rmclean.f90 for how to'//&
-      &' choose an absolute value).'
-      write(*,'(A)') 'threshold_snr: alternative to threshold= -- CLEAN'//&
-      &' stops at threshold_snr x an auto-estimated noise floor. The'//&
-      &' floor is the median of the lowest noise_percentile fraction of'//&
-      &' bins from noise_nlos random spatial pixels'' own full dirty'//&
-      &' AMP spectra (a real source is a narrow peak in an otherwise'//&
-      &' noise-dominated spectrum, so a sightline''s own lowest bins are'//&
-      &' overwhelmingly noise regardless of whether it contains a source).'
-      write(*,'(A)') 'noise_nlos (default 500), noise_percentile (default'//&
-      &' 0.15), noise_seed (default 20250101): tune the threshold_snr'//&
-      &' auto noise-floor estimate above; noise_seed makes it'//&
-      &' reproducible run to run. Ignored when threshold= is used.'
+      write(*,'(A)') 'CLEAN stopping criteria -- three independent,'//&
+      &' unambiguously-named conditions (planning/RMCLEAN_INTEGRATION_'//&
+      &'PLAN.md T8), checked in this order every iteration; niter is'//&
+      &' always the hard backstop, the other two are each optional and'//&
+      &' MAY be combined (whichever fires first wins for that pixel;'//&
+      &' neither given is valid too -- niter alone governs).'
+      write(*,'(A)') 'abs_flux_floor: stop the instant a pixel''s own peak'//&
+      &' amplitude drops to/below this literal fixed flux value -- native'//&
+      &' AMP-cube units for a bare number, or convert from Jy/mJy/uJy'//&
+      &' with no space (e.g. abs_flux_floor=10mJy) against the AMP'//&
+      &' cube''s own BUNIT. No noise/baseline adjustment -- a pure'//&
+      &' "brightest remaining feature below X" comparison.'
+      write(*,'(A)') 'auto_nsigma: stop when a pixel''s own (peak-avg)'//&
+      &' drops to/below auto_nsigma x that SAME pixel''s own RM-tail'//&
+      &' sigma. The tail sigma is estimated ONCE per pixel (not'//&
+      &' recomputed per iteration) from that pixel''s own dirty'//&
+      &' spectrum, excluding a window around its own peak (see'//&
+      &' tail_exclude_nfwhm) -- a real source is a narrow peak in an'//&
+      &' otherwise noise-dominated spectrum, so bins far from a'//&
+      &' sightline''s own peak are overwhelmingly noise regardless of'//&
+      &' whether it contains a source.'
+      write(*,'(A)') 'tail_exclude_nfwhm (default 3.0): half-width, in'//&
+      &' units of this pixel''s own RMSF FWHM, excluded around its own'//&
+      &' dirty-spectrum peak before estimating that pixel''s RM-tail'//&
+      &' sigma for auto_nsigma above. Ignored unless auto_nsigma= is'//&
+      &' given.'
       write(*,'(A)') 'niter (default 500), gain (default 0.1): Hogbom'//&
       &' CLEAN parameters, passed straight to clean_complex.'
       write(*,'(A)') 'min_samples_per_fwhm (default 2, floor 1): Gate 0''s'//&
@@ -1051,6 +1152,15 @@ contains
       write(*,'(A)') 'table_oversample (default 20): rmsf_table_t''s own'//&
       &' interpolation-table fineness (build_rmsf_offset_table''s own'//&
       &' oversample argument).'
+      write(*,'(A)') 'trace_ix/trace_iy (default 0, disabled): 1-indexed'//&
+      &' GLOBAL pixel to log a per-iteration CLEAN trend for (peak_val/'//&
+      &'rms_val/cumulative cleaned flux, plus the exact stop_reason --'//&
+      &' niter/abs_flux/auto_nsigma). Debugging/tuning aid, not meant'//&
+      &' for whole-cube production runs (one traced pixel only).'
+      write(*,'(A)') 'log_every (default 50): throttles trace_ix/trace_iy'//&
+      &' iteration lines to every log_every-th iteration; iteration 1'//&
+      &' (pre-CLEAN state) and the final iteration are always logged'//&
+      &' regardless.'
       write(*,'(A)') 'restore_fwhm (optional): override the restoring'//&
       &' beam FWHM (rad/m^2); default derived from'//&
       &' compute_rmsf_fwhm_multiband.'
@@ -1157,7 +1267,7 @@ contains
    end function flag_from_value_rmclean
 
    subroutine parse_flux_value(val, raw_value, unit_scale, ios)
-      !! Splits a threshold= value into its leading numeric part and an
+      !! Splits an abs_flux_floor= value into its leading numeric part and an
       !! optional trailing unit suffix (Jy/mJy/uJy, case-insensitive, no
       !! space -- e.g. "10mJy", "0.01Jy", or a bare "0.01"). Scans
       !! BACKWARD from the end of the string while the character is a
@@ -1241,9 +1351,8 @@ contains
    subroutine read_bunit_keyword(filename, bunit_out, found)
       !! Reads the AMP cube's own BUNIT keyword (rm_synthesis passes this
       !! through from the input Q/U cube, rm_synthesis.f90:2953/2958) --
-      !! used to resolve an explicit threshold= unit against the cube's
-      !! OWN native unit, and to sanity-check the auto threshold_snr
-      !! noise-floor mode is comparing like with like. Typical ASKAP-style
+      !! used to resolve an explicit abs_flux_floor= unit against the
+      !! cube's OWN native unit. Typical ASKAP-style
       !! values look like "Jy/beam" -- only the leading flux-unit token
       !! (up to the first '/', if any) is meaningful for the Jy/mJy/uJy
       !! scale comparison here; the per-beam/per-pixel denominator is the
@@ -1278,22 +1387,29 @@ contains
       call safe_ftclos(unit, fitsstat)
    end subroutine read_bunit_keyword
 
-   subroutine resolve_threshold(status)
-      !! Finalises the module-level `threshold` (the value clean_complex
-      !! actually compares against every pixel's own dirty amplitude) from
-      !! whichever of threshold=/threshold_snr= was given -- called once,
+   subroutine resolve_abs_flux_floor(status)
+      !! Finalises the module-level `abs_flux_floor` (native AMP-cube
+      !! units) from abs_flux_floor='s given value+unit -- called once,
       !! after read_amp_pha_geometry (nx/ny/nrm known) and before the main
-      !! tile loop. Prints exactly what it resolved to and why, so a run's
-      !! own stdout log (scripts/run_pipeline.sh's provenance capture)
-      !! records the actual number used, not just the cfg's own request.
+      !! tile loop. A no-op (status=0, abs_flux_floor left at its init
+      !! value) when have_abs_flux_floor is .false. -- auto_nsigma's own
+      !! per-pixel tail-sigma estimate (estimate_tail_sigma, src/
+      !! rmclean.f90) needs no whole-cube pre-scan or resolution step,
+      !! unlike the old threshold_snr's noise_floor pre-scan this
+      !! subroutine used to also perform (planning/RMCLEAN_INTEGRATION_
+      !! PLAN.md T8 -- that whole mechanism is retired, not just renamed).
+      !! Prints exactly what it resolved to, so a run's own stdout log
+      !! (scripts/run_pipeline.sh's provenance capture) records the
+      !! actual number used, not just the cfg's own request.
       integer, intent(out) :: status
       character(len=80) :: bunit, bunit_token
       logical :: have_bunit
       real(sp) :: native_scale
       integer :: ios, slash_pos
-      real(sp) :: noise_floor
 
       status = 0
+      if (.not.have_abs_flux_floor) return
+
       call read_bunit_keyword(ampfile, bunit, have_bunit)
       native_scale = 1.0_sp
       if (have_bunit .and. len_trim(bunit).gt.0) then
@@ -1304,164 +1420,24 @@ contains
          if (ios.ne.0) then
             write(*,'(A)') 'WARNING: '//trim(ampfile)//' BUNIT="'//&
             &trim(bunit)//'" not recognised as Jy/mJy/uJy -- assuming Jy'//&
-            &' for threshold-unit conversion and the auto noise floor.'
+            &' for abs_flux_floor unit conversion.'
             native_scale = 1.0_sp
          endif
       else
          write(*,'(A)') 'WARNING: no BUNIT keyword in '//trim(ampfile)//&
-         &' -- assuming Jy for threshold-unit conversion and the auto'//&
-         &' noise floor.'
+         &' -- assuming Jy for abs_flux_floor unit conversion.'
       endif
 
-      if (have_threshold) then
-         if (threshold_unit_scale.gt.0.0_sp) then
-            threshold = threshold_raw_value *&
-            &(threshold_unit_scale/native_scale)
-            write(*,'(A,F0.6,A,F0.6,A)') 'threshold: ', threshold_raw_value,&
-            &' (given unit) -> ', threshold, ' (native AMP-cube units,'//&
-            &' BUNIT="'//trim(bunit)//'").'
-         else
-            threshold = threshold_raw_value
-         endif
+      if (abs_flux_floor_unit_scale.gt.0.0_sp) then
+         abs_flux_floor = abs_flux_floor_raw_value *&
+         &(abs_flux_floor_unit_scale/native_scale)
+         write(*,'(A,F0.6,A,F0.6,A)') 'abs_flux_floor: ',&
+         &abs_flux_floor_raw_value, ' (given unit) -> ', abs_flux_floor,&
+         &' (native AMP-cube units, BUNIT="'//trim(bunit)//'").'
       else
-         call estimate_noise_floor(noise_floor, status)
-         if (status.ne.0) return
-         threshold = threshold_snr * noise_floor
-         write(*,'(A,I0,A,F0.4,A,F0.6,A,F0.6,A)') 'threshold_snr: auto'//&
-         &' noise floor from ', noise_nlos, ' random sightlines,'//&
-         &' lowest ', noise_percentile*100.0_sp, '% of bins = ',&
-         &noise_floor, ' (native units) -> threshold = ', threshold,&
-         &' (native units).'
+         abs_flux_floor = abs_flux_floor_raw_value
       endif
-   end subroutine resolve_threshold
-
-   subroutine estimate_noise_floor(noise_floor, status)
-      !! Auto noise-floor estimate for threshold_snr mode: draws
-      !! noise_nlos random spatial pixels (lines of sight), reads each
-      !! one's own full dirty AMP spectrum (all nrm RM bins), sorts it,
-      !! and pools the lowest noise_percentile fraction of bins from
-      !! EVERY sampled sightline into one big sample -- a real polarised
-      !! source produces one (or a few) narrow peak(s) in an otherwise
-      !! noise-dominated RM spectrum, so the lowest-amplitude bins of any
-      !! given sightline are overwhelmingly noise, not signal, regardless
-      !! of whether that particular sightline happens to contain a real
-      !! source. noise_floor is the MEDIAN of the pooled sample -- robust
-      !! to the rare sightline whose "low" bins are still elevated (e.g.
-      !! a very bright, spectrally broad source) without needing to
-      !! identify or exclude such sightlines individually. A pixel whose
-      !! spectrum is entirely NaN (outside the mask footprint) is
-      !! redrawn, up to a generous cap, rather than counted.
-      real(sp), intent(out) :: noise_floor
-      integer, intent(out) :: status
-      integer, parameter :: max_redraws_factor = 20
-      integer :: unit, blocksize, fitsstat, group
-      integer :: fpixel(3), lpixel(3), incs(3), naxes_full(3)
-      logical :: anyflag
-      real(sp), allocatable :: spectrum(:), pooled(:)
-      integer :: seed_size
-      integer, allocatable :: seed_arr(:)
-      real(sp) :: rx, ry
-      integer :: ix_draw, iy_draw, draws_done, redraws, n_lowbins
-      integer(kind=8) :: pooled_cap, pooled_used
-      integer :: k
-
-      status = 0
-      noise_floor = 0.0_sp
-      n_lowbins = max(1, nint(real(nrm, sp)*noise_percentile))
-      pooled_cap = int(noise_nlos, 8) * int(n_lowbins, 8)
-      allocate(spectrum(nrm), pooled(pooled_cap))
-      pooled_used = 0_8
-
-      call random_seed(size=seed_size)
-      allocate(seed_arr(seed_size))
-      seed_arr = noise_seed
-      call random_seed(put=seed_arr)
-
-      fitsstat = 0
-      call safe_ftopen(unit, trim(ampfile), 0, blocksize, fitsstat)
-      if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: cannot open FITS file for noise estimation: ',&
-         &trim(ampfile)
-         status = -1
-         call free_fits_unit(unit)
-         deallocate(spectrum, pooled, seed_arr)
-         return
-      endif
-      group = 1
-      naxes_full = (/ nx, ny, nrm /)
-      incs = (/ 1, 1, 1 /)
-
-      draws_done = 0
-      redraws = 0
-      do while (draws_done.lt.noise_nlos .and.&
-      &redraws.lt.noise_nlos*max_redraws_factor)
-         call random_number(rx)
-         call random_number(ry)
-         ix_draw = 1 + int(rx*real(nx, sp))
-         iy_draw = 1 + int(ry*real(ny, sp))
-         ix_draw = min(max(ix_draw, 1), nx)
-         iy_draw = min(max(iy_draw, 1), ny)
-
-         fpixel = (/ ix_draw, iy_draw, 1 /)
-         lpixel = (/ ix_draw, iy_draw, nrm /)
-         fitsstat = 0
-         call FTGSVE(unit, group, 3, naxes_full, fpixel, lpixel, incs,&
-         &0.0_sp, spectrum, anyflag, fitsstat)
-         if (fitsstat.ne.0 .or. any(spectrum.ne.spectrum)) then
-            ! all-NaN (masked) sightline, or a read hiccup -- redraw
-            redraws = redraws + 1
-            cycle
-         endif
-
-         call sort_real_inplace_rmclean(spectrum, nrm)
-         do k = 1, n_lowbins
-            pooled_used = pooled_used + 1_8
-            pooled(pooled_used) = spectrum(k)
-         enddo
-         draws_done = draws_done + 1
-      enddo
-      call safe_ftclos(unit, fitsstat)
-      if (draws_done.lt.1) then
-         write(*,*) 'ERROR: threshold_snr auto noise estimation found no'//&
-         &' usable (non-all-NaN) sightlines in ', trim(ampfile)
-         status = -1
-         deallocate(spectrum, pooled, seed_arr)
-         return
-      endif
-      if (draws_done.lt.noise_nlos) then
-         write(*,'(A,I0,A,I0,A)') 'WARNING: threshold_snr auto noise'//&
-         &' estimation only found ', draws_done, ' of ', noise_nlos,&
-         &' requested usable sightlines (cube mostly masked?) --'//&
-         &' proceeding with what was found.'
-      endif
-
-      call sort_real_inplace_rmclean(pooled(1:pooled_used), int(pooled_used))
-      noise_floor = pooled(int((pooled_used+1_8)/2_8))
-      deallocate(spectrum, pooled, seed_arr)
-   end subroutine estimate_noise_floor
-
-   subroutine sort_real_inplace_rmclean(arr, n)
-      !! Plain insertion sort, ascending -- called only on small arrays
-      !! (one pixel's own nrm-length spectrum, or the pooled noise
-      !! sample, at most noise_nlos*nrm elements), so O(n^2) is cheap
-      !! relative to FITS I/O and never appears in the main per-pixel
-      !! CLEAN loop.
-      real(sp), intent(inout) :: arr(*)
-      integer, intent(in) :: n
-      integer :: i, j
-      real(sp) :: key
-
-      do i = 2, n
-         key = arr(i)
-         j = i - 1
-         do while (j.ge.1)
-            if (arr(j).le.key) exit
-            arr(j+1) = arr(j)
-            j = j - 1
-         enddo
-         arr(j+1) = key
-      enddo
-   end subroutine sort_real_inplace_rmclean
+   end subroutine resolve_abs_flux_floor
 
    subroutine get_mem_total_kb(mem_total_kb)
       !! Total system RAM in kB, from /proc/meminfo's MemTotal -- verbatim
@@ -1552,9 +1528,12 @@ contains
          tile_bytes_est = int(tile_ra,8) * int(tile_dec,8) * bytes_per_tile_pixel
       enddo
 
-      write(*,'(A,I0,A,I0,A,I0,A,I0,A)') 'Tile plan: tile_ra x tile_dec = ',&
+      n_blocks_total = ((nx + tile_ra - 1) / tile_ra) *&
+      &((ny + tile_dec - 1) / tile_dec)
+
+      write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A)') 'Tile plan: tile_ra x tile_dec = ',&
       &tile_ra, ' x ', tile_dec, ' px (image ', nx, ' x ', ny,&
-      &' px, mem_frac_ram budget).'
+      &' px, mem_frac_ram budget) -- ', n_blocks_total, ' block(s) total.'
    end subroutine plan_rmclean_tile
 
    subroutine read_chanfreq(filename, l_sq_out, band_id_out, nchan_out, status)
@@ -2568,6 +2547,13 @@ contains
       integer, intent(in) :: ix_l, iy_l, ix0, iy0
       integer :: ix_g, iy_g
       integer :: nvalid_p, n_iter_used_p, k_p, entry_idx_p
+      character(len=16) :: stop_reason_p
+      logical :: is_traced_p
+      real(sp) :: trace_peak_p(niter), trace_rms_p(niter), trace_flux_p(niter)
+      integer :: trace_iter_p
+      logical :: trace_log_this_iter_p
+      character(len=256) :: trace_msg_p
+      real(sp) :: pixel_cleaned_flux_p, pixel_peak_resid_p
       integer, allocatable :: valid_idx_p(:)
       real(sp), allocatable :: l_sq_valid_p(:)
       real(sp) :: dirty_re_p(nrm), dirty_im_p(nrm)
@@ -2614,6 +2600,8 @@ contains
       ! build the SUBTRACTION beam.
       l_sq_valid_p(1:nvalid_p) = l_sq(valid_idx_p(1:nvalid_p))
 
+      is_traced_p = (trace_ix.gt.0 .and. ix_g.eq.trace_ix .and. iy_g.eq.trace_iy)
+
       call cache_lookup_readonly(mask_cube(ix_g,iy_g,:), entry_idx_p)
       used_throwaway = (entry_idx_p.eq.0)
       if (used_throwaway) then
@@ -2640,19 +2628,108 @@ contains
       endif
 
       if (used_throwaway) then
-         call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
-         &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
-         &throwaway_table, niter, gain, threshold, comp_re_p, comp_im_p,&
-         &resid_re_p, resid_im_p, n_iter_used_p, comp_rm_refined_p,&
-         &nsigma_refine=refine_nsigma)
+         if (is_traced_p) then
+            call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
+            &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
+            &throwaway_table, niter, gain, fwhm_rm,&
+            &have_abs_flux_floor, abs_flux_floor,&
+            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
+            &stop_reason_p, comp_rm_refined_p, nsigma_refine=refine_nsigma,&
+            &trace_peak_val=trace_peak_p, trace_rms_val=trace_rms_p,&
+            &trace_flux_val=trace_flux_p)
+         else
+            call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
+            &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
+            &throwaway_table, niter, gain, fwhm_rm,&
+            &have_abs_flux_floor, abs_flux_floor,&
+            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
+            &stop_reason_p, comp_rm_refined_p, nsigma_refine=refine_nsigma)
+         endif
          call destroy_rmsf_offset_table(throwaway_table)
       else
-         call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
-         &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
-         &cache_entries(entry_idx_p)%table, niter, gain, threshold,&
-         &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
-         &comp_rm_refined_p, nsigma_refine=refine_nsigma)
+         if (is_traced_p) then
+            call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
+            &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
+            &cache_entries(entry_idx_p)%table, niter, gain, fwhm_rm,&
+            &have_abs_flux_floor, abs_flux_floor,&
+            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
+            &stop_reason_p, comp_rm_refined_p,&
+            &nsigma_refine=refine_nsigma, trace_peak_val=trace_peak_p,&
+            &trace_rms_val=trace_rms_p, trace_flux_val=trace_flux_p)
+         else
+            call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
+            &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
+            &cache_entries(entry_idx_p)%table, niter, gain, fwhm_rm,&
+            &have_abs_flux_floor, abs_flux_floor,&
+            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
+            &stop_reason_p, comp_rm_refined_p, nsigma_refine=refine_nsigma)
+         endif
       endif
+
+      ! Per-pixel derived diagnostics: computed straight from clean_
+      ! complex's own OUTPUT arrays (no new outputs needed from that
+      ! module for these two) -- total flux CLEAN actually extracted
+      ! into components, and the peak left behind in the residual once
+      ! it stopped.
+      pixel_cleaned_flux_p = sum(sqrt(comp_re_p**2 + comp_im_p**2))
+      pixel_peak_resid_p = maxval(sqrt(resid_re_p**2 + resid_im_p**2))
+
+      if (is_traced_p) then
+         do trace_iter_p = 1, n_iter_used_p
+            ! Always log iter=1 (pre-CLEAN state, see clean_complex's own
+            ! trace_flux_val comment) and the final iteration; otherwise
+            ! throttle to every log_every-th iteration.
+            trace_log_this_iter_p = (trace_iter_p.eq.1) .or.&
+            &(trace_iter_p.eq.n_iter_used_p) .or.&
+            &(mod(trace_iter_p, log_every).eq.0)
+            if (.not.trace_log_this_iter_p) cycle
+            write(trace_msg_p,'(A,I0,A,I0,A,I0,A,ES14.6,A,ES14.6,A,ES14.6)')&
+            &'CLEAN trace ix=', ix_g, ' iy=', iy_g, ' iter=', trace_iter_p,&
+            &' peak_val=', trace_peak_p(trace_iter_p), ' rms_val=',&
+            &trace_rms_p(trace_iter_p), ' cleaned_flux_so_far=',&
+            &trace_flux_p(trace_iter_p)
+            call log_message('info','clean_trace',trim(trace_msg_p))
+         enddo
+         write(trace_msg_p,'(A,I0,A,I0,A,I0,A,I0,A,A)')&
+         &'CLEAN trace ix=', ix_g, ' iy=', iy_g, ' STOPPED after ',&
+         &n_iter_used_p, ' of ', niter, ' iterations, stop_reason=',&
+         &trim(stop_reason_p)
+         call log_message('info','clean_trace',trim(trace_msg_p))
+         write(trace_msg_p,'(A,I0,A,I0,A,ES14.6,A,ES14.6)')&
+         &'CLEAN trace ix=', ix_g, ' iy=', iy_g, ' total_cleaned_flux=',&
+         &pixel_cleaned_flux_p, ' peak_residual=', pixel_peak_resid_p
+         call log_message('info','clean_trace',trim(trace_msg_p))
+      endif
+
+      !$omp atomic
+      n_iter_used_sum = n_iter_used_sum + int(n_iter_used_p, 8)
+      !$omp atomic
+      n_iter_used_min = min(n_iter_used_min, n_iter_used_p)
+      !$omp atomic
+      n_iter_used_max = max(n_iter_used_max, n_iter_used_p)
+      !$omp atomic
+      total_cleaned_flux_sum = total_cleaned_flux_sum + real(pixel_cleaned_flux_p, dp)
+      !$omp atomic
+      peak_residual_sum = peak_residual_sum + real(pixel_peak_resid_p, dp)
+      !$omp atomic
+      peak_residual_max = max(peak_residual_max, pixel_peak_resid_p)
+      !$omp atomic
+      peak_residual_min = min(peak_residual_min, pixel_peak_resid_p)
+      select case (trim(stop_reason_p))
+      case ('abs_flux')
+         !$omp atomic
+         n_stopped_abs_flux = n_stopped_abs_flux + 1_8
+      case ('auto_nsigma')
+         !$omp atomic
+         n_stopped_auto_nsigma = n_stopped_auto_nsigma + 1_8
+      case default
+         !$omp atomic
+         n_stopped_niter = n_stopped_niter + 1_8
+      end select
 
       call restore_clean(rm_samp, nrm, comp_re_p, comp_im_p, resid_re_p,&
       &resid_im_p, fwhm_rm, restore_plan_fwd, restore_plan_bwd,&

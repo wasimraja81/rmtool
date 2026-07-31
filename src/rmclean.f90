@@ -721,8 +721,12 @@ contains
    end subroutine refine_peak_matched_filter
 
    subroutine clean_complex(l_sq, nchan, lsq_ref_compute, rm_samp, nrm,&
-   &dirty_re, dirty_im, table, niter, gain, thresh, comp_re, comp_im,&
-   &resid_re, resid_im, n_iter_used, comp_rm_refined, nsigma_refine)
+   &dirty_re, dirty_im, table, niter, gain, fwhm_rm,&
+   &have_abs_flux_floor, abs_flux_floor,&
+   &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+   &comp_re, comp_im, resid_re, resid_im, n_iter_used, stop_reason,&
+   &comp_rm_refined, nsigma_refine, trace_peak_val, trace_rms_val,&
+   &trace_flux_val)
       !! Hogbom-style complex CLEAN on the dirty FDF (dirty_re/dirty_im),
       !! against its own RM-dependent dirty beam (rmsf_table_t). Ported
       !! from rm_clean.f, modernized, with planning/
@@ -806,11 +810,72 @@ contains
       type(rmsf_table_t), intent(in) :: table
       integer, intent(in) :: nrm, niter
       real(sp), intent(in) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
-      real(sp), intent(in) :: gain, thresh
+      real(sp), intent(in) :: gain
+      ! fwhm_rm: this pixel's own RMSF restoring-beam FWHM (rad/m^2) --
+      ! ONLY used (when have_auto_nsigma) to size the tail-exclusion
+      ! window in estimate_tail_sigma below; unrelated to the RMSF table
+      ! itself (that's `table`, already lsq_ref/dRM-aware).
+      real(sp), intent(in) :: fwhm_rm
+      ! Three INDEPENDENT, unambiguously-named stopping criteria, checked
+      ! every iteration in this fixed order (planning/RMCLEAN_INTEGRATION_
+      ! PLAN.md T8 -- replaces the old single overloaded `thresh` param,
+      ! which was silently treated as a sigma-multiplier even when fed an
+      ! absolute-flux value from rmclean_cubes.f90's own threshold=
+      ! option, comparing flux^2 against flux): any combination of the
+      ! two optional ones may be active at once; niter (above) is always
+      ! the hard backstop.
+      ! 1) niter cap (always active, see the do-loop bound itself).
+      ! 2) have_abs_flux_floor/abs_flux_floor: stop the INSTANT this
+      !    pixel's own peak amplitude drops to or below a literal fixed
+      !    flux value (native AMP-cube units) -- no noise/baseline
+      !    adjustment, a pure "brightest remaining feature is below X"
+      !    comparison. abs_flux_floor is READ only when
+      !    have_abs_flux_floor is .true. (always passed, non-optional,
+      !    to avoid combinatorial optional-argument call sites in the
+      !    caller -- see clean_one_pixel's own comment).
+      logical, intent(in) :: have_abs_flux_floor
+      real(sp), intent(in) :: abs_flux_floor
+      ! 3) have_auto_nsigma/auto_nsigma_mult/tail_exclude_nfwhm: stop
+      !    when (peak_val-avg_abs) <= auto_nsigma_mult * tail_sigma,
+      !    where tail_sigma is estimated ONCE (not recomputed every
+      !    iteration -- that self-referential moving-target design was
+      !    the OTHER half of the old bug, see estimate_tail_sigma's own
+      !    comment) from THIS pixel's own dirty spectrum, in the RM
+      !    range beyond tail_exclude_nfwhm*fwhm_rm from its own peak.
+      !    auto_nsigma_mult/tail_exclude_nfwhm are READ only when
+      !    have_auto_nsigma is .true. (same always-passed convention as
+      !    above). Do not confuse auto_nsigma_mult with nsigma_refine
+      !    below -- two unrelated "n-sigma" concepts (this one gates
+      !    CLEAN's own stop; nsigma_refine gates the peak-refinement
+      !    tier escalation), deliberately given non-overlapping names.
+      logical, intent(in) :: have_auto_nsigma
+      real(sp), intent(in) :: auto_nsigma_mult, tail_exclude_nfwhm
       real(sp), intent(out) :: comp_re(nrm), comp_im(nrm)
       real(sp), intent(out) :: resid_re(nrm), resid_im(nrm)
       integer, intent(out) :: n_iter_used
+      ! stop_reason: which of the three criteria actually fired --
+      ! 'niter'/'abs_flux'/'auto_nsigma' -- so callers can log the EXACT
+      ! cause, not just an iteration count (n_iter_used==niter alone
+      ! cannot tell "hit the cap" apart from "a criterion happened to
+      ! fire on the literal last allowed iteration").
+      character(len=16), intent(out) :: stop_reason
       real(sp), intent(out) :: comp_rm_refined(nrm)
+      ! Optional per-iteration trace (peak_val/rms_val at every iteration
+      ! actually run, index 1..n_iter_used): purely mechanical data
+      ! capture, no logging here -- this module stays pure computation
+      ! (see this module's own top comment). The caller (rmclean_cubes.f90)
+      ! decides which pixel(s), if any, to request this for and does its
+      ! own log_message calls with it -- see clean_one_pixel's own
+      ! trace_ix/trace_iy handling.
+      real(sp), intent(out), optional :: trace_peak_val(niter)
+      real(sp), intent(out), optional :: trace_rms_val(niter)
+      ! trace_flux_val(iter): cumulative |component flux| extracted from
+      ! iterations 1..iter-1 (i.e. BEFORE this iteration's own
+      ! subtraction -- same snapshot point as trace_peak_val/trace_rms_
+      ! val above, so all three describe the SAME pre-iteration state).
+      ! trace_flux_val(1)==0.0 exactly (nothing cleaned yet), giving the
+      ! caller a genuine "pre-CLEAN" data point at iter=1 for free.
+      real(sp), intent(out), optional :: trace_flux_val(niter)
       ! nsigma_refine: escalation threshold for refine_peak_matched_
       ! filter's own tiered design (T3c, see that subroutine's doc
       ! comment): the fast fixed-location fit is accepted when its
@@ -854,6 +919,7 @@ contains
       real(dp) :: resid_re_dp(nrm), resid_im_dp(nrm)
       real(dp) :: comp_re_dp(nrm), comp_im_dp(nrm)
       real(dp) :: rmloc_wsum(nrm), rmloc_wloc(nrm)
+      real(sp) :: tail_sigma
       integer :: iter, imax, j
 
       comp_re_dp = 0.0_dp
@@ -865,6 +931,24 @@ contains
       dRM = rm_samp(2) - rm_samp(1)
       nsig = 3.0_sp
       if (present(nsigma_refine)) nsig = nsigma_refine
+      n_iter_used = 0
+      ! Default: if the loop below runs all the way to niter without
+      ! either optional criterion firing, this is what stands -- the
+      ! niter cap. Any exit from inside the loop overwrites it.
+      stop_reason = 'niter'
+
+      ! Auto-nsigma's own sigma estimate: computed ONCE here, from the
+      ! ORIGINAL dirty spectrum, never recomputed per iteration -- fixes
+      ! the old self-referential moving-target bug (thresh*rms_val used
+      ! the CURRENT, shrinking residual's own rms every iteration, so a
+      ! more aggressive gain chased an ever-tightening target instead of
+      ! a fixed noise floor; see planning/RMCLEAN_INTEGRATION_PLAN.md T7's
+      ! gain-sweep finding for the empirical symptom this caused).
+      tail_sigma = 0.0_sp
+      if (have_auto_nsigma) then
+         call estimate_tail_sigma(rm_samp, nrm, dirty_re, dirty_im,&
+         &fwhm_rm, tail_exclude_nfwhm, tail_sigma)
+      endif
 
       do iter = 1, niter
          n_iter_used = iter
@@ -894,7 +978,27 @@ contains
          peak_val = sqrt(re_at_peak**2 + im_at_peak**2)
          phase_val = atan2(im_at_peak, re_at_peak)
 
-         if ((peak_val - avg_abs) <= thresh*rms_val) exit
+         if (present(trace_peak_val)) trace_peak_val(iter) = peak_val
+         if (present(trace_rms_val)) trace_rms_val(iter) = rms_val
+         if (present(trace_flux_val)) trace_flux_val(iter) =&
+         &real(sum(sqrt(comp_re_dp**2 + comp_im_dp**2)), sp)
+
+         ! Checked in this fixed order every iteration; the first one
+         ! satisfied wins (see this subroutine's own top comment on
+         ! why each is a genuinely separate, unambiguously-named
+         ! criterion, not variations on one overloaded parameter).
+         if (have_abs_flux_floor) then
+            if (peak_val <= abs_flux_floor) then
+               stop_reason = 'abs_flux'
+               exit
+            endif
+         endif
+         if (have_auto_nsigma) then
+            if ((peak_val - avg_abs) <= auto_nsigma_mult*tail_sigma) then
+               stop_reason = 'auto_nsigma'
+               exit
+            endif
+         endif
 
          call compute_dirty_rmbeam(table, rm_samp, nrm, peak_loc,&
          &0.5_sp*phase_val, re_beam, im_beam)
@@ -922,6 +1026,56 @@ contains
          endif
       end do
    end subroutine clean_complex
+
+   subroutine estimate_tail_sigma(rm_samp, nrm, dirty_re, dirty_im, fwhm_rm,&
+   &tail_exclude_nfwhm, tail_sigma)
+      !! Auto-nsigma's own per-pixel noise estimate (planning/
+      !! RMCLEAN_INTEGRATION_PLAN.md T8): finds THIS pixel's own dirty
+      !! spectrum's peak bin, excludes a window of
+      !! +/-tail_exclude_nfwhm*fwhm_rm around it, and returns
+      !! rms_about_mean of the AMPLITUDE over whatever bins remain (the
+      !! "RM tail" -- far from this sightline's own peak, presumed
+      !! noise-dominated regardless of whether a real source is
+      !! present). Computed ONCE from the ORIGINAL dirty spectrum, never
+      !! touched by iteration -- unlike the old thresh*rms_val design,
+      !! which recomputed its "noise" estimate from the shrinking
+      !! residual every iteration (clean_complex's own top comment has
+      !! the full story on why that was a real bug, not just a style
+      !! issue).
+      !! Safety fallback: if the exclusion window leaves fewer than
+      !! min_tail_bins usable bins (a very narrow RM range, or a peak
+      !! sitting such that tail_exclude_nfwhm*fwhm_rm covers most of the
+      !! span), falls back to the WHOLE spectrum's own rms_about_mean
+      !! rather than failing -- graceful degradation, not a silent wrong
+      !! answer (the whole-spectrum RMS is still a valid, if slightly
+      !! source-contaminated, noise estimate).
+      integer, intent(in) :: nrm
+      real(sp), intent(in) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
+      real(sp), intent(in) :: fwhm_rm, tail_exclude_nfwhm
+      real(sp), intent(out) :: tail_sigma
+      integer, parameter :: min_tail_bins = 5
+      real(sp) :: dirty_amp(nrm), tail_amp(nrm)
+      real(sp) :: exclude_halfwidth, dummy_avg
+      integer :: peak_idx, j, n_tail
+
+      dirty_amp = sqrt(dirty_re**2 + dirty_im**2)
+      call index_absmax(dirty_amp, nrm, peak_idx, dummy_avg)
+      exclude_halfwidth = tail_exclude_nfwhm * fwhm_rm
+
+      n_tail = 0
+      do j = 1, nrm
+         if (abs(rm_samp(j) - rm_samp(peak_idx)) > exclude_halfwidth) then
+            n_tail = n_tail + 1
+            tail_amp(n_tail) = dirty_amp(j)
+         endif
+      end do
+
+      if (n_tail >= min_tail_bins) then
+         call rms_about_mean(tail_amp(1:n_tail), n_tail, tail_sigma)
+      else
+         call rms_about_mean(dirty_amp, nrm, tail_sigma)
+      endif
+   end subroutine estimate_tail_sigma
 
    subroutine compute_rmsf_fwhm(l_sq, nchan, fwhm_rm)
       !! Theoretical restoring-beam FWHM in RM, from the lambda-squared

@@ -17,7 +17,22 @@ T3's own performance gap), and T4 (memory-budgeted, threaded block I/O
 production) all done and verified -- see each ticket's
 own Evidence section below. GPU support for RM-CLEAN is explicitly
 deferred to a later, separate effort (decision 6 below); everything
-here is OpenMP-CPU-only by design.**
+here is OpenMP-CPU-only by design. T7 (CLEAN convergence/stop-reason
+logging + a reusable subimage-based gain-tuning workflow) done and
+verified; its own gain-sweep findings are a real, actionable result
+(see T7's own Evidence section) about the OLD stopping-criterion
+mechanism -- superseded, not contradicted, by T8. T8 (CLEAN
+stopping-criteria redesign: `abs_flux_floor`/`auto_nsigma`/`niter`,
+per-pixel RM-tail sigma computed once, exact `stop_reason` logging) done
+and verified -- the old `threshold=`/`threshold_snr=` pair funneled
+into one overloaded, always-multiplicative `thresh` that silently
+broke the absolute-flux mode and made the auto/n-sigma mode a
+self-referential moving target; fixing it took this same T7 subimage's
+tail RMS from 6.89 uJy (3.7x below the true ~25.5 uJy noise floor) to
+25.24 uJy (matching it), converging in a mean of 3.89 iterations instead
+of 233.7. `threshold=`/`threshold_snr=`/`noise_nlos=`/`noise_percentile=`/
+`noise_seed=` are RETIRED (not aliased) -- use `abs_flux_floor=`/
+`auto_nsigma=`/`tail_exclude_nfwhm=` in any cfg going forward.**
 
 ## Context
 
@@ -1930,3 +1945,254 @@ regression-test building block (e.g. "assert residual-near-peak RMS is
 within Nx of tail RMS" as an automated pass/fail, not just a printed
 number) -- all open questions for the session that actually picks this
 up.
+
+### T7 -- CLEAN convergence/stop-reason logging + subimage gain-tuning workflow (done)
+
+**Objective.** Two things the user asked for in the same session, done
+together since the second depends on the first: (1) make it possible to
+answer "is CLEAN converging, and why did it stop" from the log alone,
+for both a single traced sightline and the whole run; (2) get real,
+data-driven evidence for choosing `niter`/`gain`/`threshold_snr` on the
+actual Jennifer dataset, without paying for a full 4501x4501 run per
+trial.
+
+**Scope/what was built.**
+- `clean_complex` (`src/rmclean.f90`) gained a new required output,
+  `stopped_by_threshold` (alongside the pre-existing `n_iter_used`):
+  disambiguates "threshold criterion fired" from "niter cap exhausted
+  without ever satisfying it" -- `n_iter_used==niter` alone cannot tell
+  these apart (the threshold criterion can also fire, coincidentally,
+  on the literal last allowed iteration). Updated all 5 call sites
+  (`rmclean_cubes.f90` x2, plus 3 direct test callers).
+- Three new OPTIONAL per-iteration trace outputs on the same
+  subroutine -- `trace_peak_val`/`trace_rms_val`/`trace_flux_val`
+  (cumulative `sum(|comp|)` so far) -- filled only when the caller
+  supplies the arrays, so the hot (non-traced) path pays nothing extra.
+  `rmclean_mod` stays "pure computation, no logging" (its own top
+  comment's stated design boundary): it only returns more data
+  optionally; `rmclean_cubes.f90`'s `clean_one_pixel` decides which
+  pixel (`trace_ix`/`trace_iy` cfg keys, 1-indexed global, default 0 =
+  off) to request it for and does the actual `log_message` calls.
+  `log_every` (default 50) throttles those lines to every Nth
+  iteration; iteration 1 (the pre-CLEAN state -- `trace_flux_val(1)`
+  is exactly 0 there) and the final iteration are always logged
+  regardless, so the trend's start/end are never missed.
+- Run-wide aggregate summary (always on, no cfg key -- cheap
+  population-level counters, not per-iteration): printed once at run
+  end alongside the pre-existing `CLEANed N pixels.` line -- count
+  stopped-by-threshold vs hit-niter-cap (with %), `n_iter_used`
+  mean/min/max, total cleaned flux summed over every pixel, and
+  peak-residual mean/min/max across pixels. Answers "why did CLEAN
+  stop" and "how much flux/residual" at the whole-run level without
+  per-pixel log spam.
+- Block-progress logging (a smaller, earlier ask in the same session):
+  `plan_rmclean_tile` now prints the total block count once
+  (`-- N block(s) total.`), and the main tile loop prints `Block m of n
+  processed.` after each block's CLEAN compute finishes -- previously
+  neither was logged at all, so progress was unreadable without
+  manually deriving block count from the tile-plan geometry.
+- Subimage-based fast-iteration workflow: no new cutout tool needed --
+  reused `rm_synthesis`'s own pre-existing `subim=y` CFITSIO-subsection
+  read directly against the already-convolved Jennifer Q/U cubes
+  (`cfg/rmsynth-jennifer.subim128.cfg`, 128x128 px centred on the
+  4501x4501 image, RA/Dec 2187-2314, full 286-channel band, otherwise
+  identical RM settings to the production e2e cfg). Runs in ~7s
+  (vs. hours for the full cube); confirmed the centre-of-image crop
+  genuinely contains real signal (SNR up to ~20, not just noise), so
+  it exercises both the tail-noise-floor check and the "residual near a
+  real peak" check in one small cube. Working files under
+  `scratch/rmclean_tuning_subim128/`.
+
+**Correctness gate.** New standalone test `tests/test_rmclean_stop_reason.f90`
+(registered as `run_tests.sh` section 37): a noiseless single-point-
+source scenario, Case A (generous niter/gain/threshold) asserts
+`stopped_by_threshold=.true.`, `n_iter_used<niter`, a real (>5) initial
+trace peak, a weakly-monotonically-DECREASING peak trace, and a weakly-
+monotonically-INCREASING flux trace starting at exactly 0; Case B
+(niter=3, deliberately too small) asserts `stopped_by_threshold=.false.`
+and `n_iter_used==niter` exactly (cap exhausted, not a coincidental
+threshold hit on iteration 3). Full regression suite re-run after the
+`clean_complex` signature change (affects every caller): 118/118 pass
+(109 pre-existing + 7 new), including the existing small-tile/
+io_read_threads/io_write_threads/io_overlap bit-identical checks --
+confirms the new outputs/logging don't change any existing numerical
+result. Also smoke-tested end-to-end against real subimage data
+(`trace_ix=112 trace_iy=89`, the subimage's own SNR-peak pixel):
+iteration-1 trace peak matched that pixel's own dirty PEAK.MAP value,
+`log_every=50` correctly emitted iter=1/50/final(82) and skipped the
+rest, and the run-end summary's stop-reason counts matched expectations.
+
+**Evidence -- gain sweep on the 128x128 subimage** (niter=500,
+threshold_snr=5.0, `lsq_ref_compute_mode=mid` -- identical to
+production except `gain`; OMP_NUM_THREADS=6, OMP_PROC_BIND=close,
+OMP_PLACES=cores per this host's own standing thread-count convention):
+
+| gain | stopped@threshold | hit niter cap | n_iter_used mean | tail RMS (uJy, median) | peak-window RMS (uJy, median) | peak/tail ratio |
+|------|-------------------:|--------------:|-----------------:|-----------------------:|-------------------------------:|-----------------:|
+| 0.1  | 96.81% | 3.19% | 233.7 | 6.89 | 7.31 | 1.061 |
+| 0.2  | 99.88% | 0.12% | 132.9 | 5.65 | 5.93 | 1.049 |
+| 0.3  | 99.88% | 0.12% |  98.2 | 4.59 | 4.73 | 1.031 |
+| 0.5  | 99.87% | 0.13% |  74.4 | 2.86 | 2.85 | 0.995 |
+| 0.7  | 98.07% | 1.93% |  89.7 | 1.67 | 1.44 | 0.862 |
+
+Tail RMS on the matching DIRTY cube (no CLEAN at all): median 25.46
+uJy/beam, mean 25.62 uJy/beam -- consistent with the ~22-26 uJy/beam
+band-averaged Q/U noise floor already established on the full
+`jennifer_e2e` cube (T6's own motivating check), confirming this
+subimage's noise properties are representative, not an artefact of the
+crop.
+
+**Finding (real, not just a tuning preference).** Every gain tested
+leaves a CLEANed tail RMS well BELOW the true instrumental noise floor
+(6.89 uJy at gain=0.1, i.e. already ~3.7x quieter than the 25.46 uJy
+dirty floor) -- because `threshold_snr`'s stopping criterion is
+self-referential (`thresh x rms_val`, `rms_val` recomputed from the
+CURRENT residual every iteration over the WHOLE spectrum including the
+tail), so a more aggressive gain shrinks its own stopping target as it
+goes, converging to a genuinely lower absolute residual rather than
+just reaching the same target faster. This gets monotonically WORSE as
+gain increases, and at `gain=0.7` the peak/tail ratio drops BELOW 1.0
+(0.862) -- the region right at a real source ends up QUIETER than blank
+sky, a clear over-subtraction signature (removing genuine noise/
+structure as if it were flux), not a healthy convergence result.
+`gain=0.1` (current production default, used in the v1/v2/v3 Jennifer
+runs) has the peak/tail ratio closest to the theoretically-expected
+value (slightly ABOVE 1 -- real structure at the peak leaving marginally
+more residual than pure tail noise, the correct qualitative sign) of
+all 5 gains tested, but pays for it with a 3.19% niter=500 non-
+convergence rate (vs. ~0.12% at gain=0.2/0.3/0.5). **Conclusion: `gain=
+0.1` is not just a conservative default, it is the best of the 5 tested
+for residual noise fidelity -- the ~3% non-convergent pixels should be
+fixed by RAISING `niter` (e.g. 800-1000), not by raising `gain`, since
+raising gain demonstrably trades residual noise fidelity away.** Whether
+niter=500 itself, or the `threshold_snr=5.0` self-referential stopping
+criterion's own design, should change is an open question for a future
+session -- not resolved here.
+
+**UPDATE (T8, same day):** the self-referential stopping criterion
+itself -- not just niter/gain tuning around it -- turned out to be a
+real bug, not just a design choice worth revisiting. See T8 below: fixing
+it (per-pixel, ONCE-computed RM-tail sigma, `auto_nsigma=`) took this same
+subimage's tail RMS from 6.89 uJy (gain=0.1, old `threshold_snr` design --
+3.7x quieter than the true ~25.5 uJy noise floor) to 25.24 uJy (matching
+the dirty cube's own floor almost exactly), AND converged in a mean of
+3.89 iterations instead of 233.7. The gain-fidelity ranking above (0.1
+best of 5) was a real, correctly-measured finding about the OLD
+mechanism, superseded by T8's fix rather than contradicted by it.
+
+### T8 -- CLEAN stopping-criteria redesign: abs_flux_floor/auto_nsigma/niter, per-pixel tail sigma, exact stop_reason logging (done)
+
+**Objective.** The user asked directly: "why then do we have n-sigma?
+... clean up this mess ... we want unambiguous variable names ... stop
+based on whichever condition is met first: niter, absolute value
+(Jy/mJy/uJy), auto threshold (user multiplier x sigma derived from the
+data itself, RM tail etc) ... logs should report exact cause."
+
+**Root cause found.** `clean_complex`'s old `thresh` parameter was fed
+by BOTH `rmclean_cubes.f90`'s `threshold=<absolute Jy value>` and
+`threshold_snr=<n-sigma multiplier>`, and was UNCONDITIONALLY multiplied
+by `rms_val` every iteration (`peak_val-avg_abs <= thresh*rms_val`). So
+`threshold=` never actually compared an absolute flux value at all --
+it silently became another sigma-multiplier, comparing flux^2 against
+flux. And `threshold_snr` computed an absolute number ONCE up front
+(`threshold_snr x noise_floor`, from a whole-cube pre-scan of
+`noise_nlos` random sightlines), then THAT got multiplied by `rms_val`
+again -- `rms_val` recomputed fresh from the CURRENT (shrinking)
+residual every single iteration, over the WHOLE spectrum. A
+self-referential, ever-tightening target, not a fixed noise floor --
+directly explaining T7's own gain-sweep finding (residual RMS well
+below the true noise floor, getting worse with higher gain).
+
+**Design (three independent, unambiguously-named criteria, whichever
+fires first per pixel, niter always the hard backstop):**
+1. `niter` -- unchanged, the loop's own iteration cap.
+2. `abs_flux_floor=<v>` -- stop the INSTANT a pixel's own peak amplitude
+   drops to/below this literal fixed value (native units, or Jy/mJy/uJy
+   suffix). No noise/baseline adjustment -- a pure "brightest remaining
+   feature below X" comparison. This is what `threshold=` was always
+   supposed to mean and never actually did.
+3. `auto_nsigma=<n>` -- stop when `(peak_val-avg_abs) <=
+   auto_nsigma x tail_sigma`, where `tail_sigma` is estimated ONCE (new
+   `estimate_tail_sigma`, `src/rmclean.f90`) from THIS pixel's own dirty
+   spectrum: find its own peak bin, exclude a window of
+   `tail_exclude_nfwhm x fwhm_rm` (default 3.0 FWHM) around it, and take
+   `rms_about_mean` of whatever RM bins remain (the pixel's own "RM
+   tail" -- far from its own peak, presumed noise-dominated regardless
+   of whether a real source is present, same reasoning as T6's own
+   motivating check). NOT recomputed per iteration -- this is the fix
+   for the moving-target bug above. NOT a whole-cube pre-scan either
+   (unlike the old `threshold_snr`/`estimate_noise_floor`/`noise_nlos`
+   machinery, deleted entirely) -- genuinely per-pixel, matching the
+   user's own explicit choice ("literal per-pixel RM-tail sigma", not
+   reusing the old whole-cube pre-scan) when asked to disambiguate this
+   design fork.
+
+Unlike the old `threshold=`/`threshold_snr=` pair (mutually exclusive,
+exactly one required), `abs_flux_floor=`/`auto_nsigma=` are each
+independently optional and MAY be combined -- whichever fires first
+wins for that pixel. Neither given is also valid (niter-only, same
+precedent as the old `thresh=0.0`), with a printed NOTE so it's not
+silently missed.
+
+**Logging (the user's 4th, non-negotiable requirement).** `clean_complex`
+now returns `stop_reason` (`'niter'`/`'abs_flux'`/`'auto_nsigma'`, not
+just a `stopped_by_threshold` boolean, which could not distinguish 3
+outcomes) -- disambiguates `n_iter_used==niter` (cap exhausted) from a
+criterion coincidentally firing on the literal last allowed iteration.
+`rmclean_cubes.f90` tallies all 3 reasons run-wide (extends the T7
+aggregate summary: `hit niter cap` / `stopped at abs_flux` / `stopped at
+auto_nsigma`, each with a %) and logs the exact `stop_reason` per
+iteration/pixel for `trace_ix=`/`trace_iy=`-traced pixels (T7's own
+per-iteration trace mechanism, unchanged otherwise).
+
+**Naming discipline (the user's other explicit request).** Every new
+parameter name states exactly what it is -- `abs_flux_floor` (a flux
+value), `auto_nsigma_mult` (a multiplier), `tail_sigma`/`tail_exclude_
+nfwhm` (a sigma estimate and its own exclusion window) -- no quantity is
+shared between two different roles. `auto_nsigma_mult` is deliberately
+NOT called anything containing bare "nsigma" alone, to avoid collision
+with the pre-existing, unrelated `nsigma_refine` (the tiered
+peak-refinement escalation threshold in `refine_peak_matched_filter`) --
+two genuinely different "n-sigma" concepts in this codebase, now
+impossible to confuse by name alone. See
+[[feedback_unambiguous_naming]] for the standing memory this created.
+
+**Correctness gate.** `clean_complex`'s public signature changed (new
+required `fwhm_rm`/`have_abs_flux_floor`/`abs_flux_floor`/
+`have_auto_nsigma`/`auto_nsigma_mult`/`tail_exclude_nfwhm` args, `thresh`
+removed, `stopped_by_threshold`->`stop_reason`) -- updated all 5 call
+sites (`rmclean_cubes.f90` x2 tables x2 trace-variants = 4, plus 3 direct
+test callers: `test_rmclean_lsqref_flex.f90`/`test_drm_floor.f90`
+translated to niter-only mode, exact behavioral match for their old
+near-zero/n-sigma thresh values in their noiseless synthetic scenarios;
+`thesis_scenario_rmclean.f90` translated to niter-only, an EXACT match
+for its old `thresh=0.0`). `tests/test_rmclean_stop_reason.f90` rewritten
+for 3 cases: Case A (niter-only) asserts `stop_reason=='niter'` and
+`n_iter_used==niter` exactly with no early-exit possible by
+construction; Case B (`abs_flux_floor`, noiseless) asserts
+`stop_reason=='abs_flux'`, early convergence, and the final residual
+peak at/near the floor (plus the pre-existing trace-array checks); Case
+C (`auto_nsigma`, WITH fixed-seed injected Box-Muller noise -- a
+noiseless spectrum's own tail sigma is ~0, which would only test
+machine-precision convergence, not the criterion itself) asserts
+`stop_reason=='auto_nsigma'` and early convergence. Full regression
+suite: 121/121 pass (all pre-existing plus the rewritten section 31 --
+`abs_flux_floor`/`auto_nsigma` unit conversion, determinism across two
+runs with no seed at all now needed since per-pixel tail-sigma has zero
+randomness, valid-combined and valid-neither-given cases replacing the
+old mutually-exclusive/required-one checks -- and section 37's own 3
+new cases). `cfg/rmclean-e2e-smalltest.cfg`, `cfg/rmclean-jennifer.e2e.cfg`,
+`cfg/rmclean-example.cfg` updated for the renamed keys.
+
+**Evidence -- the fix actually fixes T7's finding, not just the logging.**
+Re-ran the 128x128 subimage (same data as T7) with `auto_nsigma=5.0`
+(matching the OLD `threshold_snr=5.0` production value) under the NEW
+design: tail RMS **25.24 uJy (median) / 25.42 uJy (mean)** -- matching
+the dirty cube's own true noise floor (25.46/25.62 uJy) almost exactly,
+versus the OLD design's 6.89/7.22 uJy (3.7x too quiet) at the same
+nominal "5-sigma" setting. Mean iterations to convergence: **3.89**
+(min 1, max 19) versus the old design's 233.7 -- the self-referential
+moving target was not just numerically wrong, it was also needlessly
+slow. Stop-reason summary on this run: 100.00% `auto_nsigma`, 0%
+niter/abs_flux, confirming every pixel now stops for the intended,
+physically-meaningful reason.

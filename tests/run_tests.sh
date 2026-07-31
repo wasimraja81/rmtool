@@ -1804,7 +1804,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
         if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                 phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                 maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
-                outfile="$rmc_out" threshold=0.01 niter=200 gain=0.1 \
+                outfile="$rmc_out" abs_flux_floor=0.01 niter=200 gain=0.1 \
                 > "$rmc_log" 2>&1; then
             pass "rmclean_cubes: ran to completion on a real lsq_ref_mode=mid cube"
             if grep -q "^Gate 0 OK" "$rmc_log"; then
@@ -1836,7 +1836,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
         if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                 phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                 maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
-                outfile="$rmc_tiled" threshold=0.01 niter=200 gain=0.1 \
+                outfile="$rmc_tiled" abs_flux_floor=0.01 niter=200 gain=0.1 \
                 tile_auto=n tile_ra=3 tile_dec=5 \
                 > "$rmc_tiled_log" 2>&1; then
             pass "rmclean_cubes: ran to completion with forced small (3x5) tiles"
@@ -1871,7 +1871,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
             if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                     phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                     maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
-                    outfile="$rmc_rt" threshold=0.01 niter=200 gain=0.1 \
+                    outfile="$rmc_rt" abs_flux_floor=0.01 niter=200 gain=0.1 \
                     io_read_threads=$rt > "$rmc_rt_log" 2>&1; then
                 for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
                               RESTORED.AMP RESTORED.PHA; do
@@ -1912,7 +1912,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
                 if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                         phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                         maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
-                        outfile="$rmc_wt" threshold=0.01 niter=200 gain=0.1 \
+                        outfile="$rmc_wt" abs_flux_floor=0.01 niter=200 gain=0.1 \
                         io_write_threads=$wt > "$rmc_wt_log" 2>&1; then
                     for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
                                   RESTORED.AMP RESTORED.PHA; do
@@ -1943,7 +1943,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
             if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                     phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                     maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
-                    outfile="$rmc_ov" threshold=0.01 niter=200 gain=0.1 \
+                    outfile="$rmc_ov" abs_flux_floor=0.01 niter=200 gain=0.1 \
                     io_overlap=y > "$rmc_ov_log" 2>&1; then
                 for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
                               RESTORED.AMP RESTORED.PHA; do
@@ -1968,7 +1968,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
             if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                     phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                     maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
-                    outfile="$rmc_combo" threshold=0.01 niter=200 gain=0.1 \
+                    outfile="$rmc_combo" abs_flux_floor=0.01 niter=200 gain=0.1 \
                     tile_auto=n tile_ra=3 tile_dec=5 io_read_threads=3 \
                     io_write_threads=3 io_overlap=y \
                     > "$rmc_combo_log" 2>&1; then
@@ -2022,12 +2022,12 @@ PYEOF
         if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                 phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                 maskfile="$rmc_varied_mask" outfile="$rmc_cache_big" \
-                threshold=0.01 niter=200 gain=0.1 mask_pattern_cache_max=4096 \
+                abs_flux_floor=0.01 niter=200 gain=0.1 mask_pattern_cache_max=4096 \
                 > "$OUT_DIR/rmc_cache_big.log" 2>&1 && \
            bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
                 phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                 maskfile="$rmc_varied_mask" outfile="$rmc_cache_zero" \
-                threshold=0.01 niter=200 gain=0.1 mask_pattern_cache_max=0 \
+                abs_flux_floor=0.01 niter=200 gain=0.1 mask_pattern_cache_max=0 \
                 > "$OUT_DIR/rmc_cache_zero.log" 2>&1; then
             cache_ok=1
             for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
@@ -2146,13 +2146,13 @@ fi
 #     Reuses section 29's own rmc_lsqref_amp/PHA/MASK cube trio -- a real
 #     dirty cube with known BUNIT, no need to rebuild one here.
 # ---------------------------------------------------------------------------
-section "31. rmclean_cubes: threshold units (Jy/mJy/uJy) + threshold_snr auto noise floor"
+section "31. rmclean_cubes: abs_flux_floor units (Jy/mJy/uJy) + auto_nsigma (T8)"
 
 if [[ -s "$rmc_lsqref_amp" ]]; then
     rmc_pha="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS"
     rmc_mask="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS"
 
-    # --- Unit conversion: threshold=10mJy must resolve to the same
+    # --- Unit conversion: abs_flux_floor=10mJy must resolve to the same
     # native-unit value as a hand-computed conversion from the cube's own
     # BUNIT, not just "some number" -- verified against the actual header,
     # not a hardcoded assumption about what BUNIT is. ---
@@ -2169,83 +2169,89 @@ print(s[1:] if s.startswith('0.') else s)
     rmc_unit_log="$OUT_DIR/rmc_thresh_unit.log"
     rm -f "${rmc_unit_out}".*.RMCUBE.FITS
     if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
-            maskfile="$rmc_mask" outfile="$rmc_unit_out" threshold=10mJy \
+            maskfile="$rmc_mask" outfile="$rmc_unit_out" abs_flux_floor=10mJy \
             niter=200 gain=0.1 > "$rmc_unit_log" 2>&1; then
         if grep -qF -- "-> $rmc_expected_mjy (native AMP-cube units" "$rmc_unit_log"; then
-            pass "rmclean_cubes: threshold=10mJy converts to the expected native-unit value ($rmc_expected_mjy)"
+            pass "rmclean_cubes: abs_flux_floor=10mJy converts to the expected native-unit value ($rmc_expected_mjy)"
         else
-            fail "rmclean_cubes: threshold=10mJy did not convert to the expected native-unit value $rmc_expected_mjy (see $rmc_unit_log)"
+            fail "rmclean_cubes: abs_flux_floor=10mJy did not convert to the expected native-unit value $rmc_expected_mjy (see $rmc_unit_log)"
         fi
     else
-        fail "rmclean_cubes: threshold=10mJy run failed (see $rmc_unit_log)"
+        fail "rmclean_cubes: abs_flux_floor=10mJy run failed (see $rmc_unit_log)"
     fi
 
-    # --- threshold_snr: auto noise-floor estimation runs to completion
-    # and is reproducible (same noise_seed -> bit-identical derived
-    # threshold across two separate runs). ---
+    # --- auto_nsigma: runs to completion; per-pixel RM-tail sigma has no
+    # randomness at all (unlike the old whole-cube noise_seed pre-scan),
+    # so two identical runs must be BIT-IDENTICAL, not just "same printed
+    # threshold". ---
     rmc_snr_out1="$OUT_DIR/rmc_thresh_snr1"
     rmc_snr_out2="$OUT_DIR/rmc_thresh_snr2"
     rmc_snr_log1="$OUT_DIR/rmc_thresh_snr1.log"
     rmc_snr_log2="$OUT_DIR/rmc_thresh_snr2.log"
     rm -f "${rmc_snr_out1}".*.RMCUBE.FITS "${rmc_snr_out2}".*.RMCUBE.FITS
     if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
-            maskfile="$rmc_mask" outfile="$rmc_snr_out1" threshold_snr=5.0 \
+            maskfile="$rmc_mask" outfile="$rmc_snr_out1" auto_nsigma=5.0 \
             niter=200 gain=0.1 > "$rmc_snr_log1" 2>&1 && \
        bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
-            maskfile="$rmc_mask" outfile="$rmc_snr_out2" threshold_snr=5.0 \
+            maskfile="$rmc_mask" outfile="$rmc_snr_out2" auto_nsigma=5.0 \
             niter=200 gain=0.1 > "$rmc_snr_log2" 2>&1; then
         if [[ -s "${rmc_snr_out1}.RESTORED.AMP.RMCUBE.FITS" ]] && \
-           grep -q "threshold_snr: auto noise floor" "$rmc_snr_log1"; then
-            pass "rmclean_cubes: threshold_snr auto noise-floor mode ran to completion"
+           grep -q "auto_nsigma: enabled, multiplier=5" "$rmc_snr_log1"; then
+            pass "rmclean_cubes: auto_nsigma mode ran to completion"
         else
-            fail "rmclean_cubes: threshold_snr run did not produce expected output/log (see $rmc_snr_log1)"
+            fail "rmclean_cubes: auto_nsigma run did not produce expected output/log (see $rmc_snr_log1)"
         fi
-        snr_thresh1=$(grep -oP '(?<=-> threshold = )[0-9.]+' "$rmc_snr_log1")
-        snr_thresh2=$(grep -oP '(?<=-> threshold = )[0-9.]+' "$rmc_snr_log2")
-        if [[ -n "$snr_thresh1" && "$snr_thresh1" == "$snr_thresh2" ]]; then
-            pass "rmclean_cubes: threshold_snr auto noise floor is reproducible (same noise_seed -> same threshold, $snr_thresh1)"
+        if cmp -s "${rmc_snr_out1}.RESTORED.AMP.RMCUBE.FITS" \
+                  "${rmc_snr_out2}.RESTORED.AMP.RMCUBE.FITS"; then
+            pass "rmclean_cubes: auto_nsigma is deterministic (bit-identical across two runs -- no whole-cube noise_seed pre-scan anymore, per-pixel tail sigma has no randomness)"
         else
-            fail "rmclean_cubes: threshold_snr not reproducible across identical runs ('$snr_thresh1' vs '$snr_thresh2')"
+            fail "rmclean_cubes: auto_nsigma runs were not bit-identical"
         fi
     else
-        fail "rmclean_cubes: threshold_snr run(s) failed (see $rmc_snr_log1 / $rmc_snr_log2)"
+        fail "rmclean_cubes: auto_nsigma run(s) failed (see $rmc_snr_log1 / $rmc_snr_log2)"
     fi
 
-    # --- Safety: mutually exclusive, and at least one required ---
+    # --- abs_flux_floor= and auto_nsigma= MAY now be combined (a real
+    # design change from the old mutually-exclusive threshold=/
+    # threshold_snr= pair -- whichever fires first wins per pixel). ---
     rmc_both_log="$OUT_DIR/rmc_thresh_both.log"
+    rmc_both_out="$OUT_DIR/rmc_thresh_both"
+    rm -f "${rmc_both_out}".*.RMCUBE.FITS
     if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
-            maskfile="$rmc_mask" outfile="$OUT_DIR/rmc_thresh_both" \
-            threshold=0.01 threshold_snr=5.0 > "$rmc_both_log" 2>&1; then
-        fail "rmclean_cubes: threshold= and threshold_snr= together should have been refused, but succeeded"
-    elif grep -q "specify exactly one of threshold= or threshold_snr=" "$rmc_both_log"; then
-        pass "rmclean_cubes: threshold= and threshold_snr= together is refused"
+            maskfile="$rmc_mask" outfile="$rmc_both_out" \
+            abs_flux_floor=0.01 auto_nsigma=5.0 niter=200 gain=0.1 \
+            > "$rmc_both_log" 2>&1; then
+        pass "rmclean_cubes: abs_flux_floor= and auto_nsigma= together now succeeds (combinable, not mutually exclusive)"
     else
-        fail "rmclean_cubes: threshold=+threshold_snr= rejection had the wrong message (see $rmc_both_log)"
+        fail "rmclean_cubes: abs_flux_floor=+auto_nsigma= together unexpectedly failed (see $rmc_both_log)"
     fi
 
+    # --- Neither given is also now explicitly VALID (niter-only), with
+    # an informational NOTE rather than a refusal. ---
     rmc_neither_log="$OUT_DIR/rmc_thresh_neither.log"
+    rmc_neither_out="$OUT_DIR/rmc_thresh_neither"
+    rm -f "${rmc_neither_out}".*.RMCUBE.FITS
     if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
-            maskfile="$rmc_mask" outfile="$OUT_DIR/rmc_thresh_neither" \
-            > "$rmc_neither_log" 2>&1; then
-        fail "rmclean_cubes: omitting both threshold= and threshold_snr= should have been refused, but succeeded"
-    elif grep -q "threshold= or threshold_snr= is required" "$rmc_neither_log"; then
-        pass "rmclean_cubes: omitting both threshold= and threshold_snr= is refused"
+            maskfile="$rmc_mask" outfile="$rmc_neither_out" \
+            niter=200 gain=0.1 > "$rmc_neither_log" 2>&1 && \
+       grep -q "NOTE: neither abs_flux_floor= nor auto_nsigma=" "$rmc_neither_log"; then
+        pass "rmclean_cubes: omitting both abs_flux_floor= and auto_nsigma= is valid (niter-only), with the expected NOTE"
     else
-        fail "rmclean_cubes: missing-threshold rejection had the wrong message (see $rmc_neither_log)"
+        fail "rmclean_cubes: niter-only run failed or was missing the expected NOTE (see $rmc_neither_log)"
     fi
 
     rmc_badunit_log="$OUT_DIR/rmc_thresh_badunit.log"
     if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$rmc_pha" \
             maskfile="$rmc_mask" outfile="$OUT_DIR/rmc_thresh_badunit" \
-            threshold=10Foo > "$rmc_badunit_log" 2>&1; then
-        fail "rmclean_cubes: threshold=10Foo (unrecognised unit) should have been refused, but succeeded"
-    elif grep -q "threshold must be a number" "$rmc_badunit_log"; then
-        pass "rmclean_cubes: unrecognised threshold unit is refused"
+            abs_flux_floor=10Foo > "$rmc_badunit_log" 2>&1; then
+        fail "rmclean_cubes: abs_flux_floor=10Foo (unrecognised unit) should have been refused, but succeeded"
+    elif grep -q "abs_flux_floor must be a number" "$rmc_badunit_log"; then
+        pass "rmclean_cubes: unrecognised abs_flux_floor unit is refused"
     else
         fail "rmclean_cubes: bad-unit rejection had the wrong message (see $rmc_badunit_log)"
     fi
 else
-    fail "rmclean_cubes: threshold-unit tests skipped, section 29's own rmc_lsqref_amp cube is missing"
+    fail "rmclean_cubes: abs_flux_floor-unit tests skipped, section 29's own rmc_lsqref_amp cube is missing"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2442,6 +2448,38 @@ if [[ -x bin/match_cubes ]]; then
     fi
 else
     skip "bin/match_cubes not built; skipping io_overlap bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 37. RM-CLEAN clean_complex stop-reason (stopped_by_threshold) +
+#     per-iteration trace outputs (planning/RMCLEAN_INTEGRATION_PLAN.md,
+#     T6-adjacent convergence diagnostic)
+# ---------------------------------------------------------------------------
+section "37. RM-CLEAN clean_complex stop-reason + iteration trace"
+
+stopreason_bin="$RMCLEAN_BUILD_DIR/test_rmclean_stop_reason"
+stopreason_log="$OUT_DIR/test_rmclean_stop_reason.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_rmclean_stop_reason.f90" "$rmclean_o" \
+            -o "$stopreason_bin" -lfftw3 2>"$OUT_DIR/rmclean_stopreason_build.log"; then
+        if "$stopreason_bin" > "$stopreason_log" 2>&1; then
+            while IFS= read -r line; do
+                case "$line" in
+                    *"[PASS]"*) pass "${line#*\[PASS\] }" ;;
+                    *"[FAIL]"*) fail "${line#*\[FAIL\] }" ;;
+                esac
+            done < "$stopreason_log"
+        else
+            fail "RM-CLEAN stop-reason: program exited non-zero (see $stopreason_log)"
+        fi
+    else
+        fail "RM-CLEAN stop-reason: build failed (see $OUT_DIR/rmclean_stopreason_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN stop-reason test"
 fi
 
 # ---------------------------------------------------------------------------
