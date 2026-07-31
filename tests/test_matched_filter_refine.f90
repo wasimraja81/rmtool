@@ -138,8 +138,10 @@ contains
       call run_one_case(point_rm, point_amp, chi0_true, drm_os2_in, all_pass_io)
       write(*,'(A)') '--- dRM = fwhm/4 [resolution-only -- old get_drm gate would REFUSE] ---'
       call run_one_case(point_rm, point_amp, chi0_true, fwhm_rm_in/4.0_sp, all_pass_io)
-      write(*,'(A)') '--- dRM = fwhm/2 [bare 2 samples/fwhm, coarsest sane resolution sampling] ---'
-      call run_one_case(point_rm, point_amp, chi0_true, fwhm_rm_in/2.0_sp, all_pass_io)
+      write(*,'(A)') '--- dRM = fwhm/3 [3 samples/fwhm, coarsest resolution sampling still'//&
+      &' accurate -- see run_tier_mechanics''s own comment for why 2 samples/fwhm is'//&
+      &' excluded] ---'
+      call run_one_case(point_rm, point_amp, chi0_true, fwhm_rm_in/3.0_sp, all_pass_io)
    end subroutine run_all_cases
 
    subroutine run_one_case(point_rm, point_amp, chi0_true, drm, all_pass_io)
@@ -222,8 +224,26 @@ contains
       !! fixed-location single-component fit (accepted, no search); two
       !! blended components CANNOT be (the leftover misfit is real model
       !! error, far above the claimed noise), so the escalation must
-      !! fire. Coarse resolution-only grid (fwhm/2), the tier's own
+      !! fire. Coarse resolution-only grid (fwhm/3), the tier's own
       !! hardest working regime.
+      !!
+      !! Why fwhm/3, not fwhm/2 (bug-fix follow-up, found once
+      !! compute_rmsf_fwhm's own erroneous extra 0.5 factor was removed
+      !! -- see that subroutine's own comment): at the TRUE fwhm/2 (2
+      !! samples/fwhm), even a perfectly clean, noiseless single
+      !! component has a fast-path fit residual of ~0.008 (pure parabola-
+      !! location interpolation error at that coarse a grid, confirmed
+      !! directly by instrumenting refine_peak_matched_filter's own
+      !! leftover/threshold values) -- 2.7x this test's claimed
+      !! noise_floor=0.001 threshold, so escalation fires even with no
+      !! noise or model error at all, and the "clean single component:
+      !! fast path ACCEPTED" assertion cannot hold there. At fwhm/3 the
+      !! same residual drops to ~0.002, safely under threshold, while
+      !! the blended-components case still escalates unambiguously
+      !! (residual ~0.28, two orders of magnitude above threshold either
+      !! way) -- fwhm/2 was only ever passing before this fix because
+      !! compute_rmsf_fwhm's own bug made "fwhm/2" actually mean
+      !! ~4 samples/fwhm, not the 2 its own label claimed.
       real(sp), intent(in) :: fwhm_rm_in
       logical, intent(inout) :: all_pass_io
 
@@ -236,7 +256,7 @@ contains
       real(sp) :: peak_loc_new, re_new, im_new
       logical :: used_search
 
-      drm = fwhm_rm_in/2.0_sp
+      drm = fwhm_rm_in/3.0_sp
       nrm_l = nint(rm_span/drm) + 1
       allocate(rm(nrm_l), dirty_re(nrm_l), dirty_im(nrm_l))
       do j = 1, nrm_l

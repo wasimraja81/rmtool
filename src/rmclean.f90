@@ -926,17 +926,45 @@ contains
    subroutine compute_rmsf_fwhm(l_sq, nchan, fwhm_rm)
       !! Theoretical restoring-beam FWHM in RM, from the lambda-squared
       !! span (edge channels extended by half a channel each, matching
-      !! the original rm_restore.f's own edge-handling exactly). Kept as
-      !! pi/lsq_span (planning/RMCLEAN_INTEGRATION_PLAN.md decision 8 --
+      !! the original rm_restore.f's own edge-handling exactly). pi/
+      !! lsq_span (planning/RMCLEAN_INTEGRATION_PLAN.md decision 8 --
       !! the user's deliberate choice, not the Brentjens & de Bruyn
-      !! (2005) eq. 61 constant 2*sqrt(3)/lsq_span; not revisited here).
-      !! Uses this module's own c_velocity (299.792458, matching
-      !! rm_synthesis_mod.f90's exactly) rather than the original code's
-      !! rounded "300.0" -- a real precision improvement, not just a
-      !! style change, since L_sq itself is built with the precise
-      !! constant elsewhere in this project.
+      !! (2005) eq. 61 constant 2*sqrt(3)/lsq_span; not revisited here --
+      !! pi and 2*sqrt(3) are close enough that this was never really the
+      !! question). Uses this module's own c_velocity (299.792458,
+      !! matching rm_synthesis_mod.f90's exactly) rather than the
+      !! original code's rounded "300.0" -- a real precision improvement,
+      !! not just a style change, since L_sq itself is built with the
+      !! precise constant elsewhere in this project.
       !!
-      !! Bug fixed vs. the original rm_restore.f (caught by
+      !! Bug fixed (found by the user cross-checking a real ASKAP low-
+      !! band restoring-beam value against the ~50 rad/m^2 expected from
+      !! the RMSF, not by inspection): this used to compute 0.5*pi/
+      !! lsq_span, an extra halving with no basis in this project's own
+      !! documented pi/lsq_span intent above, nor in the original
+      !! rm_restore.f's own definition of its FWHM_RM argument ("~fac/
+      !! Lsq_span... fac is pi for RM and Lambda^2 kind of extraction",
+      !! rm_restore.f's own top-of-file comment) -- the 0.5 belonged only
+      !! inside THAT file's own separate sigma computation
+      !! (sigma=0.5*(0.42466*FWHM_RM)), never in FWHM_RM itself. This
+      !! project's own restore_clean applies the standard, un-doubled
+      !! 0.42466 FWHM->sigma conversion to whatever this function
+      !! returns, so the extra 0.5 here silently halved the actual
+      !! restoring beam (and, via the same value, Gate 0's resolution
+      !! criterion and the logged "Restoring beam FWHM") to half the true
+      !! RMSF resolution. Confirmed via full-codebase search that nothing
+      !! else compensates for this: fwhm_rm/compute_rmsf_fwhm(_multiband)
+      !! are referenced nowhere outside rmclean.f90/rmclean_cubes.f90
+      !! (rm_synthesis.f90/rm_synthesis_mod.f90 have zero occurrences of
+      !! "fwhm" at all), and CLEAN's own component-finding
+      !! (clean_complex, against compute_dirty_rmbeam's exact dirty RMSF)
+      !! and grid-spacing (get_drm, a different bound entirely) never use
+      !! this value -- only restore_clean's sigma, Gate 0's
+      !! drm_required, and the informational log line do, so this was a
+      !! pure restoring-beam-width/reporting bug, never a CLEAN-model
+      !! bug.
+      !!
+      !! Separately, bug fixed vs. the original rm_restore.f (caught by
       !! tests/thesis_scenario_rmclean.f90, not by inspection): the
       !! original's own f1=c/sqrt(L_sq(nchan))/f2=c/sqrt(L_sq(1))
       !! indexing assumes a SPECIFIC l_sq ordering convention (l_sq(1)
@@ -958,7 +986,7 @@ contains
       real(sp), intent(out) :: fwhm_rm
       real(dp), parameter :: pi = 3.14159265358979_dp
 
-      fwhm_rm = real(0.5_dp*pi/padded_lsq_span(l_sq, nchan), sp)
+      fwhm_rm = real(pi/padded_lsq_span(l_sq, nchan), sp)
    end subroutine compute_rmsf_fwhm
 
    subroutine compute_rmsf_fwhm_multiband(l_sq, nchan, band_offset, band_nz,&
@@ -1000,7 +1028,10 @@ contains
          i1 = band_offset(k) + band_nz(k)
          span_sum = span_sum + padded_lsq_span(l_sq(i0:i1), band_nz(k))
       end do
-      fwhm_rm = real(0.5_dp*pi/span_sum, sp)
+      ! pi/span_sum, not 0.5*pi/span_sum -- see compute_rmsf_fwhm's own
+      ! comment for the full story on the erroneous extra 0.5 this used
+      ! to carry (same bug, same fix, same rationale).
+      fwhm_rm = real(pi/span_sum, sp)
    end subroutine compute_rmsf_fwhm_multiband
 
    function padded_lsq_span(l_sq, nchan) result(lsq_span)

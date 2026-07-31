@@ -125,6 +125,27 @@ the shelved "single" variant driver and one dated backup file).
 8. **Restoring-beam FWHM constant: keep `π` (not `2√3`)** — the user's
    deliberate, confirmed choice, not something to "fix" toward the
    Brentjens & de Bruyn (2005) eq. 61 constant.
+   **UPDATE (found via the user cross-checking a real ASKAP low-band
+   restoring-beam value against the RMSF's own expected ~50 rad/m²):**
+   the implementation had silently drifted from this decision —
+   `compute_rmsf_fwhm`/`compute_rmsf_fwhm_multiband` computed
+   `0.5*pi/lsq_span`, not `pi/lsq_span`, an erroneous extra factor of
+   0.5 with no basis in this decision or in the original `rm_restore.f`'s
+   own definition of its `FWHM_RM` argument. Fixed to plain
+   `pi/lsq_span`. Confirmed via full-codebase search that nothing
+   compensates for the old factor elsewhere (`rm_synthesis.f90`/
+   `rm_synthesis_mod.f90` have zero references to "fwhm" at all; CLEAN's
+   own component-finding runs against the exact dirty RMSF, never this
+   approximate value) — the fix's effect is confined to `restore_clean`'s
+   restoring-beam width (now 2x wider, matching the true theoretical
+   resolution), Gate 0's `drm_required` criterion (now correctly
+   permissive), and the logged "Restoring beam FWHM" value. Follow-up:
+   `tests/test_matched_filter_refine.f90`'s own coarsest resolution tier
+   moved from `fwhm/2` to `fwhm/3` (2 real samples/fwhm turns out to
+   exceed the fast path's reliable margin even for a noiseless single
+   component — a real, previously-unexercised property of the tiered
+   design, not a new bug; see that test's own `run_tier_mechanics`
+   comment for the measured residual/threshold numbers).
 9. **RM-dependent-RMSF optimization (pre-BW-depol): an offset-table keyed
    on `Δ=φ−φ_peak`, built once per dataset, interpolated into at each
    CLEAN iteration instead of recomputing the full `O(N_chan)` sum every
@@ -874,6 +895,68 @@ argued from theory alone:
    (grid cost via `suggest_drm`) decoupled from achievable chi0
    precision.
 
+**UPDATE (2026-07-31) — the "once `comp_rm_refined`/`derotate_to_lsq_ref`
+are used correctly" precondition above was NOT actually satisfied in
+`rmclean_cubes.f90`, found live in the Jennifer v2 verification run.**
+`clean_complex` computes `comp_rm_refined_p` (a required output) and
+`rmclean_cubes.f90` received it into a local variable — but never read
+it again. The program's own three `derotate_to_lsq_ref` calls (compute
+frame -> report frame, guarded by `lsq_ref_report.ne.lsq_ref_compute`)
+all used `rm_samp` uniformly, including for `comp_re_p`/`comp_im_p` --
+silently reintroducing the exact ~dRM/2-scale location error
+`comp_rm_refined` was built to eliminate, for every run where
+`lsq_ref_compute` genuinely differs from `lsq_ref_report`. This was
+dormant under the OLD default (`lsq_ref_compute_mode=native`, which for
+most cubes made `lsq_ref_compute` equal `lsq_ref_report`'s own default
+of `0`, so `ref_diff=0` and the choice of location array never
+mattered) -- it went live the moment this session switched the default
+to `mid` (decision 8's own UPDATE above), since `mid` deliberately picks
+a nonzero `lsq_ref_compute`.
+
+Found while investigating a user question about the Jennifer v2 run's
+own flux normalization (comparing CLEAN/RESTORED amplitude against the
+dirty cube): attempting to numerically verify the exact `dirty =
+[comp(*)RMSF_dirty] + resid` identity (provable by induction on
+`clean_complex`'s own subtraction loop) from the OUTPUT cubes alone kept
+failing by a large margin. Root cause traced directly to this gap --
+reconvolving `comp_re`/`comp_im` using `rm_samp(imax)` as each
+component's location (the same imprecise convention the derotation call
+itself used) breaks the delicate near-total cancellation this pixel's
+12 overlapping components require to reproduce the (heavily
+depolarized) dirty amplitude, since the RMSF is oscillatory enough that
+even sub-grid-cell location error matters when many large terms need to
+cancel to a small net value.
+
+**Fix**: `rmclean_cubes.f90`'s `derotate_to_lsq_ref` call for
+`comp_re_p`/`comp_im_p` now passes `comp_rm_refined_p` as the location
+array instead of `rm_samp` -- exactly the pattern
+`tests/test_rmclean_lsqref_flex.f90` already validated at the
+`rmclean_mod` library level (`ipeak`/`rm_found = comp_rm_refined(ipeak)`),
+just never connected into the production pipeline. `resid_re_p`/
+`resid_im_p` and `restored_re_p`/`restored_im_p` correctly keep
+`rm_samp` -- both are genuine regular-grid functions (the beam is
+evaluated AT `rm_samp(j)` for the residual; `restore_clean`'s own FFT
+convolution produces a value that genuinely lives AT `rm_samp(j)` after
+smoothing), unlike the raw component map, whose per-bin flux is
+FLUX-WEIGHTED-AVERAGE-located, not grid-centred.
+
+**Verified**: full regression suite still 109/109 (this branch was
+previously untested at nonzero `ref_diff` with a tolerance tight enough
+to catch it). Direct before/after comparison on section 29's own
+`lsq_ref_mode=mid` test cube (rebuilding pre-fix and post-fix binaries,
+running both against the identical input cubes): `CLEAN.PHA` changes by
+a real amount (max `0.111` rad, mean `0.0097` rad over 701 nonzero
+bins), `CLEAN.AMP` is bit-identical to float32 epsilon (`5.96e-8` --
+confirms a pure phase correction, no amplitude side effect), and
+`RESTORED.PHA` is EXACTLY unchanged (`0.0` -- confirms the fix is
+correctly scoped to `comp_re_p`/`comp_im_p` only, as intended). Not yet
+re-run against the full Jennifer dataset (multi-hour real-data job) --
+the fix's correctness is established at the mechanism level (matching
+the already-validated library-level test pattern) and confirmed to have
+a real, correctly-scoped, nonzero effect; a full Jennifer re-run would
+only add production-scale confirmation, not new evidence of
+correctness.
+
 **Addendum — `suggest_lsq_ref_compute`: the cheapest safe `lsq_ref`
 choice, and why a plausible-sounding alternative is actually poor.** The
 user asked directly, correctly declining to just accept "band centroid":
@@ -1580,3 +1663,270 @@ suite 93/93 green.
   flagged as a direction not a result. Ground this against the user's
   own thesis derivation, chapter 2.5.1 (see Context above), before
   designing.
+
+### T5 — GPU/CPU hybrid acceleration for RM-CLEAN (exploratory, not started)
+
+**Status: design capture only, nothing scheduled.** Preserved here per
+the user's own explicit request ("write this up in a plan doc... we
+will implement these in a very near-future project") — not a ticket to
+start, and merged into this file rather than kept as a separate
+document once the user pointed out it's a continuation of this same
+integration effort, not a distinct initiative.
+
+**Motivation, measured not assumed.** A moderately-large-scale
+verification run (`cfg/rmclean-jennifer.e2e.cfg`, 4501x4501x101, ~20.26M
+pixels) measured `tile_compute` at 97.7-98.2% of `rmclean_cubes`'s own
+total wall time across two runs (13023s of 13328s total stage time; the
+earlier pre-`lsq_ref_compute=mid` run showed 16739s of 17046s).
+`tile_read`/`tile_write` combined are under 2.3% in both — unambiguously
+compute-bound, not I/O-bound; SSD/NVMe speed has no bearing on it.
+Traced the actual per-iteration cost directly: `refine_peak_matched_
+filter`'s fast path calls `rmsf_point_direct` (`src/rmclean.f90:491-512`)
+up to 3 times per CLEAN iteration for its own closed-form amplitude fit,
+and up to `m_search` (tens to hundreds) more times on escalation. Each
+call is a direct `O(nchan)` sum of `cos`/`sin` over every good channel
+(~286 for the Jennifer band) — transcendental-heavy, not simple
+arithmetic. With `niter` up to 500 and ~20M independent pixels, this is
+both embarrassingly parallel across pixels and individually
+transcendental-heavy within one — a shape GPUs are architecturally
+suited to (raw parallelism plus dedicated special-function-unit
+throughput for `sin`/`cos`), *if* the already-known risk (warp/wavefront
+divergence from variable per-pixel iteration/escalation counts, flagged
+and deferred at decision 6 above) can be managed. The dev machine has a
+real, testable GPU (`nvidia-smi`: NVIDIA GeForce RTX 3050), and this
+project already has a working OMP `target teams distribute parallel do`
+GPU-offload build path (`rm_synthesis_mod.f90`, `GPU_NVFLAGS`/
+`GPU_GNUFLAGS` in the `Makefile`) — reusing that same offload convention
+here, rather than a new GPU programming model, is the natural low-risk
+path if/when this is implemented.
+
+**Explicit design goal: generic, self-calibrating, minimal supervision.**
+A hybrid CPU/GPU dispatch mechanism tuned to one dataset's own S/N
+distribution is not the goal — this tool runs on data from different
+telescopes, bands, and noise regimes, with no expectation a human
+re-tunes it per run. Direct analogy to FFTW's own planner
+(`FFTW_MEASURE`/`FFTW_PATIENT`: benchmark real candidate strategies on
+the actual machine and problem at hand, then commit to the measured
+winner, rather than hardcode a strategy): calibrate from a small, cheap,
+real sample of the actual data at hand, every run, not from a fixed
+rule. This project already has exactly this pattern for a different
+parameter — `threshold_snr` derives the CLEAN stopping flux from "500
+random sightlines," not a hardcoded value — the mechanism below reuses
+that already-validated pattern rather than inventing a new one.
+
+**Idea 1 — per-sightline Faraday-complexity metrics from rm_synthesis.**
+Raw peak S/N (already output as `PEAK.MAP.FITS`/`SNR.MAP.FITS`) is not a
+tight proxy for CLEAN cost: a single bright, isolated, unresolved point
+source can converge as fast as a faint one (iteration count is driven
+more by model complexity than raw amplitude), while a moderate-S/N
+sightline with two close, blended components can escalate on nearly
+every iteration and cost far more. Proposed richer metrics, motivated by
+the same qualitative questions a human would ask when visually judging a
+dirty Faraday spectrum's own complexity: (1) **peak count** — how many
+local maxima exceed a noise-relative threshold (one vs. more than one is
+the coarsest, cheapest signal); (2) **peak width ratio** — is the
+dominant peak's own width close to the theoretical RMSF FWHM
+(`compute_rmsf_fwhm_multiband`, already computed once per run), i.e.
+unresolved/simple, or genuinely wider (resolved/extended, intrinsically
+harder to CLEAN); (3) **peak clustering span** — are significant peaks
+within one contiguous Faraday-depth range, or multiple well-separated
+clusters (the same diagnostic a person uses to judge "one blended
+feature or genuinely separate RM components far apart"). All three are
+computable directly from the dirty spectrum `rm_synthesis` already
+builds per pixel, at negligible incremental cost alongside the existing
+`PEAK.MAP`/`SNR.MAP`/`RM_PEAK.MAP`/`ANG_PEAK.MAP` outputs — candidate new
+maps `NPEAKS.MAP.FITS`/`PEAKWIDTH.MAP.FITS`/`PEAKSPAN.MAP.FITS`, read by
+`rmclean_cubes` the same way it already reads `MASK.CUBE.FITS`.
+
+**Idea 2 — self-calibrating CPU/GPU dispatch.** A calibration pass, run
+once per `rmclean_cubes` invocation before the main tile loop: (1) sample
+N random pixels (matching `threshold_snr`'s own convention) from real,
+unmasked sightlines; (2) run each through the existing, unchanged CPU
+`clean_complex` path, recording its complexity metric(s) (Idea 1, or S/N
+as a fallback) alongside its actual `n_iter_used` and escalation count
+(both cheap — `n_iter_used` is already a `clean_complex` output); (3)
+bucket the sample by complexity metric and measure the *within-bucket
+variance* of iteration/escalation count — this, not correlation with the
+metric itself, is the real criterion, since divergence only costs GPU
+throughput when a dispatched batch has high internal variance,
+regardless of whether the metric predicts absolute cost well; (4) if a
+stratification exists where some buckets are meaningfully more
+homogeneous than others, assign homogeneous buckets to GPU and
+heterogeneous ones to CPU, sized against *measured* relative throughput,
+not pixel count alone; (5) if no useful stratification is found (flat
+complexity, no GPU available, or too small a sample to distinguish
+buckets confidently), fall back to CPU-only automatically — no human
+decides whether hybrid dispatch is worthwhile for a given dataset, the
+calibration pass decides, every run, from that run's own real data.
+Architecturally: preserve the existing contiguous spatial-tile I/O
+structure (`tile_ra`/`tile_dec`) rather than gathering/scattering pixels
+by classification across the whole image — within each tile, split into
+a GPU sub-batch and CPU sub-batch by the calibrated criterion, and
+dispatch both concurrently (CPU threads work the tile's own hard pixels
+while the GPU works its easy ones at the same time), no rewrite of the
+existing tile-based buffer/I/O machinery.
+
+**Idea 3 — RM-faceting (genuinely unexplored territory).** The user's
+own excitement here is deliberate: if this works, it's a real
+algorithmic contribution to RM-CLEAN, not merely an engineering speedup.
+Analogy from wide-field radio synthesis imaging: CLEAN is made tractable
+(and parallel) by faceting the sky plane into smaller regions and
+deconvolving each mostly independently, but for high-dynamic-range
+imaging this isn't fully independent — sources *outside* a facet's own
+nominal footprint still contaminate it through the dirty beam's own
+sidelobes extending past the facet boundary, so accurate deconvolution
+needs *joint* correction across facets. Proposed analogy: facet the
+**Faraday depth axis** (not the sky axis) for a single sightline — a
+facet is a region of Faraday-depth space where real signal exists,
+identified via Idea 1's own peak-clustering diagnostic; a sightline with
+multiple well-separated peaks could have its own RM range split into
+facets, each CLEANed more independently/in parallel, a natural
+additional axis of parallelism and plausibly a very GPU-friendly shape
+for the case Idea 1 flags as "simple, isolated."
+
+**Joint correction is full-range, not nearest-neighbor — corrected after
+review.** An earlier draft argued the 1-D topology of Faraday-depth
+facets (each with only two immediate neighbors, unlike an 8-connected
+2-D sky grid) made the joint-correction bookkeeping simpler than the
+imaging case. That conflated topological adjacency with the actual
+physical reach of the effect, and is wrong: `rmsf_point_direct`'s own
+R(delta) is a sum of `cos`/`sin` terms across every channel — structurally
+a sinc-like kernel (Brentjens & de Bruyn's own RMSF shape), and sinc-like
+kernels decay as roughly `1/delta`, not exponentially. A power-law decay
+means a bright enough component's own sidelobe stays non-negligible far
+from its own facet, exactly the same character imaging PSF sidelobes
+have — precisely why wide-field imaging cannot get away with correcting
+only adjacent facets either. The correct picture: a facet's own found
+components must be predicted and subtracted against the *whole*
+Faraday-depth range, not just its immediate neighbors — the same
+major-cycle structure wide-field imaging already uses (predict the full
+current model, subtract from the full data, re-facet, repeat), not a
+cheaper local patch-up. What genuinely does still favour RM-CLEAN over
+the imaging case: the RMSF used here (today, pre-bandwidth-depolarization
+— see caveat below) is exact and closed-form, a direct function of the
+channels' own `l_sq` values, not an empirically-characterized,
+direction-dependent PSF the way imaging often has to deal with — so
+whatever the joint correction has to do, full-range or not, can be
+computed precisely rather than approximated. That is the real structural
+advantage over the imaging analogy; the 1-D neighbor count is not.
+
+**Caveat: this section assumes a shift-invariant RMSF, which stops being
+true once bandwidth-depolarization lands (T-future above, decision 3/9).**
+Without BW-depol, per-channel weights `w_k` are RM-independent, so
+`R(φ;φ₀) = (1/K)Σ w_k·exp(−2i(φ−φ₀)λ²ₖ)` is, as an algebraic identity, a
+pure function of the offset `Δ=φ−φ₀` alone (shift-invariant, for any
+`λ²` sampling — exactly why `rmsf_point_direct` takes only `delta`, never
+an absolute Faraday depth, as its shape argument). With BW-depol on,
+`w_k` becomes genuinely `φ₀`-dependent per channel, not just a scalar
+factor, and shift-invariance breaks for real. T-future's own point 9
+already anticipated this for a *different* optimization (the pre-BW-depol
+offset-table inside `compute_dirty_rmbeam`) and deliberately confined it
+behind `compute_dirty_rmbeam`'s own general `(φ_grid, RM_in, phase_in) →
+beam array` interface specifically so it could be swapped out later
+without touching `rm_clean`'s own code, rather than hard-coding
+shift-invariance into the CLEAN loop itself. RM-faceting's own
+joint-correction step must follow the same discipline: today it can use
+a single, fixed R(Δ) kernel valid everywhere in Faraday-depth space; once
+BW-depol lands, the correction kernel would need to become genuinely
+RM-dependent (per T-future's own note, likely a full `(φ_peak, Δ)` 2D
+table or a separable moment-expansion of `bw_depol_correct.f`'s own
+Taylor structure — unworked, a direction not a result). BW-depol is also
+expected to make the per-evaluation RMSF cost itself more expensive than
+today's simple `O(nchan)` sum, which would shift the compute profile
+Idea 2's own calibration pass is measuring — today's profiling is a
+snapshot of the pre-BW-depol state, not necessarily representative once
+BW-depol lands. Design implication: keep RM-faceting's own
+joint-correction logic behind a similarly swappable beam-evaluation
+interface, not hard-coded against shift-invariance, so it does not need
+a full redesign when BW-depol arrives.
+
+This connects back to Idea 1 directly: sightlines classified as "one
+contiguous cluster" have nothing to facet (no benefit, added complexity
+for free); sightlines with multiple well-separated clusters are the
+natural candidates where RM-faceting — if it works — could pay off.
+Explicitly flagged as unexplored: not attempted in this project, and not
+known to the user to have been explored in the RM-CLEAN literature
+generally. If it works, this is a genuine algorithmic contribution worth
+its own validation and write-up, independent of whatever it happens to
+also do for GPU dispatch.
+
+**How the three ideas relate.** Idea 1 (complexity metrics) is the
+measurement layer — it doesn't by itself change how CLEAN runs, only
+what's known about each sightline going in. Idea 2 (self-calibrating
+dispatch) is the near-term payoff — usable as soon as Idea 1's metrics
+(or even just existing S/N) exist, no algorithmic change to CLEAN
+itself, only where each pixel's own unmodified CLEAN loop executes. Idea
+3 (RM-faceting) is the longer-term, higher-risk research direction — a
+genuine algorithmic change to CLEAN, motivated by and targeted using
+Idea 1's own clustering diagnostic, needing real numerical validation
+(does joint cross-facet correction actually recover the same answer as
+unfaceted CLEAN?) before it could be trusted on real data.
+
+**Explicitly out of scope for now:** no implementation of any of the
+above in this session or the immediately following one; no GPU kernel
+code, no new `rm_synthesis` output maps, no dispatch logic; no real
+`n_iter_used`-vs-complexity-metric data pulled from an actual run
+(deferred at the user's own explicit request, to avoid anchoring the
+generic design on one dataset's own characteristics before the mechanism
+itself is designed to be dataset-agnostic).
+
+### T6 -- validation.f90: a flexible cube-slice statistics tool (not started)
+
+**Status:** planning capture only, per the user's own explicit request --
+"I will start that work in a new session." No code written.
+
+**Motivation.** Verifying the Jennifer v2 run's correctness (the
+`comp_rm_refined`/derotation fix above) relied on ad hoc, one-off Python
+(astropy + numpy, reading FITS slices directly) to measure things like
+"RMS of AMP in the RM tail (-500 to -360 rad/m^2) across a handful of
+random pixels" -- real, useful checks, but not reusable, not in the
+codebase, and not something a future run's own correctness can be
+quickly re-verified against without re-deriving the same ad hoc script.
+The user wants this promoted to a real, permanent tool.
+
+**Concrete motivating check (the one that triggered this ticket):**
+tail-region (RM far from any real emission) dirty/restored/resid AMP
+RMS for 8 random Jennifer v2 sightlines came out ~13-30 uJy/beam
+(mean ~22-26 uJy/beam across the three cubes), independently confirmed
+by the user to be close to the band-averaged Q/U noise level -- a good
+end-to-end sanity check. The user's own follow-up, not yet checked:
+**the residual should ALSO drop to this same ~26 uJy/beam noise floor
+in the RM channels AT/NEAR the peak emission**, not just far away in
+the tail -- if CLEAN successfully removed the real signal, the
+residual near the source should look like pure noise too, indistin-
+guishable from the tail. This is a genuine "goodness of CLEAN"
+diagnostic (did CLEAN converge, or is the threshold/niter/gain
+combination leaving real, structured signal behind near the peak) that
+today has no automated check anywhere in this project.
+
+**What the tool should do (scope, as discussed, not yet designed in
+detail):**
+- Extract a slice of any RM cube (AMP/PHA, or the underlying RE/IM
+  pair) in flexible ways: an RM-index or RM-value range (e.g. "the
+  15 bins nearest a given RM", or "the tail beyond +/-X rad/m^2 from
+  the sightline's own peak", or an absolute RM range), a spatial
+  region (a box, or a list of specific (x,y) pixels, or N random
+  pixels satisfying some validity criterion like `NVALID.MAP > threshold`),
+  or some combination (e.g. "the residual cube, in a window centred on
+  each sightline's own peak RM, for N random valid pixels").
+- Report standard statistics over that slice: RMS, mean, std, min/max --
+  matching what the ad hoc Python already computed this session, not a
+  novel statistics design.
+- Compare-across-cubes mode: given the same slice definition, report
+  the same statistic for two or more cubes side by side (dirty vs
+  restored vs resid, the exact pattern used this session) -- this is
+  what makes "residual near the peak should match the tail's own noise
+  floor" a single, repeatable command instead of a bespoke script.
+- Likely CLI-driven like every other tool in this project (`bin/validate_cube`
+  or similar; the user's own suggested source file name is
+  `validation.f90`, naming/scope to be finalized when this work actually
+  starts) -- matching `rmclean_cubes`/`rm_synthesis`'s own cfg-or-CLI
+  convention rather than inventing a new interface style.
+
+**Explicitly not designed yet:** exact CLI/cfg schema, exact slice
+syntax, exact output format (human-readable table vs CSV vs a value
+usable in `tests/run_tests.sh` assertions), whether this becomes a true
+regression-test building block (e.g. "assert residual-near-peak RMS is
+within Nx of tail RMS" as an automated pass/fail, not just a printed
+number) -- all open questions for the session that actually picks this
+up.

@@ -32,23 +32,44 @@
 ! lsq_ref_compute -- the reference this program's OWN RMSF table/CLEAN
 ! computation actually uses -- IS a free, independent config choice
 ! (mode+value, mirroring rmclean_mod's own get_lsq_ref_compute exactly),
-! defaulting to 'native' (= lsq_ref_native, no extra work). Choosing a
+! defaulting to 'mid' (matching rmclean_mod's own get_lsq_ref_compute
+! doc comment: "the RECOMMENDED DEFAULT... pick it unless you have a
+! specific reason not to" -- this program's own default previously said
+! 'native' here, a real drift from that recommendation, not a
+! deliberate departure; fixed together with this comment). Choosing a
 ! DIFFERENT value is fully supported: derotate_to_lsq_ref is an exact,
 ! lossless phase rotation of the ALREADY-SAMPLED dirty spectrum (verified
 ! |P|-invariant to 1e-4 relative, tests/test_rmclean_lsqref_flex.f90), so
 ! re-expressing it at any other reference before building the table costs
-! nothing in accuracy. It also costs nothing in COMPUTE beyond one cheap
-! O(nrm) derotation per pixel: once the RM grid (CDELT3/nrm) already
-! exists, build_rmsf_offset_table/clean_complex/restore_clean's own cost
-! depends only on nrm/niter/table_oversample, none of which depend on
-! lsq_ref_compute -- the grid-size WIN a favourable reference buys
-! (get_drm's own bound, minimized by e.g. mode=mid) only applies UPSTREAM,
-! when rm_synthesis itself is deciding what CDELT3 to use (its own
-! lsq_ref_mode option, added alongside this one). So there is no reason
-! to forbid the choice here, only to apply it correctly: build the RMSF
-! table at whatever lsq_ref_compute ends up in force, matching the
-! (possibly-derotated) dirty spectrum exactly (build_rmsf_offset_table's
-! own correctness requirement: R(delta) is only a pure function of offset
+! nothing in accuracy.
+!
+! COMPUTE cost, corrected: build_rmsf_offset_table/clean_complex/
+! restore_clean's own FAST-PATH cost (the common case: refine_peak_
+! matched_filter's fixed-location closed-form fit, no search) depends
+! only on nrm/niter/table_oversample, independent of lsq_ref_compute --
+! matching this comment's own earlier claim, which was correct as far as
+! it went. But refine_peak_matched_filter's ESCALATION path (full
+! search, whenever the fast fit's own leftover misfit exceeds threshold)
+! is NOT independent of lsq_ref_compute: its own m_search/
+! cycles_in_window are set by max_offset=max_k|l_sq(k)-lsq_ref_compute|
+! (src/rmclean.f90's own refine_peak_matched_filter doc comment), the
+! exact same quantity get_drm minimizes at mode=mid -- so a favourable
+! lsq_ref_compute reduces the PER-ESCALATION search cost here too, not
+! only the upstream grid-size choice at rm_synthesis time. Previously
+! documented as "costs nothing in COMPUTE... none of which depend on
+! lsq_ref_compute", which is only true for the fast path, not the
+! escalation search -- corrected here since real (non-synthetic,
+! possibly noisy) data escalates often enough for this to matter, unlike
+! this project's own clean synthetic test scenarios. The grid SIZE
+! (nrm/CDELT3) itself remains fixed by whatever rm_synthesis already
+! wrote (its own lsq_ref_mode option, added alongside this one) --
+! lsq_ref_compute chosen here cannot change that, only the per-pixel
+! escalation cost against it.
+!
+! Apply it correctly regardless of mode: build the RMSF table at
+! whatever lsq_ref_compute ends up in force, matching the (possibly-
+! derotated) dirty spectrum exactly (build_rmsf_offset_table's own
+! correctness requirement: R(delta) is only a pure function of offset
 ! for a FIXED, SHARED reference between the dirty map and its own
 ! matched-filter template -- a mismatch is a real phase distortion, not
 ! just a rotation, per compute_dirty_rmbeam_direct's own doc comment).
@@ -381,7 +402,9 @@ program rmclean_cubes
 
    ! lsq_ref_compute: this program's OWN free choice of reference for the
    ! RMSF table/CLEAN computation (this file's own top comment) --
-   ! 'native' (default) means "use lsq_ref_native, no derotation needed".
+   ! defaults to 'mid' (recommended, minimizes the per-escalation search
+   ! cost); 'native' means "use lsq_ref_native, no derotation needed",
+   ! still available as an explicit opt-out.
    if (trim(lsq_ref_compute_mode).eq.'native') then
       lsq_ref_compute = lsq_ref_native
    else
@@ -634,7 +657,7 @@ contains
       lsq_ref_report_mode_sel = lsq_ref_report_intrinsic
       have_lsq_ref_report_value = .false.
       lsq_ref_report_value = 0.0_sp
-      lsq_ref_compute_mode = 'native'
+      lsq_ref_compute_mode = 'mid'
       have_lsq_ref_compute_value = .false.
       lsq_ref_compute_value = 0.0_sp
       mask_pattern_cache_max = 4096
@@ -1034,12 +1057,14 @@ contains
       write(*,'(A)') 'lsq_ref_report_mode (default intrinsic, i.e.'//&
       &' lsq_ref_report=0.0): where to report the derotated chi0/'//&
       &' restored phase -- a safe, independent post-processing choice.'
-      write(*,'(A)') 'lsq_ref_compute_mode (default native, i.e. whatever'//&
-      &' the cube''s own LSQREF header says): the reference this'//&
-      &' program''s own RMSF table/CLEAN computation uses -- an exact,'//&
-      &' free choice (derotate_to_lsq_ref), see this file''s own top'//&
-      &' comment for why choosing a non-native value costs nothing but'//&
-      &' also saves nothing once the RM grid already exists.'
+      write(*,'(A)') 'lsq_ref_compute_mode (default mid, the recommended'//&
+      &' choice): the reference this program''s own RMSF table/CLEAN'//&
+      &' computation uses -- an exact, free choice (derotate_to_lsq_ref,'//&
+      &' costs nothing in accuracy), and mid minimizes the per-pixel'//&
+      &' escalation search cost (refine_peak_matched_filter''s own'//&
+      &' max_offset-driven m_search) -- see this file''s own top comment'//&
+      &' for the full story, including why this does NOT change the RM'//&
+      &' grid size itself (fixed by whatever rm_synthesis already wrote).'
       write(*,'(A)') 'mask_pattern_cache_max (default 4096): pixels'//&
       &' sharing the same valid-channel mask pattern share one'//&
       &' rmsf_table_t, built once during a serial pre-scan; past this'//&
@@ -2634,8 +2659,27 @@ contains
       &restored_re_p, restored_im_p)
 
       if (lsq_ref_report.ne.lsq_ref_compute) then
-         call derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute,&
+         ! comp_re_p/comp_im_p: each bin's flux was accumulated at its own
+         ! FLUX-WEIGHTED sub-pixel location (comp_rm_refined_p), not
+         ! rm_samp(j) exactly (clean_complex's own comp_rm_refined
+         ! comment) -- derotate_to_lsq_ref's rotation angle is location-
+         ! dependent, so using rm_samp(j) here silently reintroduces the
+         ! same ~dRM/2-scale chi0 error comp_rm_refined was added to
+         ! eliminate (tests/test_rmclean_lsqref_flex.f90's own
+         ! ipeak/rm_found pattern is the reference this mirrors). Confirmed
+         ! this only matters when lsq_ref_compute.ne.lsq_ref_report (this
+         ! branch's own guard) -- moot under the old lsq_ref_compute_mode=
+         ! native default (ref_diff was usually 0), live now that mid is
+         ! the default.
+         call derotate_to_lsq_ref(comp_rm_refined_p, nrm, lsq_ref_compute,&
          &lsq_ref_report, comp_re_p, comp_im_p, comp_re_p, comp_im_p)
+         ! resid_re_p/resid_im_p and restored_re_p/restored_im_p: both are
+         ! genuine regular-grid functions (resid: compute_dirty_rmbeam
+         ! evaluates the beam AT rm_samp(j) exactly for every j; restored:
+         ! restore_clean's own FFT convolution produces a value that
+         ! genuinely lives AT rm_samp(j) after smoothing) -- rm_samp is the
+         ! correct location array for these two, unlike comp_re_p/comp_im_p
+         ! above.
          call derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute,&
          &lsq_ref_report, resid_re_p, resid_im_p, resid_re_p, resid_im_p)
          call derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute,&
