@@ -95,7 +95,6 @@
 !
 ! Usage: rmclean_cubes ampfile=<f> phafile=<f> maskfile=<f> outfile=<base>
 !    [niter=<n>] [gain=<g>] [abs_flux_floor=<v>] [auto_nsigma=<n>]
-!    [tail_exclude_nfwhm=<f>]
 !    [lsq_ref_report_mode=intrinsic|centroid|min|max|mid|fixed]
 !    [lsq_ref_report_value=<v>] [min_samples_per_fwhm=<f>]
 !    [refine_nsigma=<f>] [table_oversample=<n>] [restore_fwhm=<v>]
@@ -150,17 +149,16 @@ program rmclean_cubes
    ! floor, called after read_amp_pha_geometry).
    logical :: have_abs_flux_floor
    real(sp) :: abs_flux_floor, abs_flux_floor_raw_value, abs_flux_floor_unit_scale
-   ! auto_nsigma=<n>: stop when a pixel's own (peak-avg) drops to/below
-   ! n x that SAME pixel's own RM-tail sigma (estimated once per pixel,
-   ! from its own dirty spectrum, by clean_complex/estimate_tail_sigma --
-   ! not a whole-cube pre-scan, and not recomputed per iteration, unlike
-   ! the old threshold_snr's noise_floor + thresh*rms_val combination).
+   ! auto_nsigma=<n>: stop when a pixel's own peak amplitude drops
+   ! to/below n x that SAME pixel's own noise sigma. Sigma is estimated
+   ! once per pixel from its own FULL dirty spectrum's own interquartile
+   ! range (clean_complex/estimate_iqr_sigma, src/rmclean.f90 -- see its
+   ! own comment for why the full spectrum, not a lowest-percentile
+   ! subset, turned out to be the more accurate estimator) -- not a
+   ! whole-cube pre-scan, and not recomputed per iteration, unlike the
+   ! old threshold_snr's noise_floor + thresh*rms_val combination.
    logical :: have_auto_nsigma
    real(sp) :: auto_nsigma_mult
-   ! tail_exclude_nfwhm (default 3.0): half-width, in units of this
-   ! pixel's own RMSF FWHM, excluded around its own dirty-spectrum peak
-   ! before estimating that pixel's RM-tail sigma for auto_nsigma above.
-   real(sp) :: tail_exclude_nfwhm
    real(sp) :: min_samples_per_fwhm, refine_nsigma
    ! trace_ix/trace_iy (default 0, disabled): 1-indexed GLOBAL pixel to
    ! log a full per-iteration CLEAN trend for (peak_val/rms_val/stop
@@ -442,10 +440,10 @@ program rmclean_cubes
    call resolve_abs_flux_floor(status)
    if (status.ne.0) stop 1
    if (have_auto_nsigma) then
-      write(*,'(A,F0.4,A,F0.4,A)') 'auto_nsigma: enabled, multiplier=',&
-      &auto_nsigma_mult, ', tail_exclude_nfwhm=', tail_exclude_nfwhm,&
-      &' (per-pixel RM-tail sigma, estimated once per pixel from its'//&
-      &' own dirty spectrum -- see estimate_tail_sigma, src/rmclean.f90).'
+      write(*,'(A,F0.4,A)') 'auto_nsigma: enabled, multiplier=',&
+      &auto_nsigma_mult, ' (per-pixel noise sigma from each pixel''s'//&
+      &' own full dirty spectrum, IQR-based -- see estimate_iqr_sigma,'//&
+      &' src/rmclean.f90).'
    endif
 
    allocate(rm_samp(nrm))
@@ -733,7 +731,6 @@ contains
       abs_flux_floor_unit_scale = -1.0_sp
       have_auto_nsigma = .false.
       auto_nsigma_mult = 0.0_sp
-      tail_exclude_nfwhm = 3.0_sp
       min_samples_per_fwhm = 2.0_sp
       refine_nsigma = 3.0_sp
       trace_ix = 0
@@ -885,13 +882,6 @@ contains
             return
          endif
          have_auto_nsigma = .true.
-      case ('tail_exclude_nfwhm')
-         read(val, *, iostat=ios) tail_exclude_nfwhm
-         if (ios.ne.0 .or. tail_exclude_nfwhm.le.0.0_sp) then
-            write(*,*) 'ERROR: tail_exclude_nfwhm must be a positive number'
-            status = -1
-            return
-         endif
       case ('min_samples_per_fwhm')
          read(val, *, iostat=ios) min_samples_per_fwhm
          if (ios.ne.0 .or. min_samples_per_fwhm.lt.1.0_sp) then
@@ -1088,8 +1078,7 @@ contains
    subroutine print_usage()
       write(*,'(A)') 'Usage: rmclean_cubes ampfile=<f> phafile=<f>'//&
       &' maskfile=<f> outfile=<base>'
-      write(*,'(A)') '    [abs_flux_floor=<v>] [auto_nsigma=<n>]'//&
-      &' [tail_exclude_nfwhm=<f>]'
+      write(*,'(A)') '    [abs_flux_floor=<v>] [auto_nsigma=<n>]'
       write(*,'(A)') '    [niter=<n>] [gain=<g>] [min_samples_per_fwhm=<f>]'//&
       &' [refine_nsigma=<f>] [table_oversample=<n>] [restore_fwhm=<v>]'
       write(*,'(A)') '    [trace_ix=<n>] [trace_iy=<n>] [log_every=<n>]'
@@ -1121,20 +1110,13 @@ contains
       &' with no space (e.g. abs_flux_floor=10mJy) against the AMP'//&
       &' cube''s own BUNIT. No noise/baseline adjustment -- a pure'//&
       &' "brightest remaining feature below X" comparison.'
-      write(*,'(A)') 'auto_nsigma: stop when a pixel''s own (peak-avg)'//&
-      &' drops to/below auto_nsigma x that SAME pixel''s own RM-tail'//&
-      &' sigma. The tail sigma is estimated ONCE per pixel (not'//&
-      &' recomputed per iteration) from that pixel''s own dirty'//&
-      &' spectrum, excluding a window around its own peak (see'//&
-      &' tail_exclude_nfwhm) -- a real source is a narrow peak in an'//&
-      &' otherwise noise-dominated spectrum, so bins far from a'//&
-      &' sightline''s own peak are overwhelmingly noise regardless of'//&
-      &' whether it contains a source.'
-      write(*,'(A)') 'tail_exclude_nfwhm (default 3.0): half-width, in'//&
-      &' units of this pixel''s own RMSF FWHM, excluded around its own'//&
-      &' dirty-spectrum peak before estimating that pixel''s RM-tail'//&
-      &' sigma for auto_nsigma above. Ignored unless auto_nsigma= is'//&
-      &' given.'
+      write(*,'(A)') 'auto_nsigma: stop the instant a pixel''s own peak'//&
+      &' amplitude drops to/below auto_nsigma x that SAME pixel''s own'//&
+      &' noise sigma. The sigma is estimated ONCE per pixel (not'//&
+      &' recomputed per iteration) from that pixel''s own FULL dirty'//&
+      &' amplitude spectrum''s interquartile range, converted to sigma'//&
+      &' via the Rayleigh-distribution analytic relation (dirty'//&
+      &' amplitude is Rayleigh-, not Gaussian-, distributed).'
       write(*,'(A)') 'niter (default 500), gain (default 0.1): Hogbom'//&
       &' CLEAN parameters, passed straight to clean_complex.'
       write(*,'(A)') 'min_samples_per_fwhm (default 2, floor 1): Gate 0''s'//&
@@ -1393,11 +1375,12 @@ contains
       !! after read_amp_pha_geometry (nx/ny/nrm known) and before the main
       !! tile loop. A no-op (status=0, abs_flux_floor left at its init
       !! value) when have_abs_flux_floor is .false. -- auto_nsigma's own
-      !! per-pixel tail-sigma estimate (estimate_tail_sigma, src/
-      !! rmclean.f90) needs no whole-cube pre-scan or resolution step,
-      !! unlike the old threshold_snr's noise_floor pre-scan this
+      !! per-pixel percentile-sigma estimate (estimate_percentile_sigma,
+      !! src/rmclean.f90) needs no whole-cube pre-scan or resolution
+      !! step, unlike the old threshold_snr's noise_floor pre-scan this
       !! subroutine used to also perform (planning/RMCLEAN_INTEGRATION_
-      !! PLAN.md T8 -- that whole mechanism is retired, not just renamed).
+      !! PLAN.md T8/T9 -- that whole mechanism is retired, not just
+      !! renamed).
       !! Prints exactly what it resolved to, so a run's own stdout log
       !! (scripts/run_pipeline.sh's provenance capture) records the
       !! actual number used, not just the cfg's own request.
@@ -2631,9 +2614,9 @@ contains
          if (is_traced_p) then
             call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
             &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
-            &throwaway_table, niter, gain, fwhm_rm,&
+            &throwaway_table, niter, gain,&
             &have_abs_flux_floor, abs_flux_floor,&
-            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &have_auto_nsigma, auto_nsigma_mult,&
             &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
             &stop_reason_p, comp_rm_refined_p, nsigma_refine=refine_nsigma,&
             &trace_peak_val=trace_peak_p, trace_rms_val=trace_rms_p,&
@@ -2641,9 +2624,9 @@ contains
          else
             call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
             &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
-            &throwaway_table, niter, gain, fwhm_rm,&
+            &throwaway_table, niter, gain,&
             &have_abs_flux_floor, abs_flux_floor,&
-            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &have_auto_nsigma, auto_nsigma_mult,&
             &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
             &stop_reason_p, comp_rm_refined_p, nsigma_refine=refine_nsigma)
          endif
@@ -2652,9 +2635,9 @@ contains
          if (is_traced_p) then
             call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
             &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
-            &cache_entries(entry_idx_p)%table, niter, gain, fwhm_rm,&
+            &cache_entries(entry_idx_p)%table, niter, gain,&
             &have_abs_flux_floor, abs_flux_floor,&
-            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &have_auto_nsigma, auto_nsigma_mult,&
             &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
             &stop_reason_p, comp_rm_refined_p,&
             &nsigma_refine=refine_nsigma, trace_peak_val=trace_peak_p,&
@@ -2662,9 +2645,9 @@ contains
          else
             call clean_complex(l_sq_valid_p(1:nvalid_p), nvalid_p,&
             &lsq_ref_compute, rm_samp, nrm, dirty_re_p, dirty_im_p,&
-            &cache_entries(entry_idx_p)%table, niter, gain, fwhm_rm,&
+            &cache_entries(entry_idx_p)%table, niter, gain,&
             &have_abs_flux_floor, abs_flux_floor,&
-            &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+            &have_auto_nsigma, auto_nsigma_mult,&
             &comp_re_p, comp_im_p, resid_re_p, resid_im_p, n_iter_used_p,&
             &stop_reason_p, comp_rm_refined_p, nsigma_refine=refine_nsigma)
          endif

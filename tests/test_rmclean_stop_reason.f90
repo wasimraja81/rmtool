@@ -3,8 +3,8 @@ program test_rmclean_stop_reason
    !! (planning/RMCLEAN_INTEGRATION_PLAN.md T8 -- replaced the old single
    !! overloaded `thresh` parameter, which silently treated an absolute
    !! flux value as a sigma-multiplier, comparing flux^2 against flux):
-   !! niter cap, abs_flux_floor, and auto_nsigma (per-pixel RM-tail
-   !! sigma, estimated once, not recomputed per iteration). n_iter_used
+   !! niter cap, abs_flux_floor, and auto_nsigma (per-pixel full-spectrum
+   !! IQR-based sigma, estimated once, not recomputed per iteration). n_iter_used
    !! alone cannot tell "hit the niter cap" apart from "a criterion
    !! happened to fire on the literal last allowed iteration" --
    !! stop_reason ('niter'/'abs_flux'/'auto_nsigma') disambiguates.
@@ -20,9 +20,9 @@ program test_rmclean_stop_reason
    !! n_iter_used<niter, and the final residual's own peak amplitude is
    !! at/below the floor (the exact criterion being tested).
    !! Case C (auto_nsigma, WITH injected per-channel noise -- a
-   !! noiseless spectrum would give tail_sigma~=0, making auto_nsigma
-   !! fire only at machine precision): stop_reason=='auto_nsigma',
-   !! n_iter_used<niter.
+   !! noiseless spectrum's own IQR would still be ~0 (RMSF-sidelobe
+   !! structure, not statistical noise), making auto_nsigma fire only
+   !! at machine precision): stop_reason=='auto_nsigma', n_iter_used<niter.
    !!
    !! Also exercises the optional trace_peak_val/trace_rms_val/
    !! trace_flux_val outputs on Case B: confirms they're filled for
@@ -43,7 +43,7 @@ program test_rmclean_stop_reason
    real(sp), parameter :: rm_lo = -100.0_sp, rm_hi = 100.0_sp
 
    real(sp) :: l_sq(nchan), q(nchan), u(nchan), q_noisy(nchan), u_noisy(nchan)
-   real(sp) :: lsq_ref, fwhm_rm
+   real(sp) :: lsq_ref
    real(sp) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
    real(sp) :: dirty_re_noisy(nrm), dirty_im_noisy(nrm), resid_amp(nrm)
    real(sp) :: comp_re(nrm), comp_im(nrm), resid_re(nrm), resid_im(nrm)
@@ -65,11 +65,10 @@ program test_rmclean_stop_reason
    call dirty_spectrum(l_sq, nchan, lsq_ref, q, u, rm_samp, nrm, dirty_re, dirty_im)
    call build_rmsf_offset_table(l_sq, nchan, lsq_ref, rm_samp(nrm)-rm_samp(1),&
    &rm_samp(2)-rm_samp(1), 20, table)
-   call compute_rmsf_fwhm(l_sq, nchan, fwhm_rm)
 
    ! --- Case A: niter-only, must run every iteration --------------------
    call clean_complex(l_sq, nchan, lsq_ref, rm_samp, nrm, dirty_re, dirty_im,&
-   &table, 50, 0.1_sp, fwhm_rm, .false., 0.0_sp, .false., 0.0_sp, 3.0_sp,&
+   &table, 50, 0.1_sp, .false., 0.0_sp, .false., 0.0_sp,&
    &comp_re, comp_im, resid_re, resid_im, n_iter_used, stop_reason,&
    &comp_rm_refined)
 
@@ -82,7 +81,7 @@ program test_rmclean_stop_reason
 
    ! --- Case B: abs_flux_floor, noiseless -------------------------------
    call clean_complex(l_sq, nchan, lsq_ref, rm_samp, nrm, dirty_re, dirty_im,&
-   &table, 500, 0.1_sp, fwhm_rm, .true., 0.5_sp, .false., 0.0_sp, 3.0_sp,&
+   &table, 500, 0.1_sp, .true., 0.5_sp, .false., 0.0_sp,&
    &comp_re, comp_im, resid_re, resid_im, n_iter_used, stop_reason,&
    &comp_rm_refined, trace_peak_val=trace_peak, trace_rms_val=trace_rms,&
    &trace_flux_val=trace_flux)
@@ -110,17 +109,18 @@ program test_rmclean_stop_reason
    &//' monotonically increasing', all_pass)
 
    ! --- Case C: auto_nsigma, WITH injected per-channel noise ------------
-   ! A noiseless spectrum's own RM-tail sigma is ~0 (nothing but roundoff
-   ! out there), which would make auto_nsigma fire only once CLEAN has
-   ! driven the residual to machine precision -- not a meaningful test
-   ! of the criterion itself. Fixed-seed Gaussian-ish noise (Box-Muller
-   ! from random_number) gives a genuine, reproducible tail sigma.
+   ! A noiseless spectrum's own IQR is dominated by near-zero/RMSF-
+   ! sidelobe structure rather than genuine statistical noise, which
+   ! would make auto_nsigma fire only once CLEAN has driven the residual
+   ! to machine precision -- not a meaningful test of the criterion
+   ! itself. Fixed-seed Gaussian-ish noise (Box-Muller from
+   ! random_number) gives a genuine, reproducible noise sigma.
    call inject_noise(nchan, 0.3_sp, q, u, q_noisy, u_noisy)
    call dirty_spectrum(l_sq, nchan, lsq_ref, q_noisy, u_noisy, rm_samp, nrm,&
    &dirty_re_noisy, dirty_im_noisy)
    call clean_complex(l_sq, nchan, lsq_ref, rm_samp, nrm, dirty_re_noisy,&
-   &dirty_im_noisy, table, 500, 0.1_sp, fwhm_rm, .false., 0.0_sp, .true.,&
-   &5.0_sp, 3.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
+   &dirty_im_noisy, table, 500, 0.1_sp, .false., 0.0_sp, .true.,&
+   &5.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
    &stop_reason, comp_rm_refined)
 
    call check(trim(stop_reason) == 'auto_nsigma',&

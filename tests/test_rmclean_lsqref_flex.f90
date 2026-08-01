@@ -216,8 +216,8 @@ contains
       ! run the full 500 iterations deterministically, same effective
       ! behavior as the old thresh=1.0e-4 had in this noiseless scenario.
       call clean_complex(lsq_in, nchan, lsq_ref_compute, rm, nrm_l, dirty_re,&
-      &dirty_im, table, 500, 0.1_sp, fwhm_rm, .false., 0.0_sp, .false.,&
-      &0.0_sp, 3.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
+      &dirty_im, table, 500, 0.1_sp, .false., 0.0_sp, .false.,&
+      &0.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
       &stop_reason, comp_rm_refined)
       call restore_clean(rm, nrm_l, comp_re, comp_im, resid_re, resid_im,&
       &fwhm_rm, plan_fwd, plan_bwd, out_re, out_im)

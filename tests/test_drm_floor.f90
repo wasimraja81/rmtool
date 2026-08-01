@@ -168,7 +168,7 @@ contains
       real(sp), allocatable :: comp_rm_refined(:), comp_amp(:)
       real(sp) :: c_tmpl(n), s_tmpl(n)
       type(rmsf_table_t) :: table
-      real(sp) :: rm_found, fwhm_rm
+      real(sp) :: rm_found
 
       nrm_l = nint(rm_span/drm) + 1
       allocate(rm(nrm_l), dirty_re(nrm_l), dirty_im(nrm_l))
@@ -184,14 +184,13 @@ contains
          dirty_im(j) = (dot_product(q_in, s_tmpl) + dot_product(u_in, c_tmpl))/real(n, sp)
       end do
       call build_rmsf_offset_table(lsq_in, n, lsq_ref, rm(nrm_l)-rm(1), drm, 20, table)
-      call compute_rmsf_fwhm(lsq_in, n, fwhm_rm)
       ! niter-only (no abs_flux_floor/auto_nsigma): this test validates
       ! get_drm's oversample floor, not the stopping criterion -- run
       ! the full 500 iterations deterministically, same effective
       ! behavior as the old thresh=1.0e-4 had in this noiseless scenario.
       call clean_complex(lsq_in, n, lsq_ref, rm, nrm_l, dirty_re, dirty_im,&
-      &table, 500, 0.1_sp, fwhm_rm, .false., 0.0_sp, .false., 0.0_sp,&
-      &3.0_sp, comp_re, comp_im, resid_re, resid_im, n_iter_used,&
+      &table, 500, 0.1_sp, .false., 0.0_sp, .false., 0.0_sp,&
+      &comp_re, comp_im, resid_re, resid_im, n_iter_used,&
       &stop_reason, comp_rm_refined)
       comp_amp = sqrt(comp_re**2+comp_im**2)
       ipeak = 1

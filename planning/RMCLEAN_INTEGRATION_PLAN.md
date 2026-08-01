@@ -30,9 +30,34 @@ broke the absolute-flux mode and made the auto/n-sigma mode a
 self-referential moving target; fixing it took this same T7 subimage's
 tail RMS from 6.89 uJy (3.7x below the true ~25.5 uJy noise floor) to
 25.24 uJy (matching it), converging in a mean of 3.89 iterations instead
-of 233.7. `threshold=`/`threshold_snr=`/`noise_nlos=`/`noise_percentile=`/
-`noise_seed=` are RETIRED (not aliased) -- use `abs_flux_floor=`/
-`auto_nsigma=`/`tail_exclude_nfwhm=` in any cfg going forward.**
+of 233.7. `threshold=`/`threshold_snr=`/`noise_nlos=`/`noise_seed=`/
+`tail_exclude_nfwhm=`/(the T9-only, now ALSO retired) `noise_percentile=`
+are ALL RETIRED (not aliased) -- use `abs_flux_floor=`/`auto_nsigma=`
+in any cfg going forward, nothing else. T9 (same day) fixed a second,
+independent bug in `auto_nsigma`: `- avg_abs` was subtracted from
+`peak_val` before comparison, inherited unexamined from the
+pre-existing algorithm and itself a self-referential moving target
+(recomputed from the shrinking residual every iteration) that stopped
+CLEAN early on large-scale coherent structures -- `auto_nsigma` now
+compares `peak_val` directly, no subtraction. T9 ALSO tried a per-pixel
+lowest-percentile-fraction sigma estimate (`noise_percentile=`,
+Rayleigh-IQR-corrected) as a safer alternative to T8's own peak-
+relative exclusion window, but then measured it directly against real
+data and found it performed WORSE than simply using the pixel's own
+FULL dirty spectrum's IQR (a fixed Rayleigh factor, `IQR/0.90656`, no
+subsetting) -- so `noise_percentile=` was retired again, same day it
+was introduced, in favour of the simpler full-spectrum estimator
+(`estimate_iqr_sigma`). cfg defaults finalised: both criteria off by
+default (must opt in explicitly); `auto_nsigma`'s own default value is
+`1.0` (not `5.0` -- justified now that the sigma estimate itself is
+trustworthy); `abs_flux_floor` values are always given with an explicit
+unit suffix; `cfg/rmclean-jennifer.e2e.cfg` sets a REAL, active
+`abs_flux_floor=20uJy` (anchored to this dataset's own independently-
+measured ~25.5 uJy/beam floor) alongside `auto_nsigma=1.0` as a genuine
+safety net, not a placeholder. See T9's own Evidence section (including
+its own UPDATE) for the full mechanism, the accuracy comparison that
+drove the full-spectrum-over-percentile decision, and per-cfg
+justification.**
 
 ## Context
 
@@ -2196,3 +2221,226 @@ moving target was not just numerically wrong, it was also needlessly
 slow. Stop-reason summary on this run: 100.00% `auto_nsigma`, 0%
 niter/abs_flux, confirming every pixel now stops for the intended,
 physically-meaningful reason.
+
+**UPDATE (T9, same day):** the `tail_exclude_nfwhm`-based per-pixel
+sigma estimate above was itself replaced -- see T9. It silently fails
+for multi-component or extended/Faraday-thick sightlines (a second peak,
+or a broad plateau wider than the excluded window, still contaminates
+the "tail"); T9's percentile+IQR method (further corrected for the
+Rayleigh, not Gaussian, distribution of amplitude data) replaces it.
+Separately, T9 also found and fixed a second bug in the `auto_nsigma`
+criterion ITSELF (the `- avg_abs` subtraction, inherited unexamined from
+this ticket's own carryover of the pre-existing algorithm) that this
+ticket's own Evidence section did not catch, because the T7 subimage's
+own gain-sweep tuning happened not to exercise a large-scale coherent
+structure the way T9's own high-signal-RM-plane test did.
+
+### T9 -- auto_nsigma correctness: percentile+IQR sigma (Rayleigh-corrected), avg_abs removed (done)
+
+**Objective.** T8 shipped `auto_nsigma`'s per-pixel sigma as a peak-
+relative exclusion window (`tail_exclude_nfwhm`). The user immediately
+flagged the real weakness: "What if there are extended rm features and
+multiple peaks?" -- a second peak, or a broad plateau wider than the
+excluded window, silently contaminates the "tail" that window design
+relies on. Separately, the user asked for a concrete image-plane test
+("rms in an image plane... at a high signal RM plane") to see whether
+the residual sigma there had actually decreased to noise level -- that
+test surfaced a SECOND, independent bug in the criterion itself.
+
+**Fix 1 -- percentile+IQR replaces the exclusion window.** New
+`estimate_percentile_sigma` (`src/rmclean.f90`, replacing
+`estimate_tail_sigma`): sorts THIS pixel's own dirty AMPLITUDE spectrum,
+takes the lowest `noise_percentile` fraction (default 0.20) of bins --
+an order-statistic selection that doesn't care where or how many real
+features exist, only that a real source is a narrow-in-amplitude-rank
+excursion (same reasoning the old, retired, whole-cube `noise_percentile`
+pre-scan used, applied per-pixel here instead). `fwhm_rm`/
+`tail_exclude_nfwhm` are gone from `clean_complex`'s own signature
+entirely (no longer needed -- one fewer required argument, one fewer
+concept). cfg key renamed `tail_exclude_nfwhm=` -> `noise_percentile=`
+throughout (`rmclean_cubes.f90`, `cfg/rmclean-example.cfg`,
+`cfg/rmclean-jennifer.e2e.cfg`, 3 direct test callers, `tests/
+test_rmclean_stop_reason.f90`'s own Case C).
+
+**The image-plane test and what it found.** Ran the T7 subimage's
+CLEAN-peak pixel through the RMSF FWHM-corrected design, then looked at
+the FULL 128x128 image plane at that pixel's own RM_PEAK channel (not
+just that one pixel's own RM-axis spectrum). Two real findings:
+
+1. **This subimage's "high signal" isn't a point source.** 3801 of 4317
+   high-SNR (>7) pixels (88%) share nearly the same RM_PEAK (~150
+   rad/m^2) -- a large-scale coherent/extended polarised structure
+   spanning most of the field, not an isolated source. (The
+   spatially-widespread sharing of one RM_PEAK does NOT imply each
+   individual pixel's own RM-axis spectrum is broad -- that would be a
+   real-signal/beam-sidelobe distinction specific to each pixel, not a
+   field-wide property; conflating the two was an error corrected
+   mid-session, see point 3 below.)
+2. Image-plane RMS at that channel: dirty 108.6 uJy, resid only dropped
+   to 41.9-87.6 uJy across iterations of this fix (still well above the
+   ~24-26 uJy true tail floor at that point) -- prompting a direct
+   per-iteration trace of the brightest pixel to find out why.
+
+**Fix 2 -- the REAL bug: `- avg_abs` in the auto_nsigma comparison.**
+Tracing the brightest pixel showed CLEAN stopping at `peak_val=37 uJy`
+after only 23 (of 500) iterations -- not niter exhaustion (0% of all
+16384 pixels hit the cap), and not because `percentile_sigma` itself
+was reached. The actual comparison, inherited unexamined from the
+pre-existing algorithm, was `(peak_val - avg_abs) <= auto_nsigma_mult *
+percentile_sigma`, where `avg_abs` (mean |residual| over the WHOLE
+spectrum) is recomputed from the CURRENT residual every iteration --
+the exact same self-referential moving-target flaw already fixed once
+for the multiplicative side (`rms_val` -> `percentile_sigma`, fixed at
+T8), still present on the subtractive side. For a large-scale coherent
+structure, peak~average almost everywhere, so `peak-avg_abs` collapses
+toward zero long before the peak has actually reached anything close to
+the noise floor -- stopping CLEAN early even though the residual peak
+was still far above it. Fixed by dropping the subtraction entirely:
+`auto_nsigma` now compares `peak_val <= auto_nsigma_mult *
+percentile_sigma` directly, matching `abs_flux_floor`'s own (already
+subtraction-free) form. Re-traced the same pixel: iterations to
+convergence went from 23 -> 63, peak_val at stop from 37 -> 15.5 uJy --
+converging genuinely deeper, not just differently.
+
+**Fix 3 -- Rayleigh, not Gaussian, IQR-to-sigma conversion.** Even after
+Fix 2, the traced pixel's own `percentile_sigma` (2.84 uJy) was ~8x
+below its own independently-measured true tail sigma (22.4 uJy). Root
+cause: dirty AMPLITUDE (`sqrt(re^2+im^2)` of iid-Gaussian re/im) is
+Rayleigh-distributed, not Gaussian, AND the quartiles are taken WITHIN
+the bottom `noise_percentile` slice, not the whole population -- a
+doubly-different shape from a plain Gaussian IQR, for which the
+standard `IQR/1.349` conversion is analytically wrong. Derived the
+correct, closed-form relation: for a Rayleigh(sigma) variate, the p-th
+quantile is `x_p = sigma*sqrt(-2*ln(1-p))`; quartiles taken within the
+bottom fraction `q` correspond to OVERALL percentiles `0.25q`/`0.75q`,
+giving
+
+```
+IQR_q(sigma) = sigma * [ sqrt(-2*ln(1-0.75q)) - sqrt(-2*ln(1-0.25q)) ]
+```
+
+so `sigma = IQR_measured / IQR_q_factor(q)`, computed once from
+`noise_percentile` alone (no new data dependency). For q=0.20,
+`IQR_q_factor ~= 0.2497` (vs the Gaussian 1.349 and the untruncated-
+Rayleigh-population 0.906 -- both wrong for this specific quantity).
+Implemented in `estimate_percentile_sigma`. Caveat, stated explicitly in
+the code comment: this still assumes the bottom-q fraction is itself
+noise-dominated; an exceptionally bright source's own RMSF-sidelobe
+spread CAN still occupy more than `1-q` of a spectrum (confirmed
+directly for the one brightest pixel in this subimage: 91 of 101 bins
+above 5% of its own peak) -- a real, inherent limit of any percentile
+method, not fixed by the conversion factor alone, and not evidence that
+"widespread spatial structures have broad per-pixel spectra" in
+general (that conflation was corrected mid-session; ordinary sightlines
+occupy only a few RM bins, exactly as expected).
+
+**Evidence.** Full regression suite: 121/121 pass after all three fixes
+(same test count as T8 -- no new tests needed beyond updating existing
+call sites/values for the signature change). Re-ran the T7/T8 subimage
+end to end with the fully-fixed design (`auto_nsigma=5.0,
+noise_percentile=0.20`):
+- Aggregate tail RMS (true noise-only region): **25.26/25.44 uJy**
+  (median/mean) -- matching the dirty cube's own floor (25.46/25.62 uJy)
+  more closely than either prior attempt, and for the right reason this
+  time (verified via the avg_abs/Rayleigh mechanism, not coincidence).
+- At the brightest pixel's own peak (RM=170): dirty 165.7 uJy -> resid
+  87.2 uJy. **This is the correct, expected outcome, not under-
+  convergence** -- `auto_nsigma=5.0` means "stop once the peak is no
+  longer >5 sigma above noise," so a properly-converged residual AT A
+  REAL SOURCE's peak should settle near `N*sigma` (~5*22=110 uJy here,
+  87 uJy is close, modulo discrete gain=0.1 iteration steps), NOT
+  collapse to the bare 1-sigma noise floor -- only genuinely empty sky
+  (the tail) should reach that. Recognizing this distinction (tail ->
+  1-sigma; real-source peak -> N-sigma) corrects an implicit
+  expectation this whole investigation had been carrying since T7 that
+  "residual near a real peak should equal the tail" -- true only in the
+  weak sense of "not dramatically below the noise floor" (T7's own
+  actual finding), not "should reach exactly the tail's own value."
+
+**UPDATE (same day):** T9's own percentile-then-IQR design (lowest
+`noise_percentile` fraction, default 0.20, truncated-Rayleigh-corrected)
+was itself replaced after the user asked directly why restrict to a
+subset at all rather than using the full available spectrum. Measured
+both methods directly against many real pixels' own independently-known
+true noise (same far-RM-tail ground truth as above), split into the two
+scenarios that matter:
+
+| scenario | method | ratio to true (median) | ratio to true (mean +/- std) |
+|---|---|---:|---:|
+| highest-SNR pixel (1 case) | full-spectrum IQR | 1.00 | -- |
+| highest-SNR pixel (1 case) | truncated-20% IQR | 0.68 | -- |
+| 10 typical high-SNR pixels | full-spectrum IQR | 1.00-1.07 | 1.15-1.16 +/- 0.31-0.32 |
+| 10 typical high-SNR pixels | truncated-20% IQR | 0.78-0.79 | 0.77-0.78 +/- 0.20-0.21 |
+
+Full-spectrum wins decisively in BOTH scenarios, not a tradeoff -- the
+truncated design's own smaller sample (~20 of 101 bins) combined with
+its much larger IQR-to-sigma correction factor (~0.25 for q=0.20 vs
+~0.91 for the full population, a ~4x amplification) cost more accuracy
+than real per-pixel signal contamination ever saved. That contamination
+was ALSO measured directly (not assumed): a first check in fraction-of-
+peak units was flawed (it mostly counted ordinary Rayleigh noise
+fluctuation for modest-SNR sources, not real contamination); redone in
+absolute-sigma units against each pixel's own true noise, real
+sidelobe-driven contamination is real but moderate (~5-12% of bins
+exceed 3x true sigma for a typical bright pixel, vs ~1 bin expected by
+pure chance) -- comfortably under the 25% that would bias a full-
+spectrum Q1, EXCEPT for at least one individually-checked pixel where
+contamination reached ~30% of bins and full-spectrum IQR overestimated
+true sigma by ~1.9x (a real, demonstrated limit of ANY percentile-free
+estimator, not fixed by this change).
+
+`estimate_percentile_sigma`/`noise_percentile` retired entirely (not
+aliased) -- replaced by `estimate_iqr_sigma` (`src/rmclean.f90`): full
+101-bin dirty amplitude spectrum's own IQR, FIXED Rayleigh full-
+population factor (`IQR/0.90656`, a constant, not data-dependent).
+Simpler code (one fewer cfg key, one fewer function parameter, no
+subsetting logic) AND more accurate. Full regression suite: 121/121
+pass (updated call sites in `rmclean_cubes.f90`'s 4 `clean_complex`
+call sites, 3 direct test callers, `tests/test_rmclean_stop_reason.f90`'s
+own 3 cases).
+
+**cfg defaults finalised (same day), each justified per-file, not
+copied from the old design:**
+- `abs_flux_floor` and `auto_nsigma` both default OFF
+  (`have_abs_flux_floor`/`have_auto_nsigma` start `.false.`) -- neither
+  criterion silently activates; niter alone governs unless the user
+  explicitly opts in to one or both (the user's own explicit
+  requirement: "if user does not specify the multiplier... we should
+  not trigger this as stopping criterion").
+- `auto_nsigma`'s own default VALUE, where used, is `1.0` (not the old
+  `5.0`) -- justified directly by the full-spectrum IQR sigma's own
+  measured accuracy above (median ratio ~1.00-1.07 vs true noise): a
+  1-sigma target is no longer an arbitrary aggressive choice once the
+  sigma estimate itself is trustworthy.
+- `abs_flux_floor` values are now spelled out with an explicit unit
+  suffix (uJy) in every cfg, not a bare native-units number -- makes
+  the actual physical value legible in the cfg file itself without
+  needing to know that dataset's own BUNIT by heart.
+- `cfg/rmclean-e2e-smalltest.cfg`: `abs_flux_floor=10000uJy` (=0.01
+  Jy/beam, this fixture's own BUNIT) -- UNCHANGED value, just re-
+  expressed with an explicit unit; this is a regression-test
+  convenience choice (~1% of the fixture's own ~1 Jy injected-source
+  peak, deep enough to exercise this section's own tiling/threading/
+  io_overlap/mask-cache bit-identical checks) predating this session,
+  not a noise-derived choice -- left as-is since changing it would risk
+  invalidating already-verified baselines for no new information.
+- `cfg/rmclean-example.cfg` (generic template, unknown target data):
+  `abs_flux_floor=0.0uJy` -- a documented but EFFECTIVELY INERT
+  reminder (real dirty amplitude is always >0 from noise alone, so
+  `peak_val<=0.0` essentially never fires) that the key exists, since
+  any nonzero number here would be arbitrary for genuinely unknown
+  data; `auto_nsigma=1.0` (uncommented, active) carries the real
+  default, since it needs no prior knowledge of the target data.
+- `cfg/rmclean-jennifer.e2e.cfg` (real, specific dataset):
+  `abs_flux_floor=20uJy` -- a GENUINE, ACTIVE second criterion, not a
+  placeholder, anchored to this dataset's own independently-and-
+  repeatedly-measured ~25.5 uJy/beam noise floor (T7/T9's own tail-RMS
+  checks) with a small margin below it. Deliberately NOT left inert
+  here: T9 directly demonstrated `auto_nsigma`'s own per-pixel sigma
+  estimate can be biased for individual pixels even with the corrected
+  full-spectrum method (the ~1.9x-overestimate pixel above), so a fixed
+  floor anchored to data we actually trust is a genuine safety net --
+  whichever of the two fires first wins per pixel. Verified on the real
+  subimage: a meaningful, non-degenerate split (10.03% of pixels
+  stopped via `abs_flux_floor`, 89.97% via `auto_nsigma`), confirming
+  both criteria are doing real work, not one dominating.

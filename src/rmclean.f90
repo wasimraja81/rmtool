@@ -721,9 +721,9 @@ contains
    end subroutine refine_peak_matched_filter
 
    subroutine clean_complex(l_sq, nchan, lsq_ref_compute, rm_samp, nrm,&
-   &dirty_re, dirty_im, table, niter, gain, fwhm_rm,&
+   &dirty_re, dirty_im, table, niter, gain,&
    &have_abs_flux_floor, abs_flux_floor,&
-   &have_auto_nsigma, auto_nsigma_mult, tail_exclude_nfwhm,&
+   &have_auto_nsigma, auto_nsigma_mult,&
    &comp_re, comp_im, resid_re, resid_im, n_iter_used, stop_reason,&
    &comp_rm_refined, nsigma_refine, trace_peak_val, trace_rms_val,&
    &trace_flux_val)
@@ -811,11 +811,6 @@ contains
       integer, intent(in) :: nrm, niter
       real(sp), intent(in) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
       real(sp), intent(in) :: gain
-      ! fwhm_rm: this pixel's own RMSF restoring-beam FWHM (rad/m^2) --
-      ! ONLY used (when have_auto_nsigma) to size the tail-exclusion
-      ! window in estimate_tail_sigma below; unrelated to the RMSF table
-      ! itself (that's `table`, already lsq_ref/dRM-aware).
-      real(sp), intent(in) :: fwhm_rm
       ! Three INDEPENDENT, unambiguously-named stopping criteria, checked
       ! every iteration in this fixed order (planning/RMCLEAN_INTEGRATION_
       ! PLAN.md T8 -- replaces the old single overloaded `thresh` param,
@@ -835,21 +830,46 @@ contains
       !    caller -- see clean_one_pixel's own comment).
       logical, intent(in) :: have_abs_flux_floor
       real(sp), intent(in) :: abs_flux_floor
-      ! 3) have_auto_nsigma/auto_nsigma_mult/tail_exclude_nfwhm: stop
-      !    when (peak_val-avg_abs) <= auto_nsigma_mult * tail_sigma,
-      !    where tail_sigma is estimated ONCE (not recomputed every
-      !    iteration -- that self-referential moving-target design was
-      !    the OTHER half of the old bug, see estimate_tail_sigma's own
-      !    comment) from THIS pixel's own dirty spectrum, in the RM
-      !    range beyond tail_exclude_nfwhm*fwhm_rm from its own peak.
-      !    auto_nsigma_mult/tail_exclude_nfwhm are READ only when
-      !    have_auto_nsigma is .true. (same always-passed convention as
-      !    above). Do not confuse auto_nsigma_mult with nsigma_refine
-      !    below -- two unrelated "n-sigma" concepts (this one gates
-      !    CLEAN's own stop; nsigma_refine gates the peak-refinement
-      !    tier escalation), deliberately given non-overlapping names.
+      ! 3) have_auto_nsigma/auto_nsigma_mult: stop when peak_val <=
+      !    auto_nsigma_mult * iqr_sigma. Deliberately NOT (peak_val-
+      !    avg_abs) -- an earlier version of this subtracted avg_abs
+      !    (mean |residual| over the WHOLE spectrum), inherited
+      !    unexamined from the pre-existing algorithm, but avg_abs is
+      !    recomputed from the CURRENT residual every iteration, i.e. it
+      !    is itself a moving target exactly like the old thresh*rms_val
+      !    bug -- for a large-scale coherent structure (peak~average
+      !    almost everywhere), peak-avg_abs collapses toward zero long
+      !    before the peak has actually reached the noise floor,
+      !    stopping CLEAN early even though the residual peak is still
+      !    well above it (found empirically: planning/
+      !    RMCLEAN_INTEGRATION_PLAN.md T9's own widespread-structure test
+      !    case). A direct peak_val comparison has no such baseline/
+      !    DC-bias assumption and cannot be fooled this way.
+      !    iqr_sigma is estimated ONCE (not recomputed every iteration --
+      !    the other half of the original bug, see estimate_iqr_sigma's
+      !    own comment) from THIS pixel's own FULL dirty spectrum's own
+      !    interquartile range, converted to sigma via the analytic
+      !    Rayleigh-distribution relation (dirty AMPLITUDE is Rayleigh-,
+      !    not Gaussian-, distributed). T9 originally tried restricting
+      !    to a lowest-percentile subset first (on the theory that
+      !    excluding likely-signal bins would help), but empirically
+      !    measured against many real pixels' own independently-known
+      !    true noise (planning/RMCLEAN_INTEGRATION_PLAN.md T9's own
+      !    Evidence section), that restricted-subset estimate was
+      !    WORSE -- systematically biased low (median ratio 0.78-0.79
+      !    vs true) -- than simply using the full spectrum's own IQR
+      !    (median ratio ~1.00-1.07 vs true): restricting to a small
+      !    subset (fewer samples) combined with a much larger IQR-to-
+      !    sigma correction factor amplifies estimation variance/bias
+      !    more than real signal contamination costs the full-spectrum
+      !    estimate. auto_nsigma_mult is READ only when have_auto_nsigma
+      !    is .true. (same always-passed convention as above). Do not
+      !    confuse auto_nsigma_mult with nsigma_refine below -- two
+      !    unrelated "n-sigma" concepts (this one gates CLEAN's own stop;
+      !    nsigma_refine gates the peak-refinement tier escalation),
+      !    deliberately given non-overlapping names.
       logical, intent(in) :: have_auto_nsigma
-      real(sp), intent(in) :: auto_nsigma_mult, tail_exclude_nfwhm
+      real(sp), intent(in) :: auto_nsigma_mult
       real(sp), intent(out) :: comp_re(nrm), comp_im(nrm)
       real(sp), intent(out) :: resid_re(nrm), resid_im(nrm)
       integer, intent(out) :: n_iter_used
@@ -919,7 +939,7 @@ contains
       real(dp) :: resid_re_dp(nrm), resid_im_dp(nrm)
       real(dp) :: comp_re_dp(nrm), comp_im_dp(nrm)
       real(dp) :: rmloc_wsum(nrm), rmloc_wloc(nrm)
-      real(sp) :: tail_sigma
+      real(sp) :: iqr_sigma
       integer :: iter, imax, j
 
       comp_re_dp = 0.0_dp
@@ -944,10 +964,9 @@ contains
       ! more aggressive gain chased an ever-tightening target instead of
       ! a fixed noise floor; see planning/RMCLEAN_INTEGRATION_PLAN.md T7's
       ! gain-sweep finding for the empirical symptom this caused).
-      tail_sigma = 0.0_sp
+      iqr_sigma = 0.0_sp
       if (have_auto_nsigma) then
-         call estimate_tail_sigma(rm_samp, nrm, dirty_re, dirty_im,&
-         &fwhm_rm, tail_exclude_nfwhm, tail_sigma)
+         call estimate_iqr_sigma(dirty_re, dirty_im, nrm, iqr_sigma)
       endif
 
       do iter = 1, niter
@@ -994,7 +1013,7 @@ contains
             endif
          endif
          if (have_auto_nsigma) then
-            if ((peak_val - avg_abs) <= auto_nsigma_mult*tail_sigma) then
+            if (peak_val <= auto_nsigma_mult*iqr_sigma) then
                stop_reason = 'auto_nsigma'
                exit
             endif
@@ -1027,55 +1046,84 @@ contains
       end do
    end subroutine clean_complex
 
-   subroutine estimate_tail_sigma(rm_samp, nrm, dirty_re, dirty_im, fwhm_rm,&
-   &tail_exclude_nfwhm, tail_sigma)
+   subroutine estimate_iqr_sigma(dirty_re, dirty_im, nrm, sigma)
       !! Auto-nsigma's own per-pixel noise estimate (planning/
-      !! RMCLEAN_INTEGRATION_PLAN.md T8): finds THIS pixel's own dirty
-      !! spectrum's peak bin, excludes a window of
-      !! +/-tail_exclude_nfwhm*fwhm_rm around it, and returns
-      !! rms_about_mean of the AMPLITUDE over whatever bins remain (the
-      !! "RM tail" -- far from this sightline's own peak, presumed
-      !! noise-dominated regardless of whether a real source is
-      !! present). Computed ONCE from the ORIGINAL dirty spectrum, never
-      !! touched by iteration -- unlike the old thresh*rms_val design,
-      !! which recomputed its "noise" estimate from the shrinking
-      !! residual every iteration (clean_complex's own top comment has
-      !! the full story on why that was a real bug, not just a style
-      !! issue).
-      !! Safety fallback: if the exclusion window leaves fewer than
-      !! min_tail_bins usable bins (a very narrow RM range, or a peak
-      !! sitting such that tail_exclude_nfwhm*fwhm_rm covers most of the
-      !! span), falls back to the WHOLE spectrum's own rms_about_mean
-      !! rather than failing -- graceful degradation, not a silent wrong
-      !! answer (the whole-spectrum RMS is still a valid, if slightly
-      !! source-contaminated, noise estimate).
+      !! RMCLEAN_INTEGRATION_PLAN.md T8/T9 -- history: T8 shipped a
+      !! peak-relative exclusion window, which silently fails for
+      !! multi-component/extended sightlines; T9 then tried restricting
+      !! to the lowest noise_percentile fraction of amplitude bins
+      !! first, on the theory that excluding likely-signal bins would
+      !! help. Measured directly against many real pixels' own
+      !! independently-known true noise (T9's own Evidence section:
+      !! true sigma from each pixel's own far-RM tail, a measurement
+      !! independent of this estimator entirely), that restricted-subset
+      !! approach was WORSE, not better -- systematically biased LOW
+      !! (median ratio ~0.78-0.79 vs true, for both an extreme bright
+      !! pixel and ten ordinary ones) -- than simply using the FULL
+      !! spectrum's own IQR (median ratio ~1.00-1.07 vs true, both
+      !! cases). Restricting to a small subset (fewer samples: ~20 of
+      !! 101 bins) combined with a much larger IQR-to-sigma correction
+      !! factor (the truncated-Rayleigh factor for q=0.20 is ~0.25, vs
+      !! ~0.91 for the full population -- a ~4x amplification of any
+      !! estimation noise) cost more accuracy than real per-pixel signal
+      !! contamination (measured directly: ordinarily ~5-12% of bins
+      !! elevated above 3x the true sigma, comfortably under the 25%
+      !! that would bias a full-spectrum Q1) ever saved.
+      !!
+      !! So: sorts THIS pixel's own FULL dirty AMPLITUDE spectrum (all
+      !! nrm bins, no subsetting) and takes its own interquartile range,
+      !! converted to sigma via the Rayleigh-distribution analytic
+      !! relation -- NOT the Gaussian IQR/1.349 factor, which is wrong
+      !! here: dirty AMPLITUDE sqrt(re^2+im^2) of iid-Gaussian re/im is
+      !! Rayleigh-distributed, not Gaussian. For a Rayleigh(sigma)
+      !! variate the p-th quantile is x_p = sigma*sqrt(-2*ln(1-p)), so
+      !! the population IQR is sigma*[sqrt(-2*ln(0.25)) -
+      !! sqrt(-2*ln(0.75))] = sigma*0.90656 -- a FIXED constant (computed
+      !! once below, not data-dependent), unlike the old design's
+      !! q-dependent factor. Computed ONCE from the ORIGINAL dirty
+      !! spectrum, never touched by iteration -- unlike the old
+      !! thresh*rms_val design, which recomputed its "noise" estimate
+      !! from the shrinking residual every iteration (clean_complex's
+      !! own top comment has the full story on why that was a real bug,
+      !! not just a style issue).
       integer, intent(in) :: nrm
-      real(sp), intent(in) :: rm_samp(nrm), dirty_re(nrm), dirty_im(nrm)
-      real(sp), intent(in) :: fwhm_rm, tail_exclude_nfwhm
-      real(sp), intent(out) :: tail_sigma
-      integer, parameter :: min_tail_bins = 5
-      real(sp) :: dirty_amp(nrm), tail_amp(nrm)
-      real(sp) :: exclude_halfwidth, dummy_avg
-      integer :: peak_idx, j, n_tail
+      real(sp), intent(in) :: dirty_re(nrm), dirty_im(nrm)
+      real(sp), intent(out) :: sigma
+      real(sp), parameter :: rayleigh_iqr_factor = 0.90656_sp
+      real(sp) :: dirty_amp(nrm)
+      integer :: q1_idx, q3_idx
+      real(sp) :: q1, q3
 
       dirty_amp = sqrt(dirty_re**2 + dirty_im**2)
-      call index_absmax(dirty_amp, nrm, peak_idx, dummy_avg)
-      exclude_halfwidth = tail_exclude_nfwhm * fwhm_rm
+      call sort_real_inplace(dirty_amp, nrm)
 
-      n_tail = 0
-      do j = 1, nrm
-         if (abs(rm_samp(j) - rm_samp(peak_idx)) > exclude_halfwidth) then
-            n_tail = n_tail + 1
-            tail_amp(n_tail) = dirty_amp(j)
-         endif
-      end do
+      q1_idx = max(1, nint(real(nrm, sp)*0.25_sp))
+      q3_idx = min(nrm, nint(real(nrm, sp)*0.75_sp))
+      q1 = dirty_amp(q1_idx)
+      q3 = dirty_amp(q3_idx)
+      sigma = (q3 - q1) / rayleigh_iqr_factor
+   end subroutine estimate_iqr_sigma
 
-      if (n_tail >= min_tail_bins) then
-         call rms_about_mean(tail_amp(1:n_tail), n_tail, tail_sigma)
-      else
-         call rms_about_mean(dirty_amp, nrm, tail_sigma)
-      endif
-   end subroutine estimate_tail_sigma
+   subroutine sort_real_inplace(arr, n)
+      !! Plain insertion sort, ascending -- called only on one pixel's
+      !! own nrm-length spectrum (typically ~100s of bins), so O(n^2) is
+      !! cheap relative to the rest of clean_complex's own per-iteration
+      !! work, and never appears in a hot inner loop itself.
+      real(sp), intent(inout) :: arr(*)
+      integer, intent(in) :: n
+      integer :: i, j
+      real(sp) :: key
+      do i = 2, n
+         key = arr(i)
+         j = i - 1
+         do while (j.ge.1)
+            if (arr(j).le.key) exit
+            arr(j+1) = arr(j)
+            j = j - 1
+         enddo
+         arr(j+1) = key
+      enddo
+   end subroutine sort_real_inplace
 
    subroutine compute_rmsf_fwhm(l_sq, nchan, fwhm_rm)
       !! Theoretical restoring-beam FWHM in RM, from the lambda-squared
