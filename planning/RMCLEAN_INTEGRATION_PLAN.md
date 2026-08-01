@@ -2444,3 +2444,25 @@ copied from the old design:**
   subimage: a meaningful, non-degenerate split (10.03% of pixels
   stopped via `abs_flux_floor`, 89.97% via `auto_nsigma`), confirming
   both criteria are doing real work, not one dominating.
+
+**T9 UPDATE 2 (same day) -- unrelated pair of bugs found running the
+real full Jennifer cube with the curated cfg:**
+1. Per-thread `dur_ms` log field (`F10.3`) overflows to `**********`
+   once a single tile block's own compute stage runs longer than
+   ~16.7 min (only 6 integer digits fit) -- found live, a block
+   genuinely took 55 min. Display-only (the timing itself was always
+   correct); widened to `F18.3`.
+2. `plan_rmclean_tile`'s own `bytes_per_tile_pixel` budget formula
+   assumed 8 array-widths (2 input + 6 output, all single-buffered),
+   but the 6 output arrays (`clean_re_buf(...,2)` etc.) are allocated
+   PERMANENTLY double-buffered for the tile-write-join mechanism,
+   regardless of whether `io_overlap` is even on -- 14 array-widths,
+   not 8, a 1.75x silent under-budget that predates this session
+   (T4d). Found because the real run's own cgroup memory reached
+   39.9G against a nominal `mem_frac_ram=0.25` budget of ~15.7G;
+   confirmed by recomputing `tile_pixels_max` with the old formula --
+   it matched the run's own logged tile size almost exactly. Fixed
+   (`2 + 6*2` instead of `8`); the corrected formula accounts for
+   ~27.4G of the observed 39.9G, the remainder being CFITSIO/page-
+   cache overhead `mem_frac_ram` was never designed to budget for at
+   all. Full regression suite: 121/121 pass after both fixes.
