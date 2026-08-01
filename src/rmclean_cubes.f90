@@ -1462,10 +1462,21 @@ contains
       !! same RA-strips-first auto-tiling + safety-shrink policy as
       !! rm_synthesis_mod.f90's own plan_tile (rm_synthesis_mod.f90:
       !! 3200-3247), applied to rmclean_cubes' own per-tile-pixel byte
-      !! budget: 2 input arrays (re,im) + 6 output arrays (clean/resid/
-      !! restored re,im), each 4*nrm bytes/pixel (io_overlap's own
-      !! doubling, once T4d lands, is added on top of this same budget,
-      !! not computed here). RA (NAXIS1) is the contiguous axis on disk
+      !! budget: 2 input arrays (re,im), single-buffered, + 6 output
+      !! arrays (clean/resid/restored re,im), each 4*nrm bytes/pixel --
+      !! 14 array-widths total, NOT 8. Found as a real bug (a full-cube
+      !! run's own cgroup memory reached 39.9G against a nominal
+      !! mem_frac_ram=0.25 budget of ~15.7G, planning/
+      !! RMCLEAN_INTEGRATION_PLAN.md T9's own UPDATE): this comment
+      !! originally said the 6 output arrays' own double-buffering
+      !! (io_read_threads/io_write_threads/io_overlap, T4d) would be
+      !! "added on top of this same budget, not computed here" once
+      !! implemented, but T4d actually allocates them permanently
+      !! double-buffered (clean_re_buf(...,2) etc., below) REGARDLESS of
+      !! whether io_overlap is even on -- the budget arithmetic was never
+      !! updated to match, silently under-budgeting every mem_frac_ram=
+      !! run by 1.75x (8 assumed vs 14 actual array-widths). RA (NAXIS1)
+      !! is the contiguous axis on disk
       !! (FTGSVE/FTPSSE's own natural layout, same reasoning as
       !! reproject_cubes.f90's own tiling comment) -- keeping tile_ra=nx
       !! and packing Dec rows makes every tile read/write one contiguous
@@ -1474,7 +1485,10 @@ contains
       integer(kind=8) :: mem_total_kb, bytes_per_tile_pixel, mem_safe_bytes
       integer(kind=8) :: tile_pixels_max, image_pixels_total, tile_bytes_est
 
-      bytes_per_tile_pixel = int(4,8) * int(8,8) * int(nrm,8)
+      ! 2 input arrays (single-buffered) + 6 output arrays (each
+      ! double-buffered, unconditionally -- see this subroutine's own
+      ! top comment) = 2 + 6*2 = 14 array-widths, not 8.
+      bytes_per_tile_pixel = int(4,8) * int(2 + 6*2,8) * int(nrm,8)
       call get_mem_total_kb(mem_total_kb)
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) *&
       &1024.0d0, 8)
