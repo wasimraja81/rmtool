@@ -605,7 +605,13 @@ program rmclean_cubes
          enddo
          !$omp end do
          t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
-         write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=clean event=done tid=',&
+         ! F10.3 only holds up to 6 integer digits (max 999999.999 ms ~=
+         ! 16.7 min) before Fortran prints '*' fill instead of the value
+         ! -- too narrow once a single block's own compute stage runs
+         ! longer than that (found on a real full-cube run: one block
+         ! took 55min). F18.3 holds up to 14 integer digits, enough for
+         ! several centuries of milliseconds.
+         write(thread_msg,'(A,I0,A,I0,A,I0,A,F18.3)') 'thread_timing stage=clean event=done tid=',&
          &tid_local,' block=',tile_seq,' unit_count=',tx*ty,' dur_ms=',t_thread_elapsed
          call log_message('debug','tile_thread',trim(thread_msg))
          !$omp end parallel
