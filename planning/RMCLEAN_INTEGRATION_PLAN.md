@@ -67,12 +67,20 @@ is 2.7x over that limit), silently truncating the valid-channel mask
 read at ~76 of 288 channels for EVERY pixel in the image. Fixed by
 switching to `FTGPVBLL`, CFITSIO's own genuinely-64-bit entry point for
 the exact same underlying C call -- verified directly against this
-project's own bundled cfitsio-4.3.1 source, not assumed. T10b (RAM-aware
-mask handling: unify the mask-cube read with the AMP/PHA tiled I/O
-scheme, make the mask-pattern cache build incrementally instead of one
-upfront whole-cube-resident pass) is the architectural follow-up, not
-yet started -- see T10's own ticket text for the full investigation,
-evidence, and design.
+project's own bundled cfitsio-4.3.1 source, not assumed. A full-cube
+confirmation run (`jennifer_e2e_v5_cleaned`) proved this single bug was
+the root cause of three things investigated this session as apparently
+separate mysteries: niter-cap hit rate 99.05% -> 0.00% across all
+20,259,001 real pixels, mean iterations 496.72 -> 55.29, ~2.7x faster
+wall time, and the signal-free-RM-plane residual-exceeds-dirty finding
+reversed to the correct direction. T10b (RAM-aware mask handling: unify
+the mask-cube read with the AMP/PHA tiled I/O scheme, make the
+mask-pattern cache build incrementally instead of one upfront
+whole-cube-resident pass) is next, not yet started. T11 (CLEAN
+divergence / noise-wasting-compute stopping criteria -- the general
+algorithmic case, distinct from T10a's own data-corruption bug) is
+deferred until after T10b, per the user's own explicit ordering
+instruction -- see T10's and T11's own ticket text for full detail.
 
 ## Context
 
@@ -2731,14 +2739,60 @@ needed. Not yet implemented; needs its own dev-test-validate pass
 sizing formula extension all need independent verification) before
 landing.
 
-**Still open (not blocking T10a, to revisit once T10b lands):**
-- Whether pixel (65,65) (and the aggregate 99% niter-hit rate) still
-  shows genuine stagnation once run against CORRECTLY-read mask data --
-  needs a fresh full-cube run with the T10a fix to check; the originally
-  -scoped divergence/stagnation stopping-criteria work may turn out to
-  be smaller, or largely unnecessary, once CLEAN is no longer working
-  against wrong RMSF tables for most of the image.
-- The signal-free-RM-plane residual/CLEAN-component contamination --
-  very likely caused or substantially worsened by this same bug; needs
-  re-checking against a post-fix run before any separate investigation
-  is warranted.
+**Both open questions above were resolved by the full-cube confirmation
+run** (see T10a's own "full-cube confirmation" text above): niter-cap
+hit rate 99.05% -> 0.00%, and the signal-free-RM-plane residual-exceeds-
+dirty finding reversed to the correct direction. Both were caused by
+this ticket's own bug, not a separate issue.
+
+**Work order, per the user's own explicit instruction:** T10b (below)
+is next, ahead of T11 (below) -- do NOT start T11 until T10b is done.
+
+### T11 -- CLEAN divergence / noise-wasting-compute stopping criteria (deferred until after T10b, not started)
+
+Captured here as a deferred, explicitly-NOT-dropped ticket, per the
+user's own instruction: "make a clear note of the possibilities of
+CLEAN divergence or digging into noise wasting compute scenarios. We
+will add them AFTER T10b is done." This was the ORIGINAL motivation for
+this session's divergence/stagnation stopping-criteria design work
+(before the T10a mask-read bug was found and turned out to be the real
+cause of the specific symptom that prompted it -- pixel (65,65)
+appearing to never converge). With that specific symptom fully
+explained and resolved (T10a's full-cube confirmation: 0.00% niter-cap
+hits across all 20,259,001 real pixels), the ORIGINAL urgency is gone,
+but the two underlying failure modes this ticket was meant to guard
+against are general algorithmic possibilities, not specific to the bug
+that was just fixed, and remain worth designing for independently:
+
+1. **CLEAN divergence:** nothing in `clean_complex`'s current three
+   stopping criteria (`niter`/`abs_flux_floor`/`auto_nsigma`) detects a
+   peak residual that is actually GROWING from iteration to iteration,
+   rather than shrinking or plateauing -- the user's own concern: "we
+   should stop CLEAN from diverging. So if the peak resid starts to
+   grow, stop clean." A future dataset, gain setting, or pathological
+   sightline could in principle diverge without any of today's criteria
+   catching it (abs_flux_floor/auto_nsigma only fire when the residual
+   drops LOW enough, never when it grows).
+2. **Noise-wasting-compute (stagnation):** niter iterations spent on a
+   pixel whose residual has stopped making real progress (plateaued or
+   oscillating within a small band) without either converging to a
+   stopping criterion or diverging -- wasted compute, not incorrect
+   output, but worth detecting and logging (the user's own suggestion:
+   "if niters are used without residual dropping, or clean flux
+   increasing, that is a sign we have reached noise floor... look at
+   last 3 iterations to decide on this criterion").
+
+Design constraints already agreed with the user, from before the T10a
+detour (still valid, carry forward when this ticket is picked up):
+small tolerance for the stagnation check; BOTH new criteria default to
+**ON** (unlike `abs_flux_floor`/`auto_nsigma`, which are opt-in); log
+clearly which criterion fired (`stop_reason` extends from 3 values to
+5); use empirically-derived tolerances/windows (re-trace a real pixel
+with `log_every=1` first, per [[feedback_no_loose_statistical_guesses]]
+-- do not guess a tolerance number). The permanent small fixture at
+`tests/data/rmclean_pixel65_65/` (built during the T10a investigation)
+is available for this ticket's own regression test, though since that
+specific pixel no longer stagnates post-T10a, a genuinely-stagnating or
+-diverging test case will need to be constructed deliberately (e.g.
+synthetic data, or a deliberately adversarial gain/niter combination)
+rather than found incidentally in real data.
