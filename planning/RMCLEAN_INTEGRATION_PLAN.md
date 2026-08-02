@@ -57,7 +57,22 @@ measured ~25.5 uJy/beam floor) alongside `auto_nsigma=1.0` as a genuine
 safety net, not a placeholder. See T9's own Evidence section (including
 its own UPDATE) for the full mechanism, the accuracy comparison that
 drove the full-spectrum-over-percentile decision, and per-cfg
-justification.**
+justification.** T10a (done) fixed a real, serious, silent data-
+corruption bug found while investigating why a real full-cube CLEAN run
+diverged from small-subimage test behaviour: `read_mask_cube`'s use of
+the plain `FTGPVB` CFITSIO entry point overflowed its 32-bit
+`firstelem`/`nelem` arguments for any mask cube exceeding 2^31 total
+elements (this project's own Jennifer ASKAP mask cube, 4501x4501x288,
+is 2.7x over that limit), silently truncating the valid-channel mask
+read at ~76 of 288 channels for EVERY pixel in the image. Fixed by
+switching to `FTGPVBLL`, CFITSIO's own genuinely-64-bit entry point for
+the exact same underlying C call -- verified directly against this
+project's own bundled cfitsio-4.3.1 source, not assumed. T10b (RAM-aware
+mask handling: unify the mask-cube read with the AMP/PHA tiled I/O
+scheme, make the mask-pattern cache build incrementally instead of one
+upfront whole-cube-resident pass) is the architectural follow-up, not
+yet started -- see T10's own ticket text for the full investigation,
+evidence, and design.
 
 ## Context
 
@@ -2473,3 +2488,185 @@ real full Jennifer cube with the curated cfg:**
    ~27.4G of the observed 39.9G, the remainder being CFITSIO/page-
    cache overhead `mem_frac_ram` was never designed to budget for at
    all. Full regression suite: 121/121 pass after both fixes.
+
+### T10 -- mask-cube read overflow (found via a real full-cube run diverging from small-subimage tests) + RAM-aware mask handling (T10a done, T10b not started)
+
+**Background:** after T9 landed, the user ran a full 4501x4501
+Jennifer CLEAN with the curated cfg (`jennifer_e2e_v4_cleaned`, isolated
+in a systemd scope). The run's own aggregate summary was starkly
+different from every small-subimage test this session: 99.05% of all
+20,259,001 pixels hit the `niter=500` cap (mean `n_iter_used=496.72`),
+versus 0% in repeated small-subimage tests using the identical curated
+cfg. The user directly challenged the discrepancy rather than accepting
+reassurance from more small-scale samples, and separately reported an
+independent visual finding: at the first/last RM planes (should be
+noise-like, no real Galactic-RM signal there), the RESIDUAL showed
+spatially coherent structure and nonzero CLEAN components in 5-7% of all
+pixels, with residual peaks (1890-2443 uJy) far exceeding the dirty
+cube's own peak (290-361 uJy) at the same planes -- a direct sign of
+bad subtraction, not just slow convergence.
+
+**Investigation (this session, "no loose guesses" throughout -- every
+step below was directly verified, not assumed):**
+
+1. Built a permanent small (64x64 pixel, full RM/channel depth) FITS
+   cutout fixture, `tests/data/rmclean_pixel65_65/`, centred on the
+   exact full-image pixel (65,65) that a prior investigation had traced
+   as never converging (oscillating ~37-42 uJy through all 500
+   iterations). Confirmed via direct `astropy` comparison that the
+   cutout's own AMP/PHA/MASK/CHANFREQ data at this pixel is BIT-
+   IDENTICAL to the real full-size file at the same physical pixel.
+
+2. Ran the identical CLEAN (same cfg, `niter`-only, no stopping
+   criteria) against both the cutout and a forced-small-first-tile
+   invocation of the REAL full-size file (`tile_ra=100,tile_dec=100`,
+   only block 1 needed since it starts at tile origin (1,1), so global
+   pixel (65,65) falls inside it). Results diverged sharply even at
+   `iter=1` (before any subtraction): cutout `peak_val=78.69 uJy`
+   (matching the raw dirty amplitude peak, ~78.25 uJy) vs. full-cube-tile
+   `peak_val=68.20 uJy` -- and the full-cube run genuinely oscillated
+   37-42 uJy through iteration 500 without converging, exactly matching
+   the earlier (pre-compaction) finding.
+
+3. Ruled out, one at a time, by direct test rather than assumption:
+   - **Threading/scheduling**: `OMP_NUM_THREADS=1` reproduced the exact
+     same "wrong" 68.20 uJy result -- not a race condition.
+   - **Mask-pattern cache path**: `mask_pattern_cache_max=0` (forcing
+     every pixel through the independent "throwaway table" code path,
+     bypassing the cache construction entirely) reproduced the exact
+     same wrong result -- not a cache-indexing bug.
+   - **The dirty spectrum fed into `clean_complex`**: added temporary
+     debug instrumentation dumping the FULL 101-element `dirty_re_p`/
+     `dirty_im_p` arrays (pre- and post-derotation, 17-significant-digit
+     precision) for the traced pixel in both runs. Bit-identical in
+     every element, both before and after `derotate_to_lsq_ref`. This
+     ruled out the read-tile mechanism (`read_amp_pha_tile`/FTGSVE), the
+     derotation step, and the RMSF-table build inputs (`l_sq`,
+     `lsq_ref_compute`, `rm_samp`, `cdelt3_amp`) as candidates -- all
+     confirmed identical.
+   - The SAME debug dump also logged `nvalid_p` (the pixel's own valid-
+     channel count, from `mask_cube(ix_g,iy_g,:)`): **286 in the cutout,
+     only 76 in the full-cube run** -- for the exact same physical pixel,
+     despite the raw MASK.CUBE.FITS data being independently confirmed
+     byte-identical between the two files via `astropy`. This was the
+     real signal: the bug is in how the FULL mask cube gets loaded into
+     memory, not in anything per-pixel.
+
+4. Root cause, confirmed not guessed: `read_mask_cube`
+   (`src/rmclean_cubes.f90`) read the ENTIRE mask cube in one call:
+   `call FTGPVB(unit, 1, 1, nx_in*ny_in*nchan_in, 0_1, mask_out, ...)`.
+   For the real Jennifer MASK.CUBE.FITS, `nx_in*ny_in*nchan_in` =
+   4501*4501*288 = 5,834,592,288 -- computed in ordinary 32-bit integer
+   arithmetic, overflowing the signed 32-bit limit (2,147,483,647) by
+   more than 2.7x. Wrapped mod 2^32, the value passed to CFITSIO as
+   `nelem` becomes 1,539,624,992 -- since Fortran arrays are column-
+   major, this truncates the read at channel
+   1,539,624,992/(4501*4501) ~= channel 76 of 288, leaving channels
+   77-288 as whatever the freshly-`allocate`d memory contained (zero on
+   this platform, i.e. "invalid channel") for EVERY pixel in the WHOLE
+   image, not just the traced one. The arithmetic prediction (truncation
+   at channel ~76) matches the observed `nvalid_p=76` almost exactly.
+   This single bug plausibly explains all three symptoms discovered this
+   session at once: the 99.05% niter-cap-hit rate (CLEAN working against
+   drastically-wrong valid-channel patterns -> wrong RMSF
+   tables/derotation/refinement for most of the image), the signal-free-
+   RM-plane contamination (garbage subtraction from wrong tables leaves
+   residual power everywhere), and the pixel-(65,65) mismatch itself.
+   The small 64x64 cutout (64*64*288=1,179,648 elements) never came
+   remotely close to the overflow threshold, which is exactly why every
+   small-subimage test this session behaved correctly while the one real
+   full-cube run did not.
+
+**Why this wasn't caught earlier:** T4's own design (see T4's own text
+above) deliberately keeps the mask cube whole-cube-resident rather than
+tiled, since `build_mask_pattern_cache`'s one-time global pre-scan needs
+to see every pixel before any tile is CLEANed. Every piece of prior
+testing (T7/T8/T9's own subimage-based evidence-gathering, the full
+121-test regression suite) used cube sizes far below the 2^31-element
+threshold; this session's full 4501x4501x288 Jennifer run was the FIRST
+time this exact code path was exercised against a real dataset large
+enough to trigger it.
+
+**T10a (done) -- the correctness fix:** the user pushed back hard,
+twice, on treating this as solved by architecture alone. First
+objection: tiling reduces the ODDS of hitting the overflow under
+today's tile-sizing defaults, but doesn't PROVE it can't happen (a large
+enough `mem_frac_ram`/tile choice on a big enough machine or dataset
+could still ask a single CFITSIO call to move >2^31 elements). Second,
+sharper objection, in response to a claim that switching to tiled reads
+would make the overflow "disappear": the user demanded direct proof that
+64-bit element counts are actually supported by the underlying FITS
+library (rather than assuming the problem was solved by never asking
+for enough elements at once), correctly guessing that other CFITSIO
+calls in this same codebase already use 64-bit-safe interfaces. Verified
+directly against this project's own bundled `cfitsio-4.3.1` source
+(not assumed): `f77_wrap2.c`'s own `FCALLSCSUB8` declarations show the
+plain `FTGPVB` entry narrows `firstelem`/`nelem` to 32-bit `LONG`, but a
+SEPARATE entry point, `FTGPVBLL`, wraps the IDENTICAL underlying C
+function (`ffgpvb`, whose own C signature already takes `LONGLONG
+nelem`) with genuine 64-bit `LONGLONG` arguments -- confirming the
+library fully supports this, the plain entry point was just the wrong
+one to call. Separately confirmed `FTGSVE` (used everywhere else in this
+codebase for AMP/PHA tile reads) has NO equivalent exposure at any
+image size: its own C implementation (`getcol.c:422`,
+`nelem = nelem * naxes[ii]`) accumulates the total element count in
+genuine `LONGLONG` internally, regardless of the per-axis argument
+types, which only ever need to hold small values (image width, channel
+count) individually. `FTGPVB` is used in exactly one place in the whole
+codebase (`read_mask_cube`); nowhere else needed touching. Fixed by
+switching to `FTGPVBLL` with `firstelem`/`nelem` computed as
+`integer(kind=8)` (`int(nx_in,8)*int(ny_in,8)*int(nchan_in,8)`) --
+correct at any dataset size, not bounded by today's Jennifer cube
+specifically. **Verified:** full suite 121/121 after the fix; re-ran the
+exact forced-small-tile pixel-(65,65) cross-check against the real full
+file -- `iter=1` through `iter=500` now BIT-IDENTICAL to the cutout's own
+trace (`peak_val` 78.69138E-05 uJy at iter1, 1.894835E-06 at iter500,
+matching to the last printed digit), and the startup log now reports
+"Mask-pattern cache: 1 distinct pattern(s) cached" (was 2) -- confirming
+the second "pattern" seen earlier was itself a corruption artifact of
+the truncated read, not real structure in the data.
+
+**T10b (not started) -- RAM-aware mask handling, the architectural
+follow-up:** T10a fixes the correctness bug but leaves the "hold the
+entire mask cube resident in memory, uncounted by `mem_frac_ram`"
+design unchanged -- correct now, but not RAM-budgeted, and the user
+explicitly asked to future-proof this rather than stop at the minimal
+fix ("Let's not shy away from hard work"). The user's own question, that
+this ticket should resolve: why does the mask cube need a separate
+whole-cube-resident read at all, when AMP/PHA are already read via the
+SAME per-tile machinery regardless of image size? Answer worked out in
+discussion: the ONLY real reason is `build_mask_pattern_cache`'s
+one-time global pre-scan, deliberately done serially so the main
+parallel CLEAN loop's own per-pixel cache lookups can stay lock-free.
+Design direction agreed: move the mask-pattern cache from "one upfront
+serial pre-scan, build-once" to an INCREMENTAL scheme -- built as tiles
+are processed (first pixel with a new pattern builds its table, later
+pixels anywhere reuse it), with the lookup-or-insert operation
+synchronized (an `!$omp critical` section) instead of relying on
+insertion having already fully completed. This lets the mask cube be
+read through the exact same tiled/`io_read_threads`/`io_overlap`-aware
+mechanism as AMP/PHA (a `read_mask_tile` sibling to
+`read_amp_pha_tile`), makes mask memory part of the SAME
+`mem_frac_ram`-budgeted `plan_rmclean_tile`/`bytes_per_tile_pixel`
+formula (one more term: 1 byte x `nchan` per pixel, alongside the
+existing `4*(2+6*2)*nrm`), and lets `read_mask_cube` and its overflow
+be deleted outright rather than patched. A big machine naturally gets
+tiles large enough to recover today's whole-cube-resident behaviour for
+free (up to and including the whole image in one tile, if it fits); a
+small machine naturally gets smaller ones -- no separate fallback logic
+needed. Not yet implemented; needs its own dev-test-validate pass
+(tile-geometry changes, the cache's new locking model, and the tile-
+sizing formula extension all need independent verification) before
+landing.
+
+**Still open (not blocking T10a, to revisit once T10b lands):**
+- Whether pixel (65,65) (and the aggregate 99% niter-hit rate) still
+  shows genuine stagnation once run against CORRECTLY-read mask data --
+  needs a fresh full-cube run with the T10a fix to check; the originally
+  -scoped divergence/stagnation stopping-criteria work may turn out to
+  be smaller, or largely unnecessary, once CLEAN is no longer working
+  against wrong RMSF tables for most of the image.
+- The signal-free-RM-plane residual/CLEAN-component contamination --
+  very likely caused or substantially worsened by this same bug; needs
+  re-checking against a post-fix run before any separate investigation
+  is warranted.
