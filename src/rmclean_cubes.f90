@@ -609,9 +609,10 @@ program rmclean_cubes
          ! 16.7 min) before Fortran prints '*' fill instead of the value
          ! -- too narrow once a single block's own compute stage runs
          ! longer than that (found on a real full-cube run: one block
-         ! took 55min). F18.3 holds up to 14 integer digits, enough for
-         ! several centuries of milliseconds.
-         write(thread_msg,'(A,I0,A,I0,A,I0,A,F18.3)') 'thread_timing stage=clean event=done tid=',&
+         ! took 55min). F0.3 (auto-width) has no overflow ceiling and no
+         ! fixed-width padding, matching this file's own convention for
+         ! other floating-point log fields (F0.6, F0.4).
+         write(thread_msg,'(A,I0,A,I0,A,I0,A,F0.3)') 'thread_timing stage=clean event=done tid=',&
          &tid_local,' block=',tile_seq,' unit_count=',tx*ty,' dur_ms=',t_thread_elapsed
          call log_message('debug','tile_thread',trim(thread_msg))
          !$omp end parallel

@@ -2451,7 +2451,14 @@ real full Jennifer cube with the curated cfg:**
    once a single tile block's own compute stage runs longer than
    ~16.7 min (only 6 integer digits fit) -- found live, a block
    genuinely took 55 min. Display-only (the timing itself was always
-   correct); widened to `F18.3`.
+   correct); first widened to `F18.3`, then corrected again to `F0.3`
+   (auto-width) after the user pointed out `F18.3` still left ugly
+   fixed-width leading-space padding on every line -- `F0.3` has no
+   overflow ceiling AND no padding, matching this file's own existing
+   convention for other floating-point log fields (`F0.6`, `F0.4`).
+   Verified: rebuilt, full suite 121/121, and a live debug-level run
+   against the `rmclean_tuning_subim128` fixture shows clean
+   `dur_ms=489.936`-style output with no asterisks and no padding.
 2. `plan_rmclean_tile`'s own `bytes_per_tile_pixel` budget formula
    assumed 8 array-widths (2 input + 6 output, all single-buffered),
    but the 6 output arrays (`clean_re_buf(...,2)` etc.) are allocated
