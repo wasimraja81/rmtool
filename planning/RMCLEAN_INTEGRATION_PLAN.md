@@ -2656,6 +2656,48 @@ restoration) and the full suite is 122/122 again. Runs in ~3s wall time
 -- `tests/output/` is gitignored and the fixture is deleted at the end
 of every run regardless of pass/fail.
 
+**T10a full-cube confirmation (`jennifer_e2e_v5_cleaned`, isolated
+systemd scope, 6 threads, MemoryMax=40G, same curated cfg as the flawed
+v4 run):** a complete real 4501x4501 run with the fix, replacing v4
+(deleted). Result is a complete reversal of every symptom this ticket
+set out to explain:
+- **niter-cap hit rate: 0.00% (0 of 20,259,001 pixels)**, versus v4's
+  99.05%. `n_iter_used` mean 55.29 (min 4, max 145), versus v4's mean
+  496.72 (min 3, max 500) -- not a single pixel exhausts the iteration
+  budget any more.
+- Both stopping criteria now do real, well-balanced work:
+  `abs_flux_floor` 26.12% (5,291,908 pixels), `auto_nsigma` 73.88%
+  (14,967,093 pixels) -- versus v4's degenerate 0.33%/0.62% split (the
+  other 99.05% never got the chance to stop early at all).
+- Total wall time ~81 minutes (17:00:20-18:21:28), versus v4's ~3h39m --
+  ~2.7x faster overall, entirely as a side effect of CLEAN no longer
+  fighting wrong RMSF tables for most of the image.
+- The signal-free-RM-plane finding (residual exceeding dirty at the
+  first/last RM planes) is also reversed: residual peak now BELOW dirty
+  peak at both edges (190.6 vs 290.4 uJy at RM=-500; 108.4 vs 361.1 uJy
+  at RM=+500), versus v4's 1890-2443 vs 290-361 uJy -- correct CLEAN
+  behaviour restored. One number NOT yet interpreted (per
+  [[feedback_no_loose_statistical_guesses]]): ~23% of all pixels still
+  show a nonzero CLEAN component at these edge planes -- higher than
+  the 5-7% originally flagged as concerning, but that earlier figure
+  came from a run where 99% of pixels never actually converged, so it
+  is not a valid baseline for comparison either. Whether ~23% is
+  consistent with pure-noise placement at a domain edge, for a sample
+  this large, has not been computed and should not be asserted either
+  way without doing so -- open, not blocking, tracked separately.
+
+**Conclusion:** the mask-cube read overflow (T10a) was the actual root
+cause of the pixel-(65,65) "never converges" finding, the real v4 run's
+99.05% niter-cap-hit rate, AND the signal-free-RM-plane contamination --
+all three were investigated this session as apparently separate
+mysteries before the single underlying bug was found. The originally-
+scoped divergence/stagnation stopping-criteria work (detecting a peak
+residual that plateaus/oscillates or grows without bound) may no longer
+be necessary at all now that CLEAN converges cleanly for every pixel in
+the real dataset -- needs the user's own decision on whether to still
+pursue it as a general defensive measure, or park it, before any further
+work in that direction.
+
 **T10b (not started) -- RAM-aware mask handling, the architectural
 follow-up:** T10a fixes the correctness bug but leaves the "hold the
 entire mask cube resident in memory, uncounted by `mem_frac_ram`"
