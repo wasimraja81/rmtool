@@ -2626,6 +2626,36 @@ matching to the last printed digit), and the startup log now reports
 the second "pattern" seen earlier was itself a corruption artifact of
 the truncated read, not real structure in the data.
 
+**Regression test (`tests/test_mask_read_overflow.f90`, suite section
+38):** `read_mask_cube` lived as a procedure nested inside `program
+rmclean_cubes` itself, not callable from a separate test program --
+extracted into a new module, `src/rmclean_io_mod.f90` (it already took
+every dependency as an explicit argument, so this was a clean,
+behaviour-neutral extraction, confirmed by the full suite staying
+121/121 immediately after, before the test itself was even added; this
+module is also the intended home for T10b's own future `read_mask_tile`).
+A genuine overflow test needs a fixture whose total element count
+exceeds 2^31 -- unavoidably ~2.4GB for a byte-typed mask cube, no way
+around that. Kept fast via an OS-level SPARSE file: the 2880-byte
+primary header is hand-built via raw Fortran stream I/O (bypassing
+CFITSIO for file CREATION entirely -- confirmed directly that closing a
+file CFITSIO itself created via `FTINIT`/`FTPHPR` actually materializes
+real disk blocks for its whole declared data section, `du` showing the
+full ~2.3G, which would have defeated a lightweight fixture), then only
+3 bytes are actually written (first element, an untouched middle
+element expected to read back 0, and the very last of 2.4 billion
+elements) -- everything else is an unwritten hole. CFITSIO (via
+`read_mask_cube`'s own `FTGPVBLL`) is used only for the READ side, the
+actual thing under test; it does not care how the file was created.
+Verified the test genuinely discriminates: temporarily reverted
+`rmclean_io_mod.f90` to the old buggy `FTGPVB` call, rebuilt just the
+test, confirmed it FAILS (both the first and last markers read back 0);
+restored the real fix, confirmed the diff against git is empty (exact
+restoration) and the full suite is 122/122 again. Runs in ~3s wall time
+(mostly kernel sparse-I/O syscalls, 5ms user CPU) and leaves no residue
+-- `tests/output/` is gitignored and the fixture is deleted at the end
+of every run regardless of pass/fail.
+
 **T10b (not started) -- RAM-aware mask handling, the architectural
 follow-up:** T10a fixes the correctness bug but leaves the "hold the
 entire mask cube resident in memory, uncounted by `mem_frac_ram`"
