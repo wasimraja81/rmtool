@@ -76,11 +76,20 @@ wall time, and the signal-free-RM-plane residual-exceeds-dirty finding
 reversed to the correct direction. T10b (RAM-aware mask handling: unify
 the mask-cube read with the AMP/PHA tiled I/O scheme, make the
 mask-pattern cache build incrementally instead of one upfront
-whole-cube-resident pass) is next, not yet started. T11 (CLEAN
-divergence / noise-wasting-compute stopping criteria -- the general
-algorithmic case, distinct from T10a's own data-corruption bug) is
-deferred until after T10b, per the user's own explicit ordering
-instruction -- see T10's and T11's own ticket text for full detail.
+whole-cube-resident pass) is DONE -- `read_mask_tile`/`read_mask_chunk`
+(`FTGSVB`-based, confirmed no overflow exposure at any size) replace the
+deleted `read_mask_cube`; `mask_tile` is now tiled exactly like AMP/PHA;
+the mask-pattern cache builds incrementally, once per tile, with no
+locks needed (the tile loop's own strict sequencing already guarantees
+insertion never races a lookup). A full real-data confirmation run
+(`jennifer_e2e_v6_cleaned`) is BYTE-FOR-BYTE IDENTICAL to T10a's own
+`v5` run across all 6 output cubes, with an exactly-matching aggregate
+stop-reason summary -- proving T10b is a pure architectural
+improvement with zero behavioural change. T11 (CLEAN divergence /
+noise-wasting-compute stopping criteria -- the general algorithmic
+case, distinct from T10a's own data-corruption bug) is next, per the
+user's own explicit ordering instruction -- see T10's and T11's own
+ticket text for full detail.
 
 ## Context
 
@@ -2706,38 +2715,126 @@ the real dataset -- needs the user's own decision on whether to still
 pursue it as a general defensive measure, or park it, before any further
 work in that direction.
 
-**T10b (not started) -- RAM-aware mask handling, the architectural
-follow-up:** T10a fixes the correctness bug but leaves the "hold the
-entire mask cube resident in memory, uncounted by `mem_frac_ram`"
-design unchanged -- correct now, but not RAM-budgeted, and the user
-explicitly asked to future-proof this rather than stop at the minimal
-fix ("Let's not shy away from hard work"). The user's own question, that
-this ticket should resolve: why does the mask cube need a separate
-whole-cube-resident read at all, when AMP/PHA are already read via the
-SAME per-tile machinery regardless of image size? Answer worked out in
-discussion: the ONLY real reason is `build_mask_pattern_cache`'s
-one-time global pre-scan, deliberately done serially so the main
-parallel CLEAN loop's own per-pixel cache lookups can stay lock-free.
-Design direction agreed: move the mask-pattern cache from "one upfront
-serial pre-scan, build-once" to an INCREMENTAL scheme -- built as tiles
-are processed (first pixel with a new pattern builds its table, later
-pixels anywhere reuse it), with the lookup-or-insert operation
-synchronized (an `!$omp critical` section) instead of relying on
-insertion having already fully completed. This lets the mask cube be
-read through the exact same tiled/`io_read_threads`/`io_overlap`-aware
-mechanism as AMP/PHA (a `read_mask_tile` sibling to
-`read_amp_pha_tile`), makes mask memory part of the SAME
-`mem_frac_ram`-budgeted `plan_rmclean_tile`/`bytes_per_tile_pixel`
-formula (one more term: 1 byte x `nchan` per pixel, alongside the
-existing `4*(2+6*2)*nrm`), and lets `read_mask_cube` and its overflow
-be deleted outright rather than patched. A big machine naturally gets
-tiles large enough to recover today's whole-cube-resident behaviour for
-free (up to and including the whole image in one tile, if it fits); a
-small machine naturally gets smaller ones -- no separate fallback logic
-needed. Not yet implemented; needs its own dev-test-validate pass
-(tile-geometry changes, the cache's new locking model, and the tile-
-sizing formula extension all need independent verification) before
-landing.
+**T10b (done) -- RAM-aware mask handling, the architectural follow-up:**
+T10a fixed the correctness bug but left the "hold the entire mask cube
+resident in memory, uncounted by `mem_frac_ram`" design unchanged --
+correct, but not RAM-budgeted. The user explicitly asked to
+future-proof this rather than stop at the minimal fix ("Let's not shy
+away from hard work"), and pushed back directly on a first attempt to
+frame this as solved by tiling alone: even a tiled read could in
+principle still ask a single CFITSIO call to move more elements than a
+32-bit count can hold, if `mem_frac_ram`/tile size were large enough on
+a big enough machine or dataset -- the fix needed to be genuine, not
+just statistically unlikely under today's defaults. That question was
+answered directly (not assumed): `FTGSVE` (already used for AMP/PHA
+tile reads) has no equivalent exposure at any size, confirmed against
+this project's own bundled cfitsio-4.3.1 C source (`getcol.c:422`,
+`nelem = nelem * naxes[ii]` -- the per-axis-extent-to-total-count
+accumulation is done in genuine 64-bit `LONGLONG` internally,
+regardless of the wrapper's own per-axis argument types, which only
+ever need to hold small values like image width or channel count
+individually). `FTGSVB` (the byte-typed counterpart, needed for the
+mask) shares the identical underlying subsection-read machinery,
+confirmed both by direct compile/link (`FTGSVB` resolves cleanly
+against this system's libcfitsio) and by a real functional test (a
+2x2x10 fixture, reading a 2x2 offset subregion split across 3
+`io_read_threads` workers, matched an independent Python/astropy
+reference exactly for all 4 sub-pixels).
+
+**The user's own deeper question, which this ticket set out to answer:**
+why does the mask cube need a separate whole-cube-resident read at all,
+when AMP/PHA are already read via the SAME per-tile machinery regardless
+of image size? Answer: the ONLY real reason was `build_mask_pattern_
+cache`'s one-time global pre-scan, deliberately done serially so the
+main parallel CLEAN loop's own per-pixel cache lookups could stay
+lock-free. That pre-scan doesn't actually need a global view in one
+pass -- it only needs INSERTION to happen serially before the matching
+LOOKUP, and the tile loop is already strictly sequential (one tile
+fully processed before the next begins), so scanning each tile's own
+mask subrange for new patterns, once, serially, right before that
+SAME tile's own parallel CLEAN loop starts, preserves the exact same
+safety property (`cache_lookup_readonly` never races an insertion) with
+no locks needed at all -- simpler than the `!$omp critical` design
+originally sketched in discussion, once actually reasoned through
+against the loop's real structure.
+
+**What changed:**
+- `src/rmclean_io_mod.f90`: added `read_mask_tile`/`read_mask_chunk` (a
+  `read_amp_pha_tile`/`read_amp_pha_chunk` sibling, `FTGSVB`-based,
+  `io_read_threads`-aware). `read_mask_cube` (T10a's own fix) deleted
+  outright, not kept as an unused utility -- its only call site is gone,
+  and the overflow class it guarded against cannot recur in this module
+  at all (`FTGSVB` has no flat pre-multiplied element-count argument to
+  overflow in the first place).
+- `src/rmclean_cubes.f90`: `mask_cube` (whole-cube-resident,
+  `(nx,ny,nchan)`) replaced by `mask_tile` (tiled, `(tile_ra,tile_dec,
+  nchan)`, exactly like `re_tile`/`im_tile`). `plan_rmclean_tile`'s
+  `bytes_per_tile_pixel` gained one more term (`+ nchan`, 1 byte/voxel,
+  single-buffered -- read-only working data, never written out, so no
+  double-buffering needed unlike the 6 output arrays). `plan_rmclean_
+  tile` now runs BEFORE mask allocation (it no longer needs the mask
+  read first at all). `build_mask_pattern_cache` split into
+  `init_mask_pattern_cache` (allocates the empty cache structures once,
+  before the tile loop) and `update_mask_pattern_cache_for_tile(tx,ty)`
+  (the actual per-tile serial pre-scan, called once per tile right
+  after that tile's own `read_mask_tile` and before its own parallel
+  CLEAN loop). Running totals (`n_distinct_patterns_total`/
+  `n_overflow_pixels_total`) accumulate across every tile's own call;
+  the "Mask-pattern cache: N distinct pattern(s) cached" summary line
+  moved from a startup message (right after the old one-shot pre-scan)
+  to the very end of the run (there is no longer one single pre-scan
+  moment to print it at -- a real, deliberate behaviour change, not an
+  oversight). `clean_one_pixel`/`cache_lookup_readonly` call sites
+  switched from `mask_cube(ix_g,iy_g,:)` (global indexing) to
+  `mask_tile(ix_l,iy_l,:)` (tile-local, matching `re_tile`/`im_tile`'s
+  own convention already used in the same subroutine); `ix_g`/`iy_g`
+  are still computed and used, but now only for `trace_ix`/`trace_iy`
+  matching, not mask addressing.
+- `tests/test_mask_read_overflow.f90` and its `run_tests.sh` section 38
+  retired (not just deleted silently) -- the specific vulnerability
+  class it tested for (a flat, pre-multiplied 32-bit element count) no
+  longer exists anywhere in the production code path, since `FTGSVB` has
+  no argument shape that could ever overflow that way. `read_mask_tile`
+  is already exercised by the EXISTING section 29 end-to-end test (which
+  specifically compares a forced small-tile run against the default
+  single-tile run and requires them to agree numerically) -- arguably a
+  more meaningful test for THIS function than a dedicated unit test
+  would be, since it exercises real tile-boundary/offset addressing and
+  the incremental cache across genuinely different tile geometries, not
+  a synthetic fixture.
+
+**Verified, in order:**
+1. `read_mask_tile` functionally correct in isolation: a 2x2x10 real
+   FITS fixture, reading a 2x2 offset subregion (not the whole file)
+   split across 3 `io_read_threads` workers, matched an independent
+   numpy/astropy reference exactly, byte for byte, for all 4 sub-pixels.
+2. Full suite green immediately after the tile-loop/cache-redesign
+   integration, first attempt: 122/122, including section 29's own
+   forced-small-tile-vs-default-tile numerical consistency check (a real
+   end-to-end exercise of tile-boundary mask addressing).
+3. **Full real-data confirmation, the strongest test available:** a
+   complete fresh 4501x4501 Jennifer CLEAN with the T10b binary
+   (`jennifer_e2e_v6_cleaned`, same curated cfg, same isolation/thread
+   conventions as T10a's own `v5` confirmation run). Aggregate
+   stop-reason summary EXACTLY matches `v5` in every figure: niter-cap
+   hits 0 (0.00%), `abs_flux_floor` 5,291,908 (26.12%), `auto_nsigma`
+   14,967,093 (73.88%), `n_iter_used` mean=55.29 min=4 max=145 -- not
+   approximately similar, identical to the last digit. All 6 output
+   cubes (`CLEAN`/`RESID`/`RESTORED` x `AMP`/`PHA`) are BYTE-FOR-BYTE
+   IDENTICAL between `v5` and `v6` (`cmp`, no diff reported on any of
+   the 6 ~8.2GB files). Wall time also closely matched (~83min vs
+   ~81min) -- no meaningful performance regression from the switch to
+   tiled mask reads and per-tile incremental caching. Tile plan changed
+   from 7 blocks (v5, mask footprint not yet budgeted) to 8 blocks (v6,
+   correctly smaller now that the mask's own memory is counted) --
+   exactly the intended effect of the formula change, with zero output
+   difference as a result, confirming the new budget doesn't change
+   CLEAN's own numerical behaviour, only how tile size is chosen.
+4. 121/121 after retiring `test_mask_read_overflow.f90`/section 38 (down
+   from 122, as expected -- one test removed, none newly broken).
+
+T10b is done. `v5`'s outputs were deleted after confirming byte-identity
+with `v6` (redundant, ~49GB freed); `v6` is the current reference output.
 
 **Both open questions above were resolved by the full-cube confirmation
 run** (see T10a's own "full-cube confirmation" text above): niter-cap

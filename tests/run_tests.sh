@@ -2483,48 +2483,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 38. RM-CLEAN mask-cube read overflow (T10a) – FTGPVBLL correctness for a
-#     >2^31-element mask cube (the exact overflow that silently truncated
-#     the real Jennifer ASKAP mask cube, 4501x4501x288, at ~76 of 288
-#     channels for every pixel before this ticket's fix). Generates a
-#     ~2.4e9-element sparse fixture on the fly (only 3 bytes actually
-#     written; the rest are unwritten holes reading back as zero without
-#     consuming real disk blocks) and calls rmclean_io_mod's own
-#     read_mask_cube directly.
-# ---------------------------------------------------------------------------
-section "38. RM-CLEAN mask-cube read overflow (T10a)"
-
-maskoverflow_bin="$RMCLEAN_BUILD_DIR/test_mask_read_overflow"
-maskoverflow_log="$OUT_DIR/test_mask_read_overflow.log"
-fitsio_unit_o="$RMCLEAN_BUILD_DIR/fitsio_unit_mod.o"
-rmclean_io_o="$RMCLEAN_BUILD_DIR/rmclean_io_mod.o"
-
-if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
-        -O3 -J"$rmclean_mod_dir" -c "$REPO_ROOT/src/fitsio_unit_mod.f90" \
-        -o "$fitsio_unit_o" 2>"$OUT_DIR/mask_overflow_build.log" \
-    && gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
-        -O3 -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
-        -c "$REPO_ROOT/src/rmclean_io_mod.f90" \
-        -o "$rmclean_io_o" 2>>"$OUT_DIR/mask_overflow_build.log" \
-    && gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
-        -O3 -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
-        "$TESTS_DIR/test_mask_read_overflow.f90" "$fitsio_unit_o" "$rmclean_io_o" \
-        -o "$maskoverflow_bin" -lcfitsio 2>>"$OUT_DIR/mask_overflow_build.log"; then
-    if (cd "$REPO_ROOT" && "$maskoverflow_bin") > "$maskoverflow_log" 2>&1; then
-        while IFS= read -r line; do
-            case "$line" in
-                *"PASS:"*) pass "${line#*PASS: }" ;;
-                *"FAIL:"*) fail "${line#*FAIL: }" ;;
-            esac
-        done < "$maskoverflow_log"
-    else
-        fail "mask-cube read overflow: program exited non-zero (see $maskoverflow_log)"
-    fi
-else
-    fail "mask-cube read overflow: build failed (see $OUT_DIR/mask_overflow_build.log)"
-fi
-
-# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

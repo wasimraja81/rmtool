@@ -1,69 +1,123 @@
 module rmclean_io_mod
    !! T10: shared, independently-testable FITS I/O helpers for
    !! rmclean_cubes, split out of the program itself so they can be
-   !! unit-tested in isolation (planning/RMCLEAN_INTEGRATION_PLAN.md
-   !! ticket T10's own regression test needs to call read_mask_cube
-   !! directly against a synthetic oversized fixture, which is not
-   !! possible for a procedure nested inside a `program`). Intended as
-   !! the home for T10b's own future read_mask_tile too, once the mask
-   !! cube's whole-cube-resident read is unified with the AMP/PHA tiled
-   !! scheme -- see that ticket's own text.
+   !! unit-tested in isolation. Originally also held read_mask_cube
+   !! (T10a's fix for a 32-bit element-count overflow in a whole-cube
+   !! FTGPVB read), retired once T10b replaced its only call site with
+   !! read_mask_tile below -- FTGSVB (tiled subsection read) has no
+   !! equivalent flat pre-multiplied element-count argument at all, so
+   !! the overflow class T10a fixed cannot recur in this module; see
+   !! planning/RMCLEAN_INTEGRATION_PLAN.md ticket T10 for the full
+   !! investigation/evidence of both.
    use fitsio_unit_mod
    implicit none
    private
-   public :: read_mask_cube
+   public :: read_mask_tile
 
 contains
 
-   subroutine read_mask_cube(filename, nx_in, ny_in, nchan_in, mask_out, status)
-      !! T10a: reads the WHOLE mask cube in one FTGPVBLL call (genuine
-      !! 64-bit element count/offset) rather than the plain FTGPVB entry
-      !! point, whose Fortran-visible firstelem/nelem are narrowed to a
-      !! 32-bit LONG even though the underlying C ffgpvb() (and this same
-      !! library's FTGSVE, used everywhere else in this codebase) is
-      !! LONGLONG-safe throughout -- confirmed directly against this
-      !! project's own bundled cfitsio-4.3.1 source (f77_wrap2.c's own
-      !! FCALLSCSUB8 declarations for ffgpvb: the plain FTGPVB entry
-      !! declares firstelem/nelem as LONG, a SEPARATE FTGPVBLL entry
-      !! declares the identical two arguments LONGLONG -- both wrapping
-      !! the same C function, so FTGPVBLL is not a slower/different
-      !! code path, just the correctly-typed entry point). A real
-      !! dataset can trivially exceed 2^31 total mask-cube elements
-      !! (nx*ny*nchan) -- e.g. this project's own Jennifer ASKAP mask
-      !! cube (4501x4501x288 ~= 5.83 billion) overflowed the plain
-      !! FTGPVB's 32-bit nelem, silently truncating the read at ~76 of
-      !! 288 channels for EVERY pixel in the image (see planning/
-      !! RMCLEAN_INTEGRATION_PLAN.md ticket T10 for the full
-      !! investigation/evidence). FTGPVBLL's firstelem/nelem below are
-      !! genuine integer(kind=8), so this is correct at any dataset size,
-      !! not just today's.
-      character(len=*), intent(in) :: filename
-      integer, intent(in) :: nx_in, ny_in, nchan_in
-      integer(kind=1), allocatable, intent(out) :: mask_out(:,:,:)
-      integer, intent(out) :: status
-      integer :: unit, blocksize, fitsstat
-      integer(kind=8) :: n_elements_total
+   subroutine split_range_rmclean_io(n_total, n_threads, base, rem)
+      !! Same convention as rmclean_cubes.f90's own split_range_rmclean
+      !! (itself matching rm_synthesis_mod.f90's split_channels_across_
+      !! threads) -- kept as a small private duplicate here rather than
+      !! shared via host association, since this module cannot host-
+      !! associate into the program that calls it.
+      integer, intent(in) :: n_total, n_threads
+      integer, intent(out) :: base, rem
+      base = n_total / n_threads
+      rem = mod(n_total, n_threads)
+   end subroutine split_range_rmclean_io
+
+   subroutine read_mask_chunk(maskfile, nx_full, ny_full, nchan_full, ix0,&
+   &iy0, tx, ty, chan_beg, chan_len, mask_out, status_par)
+      !! One io_read_threads worker's own disjoint channel-chunk of one
+      !! mask tile -- see read_mask_tile's own comment. FTGSVB (byte
+      !! subsection read) is the mask-cube analogue of FTGSVE (used for
+      !! AMP/PHA tile reads, read_amp_pha_chunk in rmclean_cubes.f90):
+      !! both take per-axis extents (naxes/blc/trc), never a single
+      !! pre-multiplied flat element count, so neither has the 32-bit
+      !! overflow exposure T10a fixed in the old whole-cube FTGPVB call
+      !! (confirmed directly for FTGSVE's own underlying C implementation,
+      !! planning/RMCLEAN_INTEGRATION_PLAN.md ticket T10a's own evidence;
+      !! FTGSVB shares the same underlying subsection-read machinery,
+      !! parameterised only by output datatype).
+      character(len=*), intent(in) :: maskfile
+      integer, intent(in) :: nx_full, ny_full, nchan_full
+      integer, intent(in) :: ix0, iy0, tx, ty, chan_beg, chan_len
+      integer(kind=1), intent(out) :: mask_out(tx,ty,chan_len)
+      integer, intent(inout) :: status_par
+      integer :: unit, blocksize, fitsstat, group
+      integer :: fpixel(3), lpixel(3), incs(3), naxes_full(3)
       logical :: anyflag
 
-      status = 0
-      allocate(mask_out(nx_in,ny_in,nchan_in))
-      n_elements_total = int(nx_in,8)*int(ny_in,8)*int(nchan_in,8)
+      group = 1
+      naxes_full = (/ nx_full, ny_full, nchan_full /)
+      fpixel = (/ ix0, iy0, chan_beg /)
+      lpixel = (/ ix0+tx-1, iy0+ty-1, chan_beg+chan_len-1 /)
+      incs = (/ 1, 1, 1 /)
+
       fitsstat = 0
-      call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
+      call safe_ftopen(unit, trim(maskfile), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: cannot open FITS file: ', trim(filename)
-         status = -1
+         write(*,*) 'ERROR: cannot open FITS file: ', trim(maskfile)
+         !$omp atomic write
+         status_par = -1
          call free_fits_unit(unit)
          return
       endif
-      call FTGPVBLL(unit, 1, 1_8, n_elements_total, 0_1, mask_out, anyflag,&
-      &fitsstat)
+      call FTGSVB(unit, group, 3, naxes_full, fpixel, lpixel, incs, 0_1,&
+      &mask_out, anyflag, fitsstat)
       call safe_ftclos(unit, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: failed to read data from: ', trim(filename)
-         status = -1
-         return
+         write(*,*) 'ERROR: failed to read tile data from: ', trim(maskfile)
+         !$omp atomic write
+         status_par = -1
       endif
-   end subroutine read_mask_cube
+   end subroutine read_mask_chunk
+
+   subroutine read_mask_tile(maskfile, nx_full, ny_full, nchan_full, ix0,&
+   &iy0, tx, ty, io_read_threads_eff, mask_out, status)
+      !! T10b: reads one tile's own mask subregion (full channel depth,
+      !! [ix0:ix0+tx-1, iy0:iy0+ty-1, 1:nchan_full]) via FTGSVB, the same
+      !! io_read_threads-parallel-chunk scheme read_amp_pha_tile already
+      !! uses for AMP/PHA (rmclean_cubes.f90) -- replaces the old
+      !! whole-cube-resident read_mask_cube in production use. Correct at
+      !! any tile size (up to and including tx=nx_full,ty=ny_full, i.e.
+      !! today's former whole-cube-resident behaviour, recovered for free
+      !! when a tile that large fits the memory budget) and at any
+      !! dataset size, since FTGSVB has no flat-element-count overflow
+      !! exposure (see read_mask_chunk's own comment).
+      character(len=*), intent(in) :: maskfile
+      integer, intent(in) :: nx_full, ny_full, nchan_full, ix0, iy0, tx, ty
+      integer, intent(in) :: io_read_threads_eff
+      integer(kind=1), intent(out) :: mask_out(tx,ty,nchan_full)
+      integer, intent(out) :: status
+      integer :: base_chan, rem_chan, ith, chan_beg, chan_len
+      integer :: status_par
+
+      status = 0
+      status_par = 0
+      call split_range_rmclean_io(nchan_full, io_read_threads_eff, base_chan,&
+      &rem_chan)
+
+      !$omp parallel do schedule(static) default(shared)&
+      !$omp& private(ith,chan_beg,chan_len) num_threads(io_read_threads_eff)
+      do ith = 0, io_read_threads_eff-1
+         if (ith.lt.rem_chan) then
+            chan_len = base_chan + 1
+            chan_beg = ith*(base_chan+1) + 1
+         else
+            chan_len = base_chan
+            chan_beg = rem_chan*(base_chan+1) + (ith-rem_chan)*base_chan + 1
+         endif
+         if (chan_len.gt.0) then
+            call read_mask_chunk(maskfile, nx_full, ny_full, nchan_full, ix0,&
+            &iy0, tx, ty, chan_beg, chan_len,&
+            &mask_out(:,:,chan_beg:chan_beg+chan_len-1), status_par)
+         endif
+      enddo
+      !$omp end parallel do
+      if (status_par.ne.0) status = -1
+   end subroutine read_mask_tile
 
 end module rmclean_io_mod

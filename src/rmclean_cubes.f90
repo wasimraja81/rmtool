@@ -216,11 +216,21 @@ program rmclean_cubes
    logical :: have_lsqref_keyword
    real(sp), allocatable :: rm_samp(:)
 
-   ! mask_cube stays whole-cube-resident (T4's own top-of-file comment on
-   ! this deliberate divergence from rm_synthesis's per-tile mask): tiny
-   ! relative to the float cubes, and build_mask_pattern_cache needs one
-   ! global pre-scan before any tile is CLEANed.
-   integer(kind=1), allocatable :: mask_cube(:,:,:)
+   ! T10b: mask_tile is now tiled exactly like re_tile/im_tile below
+   ! (replacing the old whole-cube-resident mask_cube + its own separate
+   ! read_mask_cube, T4's original deliberate divergence) -- read fresh
+   ! per tile via read_mask_tile, and the mask-pattern cache is now built
+   ! INCREMENTALLY, one tile's own (1:tx,1:ty,:) subrange at a time
+   ! (update_mask_pattern_cache_for_tile), rather than one upfront global
+   ! pre-scan requiring the whole mask resident in memory. This also
+   ! makes the mask's own memory footprint part of the SAME
+   ! mem_frac_ram-budgeted tile-sizing formula as everything else
+   ! (plan_rmclean_tile's own bytes_per_tile_pixel) -- a big machine
+   ! naturally gets a tile large enough to recover the old whole-cube-
+   ! resident behaviour for free (up to tx=nx,ty=ny, if it fits the
+   ! budget); a small machine naturally gets smaller tiles instead of
+   ! failing outright.
+   integer(kind=1), allocatable :: mask_tile(:,:,:)
 
    ! T4a: per-tile input buffers, allocated ONCE at the planned
    ! (tile_ra,tile_dec,nrm) max size and reused across every tile -- a
@@ -359,10 +369,17 @@ program rmclean_cubes
    character(len=160) :: thread_msg
 
    ! --- Mask-pattern -> rmsf_table_t cache (planning/RMCLEAN_INTEGRATION_
-   ! PLAN.md decision 10) -- built once, serially, by build_mask_pattern_
-   ! cache below, BEFORE the parallel per-pixel CLEAN loop starts, so
-   ! every thread's own lookup (cache_lookup_readonly) is read-only and
-   ! race-free. See table_cache_entry_t's own comment.
+   ! PLAN.md decision 10) -- T10b: built INCREMENTALLY now, one tile's
+   ! own mask subrange at a time (update_mask_pattern_cache_for_tile),
+   ! called serially right after that tile's own mask_tile is read and
+   ! BEFORE that tile's own parallel per-pixel CLEAN loop starts, so
+   ! every thread's own lookup (cache_lookup_readonly) is still read-only
+   ! and race-free within that tile -- insertion for a LATER tile happens
+   ! strictly after all of THIS tile's own lookups have completed
+   ! (sequential tile loop), so the same "insertion never races a
+   ! lookup" safety argument as the old one-upfront-pass design still
+   ! holds, just repeated once per tile instead of once globally. See
+   ! table_cache_entry_t's own comment.
    type :: table_cache_entry_t
       integer(kind=8) :: hash = 0_8
       integer(kind=1), allocatable :: pattern(:)
@@ -371,6 +388,11 @@ program rmclean_cubes
    type(table_cache_entry_t), allocatable :: cache_entries(:)
    integer, allocatable :: cache_buckets(:)
    integer :: n_cache_entries, n_cache_buckets
+   ! Running totals across ALL tiles (T10b), printed once after the
+   ! whole tile loop completes -- the old design printed this once,
+   ! right after its own single global pre-scan; there is no longer one
+   ! single pre-scan moment to print it at.
+   integer :: n_distinct_patterns_total, n_overflow_pixels_total
 
    call parse_args(status)
    if (status.ne.0) stop 1
@@ -482,14 +504,17 @@ program rmclean_cubes
    endif
    write(*,'(A,F0.6,A)') 'Restoring beam FWHM = ', fwhm_rm, ' rad/m^2'
 
-   call read_mask_cube(maskfile, nx, ny, nchan, mask_cube, status)
-   if (status.ne.0) stop 1
-
    call plan_fourier_interp(nrm, nrm, restore_plan_fwd, restore_plan_bwd)
 
-   call build_mask_pattern_cache()
-
+   ! T10b: plan_rmclean_tile now runs BEFORE the mask cache is
+   ! initialised (it no longer needs the mask read first -- there is no
+   ! more whole-cube read_mask_cube call at all), since its own
+   ! bytes_per_tile_pixel budget now includes the mask's own per-pixel
+   ! footprint too, and mask_tile below is allocated at the tile size it
+   ! decides.
    call plan_rmclean_tile()
+
+   call init_mask_pattern_cache()
 
    ! T4b: same clamp convention as rm_synthesis's own io_read_threads --
    ! never more threads than OMP has, never more than there are RM planes
@@ -510,6 +535,7 @@ program rmclean_cubes
    endif
 
    allocate(re_tile(tile_ra,tile_dec,nrm), im_tile(tile_ra,tile_dec,nrm))
+   allocate(mask_tile(tile_ra,tile_dec,nchan))
    allocate(clean_re_buf(tile_ra,tile_dec,nrm,2), clean_im_buf(tile_ra,tile_dec,nrm,2))
    allocate(resid_re_buf(tile_ra,tile_dec,nrm,2), resid_im_buf(tile_ra,tile_dec,nrm,2))
    allocate(restored_re_buf(tile_ra,tile_dec,nrm,2), restored_im_buf(tile_ra,tile_dec,nrm,2))
@@ -587,8 +613,21 @@ program rmclean_cubes
          call timer_start(t_stage)
          call read_amp_pha_tile(ampfile, phafile, ix_tile_beg, iy_tile_beg,&
          &tx, ty, re_tile(1:tx,1:ty,:), im_tile(1:tx,1:ty,:), status)
+         if (status.ne.0) stop 1
+         ! T10b: this tile's own mask subregion, read via the same
+         ! tiled/io_read_threads-aware mechanism as AMP/PHA above,
+         ! replacing the old once-upfront whole-cube read_mask_cube.
+         call read_mask_tile(maskfile, nx, ny, nchan, ix_tile_beg,&
+         &iy_tile_beg, tx, ty, io_read_threads_eff,&
+         &mask_tile(1:tx,1:ty,:), status)
          call timer_stop('tile_read', t_stage)
          if (status.ne.0) stop 1
+
+         ! T10b: incremental mask-pattern-cache pre-scan for THIS tile
+         ! only, serial, before the parallel CLEAN loop below starts --
+         ! replaces the old one-upfront-global build_mask_pattern_cache
+         ! call (see update_mask_pattern_cache_for_tile's own comment).
+         call update_mask_pattern_cache_for_tile(tx, ty)
 
          call timer_start(t_stage)
          !$omp parallel default(shared)&
@@ -666,6 +705,16 @@ program rmclean_cubes
       enddo
       iy_tile_beg = iy_tile_beg + ty
    enddo
+   ! T10b: printed once here now, accumulated across every tile's own
+   ! update_mask_pattern_cache_for_tile call -- the old design printed
+   ! this once, right after its own single global pre-scan; there is no
+   ! longer one single pre-scan moment to print it at.
+   write(*,'(A,I0,A,I0,A)') 'Mask-pattern cache: ', n_distinct_patterns_total,&
+   &' distinct pattern(s) cached'
+   if (n_overflow_pixels_total.gt.0) then
+      write(*,'(A,I0,A)') '  (', n_overflow_pixels_total, ' pixel(s) past'//&
+      &' mask_pattern_cache_max fall back to a one-off table each)'
+   endif
    write(*,'(A,I0,A)') 'CLEANed ', n_pixels_done, ' pixels.'
    if (n_stopped_niter+n_stopped_abs_flux+n_stopped_auto_nsigma .gt. 0_8) then
       block
@@ -1489,8 +1538,14 @@ contains
 
       ! 2 input arrays (single-buffered) + 6 output arrays (each
       ! double-buffered, unconditionally -- see this subroutine's own
-      ! top comment) = 2 + 6*2 = 14 array-widths, not 8.
-      bytes_per_tile_pixel = int(4,8) * int(2 + 6*2,8) * int(nrm,8)
+      ! top comment) = 2 + 6*2 = 14 array-widths, not 8, each 4 bytes/
+      ! voxel x nrm voxels/pixel. T10b: the mask tile (read_mask_tile,
+      ! replacing the old whole-cube-resident read_mask_cube) is now
+      ! ALSO part of this same per-tile budget -- 1 byte/voxel x nchan
+      ! voxels/pixel, single-buffered (read-only working data, never
+      ! written out, so no double-buffering needed unlike the outputs).
+      bytes_per_tile_pixel = int(4,8) * int(2 + 6*2,8) * int(nrm,8) +&
+      &int(nchan,8)
       call get_mem_total_kb(mem_total_kb)
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) *&
       &1024.0d0, 8)
@@ -2364,7 +2419,7 @@ contains
 
    function fnv1a_hash(bytes, n) result(h)
       !! Standard 64-bit FNV-1a over a byte pattern (here: one pixel's
-      !! own valid-channel mask row, mask_cube(ix,iy,:)) -- used as the
+      !! own valid-channel mask row, mask_tile(ix_l,iy_l,:)) -- used as the
       !! bucket key for table_cache_entry_t below. Collisions are
       !! possible (any hash is), so every lookup below ALSO does a full
       !! byte-for-byte pattern compare on a hash match -- never trusts
@@ -2385,14 +2440,15 @@ contains
    subroutine cache_lookup_readonly(pattern, entry_idx)
       !! Open-addressing (linear probing) lookup into cache_buckets/
       !! cache_entries -- PURE READ access, safe to call concurrently
-      !! from every OMP thread in the main CLEAN loop, since
-      !! build_mask_pattern_cache below has already fully populated the
-      !! cache serially before that parallel region ever starts (no
-      !! insertion ever happens in here). entry_idx=0 means "not
-      !! cached" -- either this exact pattern never occurred during the
-      !! pre-scan (impossible, since the pre-scan visits the same
-      !! mask_cube this is called against) or the cache was already at
-      !! mask_pattern_cache_max when this pattern was first seen --
+      !! from every OMP thread in the main CLEAN loop, since T10b's own
+      !! update_mask_pattern_cache_for_tile has already fully populated
+      !! the cache for THIS tile serially before that tile's own parallel
+      !! region ever starts (no insertion ever happens in here).
+      !! entry_idx=0 means "not cached" -- either this exact pattern
+      !! never occurred during the pre-scan (impossible, since the
+      !! pre-scan visits the same mask_tile this is called against) or
+      !! the cache was already at mask_pattern_cache_max when this
+      !! pattern was first seen --
       !! either way, the caller's own correct response is to build a
       !! one-off throwaway table (see clean_one_pixel).
       integer(kind=1), intent(in) :: pattern(:)
@@ -2418,38 +2474,51 @@ contains
       enddo
    end subroutine cache_lookup_readonly
 
-   subroutine build_mask_pattern_cache()
-      !! Serial pre-scan (planning/RMCLEAN_INTEGRATION_PLAN.md decision
-      !! 10), called ONCE before the parallel per-pixel CLEAN loop:
-      !! canonicalize each pixel's own valid-channel bit pattern
-      !! (mask_cube(ix,iy,:) itself, already a 0/1 byte array -- no
-      !! further packing needed), hash it, and build ONE rmsf_table_t
-      !! per DISTINCT pattern, up to mask_pattern_cache_max. This is
-      !! the ONLY place cache_entries/cache_buckets/n_cache_entries are
-      !! ever written -- by construction single-threaded, so no lock is
-      !! needed here either.
+   subroutine init_mask_pattern_cache()
+      !! T10b: allocates the (empty) cache structures once, before the
+      !! tile loop starts -- no scanning here any more (that now happens
+      !! per tile, see update_mask_pattern_cache_for_tile below), since
+      !! the mask is no longer whole-cube-resident at this point in the
+      !! program. Running totals for the final summary print (moved to
+      !! after the whole tile loop -- there is no longer one single
+      !! pre-scan moment to print it at) start at zero here.
+      n_cache_buckets = max(16, 4*mask_pattern_cache_max)
+      allocate(cache_buckets(0:n_cache_buckets-1))
+      cache_buckets = 0
+      allocate(cache_entries(max(1, mask_pattern_cache_max)))
+      n_cache_entries = 0
+      n_distinct_patterns_total = 0
+      n_overflow_pixels_total = 0
+   end subroutine init_mask_pattern_cache
+
+   subroutine update_mask_pattern_cache_for_tile(tx_in, ty_in)
+      !! T10b: serial pre-scan of ONE tile's own mask_tile(1:tx_in,
+      !! 1:ty_in,:) subrange, called once per tile, right after that
+      !! tile's own read_mask_tile call and BEFORE that tile's own
+      !! parallel per-pixel CLEAN loop starts -- same safety argument as
+      !! the old one-upfront-global-pass design (cache_entries/
+      !! cache_buckets/n_cache_entries are only ever written here,
+      !! serially, never during the parallel loop), just repeated once
+      !! per tile instead of once for the whole image. A pattern
+      !! discovered while scanning an EARLIER tile remains cached and
+      !! reusable by any LATER tile (cache_entries/cache_buckets persist
+      !! across calls, initialised once by init_mask_pattern_cache, not
+      !! reset here).
+      integer, intent(in) :: tx_in, ty_in
       integer :: ix_l, iy_l, entry_idx
       integer(kind=8) :: h, probe
       integer :: tries, slot
       integer :: nvalid_l
       integer, allocatable :: valid_idx_l(:)
       real(sp), allocatable :: l_sq_valid_l(:)
-      integer :: n_distinct_patterns, n_overflow_pixels
 
-      n_cache_buckets = max(16, 4*mask_pattern_cache_max)
-      allocate(cache_buckets(0:n_cache_buckets-1))
-      cache_buckets = 0
-      allocate(cache_entries(max(1, mask_pattern_cache_max)))
-      n_cache_entries = 0
       allocate(valid_idx_l(nchan), l_sq_valid_l(nchan))
-      n_distinct_patterns = 0
-      n_overflow_pixels = 0
 
-      do iy_l = 1, ny
-         do ix_l = 1, nx
-            if (all(mask_cube(ix_l,iy_l,:).eq.0_1)) cycle
+      do iy_l = 1, ty_in
+         do ix_l = 1, tx_in
+            if (all(mask_tile(ix_l,iy_l,:).eq.0_1)) cycle
 
-            h = fnv1a_hash(mask_cube(ix_l,iy_l,:), nchan)
+            h = fnv1a_hash(mask_tile(ix_l,iy_l,:), nchan)
             probe = modulo(h, int(n_cache_buckets, 8))
             entry_idx = -1
             do tries = 1, n_cache_buckets
@@ -2457,7 +2526,7 @@ contains
                if (cache_buckets(slot).eq.0) exit
                if (cache_entries(cache_buckets(slot))%hash.eq.h) then
                   if (all(cache_entries(cache_buckets(slot))%pattern.eq.&
-                  &mask_cube(ix_l,iy_l,:))) then
+                  &mask_tile(ix_l,iy_l,:))) then
                      entry_idx = cache_buckets(slot)
                      exit
                   endif
@@ -2467,20 +2536,20 @@ contains
             if (entry_idx.ne.-1) cycle ! already cached (0 means bucket array full, handled below)
 
             if (n_cache_entries.ge.mask_pattern_cache_max) then
-               n_overflow_pixels = n_overflow_pixels + 1
+               n_overflow_pixels_total = n_overflow_pixels_total + 1
                cycle ! safety valve: clean_one_pixel builds a throwaway table
             endif
 
             n_cache_entries = n_cache_entries + 1
-            n_distinct_patterns = n_distinct_patterns + 1
+            n_distinct_patterns_total = n_distinct_patterns_total + 1
             cache_buckets(slot) = n_cache_entries
             cache_entries(n_cache_entries)%hash = h
             allocate(cache_entries(n_cache_entries)%pattern(nchan))
-            cache_entries(n_cache_entries)%pattern = mask_cube(ix_l,iy_l,:)
+            cache_entries(n_cache_entries)%pattern = mask_tile(ix_l,iy_l,:)
 
             nvalid_l = 0
             do k = 1, nchan
-               if (mask_cube(ix_l,iy_l,k).ne.0) then
+               if (mask_tile(ix_l,iy_l,k).ne.0) then
                   nvalid_l = nvalid_l + 1
                   valid_idx_l(nvalid_l) = k
                endif
@@ -2493,31 +2562,24 @@ contains
       enddo
 
       deallocate(valid_idx_l, l_sq_valid_l)
-      write(*,'(A,I0,A,I0,A)') 'Mask-pattern cache: ', n_distinct_patterns,&
-      &' distinct pattern(s) cached'
-      if (n_overflow_pixels.gt.0) then
-         write(*,'(A,I0,A)') '  (', n_overflow_pixels, ' pixel(s) past'//&
-         &' mask_pattern_cache_max fall back to a one-off table each)'
-      endif
-   end subroutine build_mask_pattern_cache
+   end subroutine update_mask_pattern_cache_for_tile
 
    subroutine clean_one_pixel(ix_l, iy_l, ix0, iy0)
       !! One pixel's full CLEAN+restore, called from the main program's
       !! own per-tile `!$omp parallel do` over the tile's own local
       !! (ix_l,iy_l) in [1,tx]x[1,ty]. (ix0,iy0) is the tile's own origin
-      !! (ix_tile_beg,iy_tile_beg) so this subroutine can address the
-      !! still-whole-cube-resident mask_cube/pattern cache at their GLOBAL
-      !! pixel position (ix_g,iy_g) while reading/writing the tile-local
-      !! re_tile/im_tile/clean_*_tile/resid_*_tile/restored_*_tile arrays
-      !! at their LOCAL position -- see this file's own top comment on why
-      !! the mask stays whole-cube-resident while the float cubes are now
-      !! tiled (T4a). Every array declared here is a genuine LOCAL
+      !! (ix_tile_beg,iy_tile_beg) -- T10b: mask_tile is now tiled just
+      !! like re_tile/im_tile, addressed at the SAME local (ix_l,iy_l),
+      !! not the global (ix_g,iy_g) the old whole-cube-resident mask_cube
+      !! needed; ix_g/iy_g are still computed and used, but now only for
+      !! trace_ix/trace_iy matching (is_traced_p below), not for mask
+      !! addressing. Every array declared here is a genuine LOCAL
       !! (automatic per-call) variable -- Fortran gives each concurrent
       !! call its own independent storage for these, with no `save` and
       !! no module-level state written here, so this subroutine is
       !! thread-safe purely by construction, no explicit `private()`
       !! bookkeeping needed for them. Everything this subroutine reads via
-      !! host association (re_tile, mask_cube, rm_samp, l_sq, cache_
+      !! host association (re_tile, mask_tile, rm_samp, l_sq, cache_
       !! entries/cache_buckets, restore_plan_fwd/bwd, ...) is READ-ONLY
       !! here; every array it WRITES (the 6 tile-output arrays) is written
       !! only at (ix_l,iy_l,:), a disjoint location per call -- no race
@@ -2548,7 +2610,7 @@ contains
       nvalid_p = 0
       allocate(valid_idx_p(nchan), l_sq_valid_p(nchan))
       do k_p = 1, nchan
-         if (mask_cube(ix_g,iy_g,k_p).ne.0) then
+         if (mask_tile(ix_l,iy_l,k_p).ne.0) then
             nvalid_p = nvalid_p + 1
             valid_idx_p(nvalid_p) = k_p
          endif
@@ -2580,7 +2642,7 @@ contains
 
       is_traced_p = (trace_ix.gt.0 .and. ix_g.eq.trace_ix .and. iy_g.eq.trace_iy)
 
-      call cache_lookup_readonly(mask_cube(ix_g,iy_g,:), entry_idx_p)
+      call cache_lookup_readonly(mask_tile(ix_l,iy_l,:), entry_idx_p)
       used_throwaway = (entry_idx_p.eq.0)
       if (used_throwaway) then
          call build_rmsf_offset_table(l_sq_valid_p(1:nvalid_p), nvalid_p,&
