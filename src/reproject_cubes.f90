@@ -2181,6 +2181,12 @@ contains
       &' ever in flight at a time (concurrent CFITSIO handle use from two'
       write(*,'(A)') '  threads is unsafe) -- still overlaps the write with the'//&
       &' following block''s read+compute, which is where the dead time is.'
+      write(*,'(A)') ''
+      write(*,'(A)') 'Optional keys (CLI or config, logging/timing):'
+      write(*,'(A)') '  log_level       = error|warn|info|debug (default info)'
+      write(*,'(A)') '  timing_enabled  = y|n -- print a stage timing summary (default n)'
+      write(*,'(A)') '  log_output_file = path -- append log/timing output to this file'//&
+      &' instead of stdout (default empty = stdout)'
    end subroutine print_usage
 
    subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&

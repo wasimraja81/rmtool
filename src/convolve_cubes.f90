@@ -711,7 +711,7 @@ contains
       write(*,'(A)') '    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]'
       write(*,'(A)') '    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]'
       write(*,'(A)') '    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]'
-      write(*,'(A)') '    [npts=<n>] [khachiyan_tol=<tol>]'
+      write(*,'(A)') '    [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n]'
       write(*,'(A)') '  convolve_cubes --config <cfgfile>'
       write(*,'(A)') '  convolve_cubes --help | -h'
       write(*,'(A)') ''
@@ -752,6 +752,17 @@ contains
       write(*,'(A)') 'npts (default 2000), khachiyan_tol (default 1e-5): passed straight to'//&
       &' commonbeam_mod''s find_common_beam -- boundary points sampled per beam and'
       write(*,'(A)') '  Khachiyan-algorithm convergence tolerance for the common-beam fit.'
+      write(*,'(A)') ''
+      write(*,'(A)') 'io_overlap (default n): y -- write each block on a background thread,'//&
+      &' overlapped with the NEXT block''s own read+convolve, instead of blocking'
+      write(*,'(A)') '  on the write before starting it. Only one background write is'//&
+      &' ever in flight at a time.'
+      write(*,'(A)') ''
+      write(*,'(A)') 'Optional keys (CLI or config, logging/timing):'
+      write(*,'(A)') '  log_level       = error|warn|info|debug (default info)'
+      write(*,'(A)') '  timing_enabled  = y|n -- print a stage timing summary (default n)'
+      write(*,'(A)') '  log_output_file = path -- append log/timing output to this file'//&
+      &' instead of stdout (default empty = stdout)'
    end subroutine print_usage
 
    subroutine cfg_split_key_value(raw_line, key, val, has_kv)
