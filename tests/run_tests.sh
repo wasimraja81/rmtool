@@ -21,7 +21,7 @@
 #  13. io_overlap (async tile write) – bit-identical to io_overlap=n across
 #      a 7-tile run (odd tile count exercises the ping-pong buffer join
 #      and end-of-loop cleanup, not just a single-tile no-op)
-#  14. io_write_threads>1 – bit-identical to io_write_threads=1 across a
+#  14. nwriters>1 – bit-identical to nwriters=1 across a
 #      7-tile run (T6 raw-write path bypasses CFITSIO for AMP/PHA pixel
 #      writes; guards against the CFITSIO handle-aliasing bug and the
 #      stale-buffer-at-close bug that raw-write mode replaced it with)
@@ -183,7 +183,7 @@ require_timing_csv_row() {
 }
 
 # io_overlap must serialize all tile writes against each other (this test
-# runs with the io_write_threads=1 default, so all tiles share a single
+# runs with the nwriters=1 default, so all tiles share a single
 # FITS handle), even though writes overlap in time with the *next* tile's
 # read/mask/prep/compute. This checks that structural invariant directly from the
 # tile_write start/done log markers, since it's a timing-dependent race:
@@ -789,9 +789,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 14. io_write_threads>1 (T6 raw-write) – bit-identical to io_write_threads=1
+# 14. nwriters>1 (T6 raw-write) – bit-identical to nwriters=1
 # ---------------------------------------------------------------------------
-# io_write_threads>1 used to open N read-write FTOPEN handles onto the SAME
+# nwriters>1 used to open N read-write FTOPEN handles onto the SAME
 # output file; CFITSIO aliases them onto one shared buffer
 # (fits_already_open()), so concurrent ftpsse() calls on them corrupted that
 # buffer -- a real SIGSEGV on a Setonix run. That mechanism is gone: N>1 now
@@ -805,30 +805,30 @@ fi
 # remainder) so the RM-chunk split logic is exercised across a tile whose
 # width equals the full output width (fast path) with an uneven trailing
 # tile, not just a single-tile no-op.
-section "14. io_write_threads>1 – bit-identical to io_write_threads=1 (T6)"
+section "14. nwriters>1 – bit-identical to nwriters=1 (T6)"
 if [[ -x "$BIN_OMP" ]]; then
     cfg_wt1=$(make_cfg "wt1" "n" "tile_auto=n
 tile_ra=32
 tile_dec=5
 cubestat=y
-io_write_threads=1")
+nwriters=1")
     cfg_wt4=$(make_cfg "wt4" "n" "tile_auto=n
 tile_ra=32
 tile_dec=5
 cubestat=y
-io_write_threads=4")
+nwriters=4")
     log_wt1="$OUT_DIR/wt1.log"
     log_wt4="$OUT_DIR/wt4.log"
     rm -f "$OUT_DIR"/wt1.*.FITS "$OUT_DIR"/wt4.*.FITS
 
     if run_binary "$BIN_OMP" "$cfg_wt1" "$log_wt1" && \
        run_binary "$BIN_OMP" "$cfg_wt4" "$log_wt4"; then
-        pass "io_write_threads=1 and =4: both runs completed without crashing"
+        pass "nwriters=1 and =4: both runs completed without crashing"
 
         if grep -q "using raw stream writes" "$log_wt4"; then
-            pass "io_write_threads=4: raw-write path confirmed taken"
+            pass "nwriters=4: raw-write path confirmed taken"
         else
-            fail "io_write_threads=4: expected raw-write startup message not found in $log_wt4"
+            fail "nwriters=4: expected raw-write startup message not found in $log_wt4"
         fi
 
         all_match=1
@@ -840,21 +840,21 @@ io_write_threads=4")
                 if ! python3 "$TESTS_DIR/compare_cubes.py" "$f1" "$f4" --exact \
                         > /dev/null 2>&1; then
                     all_match=0
-                    fail "io_write_threads=4: ${suffix} differs from io_write_threads=1"
+                    fail "nwriters=4: ${suffix} differs from nwriters=1"
                 fi
             else
                 all_match=0
-                fail "io_write_threads=4: ${suffix} output missing (expected $f1 and $f4)"
+                fail "nwriters=4: ${suffix} output missing (expected $f1 and $f4)"
             fi
         done
         if [[ "$all_match" -eq 1 ]]; then
-            pass "io_write_threads=4: all 8 output products bit-identical to io_write_threads=1"
+            pass "nwriters=4: all 8 output products bit-identical to nwriters=1"
         fi
     else
-        fail "io_write_threads test: OMP run failed (see $log_wt1 / $log_wt4)"
+        fail "nwriters test: OMP run failed (see $log_wt1 / $log_wt4)"
     fi
 else
-    skip "OMP binary not available; skipping io_write_threads test"
+    skip "OMP binary not available; skipping nwriters test"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1889,9 +1889,9 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
         [[ "$rt_ok" -eq 1 ]] && \
             pass "rmclean_cubes: io_read_threads=1,2,4 all bit-identical to the default run"
 
-        # T4c: io_write_threads -- raw stream writes bypassing CFITSIO must
+        # T4c: nwriters -- raw stream writes bypassing CFITSIO must
         # be BYTE-IDENTICAL to the default (FTPSSE) write path. Repeated 5x
-        # at io_write_threads=4: this path previously had a genuine,
+        # at nwriters=4: this path previously had a genuine,
         # PROBABILISTIC bug (FTGHAD's 3 output arguments come back with
         # their upper 32 bits UNTOUCHED by this system's installed
         # libcfitsio -- a real Fortran-wrapper/library ABI truncation,
@@ -1913,28 +1913,28 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
                         phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
                         maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
                         outfile="$rmc_wt" abs_flux_floor=0.01 niter=200 gain=0.1 \
-                        io_write_threads=$wt > "$rmc_wt_log" 2>&1; then
+                        nwriters=$wt > "$rmc_wt_log" 2>&1; then
                     for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
                                   RESTORED.AMP RESTORED.PHA; do
                         if ! cmp -s "${rmc_out}.${suffix}.RMCUBE.FITS" \
                                     "${rmc_wt}.${suffix}.RMCUBE.FITS"; then
                             wt_ok=0
-                            fail "rmclean_cubes: io_write_threads=$wt (rep $rep) differs from io_write_threads=1 on $suffix"
+                            fail "rmclean_cubes: nwriters=$wt (rep $rep) differs from nwriters=1 on $suffix"
                         fi
                     done
                 else
                     wt_ok=0
-                    fail "rmclean_cubes: io_write_threads=$wt (rep $rep) run failed (see $rmc_wt_log)"
+                    fail "rmclean_cubes: nwriters=$wt (rep $rep) run failed (see $rmc_wt_log)"
                 fi
             done
         done
         [[ "$wt_ok" -eq 1 ]] && \
-            pass "rmclean_cubes: io_write_threads=1,2,4 all bit-identical to the default run (5 reps each)"
+            pass "rmclean_cubes: nwriters=1,2,4 all bit-identical to the default run (5 reps each)"
 
         # T4d: io_overlap -- background-thread tile writes must be
         # BYTE-IDENTICAL to the default (inline write) path, both alone
         # and combined with forced small tiles + io_read_threads +
-        # io_write_threads together (the combined stress case actually
+        # nwriters together (the combined stress case actually
         # exercised, not just each mechanism in isolation).
         rmc_ov_log="$OUT_DIR/rmclean_cubes_ov_run.log"
         ov_ok=1
@@ -1970,14 +1970,14 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
                     maskfile="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS" \
                     outfile="$rmc_combo" abs_flux_floor=0.01 niter=200 gain=0.1 \
                     tile_auto=n tile_ra=3 tile_dec=5 io_read_threads=3 \
-                    io_write_threads=3 io_overlap=y \
+                    nwriters=3 io_overlap=y \
                     > "$rmc_combo_log" 2>&1; then
                 for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
                               RESTORED.AMP RESTORED.PHA; do
                     if ! cmp -s "${rmc_tiled}.${suffix}.RMCUBE.FITS" \
                                 "${rmc_combo}.${suffix}.RMCUBE.FITS"; then
                         combo_ok=0
-                        fail "rmclean_cubes: combined small-tile+io_read_threads+io_write_threads+io_overlap (rep $rep) differs from small-tile-only on $suffix"
+                        fail "rmclean_cubes: combined small-tile+io_read_threads+nwriters+io_overlap (rep $rep) differs from small-tile-only on $suffix"
                     fi
                 done
             else
@@ -1986,7 +1986,7 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
             fi
         done
         [[ "$combo_ok" -eq 1 ]] && \
-            pass "rmclean_cubes: combined small-tile+io_read_threads+io_write_threads+io_overlap bit-identical to small-tile-only (5 reps)"
+            pass "rmclean_cubes: combined small-tile+io_read_threads+nwriters+io_overlap bit-identical to small-tile-only (5 reps)"
 
         # Mask-pattern cache correctness: a deliberately varied mask (many
         # distinct per-pixel valid-channel patterns, forcing both cache

@@ -201,7 +201,7 @@ The primary driver is scalable processing for very large cubes under constrained
   full build matrix successful, `22/22` tests passing.
 
 This section predates, and is superseded by, the `3.0` IO-efficiency
-milestone (`io_read_threads`/`io_write_threads`/`io_overlap`, T0-T6) --
+milestone (`io_read_threads`/`nwriters`/`io_overlap`, T0-T6) --
 see `docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md` and `docs/dev/ARCHIVED/CHANGELOG.md` for what's actually
 most recent; this file's scope is timeline/RM-chunking, not I/O.
 

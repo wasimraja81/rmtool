@@ -190,7 +190,7 @@ module rm_synthesis_mod
     logical :: use_gpu = .false.
     ! I/O parallelism
     logical :: io_overlap = .false.
-    integer(int32) :: io_read_threads = 1, io_write_threads = 1
+    integer(int32) :: io_read_threads = 1, nwriters = 1
     ! Logging & timing
     character(len=16) :: log_level = 'info'
     logical :: timing_enabled = .false., timing_tile_enabled = .false.
@@ -1836,7 +1836,7 @@ contains
     logical :: seen_use_gpu
     logical :: seen_io_overlap
     logical :: seen_io_read_threads
-    logical :: seen_io_write_threads
+    logical :: seen_nwriters
     logical :: seen_log_level
     logical :: seen_timing_enabled
     logical :: seen_timing_tile_enabled
@@ -1911,7 +1911,7 @@ contains
     seen_use_gpu = .false.
     seen_io_overlap = .false.
     seen_io_read_threads = .false.
-    seen_io_write_threads = .false.
+    seen_nwriters = .false.
     seen_log_level = .false.
     seen_timing_enabled = .false.
     seen_timing_tile_enabled = .false.
@@ -1970,7 +1970,7 @@ contains
     cfg%use_gpu = .false.
     cfg%io_overlap = .false.
     cfg%io_read_threads = 1
-    cfg%io_write_threads = 1
+    cfg%nwriters = 1
     cfg%log_level = 'info'
     cfg%timing_enabled = .false.
     cfg%timing_tile_enabled = .false.
@@ -2668,17 +2668,17 @@ contains
           close(unit_cfg)
           return
         end if
-      case ('io_write_threads')
-        if (seen_io_write_threads) then
-          write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_write_threads'
+      case ('nwriters')
+        if (seen_nwriters) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': nwriters'
           status = -199
           close(unit_cfg)
           return
         end if
-        seen_io_write_threads = .true.
-        read(val, *, iostat=io_stat) cfg%io_write_threads
-        if (io_stat /= 0 .or. cfg%io_write_threads < 1) then
-          write(*,*) 'Error reading io_write_threads at line ', line_no
+        seen_nwriters = .true.
+        read(val, *, iostat=io_stat) cfg%nwriters
+        if (io_stat /= 0 .or. cfg%nwriters < 1) then
+          write(*,*) 'Error reading nwriters at line ', line_no
           status = -199
           close(unit_cfg)
           return
@@ -3614,9 +3614,9 @@ contains
   end subroutine csv_get_item
 
   !===========================================================================
-  ! Safe intra-write parallelism for io_write_threads>1 (T6).
+  ! Safe intra-write parallelism for nwriters>1 (T6).
   !===========================================================================
-  ! io_write_threads>1 used to open N CFITSIO handles onto the same output
+  ! nwriters>1 used to open N CFITSIO handles onto the same output
   ! file, which CFITSIO silently aliases onto one shared internal buffer
   ! (fits_already_open() -- see the T4 postmortem in
   ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md), corrupting that buffer
@@ -3743,7 +3743,7 @@ contains
     ! does not guarantee ANY I/O statement -- open() included, newunit=
     ! or not -- is safe to call concurrently without explicit
     ! synchronization. Confirmed the hard way: this call is reached
-    ! concurrently (once per io_write_threads worker, each opening the
+    ! concurrently (once per nwriters worker, each opening the
     ! SAME file path for its own disjoint byte range) from do_tile_write's
     ! own `!$omp parallel do`, and a first attempt at fixing a real,
     ! observed corruption here (planning/RMCLEAN_INTEGRATION_PLAN.md

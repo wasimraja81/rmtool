@@ -293,7 +293,7 @@ their per-pixel work is different in shape:
 
 Full mechanics for `rm_synthesis`/`rmclean_cubes` (the exact per-pixel
 byte formula, the auto-tiling shrink policy, and the
-`io_read_threads`/`io_write_threads`/`io_overlap` keys that ride
+`io_read_threads`/`nwriters`/`io_overlap` keys that ride
 alongside tile sizing) are in [docs/user/PARALLELISM.md](PARALLELISM.md) and
 README's own "Tile Memory Planning and I/O Parallelism" section. For
 `reproject_cubes`/`convolve_cubes`/`match_cubes`, the equivalent
@@ -306,7 +306,7 @@ just the decision guide, not the full mechanism.
 
 ## 5. I/O parallelism: quick picks
 
-Three independent keys — `io_read_threads`, `io_write_threads`,
+Three independent keys — `io_read_threads`, `nwriters`,
 `io_overlap` — all default to fully serial. Quick picks, not the full
 reasoning (see README's own "Tile Memory Planning and I/O Parallelism"
 section for the complete rule-of-thumb table and when `io_overlap` can
@@ -315,7 +315,7 @@ actually hurt):
 - **Single local disk, small-to-medium cube**: leave everything at
   default. Parallel I/O mostly helps parallel/shared storage.
 - **Lustre, multi-server NFS, or cloud block storage**: try
-  `io_read_threads`/`io_write_threads` set to roughly your storage's
+  `io_read_threads`/`nwriters` set to roughly your storage's
   stripe count (often 4-16) — a single I/O stream rarely saturates
   that kind of storage.
 - **RAM-constrained** *and* not on parallel storage: leave

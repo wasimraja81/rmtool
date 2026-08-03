@@ -97,7 +97,7 @@ mem_frac_vram=0.70
 gpu_vram_mib=6144
 io_overlap=y
 io_read_threads=4
-io_write_threads=4
+nwriters=4
 cubestat=y
 
 # Logging and timing

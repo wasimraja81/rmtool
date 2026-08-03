@@ -312,6 +312,40 @@ whole run (including final `FTCLOS`) completes, which is what actually
 caught it during development.
 
 
+### T7 - `io_write_threads` renamed to `nwriters` ✓ DONE
+
+**Gap:** `io_write_threads` names a count with a name that reads like a
+boolean/mode flag ("threads" plural, no unit implied) rather than the
+plain integer it is. Raised while designing a matching writer-count
+option for `convolve_cubes`/`match_cubes`/`reproject_cubes` (see
+`docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md`'s own T21+): the user wanted
+one consistent name for "how many concurrent writers" across every
+tool in the package, including this one, rather than inventing a new
+name for the new tools while this one kept the old.
+
+**Fix:** renamed `io_write_threads` → `nwriters` everywhere it is a
+live, current-state reference: the cfg key itself, `cfg%nwriters`
+(`rm_synthesis_mod.f90`), `nwriters`/`nwriters_eff` (`rm_synthesis.f90`,
+`rmclean_cubes.f90`), the one comment mention in `fitsio_unit_mod.f90`,
+every `cfg/*.cfg`/`cfg/*.sbatch` template, `tests/run_tests.sh`, and
+the live user-facing docs (`docs/user/ARCHITECTURE.md`,
+`PARALLELISM.md`, `APP_REFERENCE.md`, `EXAMPLES.md`,
+`DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md`). Pure rename, no logic
+change — the clamp formula (`max(1, min(nwriters, omp_get_max_threads()))`)
+is untouched; see the "Thread-count design rationale" section below
+for why that clamp stays as-is rather than switching to a spare-core-
+headroom formula. Historical record is deliberately NOT rewritten:
+T2-T6 above, and `docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`'s own
+closed-out T5b entry, keep saying `io_write_threads` since that is
+what was literally true when each was written — same convention this
+project already uses for `docs/dev/ARCHIVED/`.
+
+**Verification:** full 4-variant rm_synthesis rebuild (`OMP×GPU`,
+`scripts/make_all.sh`) plus all 4 ancillary tools, zero errors. Full
+suite: 132/132, including §14 (`nwriters=1` vs `=4` bit-identical) and
+the `rmclean_cubes` `nwriters=1,2,4` bit-identical sections — both
+confirmed passing under the new name, not just renamed and assumed.
+
 ## Answers to kickoff questions
 1. Can we read FITS cubes in parallel?
    - Yes — implemented via `io_read_threads`.

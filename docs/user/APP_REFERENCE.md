@@ -143,7 +143,7 @@ the README's own "Configuration" section are for).
 | `tile_ra` / `tile_dec` | `0`/`0` (auto) | Manual tile-size override; ignored when `tile_auto=y`. |
 | `mem_frac_ram` | `0.25` | Fraction (0,0.95] of system RAM budgeted per tile. |
 | `io_read_threads` | `1` | N independent read-only FITS handles per input cube. |
-| `io_write_threads` | `1` | N-way parallel AMP/PHA writes via raw stream I/O. |
+| `nwriters` | `1` | N-way parallel AMP/PHA writes via raw stream I/O. |
 | `io_overlap` | `n` | `y`: overlap tile N's write with tile N+1's read/compute on a background thread. |
 
 **Logging & timing:**
@@ -402,7 +402,7 @@ bin/rmclean_cubes ampfile=<f> phafile=<f> maskfile=<f> outfile=<base>
     [lsq_ref_report_mode=intrinsic|centroid|min|max|mid|fixed] [lsq_ref_report_value=<v>]
     [lsq_ref_compute_mode=native|zero|centroid|min|max|fixed] [lsq_ref_compute_value=<v>]
     [mask_pattern_cache_max=<n>] [mem_frac_ram=<f>] [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]
-    [io_read_threads=<n>] [io_write_threads=<n>] [io_overlap=y|n]
+    [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]
     [log_level=<level>] [timing_enabled=y|n] [log_output_file=<path>]
 bin/rmclean_cubes --config <cfgfile>
 bin/rmclean_cubes --help | -h
@@ -479,7 +479,7 @@ printed saying so.
 | Key | Default | Meaning |
 |---|---|---|
 | `io_read_threads` | `1` | Parallel chunked reads of each tile's own AMP/PHA/mask depth range. |
-| `io_write_threads` | `1` | Parallel chunked writes of each tile's 6 output cubes; `>1` bypasses CFITSIO for pixel writes (raw stream writes at computed byte offsets). |
+| `nwriters` | `1` | Parallel chunked writes of each tile's 6 output cubes; `>1` bypasses CFITSIO for pixel writes (raw stream writes at computed byte offsets). |
 | `io_overlap` | `n` | `y`: write each tile's 6 output cubes on a background thread while the next tile's read/compute proceeds. |
 
 **Logging & timing:**

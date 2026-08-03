@@ -17,7 +17,7 @@ user-controlled fraction of available RAM (`mem_frac_ram`). The *tile
 loop itself* is always serial (tile N+1 is never computed before tile N
 is), but each tile's read, write, and the boundary between consecutive
 tiles can each independently be made concurrent via three orthogonal cfg
-keys — `io_read_threads`, `io_write_threads`, and `io_overlap`. All three
+keys — `io_read_threads`, `nwriters`, and `io_overlap`. All three
 default to the fully serial behaviour below; see
 `docs/user/ARCHITECTURE.md` ("Parallel read/write" and "Async read/write
 overlap") and `docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full
@@ -54,7 +54,7 @@ for ix_tile, iy_tile  (serial)
     FTGSVE → specQ, specU                     ← read (parallel if io_read_threads>1)
     build mask_tile_arr                        ← serial single pass
     extract P(RM, pixel)                       ← CPU or GPU, see §2/§3
-    write AMP/PHA/… → output FITS               ← write (parallel if io_write_threads>1)
+    write AMP/PHA/… → output FITS               ← write (parallel if nwriters>1)
                                                    ^ next tile's read waits for this
 
 Overlapping (io_overlap=y):
@@ -65,23 +65,23 @@ Overlapping (io_overlap=y):
                                                       own read/mask/prep/compute
 ```
 
-**Write parallelism (`io_write_threads`)**, independent of the above:
+**Write parallelism (`nwriters`)**, independent of the above:
 each tile's AMP/PHA write splits its RM bins into N disjoint chunks, each
 written by its own Fortran STREAM I/O unit directly to its byte offset —
 bypassing CFITSIO's write path for pixel data entirely, so N independent
 writes to disjoint byte ranges of the same file are POSIX-safe. 2D map
 outputs (MASK, NVALID, cubestat) always write via a single serial CFITSIO
-call regardless of `io_write_threads` — their cost is negligible next to
+call regardless of `nwriters` — their cost is negligible next to
 the RM cube writes.
 
-`io_overlap`'s background write and `io_write_threads`'s RM-chunk split
+`io_overlap`'s background write and `nwriters`'s RM-chunk split
 compose: the write pthread dispatched for tile N can itself fan out into
 N raw-write threads, all while tile N+1's read/compute proceeds on the
 main thread. Both are validated bit-identical to the fully serial path,
 together and separately. **The two keys are fully independent** — either
 can be set without the other:
 
-| `io_write_threads` | `io_overlap` | Behaviour |
+| `nwriters` | `io_overlap` | Behaviour |
 |---|---|---|
 | 1 | n | Fully serial — pre-T5/T6 behaviour |
 | N>1 | n | Each tile's write is N-way parallel, but the main thread waits for it to finish before starting the next tile's read |
@@ -89,12 +89,12 @@ can be set without the other:
 | N>1 | y | Both: write(N) is N-way parallel *and* hidden behind tile N+1 |
 
 If RAM is tight (so `io_overlap`'s doubled buffers are a problem) but the
-output storage is parallel (Lustre/NFS/cloud), `io_write_threads=N>1`
+output storage is parallel (Lustre/NFS/cloud), `nwriters=N>1`
 alone with `io_overlap=n` is a lower-memory way to still get a real write
 speedup — you just don't get the "hide it behind the next tile" benefit
 on top.
 
-### Thread-pool interplay: how `OMP_NUM_THREADS`, `io_read_threads`, `io_write_threads`, and `io_overlap` actually share cores
+### Thread-pool interplay: how `OMP_NUM_THREADS`, `io_read_threads`, `nwriters`, and `io_overlap` actually share cores
 
 Every `!$omp parallel do` region draws its worker OS threads from
 libgomp's thread pool — but that pool is **owned by whichever host
@@ -108,11 +108,11 @@ threads shared between the two regions, serializing them. Practically:
 |---|---|---|---|
 | `io_read_threads=N` | Main thread | Up to N, from the main thread's own pool — reused for every `!$omp parallel do` the main thread issues | Nothing else: read finishes before mask/prep/compute starts, same tile, same thread |
 | Mask/prep/compute (`OMP_NUM_THREADS`) | Main thread | Up to `OMP_NUM_THREADS`, same pool as read | The **write pthread**, if `io_overlap=y` and a previous tile's write is still running |
-| `io_overlap=y` write dispatch | A fresh pthread, spawned per tile (`tile_write_dispatch_async`) | Just the pthread itself (1 extra OS thread) if `io_write_threads=1` | The main thread's entire next-tile read → mask → prep → compute → cubestat sequence |
-| `io_write_threads=N>1` | The write pthread (not the main thread) | A **second, separate** pool of N OS threads — created fresh every tile, since the write pthread itself is fresh every tile | Whatever the main thread is doing at that moment |
+| `io_overlap=y` write dispatch | A fresh pthread, spawned per tile (`tile_write_dispatch_async`) | Just the pthread itself (1 extra OS thread) if `nwriters=1` | The main thread's entire next-tile read → mask → prep → compute → cubestat sequence |
+| `nwriters=N>1` | The write pthread (not the main thread) | A **second, separate** pool of N OS threads — created fresh every tile, since the write pthread itself is fresh every tile | Whatever the main thread is doing at that moment |
 
 So `io_read_threads` never competes with compute for cores — they run
-sequentially on the same thread. `io_write_threads` and `io_overlap`,
+sequentially on the same thread. `nwriters` and `io_overlap`,
 together, genuinely add OS threads on top of whatever the main thread is
 using at that moment — real, additive demand on cores, not shared reuse.
 In practice this is usually cheap: read/write threads are I/O-bound
@@ -120,7 +120,7 @@ In practice this is usually cheap: read/write threads are I/O-bound
 than CPU-bound like compute, so the OS scheduler hands compute the core
 time whenever a read/write thread is blocked — but it *is* genuine
 oversubscription, not something the runtime silently avoids. Setting
-`io_write_threads` to something close to `OMP_NUM_THREADS` (rather than
+`nwriters` to something close to `OMP_NUM_THREADS` (rather than
 a modest value like the storage's stripe count) is where this actually
 starts to cost real compute throughput, since the byte-swap work across
 that many threads is no longer negligible.
@@ -131,7 +131,7 @@ that many threads is no longer negligible.
 |---|---|---|
 | `OMP_NUM_THREADS` | All available cores | The only thread type here that's genuinely CPU-bound and wants a dedicated core continuously |
 | `io_read_threads` | Storage stripe count (e.g. `lfs getstripe`, typically 4–16) | Runs before compute starts, same thread — effectively free to raise |
-| `io_write_threads` | Same ballpark (4–16), not close to your full core count | Runs concurrently with the next tile's compute if `io_overlap=y`; I/O-bound so contention is mild at modest values |
+| `nwriters` | Same ballpark (4–16), not close to your full core count | Runs concurrently with the next tile's compute if `io_overlap=y`; I/O-bound so contention is mild at modest values |
 | `io_overlap` | `y` on parallel/networked storage with spare RAM; `n` on a single disk or tight RAM | Determines whether write(N) and read/compute(N+1) run concurrently at all — see `docs/user/ARCHITECTURE.md` ("When `io_overlap=y` can be detrimental") for the full RAM/disk-speed decision matrix |
 
 #### HPC scheduler sizing: request more CPUs than `OMP_NUM_THREADS`
@@ -140,7 +140,7 @@ On a scheduler (Slurm `--cpus-per-task` and similar) you explicitly request
 a CPU allocation, unlike a desktop where "all available cores" is just
 whatever the machine has. Requesting **more** CPUs than `OMP_NUM_THREADS`
 gives the OS genuinely idle cores in the job's allocation to place the
-`io_write_threads` team on, instead of time-slicing it against the
+`nwriters` team on, instead of time-slicing it against the
 compute pool -- worth doing given the "additive, not shared" cost from
 the table above.
 
@@ -157,13 +157,13 @@ write pthread itself has no affinity set by this code either; it inherits
 the process's full allocated CPU mask.
 
 Robust recommendation regardless of that open question: size the request
-as `cpus-per-task ≈ OMP_NUM_THREADS + io_write_threads`. That guarantees
+as `cpus-per-task ≈ OMP_NUM_THREADS + nwriters`. That guarantees
 enough physical cores exist for both pools even in the worst case where
 binding doesn't cleanly separate them -- true independent of exactly how
 libgomp partitions places across teams from different initiating threads.
 To actually confirm rather than reason about it on a given cluster:
 compare `tile_write` wall-clock time with and without the extra headroom
-at a fixed `io_write_threads`, or inspect live thread placement with
+at a fixed `nwriters`, or inspect live thread placement with
 `taskset -pc <pid>` / `hwloc-ps` against the compute and write-pthread OS
 threads mid-run.
 
@@ -443,7 +443,7 @@ identical serial-outer-tile-loop/parallel-inner-stage structure:
 mem_frac_ram      fraction of system RAM budgeted per tile (default 0.25)
 tile_ra/tile_dec  manual tile-size override; 0/0 = auto (tile_auto=y)
 io_read_threads   N independent read-only FITS handles per input cube
-io_write_threads  N-way parallel output writes (raw stream I/O, bypasses CFITSIO)
+nwriters  N-way parallel output writes (raw stream I/O, bypasses CFITSIO)
 io_overlap        overlap tile N's write with tile N+1's read/compute
 ```
 

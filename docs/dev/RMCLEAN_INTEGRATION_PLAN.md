@@ -2893,3 +2893,45 @@ specific pixel no longer stagnates post-T10a, a genuinely-stagnating or
 -diverging test case will need to be constructed deliberately (e.g.
 synthetic data, or a deliberately adversarial gain/niter combination)
 rather than found incidentally in real data.
+
+### T12 -- `io_write_threads` renamed to `nwriters` ✓ DONE
+
+**Gap:** same naming complaint raised across the whole package while
+designing a matching writer-count option for `convolve_cubes`/
+`match_cubes`/`reproject_cubes` (see `docs/dev/
+MULTI_BAND_TOMOGRAPHY_PLAN.md`'s own T21+) -- `io_write_threads` reads
+like a mode flag, not the plain integer count it is. One consistent
+name (`nwriters`) across every tool in the package, including this
+one, rather than the new tools getting a different name than the
+already-shipped ones.
+
+**Fix:** renamed `io_write_threads`/`io_write_threads_eff` →
+`nwriters`/`nwriters_eff` in `rmclean_cubes.f90` (cfg key, code,
+comments, `--help` text), `cfg/rmclean-example.cfg`, and every
+`tests/run_tests.sh` reference exercising this tool. Pure rename, no
+logic change -- the clamp formula (`max(1, min(nwriters,
+omp_get_max_threads()))`, further clamped to `nrm`) is untouched;
+considered and explicitly rejected switching to a spare-core-headroom
+formula (capping at `omp_get_num_procs() - omp_get_max_threads()`
+instead of at `omp_get_max_threads()` itself) -- in practice, the
+write pthread(s) piggyback on cores that are genuinely idle at that
+moment (either the 2 physical cores outside this machine's own
+`OMP_NUM_THREADS=6` convention, or the OMP worker threads' own idle
+window between one tile's `!$omp end parallel` and the next tile's
+first `!$omp parallel`, while the next tile's single-threaded read/
+mask/prep runs), so real contention with compute is far lower in
+practice than a naive "N writers + N compute threads on an 8-core
+box" count would suggest. This project's own real Jennifer T3b
+validation run (see [[project_jennifer_t3b_validation]]) used
+`io_write_threads=2` alongside `OMP_NUM_THREADS=6` on this same
+8-core machine -- 6+2=8, saturating physical cores without exceeding
+them -- consistent with, though not an explicit test of, this reasoning.
+Historical record deliberately NOT rewritten: T0-T11 above keep saying
+`io_write_threads`/`io_read_threads` since that is what was literally
+true when each was written.
+
+**Verification:** full 4-variant rm_synthesis rebuild plus all 4
+ancillary tools (`scripts/make_all.sh`), zero errors. Full suite:
+132/132, including the `rmclean_cubes: nwriters=1,2,4` bit-identical
+sections and the combined small-tile+`io_read_threads`+`nwriters`+
+`io_overlap` stress case -- both confirmed passing under the new name.

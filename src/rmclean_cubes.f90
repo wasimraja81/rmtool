@@ -199,7 +199,7 @@ program rmclean_cubes
    ! Same scheme/key name/clamping convention as rm_synthesis's own
    ! io_read_threads: each thread opens its OWN readonly CFITSIO handle
    ! (safe -- readonly opens are exempt from the same-file handle-aliasing
-   ! hazard read-write handles hit, see io_write_threads/T4c's own
+   ! hazard read-write handles hit, see nwriters/T4c's own
    ! comment) and reads its own disjoint RM-slice of the tile.
    integer :: io_read_threads, io_read_threads_eff
 
@@ -331,7 +331,7 @@ program rmclean_cubes
    character(len=600) :: out_path(n_outputs)
    integer(kind=8) :: out_datastart(n_outputs)
    logical :: out_is_open(n_outputs)
-   integer :: io_write_threads, io_write_threads_eff
+   integer :: nwriters, nwriters_eff
 
    integer :: ix, iy, k
    integer(kind=8) :: restore_plan_fwd, restore_plan_bwd
@@ -527,11 +527,11 @@ program rmclean_cubes
    endif
 
    ! T4c: same clamp convention as io_read_threads_eff above.
-   io_write_threads_eff = max(1, min(io_write_threads, omp_get_max_threads()))
-   io_write_threads_eff = min(io_write_threads_eff, nrm)
-   if (io_write_threads.gt.io_write_threads_eff) then
-      write(*,'(A,I0,A,I0)') 'WARNING: io_write_threads=', io_write_threads,&
-      &' clamped to ', io_write_threads_eff
+   nwriters_eff = max(1, min(nwriters, omp_get_max_threads()))
+   nwriters_eff = min(nwriters_eff, nrm)
+   if (nwriters.gt.nwriters_eff) then
+      write(*,'(A,I0,A,I0)') 'WARNING: nwriters=', nwriters,&
+      &' clamped to ', nwriters_eff
    endif
 
    allocate(re_tile(tile_ra,tile_dec,nrm), im_tile(tile_ra,tile_dec,nrm))
@@ -808,7 +808,7 @@ contains
       tile_auto = .true.
       mem_frac_ram = 0.25_sp
       io_read_threads = 1
-      io_write_threads = 1
+      nwriters = 1
       io_overlap = .false.
       log_level = 'info'
       timing_enabled = .false.
@@ -1073,10 +1073,10 @@ contains
             status = -1
             return
          endif
-      case ('io_write_threads')
-         read(val, *, iostat=ios) io_write_threads
-         if (ios.ne.0 .or. io_write_threads.lt.1) then
-            write(*,*) 'ERROR: io_write_threads must be an integer >= 1'
+      case ('nwriters')
+         read(val, *, iostat=ios) nwriters
+         if (ios.ne.0 .or. nwriters.lt.1) then
+            write(*,*) 'ERROR: nwriters must be an integer >= 1'
             status = -1
             return
          endif
@@ -1145,7 +1145,7 @@ contains
       &'|max|mid|fixed] [lsq_ref_compute_value=<v>]'
       write(*,'(A)') '    [mask_pattern_cache_max=<n>] [mem_frac_ram=<f>]'//&
       &' [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]'//&
-      &' [io_read_threads=<n>] [io_write_threads=<n>] [io_overlap=y|n]'
+      &' [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]'
       write(*,'(A)') '   or: rmclean_cubes --config <cfgfile>'
       write(*,'(A)') '   or: rmclean_cubes --help | -h'
       write(*,'(A)') ''
@@ -1238,9 +1238,9 @@ contains
       &' chunked reads of each tile''s AMP/PHA RM-depth range -- same'//&
       &' scheme as rm_synthesis''s own io_read_threads; clamped to'//&
       &' min(io_read_threads, OMP thread count, tile''s own nrm).'
-      write(*,'(A)') 'io_write_threads (default 1): parallel chunked'//&
+      write(*,'(A)') 'nwriters (default 1): parallel chunked'//&
       &' writes of each tile''s 6 output cubes -- same scheme as'//&
-      &' rm_synthesis''s own io_write_threads: >1 switches to raw'//&
+      &' rm_synthesis''s own nwriters: >1 switches to raw'//&
       &' stream writes at computed byte offsets, bypassing CFITSIO''s'//&
       &' own ftpsse for the pixel data (concurrent CFITSIO read-write'//&
       &' handles on one file are unsafe -- see write_output_tile''s own'//&
@@ -1248,7 +1248,7 @@ contains
       write(*,'(A)') 'io_overlap (default n): y = write each tile''s 6'//&
       &' output cubes on a background thread while the NEXT tile''s'//&
       &' read/compute proceeds -- same scheme as rm_synthesis''s own'//&
-      &' io_overlap; works with any io_write_threads setting.'
+      &' io_overlap; works with any nwriters setting.'
    end subroutine print_usage
 
    subroutine cfg_split_key_value(raw_line, key, val, has_kv)
@@ -1520,7 +1520,7 @@ contains
       !! mem_frac_ram=0.25 budget of ~15.7G, planning/
       !! RMCLEAN_INTEGRATION_PLAN.md T9's own UPDATE): this comment
       !! originally said the 6 output arrays' own double-buffering
-      !! (io_read_threads/io_write_threads/io_overlap, T4d) would be
+      !! (io_read_threads/nwriters/io_overlap, T4d) would be
       !! "added on top of this same budget, not computed here" once
       !! implemented, but T4d actually allocates them permanently
       !! double-buffered (clean_re_buf(...,2) etc., below) REGARDLESS of
@@ -1989,12 +1989,12 @@ contains
       !! WCS on every axis, since this program never resamples anything --
       !! Gate 0 validates the existing RM grid rather than changing it).
       !!
-      !! T4c: if io_write_threads_eff==1, leaves out_unit(idx) OPEN -- the
+      !! T4c: if nwriters_eff==1, leaves out_unit(idx) OPEN -- the
       !! caller keeps it open across the whole tile loop and closes it
       !! itself via close_output_cube once every tile has been written; a
       !! still-empty (never-written) FITS data segment is a well-defined
       !! intermediate state that later FTPSSE subset writes fill in. If
-      !! io_write_threads_eff>1, fetches this HDU's pixel-data byte offset
+      !! nwriters_eff>1, fetches this HDU's pixel-data byte offset
       !! (FTGHAD) into out_datastart(idx) and closes the handle
       !! IMMEDIATELY -- this FTCLOS is what makes CFITSIO actually define/
       !! flush the HDU to its full declared NAXIS extent on disk (ported
@@ -2060,7 +2060,7 @@ contains
       endif
       call safe_ftclos(src_unit, fitsstat)
       out_is_open(idx) = .true.
-      if (io_write_threads_eff.gt.1) then
+      if (nwriters_eff.gt.1) then
          fitsstat = 0
          local_unit = out_unit(idx)
          ! Zero-init before the call: this system's installed libcfitsio
@@ -2097,12 +2097,12 @@ contains
    subroutine write_output_tile(idx_amp, idx_pha, nx_in, ny_in, nrm_in,&
    &ix0, iy0, tx, ty, re_in, im_in, status)
       !! T4a/T4c: re/im -> amp/pha (inverse of read_amp_pha_tile's own
-      !! forward convention). io_write_threads_eff==1 (default): written
+      !! forward convention). nwriters_eff==1 (default): written
       !! via FTPSSE (subset write) at this tile's own [ix0:ix0+tx-1,
       !! iy0:iy0+ty-1, 1:nrm_in] window into the already-open
       !! out_unit(idx_amp/idx_pha) (opened once by open_output_cube,
       !! closed once by close_output_cube after every tile has been
-      !! written). io_write_threads_eff>1: this tile's own nrm_in range is
+      !! written). nwriters_eff>1: this tile's own nrm_in range is
       !! split (split_range_rmclean) across that many threads, each
       !! writing its own disjoint RM-chunk via write_rm_chunk_raw_rmclean
       !! -- raw stream writes at computed byte offsets, bypassing
@@ -2111,7 +2111,7 @@ contains
       !! internal buffer (cfitsio's own fits_already_open() contract) and
       !! concurrent writes through them corrupt it -- confirmed by
       !! rm_synthesis's own T4 postmortem (real SIGSEGV in memmove inside
-      !! libcfitsio), which is why io_write_threads>1 never opens extra
+      !! libcfitsio), which is why nwriters>1 never opens extra
       !! CFITSIO handles at all (see open_output_cube's own early-close).
       integer, intent(in) :: idx_amp, idx_pha
       integer, intent(in) :: nx_in, ny_in, nrm_in, ix0, iy0, tx, ty
@@ -2127,7 +2127,7 @@ contains
       amp_tile = sqrt(re_in**2 + im_in**2)
       pha_tile = atan2(im_in, re_in)
 
-      if (io_write_threads_eff.le.1) then
+      if (nwriters_eff.le.1) then
          naxes_out = (/ nx_in, ny_in, nrm_in /)
          fpixel = (/ ix0, iy0, 1 /)
          lpixel = (/ ix0+tx-1, iy0+ty-1, nrm_in /)
@@ -2147,10 +2147,10 @@ contains
             status = -1
          endif
       else
-         call split_range_rmclean(nrm_in, io_write_threads_eff, base_chan, rem_chan)
+         call split_range_rmclean(nrm_in, nwriters_eff, base_chan, rem_chan)
          !$omp parallel do schedule(static) default(shared)&
-         !$omp& private(ith,rm_beg,rm_len) num_threads(io_write_threads_eff)
-         do ith = 0, io_write_threads_eff-1
+         !$omp& private(ith,rm_beg,rm_len) num_threads(nwriters_eff)
+         do ith = 0, nwriters_eff-1
             if (ith.lt.rem_chan) then
                rm_len = base_chan + 1
                rm_beg = ith*(base_chan+1) + 1
@@ -2300,7 +2300,7 @@ contains
       !! pixel data entirely (see write_output_tile's own comment for
       !! why).
       !!
-      !! This routine is reached concurrently (once per io_write_threads
+      !! This routine is reached concurrently (once per nwriters
       !! worker, each opening the SAME file path for its own disjoint
       !! byte range) from write_output_tile's own `!$omp parallel do`.
       !! The Fortran standard does not guarantee any I/O statement --

@@ -22,7 +22,7 @@ module fitsio_unit_mod
    !! per-tile data transfer calls (FTGSVE/FTPSSE/FTGPVB/FTGREC/...) stay
    !! OUTSIDE these critical sections -- only the structural open/close
    !! bookkeeping needs serializing, not the I/O itself, so
-   !! io_read_threads/io_write_threads/per-thread WCS loading keep their
+   !! io_read_threads/nwriters/per-thread WCS loading keep their
    !! real parallelism.
    implicit none
    private

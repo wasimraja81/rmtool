@@ -352,9 +352,9 @@ integer   thread_id_now
 real(dp)  t_thread_stage_start, t_thread_stage_elapsed
  ! Parallel IO variables (T2 read / T3 write — IO optimisation branch)
  ! io_read_threads  : cfg key; 1=serial, N>1 opens N handles per input file
- ! io_write_threads : cfg key; 1=serial, N>1 opens N handles per output cube
+ ! nwriters : cfg key; 1=serial, N>1 opens N handles per output cube
 integer   io_read_threads_eff
-integer   io_write_threads_eff
+integer   nwriters_eff
  ! Read-side per-thread handles and scratch
 integer, allocatable :: par_unit_Q(:), par_unit_U(:)
 integer, allocatable :: par_unit_I(:), par_unit_mask(:)
@@ -373,11 +373,11 @@ integer   io_par_fpixels(max_axis), io_par_lpixels(max_axis)
 integer   io_par_incs_band(max_axis)
 logical   io_par_read_ok
  ! Write-side handle and scratch (RM-chunked for AMP/PHA cubes). Always a
- ! single handle now regardless of io_write_threads_eff -- see the T6
+ ! single handle now regardless of nwriters_eff -- see the T6
  ! comment above "Parallel write handle setup" for why.
 integer   par_wunit_amp, par_wunit_pha
  ! 0-based byte offset of each output HDU's pixel data (CFITSIO FTGHAD),
- ! fetched once; feeds write_rm_chunk_raw() when io_write_threads_eff>1.
+ ! fetched once; feeds write_rm_chunk_raw() when nwriters_eff>1.
 integer(kind=int64) :: datastart_amp, datastart_pha
  ! FTGHAD also reports these; unused here (we only need datastart) but
  ! required as call arguments.
@@ -1429,7 +1429,7 @@ nbuffer = naxes(1)
  ! call, a copy-pasted wrong unit number, or a crash mid-write could
  ! corrupt the user's original data for no reason.
  ! Also brings this file in line with docs/ARCHITECTURE.md's own
- ! documented CFITSIO lesson (see its "History: io_write_threads>1 was
+ ! documented CFITSIO lesson (see its "History: nwriters>1 was
  ! unsafe" postmortem, a real SIGSEGV): CFITSIO aliases repeat
  ! READ-WRITE opens of an already-open file onto one shared buffer, but
  ! exempts READ-ONLY opens from that aliasing by design ("2 different
@@ -3542,39 +3542,39 @@ endif
  ! which is strictly worse than a single call.
 #if HOST_OMP == 1
 io_read_threads_eff  = max(1, min(cfg%io_read_threads,  omp_get_max_threads()))
-io_write_threads_eff = max(1, min(cfg%io_write_threads, omp_get_max_threads()))
+nwriters_eff = max(1, min(cfg%nwriters, omp_get_max_threads()))
 if(cfg%io_read_threads .gt. omp_get_max_threads())then
    write(*,*)" WARNING: io_read_threads=",cfg%io_read_threads,&
    &" > OMP max threads=",omp_get_max_threads(),&
    &"; clamped to ",io_read_threads_eff
 endif
-if(cfg%io_write_threads .gt. omp_get_max_threads())then
-   write(*,*)" WARNING: io_write_threads=",cfg%io_write_threads,&
+if(cfg%nwriters .gt. omp_get_max_threads())then
+   write(*,*)" WARNING: nwriters=",cfg%nwriters,&
    &" > OMP max threads=",omp_get_max_threads(),&
-   &"; clamped to ",io_write_threads_eff
+   &"; clamped to ",nwriters_eff
 endif
 #else
 if(cfg%io_read_threads .gt. 1)then
    write(*,*)" NOTE: io_read_threads=",cfg%io_read_threads,&
    &" ignored in serial binary (HOST_OMP=0); using 1"
 endif
-if(cfg%io_write_threads .gt. 1)then
-   write(*,*)" NOTE: io_write_threads=",cfg%io_write_threads,&
+if(cfg%nwriters .gt. 1)then
+   write(*,*)" NOTE: nwriters=",cfg%nwriters,&
    &" ignored in serial binary (HOST_OMP=0); using 1"
 endif
 io_read_threads_eff  = 1
-io_write_threads_eff = 1
+nwriters_eff = 1
 #endif
  ! Further clamp to available data depth (can't have more IO threads than
  ! channels or RM bins respectively).
 io_read_threads_eff  = min(io_read_threads_eff,  nz_out)
-io_write_threads_eff = min(io_write_threads_eff, nrm_out)
+nwriters_eff = min(nwriters_eff, nrm_out)
 
  ! ===========================================================================
- ! io_write_threads>1: safe via raw stream writes, NOT via multiple CFITSIO
+ ! nwriters>1: safe via raw stream writes, NOT via multiple CFITSIO
  ! handles (T6). Read this before touching the code below.
  ! ===========================================================================
- ! io_write_threads>1 used to open N FTOPEN(...,1,...) (read-write) handles
+ ! nwriters>1 used to open N FTOPEN(...,1,...) (read-write) handles
  ! onto the SAME output file. CFITSIO's fits_already_open() (cfitsio-4.3.1/
  ! cfileio.c ~lines 1512-1520,1653) aliases repeat read-write opens of an
  ! already-open file onto ONE shared internal FITSfile buffer -- by
@@ -3582,27 +3582,27 @@ io_write_threads_eff = min(io_write_threads_eff, nrm_out)
  ! The "N independent handles" that implied were therefore not independent
  ! at all, and concurrent ftpsse() calls on them corrupted that shared
  ! buffer -- a real SIGSEGV inside memmove (inside libcfitsio) on a
- ! Setonix run with io_write_threads=4 (see the T4 postmortem in
- ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md). io_write_threads_eff was
+ ! Setonix run with nwriters=4 (see the T4 postmortem in
+ ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md). nwriters_eff was
  ! hard-clamped to 1 as a result.
  !
- ! That clamp is gone. Instead, when io_write_threads_eff>1, the tile
+ ! That clamp is gone. Instead, when nwriters_eff>1, the tile
  ! write uses write_rm_chunk_raw() (rm_synthesis_mod.f90), which writes
  ! pixel data directly to the output file's path via Fortran STREAM I/O,
  ! never asking CFITSIO to touch the file concurrently at all -- so its
  ! handle-aliasing behaviour never enters the picture. par_wunit_amp/
  ! par_wunit_pha below are therefore now ALWAYS a single aliased handle,
- ! regardless of io_write_threads_eff; see "Parallel write handle setup".
+ ! regardless of nwriters_eff; see "Parallel write handle setup".
  ! Read-only opens (io_read_threads) were never affected by any of this --
  ! CFITSIO explicitly exempts mode=0 opens from the aliasing ("2 different
  ! threads cannot share the same FITSfile pointer"), so those N handles
  ! genuinely are independent.
-if(io_write_threads_eff .gt. 1)then
-   write(*,*)" Parallel FITS write: io_write_threads=",io_write_threads_eff,&
+if(nwriters_eff .gt. 1)then
+   write(*,*)" Parallel FITS write: nwriters=",nwriters_eff,&
    &" via raw stream writes (CFITSIO handle aliasing bypassed -- see"
-   write(*,*)"   docs/ARCHITECTURE.md 'Parallel write -- io_write_threads')."
+   write(*,*)"   docs/ARCHITECTURE.md 'Parallel write -- nwriters')."
    call log_message('info','startup',&
-   &'io_write_threads>1: using raw stream writes, bypassing CFITSIO '//&
+   &'nwriters>1: using raw stream writes, bypassing CFITSIO '//&
    &'handle aliasing (see ARCHITECTURE.md)')
 endif
  ! Allocate and populate per-thread unit arrays.
@@ -3637,7 +3637,7 @@ else
 endif
 
  ! --- Parallel write handle setup ---
- ! Always alias the single existing handles -- io_write_threads_eff>1 no
+ ! Always alias the single existing handles -- nwriters_eff>1 no
  ! longer opens extra CFITSIO handles (that was the unsafe mechanism; see
  ! the T6 comment above). Instead, fetch each file's data-start byte
  ! offset once via FTGHAD on this same handle, right after its header was
@@ -3694,7 +3694,7 @@ endif
 ! the raw-written bytes read back correctly; post-close they read back as
 ! zero, with datastart/dataend unchanged -- i.e. not a header-growth
 ! shift, but exactly this stale-buffer-flush mechanism.)
-if(io_write_threads_eff.gt.1)then
+if(nwriters_eff.gt.1)then
    ! This FTCLOS is where CFITSIO defines/flushes the AMP and PHA HDUs
    ! for the first time, which is when the OS-visible file size jumps to
    ! its full declared NAXIS extent (confirmed by real Setonix runs).
@@ -4715,7 +4715,7 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       ! data, never the control flow.
       call populate_write_job(write_job(cur_slot), par_wunit_amp,&
       &par_wunit_pha, outfileAMP, outfileANG, datastart_amp,&
-      &datastart_pha, io_write_threads_eff, out_mask_open,&
+      &datastart_pha, nwriters_eff, out_mask_open,&
       &out_nvalid_open, out_peak_open, out_rmpeak_open,&
       &out_angpeak_open, out_snr_open, group, naxes_out(1:3),&
       &naxes_mask, naxes_nvalid, naxes_stat, ix_out_beg, ix_out_end,&
@@ -4727,14 +4727,14 @@ do ix_tile_beg = xpix_beg,xpix_end,cfg%tile_ra*incs(1)
       if(cfg%io_overlap)then
          ! Handle safety: before any new write is dispatched, whichever
          ! write is currently outstanding (either slot) is joined first,
-         ! unconditionally, regardless of io_write_threads_eff. This rule
+         ! unconditionally, regardless of nwriters_eff. This rule
          ! predates the T6 raw-write mechanism, from when every tile's
          ! write shared the same two FITS handles (AMP/PHA) regardless of
          ! slot and two pthreads calling ftpsse on the same handle at once
          ! was unsafe no matter how well-separated their byte ranges or
          ! buffers were (see the postmortem in docs/ARCHITECTURE.md). It
          ! remains in force unconditionally today, including under
-         ! io_write_threads_eff>1's raw-write path: each tile's own
+         ! nwriters_eff>1's raw-write path: each tile's own
          ! RM-chunks already write to genuinely disjoint byte ranges via
          ! independent stream units, so two different tiles' writes could
          ! in principle also overlap safely by the same POSIX guarantee --
