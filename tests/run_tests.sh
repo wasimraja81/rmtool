@@ -2840,6 +2840,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 42. convolve_cubes/match_cubes/reproject_cubes: a long infiles= CLI
+#     argument (>512 chars combined) is not silently truncated (T17,
+#     docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md). Real bug found while
+#     running scripts/run_pipeline.sh on real WALLABY+EMU data: its own
+#     symlink-redirection scheme (needed to land match_cubes' output on
+#     NVMe rather than match_input_path's own disk) lengthens every
+#     path enough that a 4-file infiles= argument crossed 512 chars --
+#     silently truncated by the old `character(len=512) :: this_arg`
+#     CLI-token buffer (Fortran does not error on this, it just cuts
+#     the string), producing a nonsense path and a confusing "failed to
+#     open" error far from the real cause. Fixed by widening this_arg/
+#     cli_val and the raw_infiles/raw_beamfiles/raw_badchan_file CSV
+#     staging buffers to 16384 chars in all three tools.
+# ---------------------------------------------------------------------------
+section "42. convolve_cubes/match_cubes/reproject_cubes: long infiles= argument not truncated (T17)"
+
+lia_dir="$OUT_DIR/long_infiles_arg/a/really/quite/deeply/nested/directory/structure/designed/specifically/to/push/the/combined/infiles/argument/comfortably/past/the/old/five_hundred_twelve/character/limit/for/a/real/regression/test"
+mkdir -p "$lia_dir"
+cp "$DATA_DIR/TEST.Q.FITSCUBE" "$lia_dir/bandA.fits"
+cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$lia_dir/bandB.fits"
+awk 'BEGIN{for(i=1;i<=200;i++) print i, 10.0, 10.0, 0.0}' > "$lia_dir/bandA_beamlog.txt"
+awk 'BEGIN{for(i=1;i<=150;i++) print i, 10.0, 10.0, 0.0}' > "$lia_dir/bandB_beamlog.txt"
+lia_infiles="$lia_dir/bandA.fits,$lia_dir/bandB.fits"
+
+if [[ ${#lia_infiles} -le 512 ]]; then
+    skip "long infiles= test fixture path is not actually long enough (${#lia_infiles} chars) to exercise the old 512-char limit -- OUT_DIR is unusually short on this machine"
+else
+    if [[ -x bin/convolve_cubes ]]; then
+        rm -f "$lia_dir/bandA_CONV.FITS" "$lia_dir/bandB_CONV.FITS"
+        lia_convolve_log="$OUT_DIR/lia_convolve.log"
+        if bin/convolve_cubes infiles="$lia_infiles" \
+                beamfiles="$lia_dir/bandA_beamlog.txt,$lia_dir/bandB_beamlog.txt" \
+                target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 \
+                > "$lia_convolve_log" 2>&1 && \
+           [[ -s "$lia_dir/bandA_CONV.FITS" && -s "$lia_dir/bandB_CONV.FITS" ]]; then
+            pass "convolve_cubes: ${#lia_infiles}-char infiles= argument (>512) not truncated, both bands processed"
+        else
+            fail "convolve_cubes: long infiles= argument (${#lia_infiles} chars) failed (see $lia_convolve_log)"
+        fi
+    else
+        skip "bin/convolve_cubes not built; skipping long infiles= test"
+    fi
+
+    if [[ -x bin/match_cubes ]]; then
+        rm -f "$lia_dir/bandA_CONV.FITS" "$lia_dir/bandB_CONV.FITS"
+        lia_match_log="$OUT_DIR/lia_match.log"
+        if bin/match_cubes stages=convolve infiles="$lia_infiles" \
+                beamfiles="$lia_dir/bandA_beamlog.txt,$lia_dir/bandB_beamlog.txt" \
+                target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 \
+                > "$lia_match_log" 2>&1 && \
+           [[ -s "$lia_dir/bandA_CONV.FITS" && -s "$lia_dir/bandB_CONV.FITS" ]]; then
+            pass "match_cubes: ${#lia_infiles}-char infiles= argument (>512) not truncated, both bands processed"
+        else
+            fail "match_cubes: long infiles= argument (${#lia_infiles} chars) failed (see $lia_match_log)"
+        fi
+    else
+        skip "bin/match_cubes not built; skipping long infiles= test"
+    fi
+
+    if [[ -x bin/reproject_cubes ]]; then
+        cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$lia_dir/bandC.fits"
+        lia_infiles_reproj="$lia_dir/bandA.fits,$lia_dir/bandC.fits"
+        rm -f "$lia_dir/bandC_REPROJ.FITS"
+        lia_reproject_log="$OUT_DIR/lia_reproject.log"
+        if bin/reproject_cubes mode=reference reffile="$lia_dir/bandA.fits" \
+                infiles="$lia_infiles_reproj" \
+                > "$lia_reproject_log" 2>&1 && \
+           [[ -s "$lia_dir/bandC_REPROJ.FITS" ]]; then
+            pass "reproject_cubes: ${#lia_infiles_reproj}-char infiles= argument (>512) not truncated, genuinely-mismatched band reprojected"
+        else
+            fail "reproject_cubes: long infiles= argument (${#lia_infiles_reproj} chars) failed (see $lia_reproject_log)"
+        fi
+    else
+        skip "bin/reproject_cubes not built; skipping long infiles= test"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

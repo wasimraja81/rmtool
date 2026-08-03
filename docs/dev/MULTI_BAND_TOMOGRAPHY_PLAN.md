@@ -2219,3 +2219,95 @@ as an all-NaN plane, for both `convolve_cubes` and `match_cubes`
 independently. Then locked in as a permanent regression (`tests/
 run_tests.sh` section 41, both tools). Full suite: 129/129 (up from
 127).
+
+### T17 — Long `infiles=` CLI Argument Silently Truncated at 512 Chars
+
+**Gap found the hard way, running `scripts/run_pipeline.sh` on the real
+WALLABY+EMU data:** the real run failed with a bizarre "failed to open
+FITS file: .../match_input_symlinks/im" -- a filename cut off after 2
+characters. Root-caused directly, not guessed: `run_pipeline.sh`'s own
+symlink-redirection scheme (needed to land `match_cubes`' output on a
+different disk than its raw input -- see T18 below) lengthens every
+path by the symlink directory's own prefix; the combined `infiles=`
+argument for 4 real files came to 565 characters. `parse_args`'s own
+`character(len=512) :: this_arg` CLI-token buffer in `convolve_cubes.
+f90`/`match_cubes.f90`/`reproject_cubes.f90` silently truncates
+anything longer (Fortran raises no error on this), and the cut
+happened to land exactly at "...match_input_symlinks/im" -- byte for
+byte matching the error. This bug was real but dormant before this
+session: every earlier manual invocation used the shorter raw
+`/data1/tmp/multi-band/...` paths directly, never crossing 512 chars.
+
+**Fix:** widened `this_arg`/`cli_val` and the `raw_infiles`/
+`raw_beamfiles`/`raw_badchan_file` CSV-staging buffers (and the
+equivalent cfg-file-reading buffers) from 512 to 16384 characters in
+all three tools -- comfortable headroom over the theoretical worst
+case (`max_inputs`=50 entries x up to 512 chars each). Per-entry
+buffers (`infiles(:)`/`beamfiles(:)`/`badchan_file(:)`, each already
+512 chars) were not the problem and are unchanged.
+
+**Verification:** confirmed the exact failure mode first (a 565-char
+argument reproduces the identical truncation), then confirmed the fix
+with a 515-char and later a 533-char real `infiles=` argument across
+all three tools -- both bands processed correctly, full paths intact
+throughout. Locked in as a permanent regression (`tests/run_tests.sh`
+section 42, all three tools, using a deliberately deep nested fixture
+path to exceed 512 chars). Full suite: 132/132 (up from 129).
+
+### T18 — `scripts/run_pipeline.sh`: Any Non-Empty Subset of Stages
+
+**Gap found while setting up the real WALLABY+EMU run's hybrid disk
+plan** (matched cubes on a slow, high-capacity disk alongside the raw
+input; `rm_synthesis`/`rmclean_cubes` output on a fast NVMe disk):
+`run_pipeline.sh` has exactly one `outdir=`, used both as the
+destination for `match_cubes`' own symlink-redirected output AND for
+`rm_synthesis`/`rmclean_cubes`' own output -- it cannot express two
+different disks for one invocation. Compounding this, the script
+previously hard-required `rmsynth` in every `stages=` list ("match
+alone is not a full pipeline run -- use bin/match_cubes directly for
+that"), so there was no way to run `match` in one invocation (`outdir`
+on the slow disk) and `rmsynth`(`,rmclean`) in a separate, later
+invocation (`outdir` on the fast disk) through the script itself.
+
+**Fix:** removed the hard `rmsynth`-required check. Any non-empty
+subset of `{match, rmsynth, rmclean}` is now valid. Whenever a stage's
+own inputs would normally come from an earlier stage that is NOT
+present in the SAME invocation, that stage's own cfg template's own
+path-shaped keys are used exactly as written, instead of being
+overridden with a chained value -- `rmsynth`'s `path=`/`infileQ=`/
+`infileU=` (already behaved this way whenever `match` was absent) and,
+newly, `rmclean`'s `ampfile=`/`phafile=`/`maskfile=`/`outfile=`
+whenever `rmsynth` is absent (with existence checks against whatever
+the template says, so a stale/missing path fails loudly and by name
+rather than a bare "not found").
+
+**A second, previously-masked bug found in the process:**
+`scratch/run_rmsynthesis_test.sh`'s own cfg-value extraction
+(`awk -F= '/^path=/{...}'`) was anchored to a bare `key=value` with NO
+whitespace tolerance, unlike this same script's own `use_gpu`/
+`dry_run` extraction a few lines away (`/^use_gpu[[:space:]]*=/`).
+This never mattered before because `run_pipeline.sh` always rewrote
+`path=`/`infileQ=`/`infileU=`/`outfile=` into tight `key=value` form
+via its own `cfg_set_inplace` whenever `match` ran -- but this
+project's own common aligned cfg style (`path                = ...`)
+is exactly what every `rmsynth_cfg_template` in this repo already uses,
+and a `stages=rmsynth`-alone invocation (T18's whole point) feeds such
+a template straight through unmodified. Fixed to match the same
+`[[:space:]]*=` tolerance already used two lines above it in the same
+file.
+
+**Verification:** the existing full-chain smoketests (`cfg/
+pipeline-e2e-smalltest.cfg`, `cfg/pipeline-e2e-multiband-smalltest.
+cfg`) re-run and confirmed unchanged. The new capability itself
+verified with a genuine 3-way split -- `stages=match` alone (real
+reprojection of a genuinely-mismatched band, correct manifest,
+`outdir` on one disk) -> `stages=rmsynth` alone (template's own
+`path=`/`infileQ=`/`infileU=` pointed at the match-only run's real
+output, `outdir` on a different disk) -> `stages=rmclean` alone
+(template's own `ampfile=`/`phafile=`/`maskfile=` pointed at the
+rmsynth-only run's real output) -- all three ran correctly end to end,
+each stage's real output consumed correctly by the next, run as three
+fully separate `run_pipeline.sh` invocations. Full suite: 132/132
+(unaffected -- this script is not part of `tests/run_tests.sh`'s own
+automated coverage, verified instead via its existing manual smoketest
+cfg convention).

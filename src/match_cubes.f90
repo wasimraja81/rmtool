@@ -607,8 +607,17 @@ contains
 
    subroutine parse_args(status)
       integer, intent(out) :: status
-      character(len=512) :: this_arg, cli_key, cli_val, cfgfile
-      character(len=512) :: raw_infiles, raw_beamfiles, raw_badchan_file
+      ! this_arg/cli_val and the raw_* CSV-list staging variables below
+      ! hold a WHOLE comma-separated infiles=/beamfiles=/badchan_file=
+      ! argument, not one path -- up to max_inputs (50) entries, each up
+      ! to 512 chars (infiles(:)'s own per-entry length). 16384 gives
+      ! generous headroom over the worst case (~25,600 chars); 512 here
+      ! silently truncated a real run's own infiles= argument (found via
+      ! scripts/run_pipeline.sh's symlink-redirection scheme, which
+      ! lengthens every path enough to cross 512 for just 4 real files).
+      character(len=16384) :: this_arg, cli_val
+      character(len=512) :: cli_key, cfgfile
+      character(len=16384) :: raw_infiles, raw_beamfiles, raw_badchan_file
       integer :: argc, iarg
       logical :: has_kv, have_cfgfile, seen_infiles, seen_stages
 
@@ -892,7 +901,8 @@ contains
       character(len=*), intent(inout) :: raw_infiles, raw_beamfiles, raw_badchan_file
       logical, intent(inout) :: seen_infiles, seen_stages
       integer, intent(out) :: status
-      character(len=512) :: line, key, val
+      character(len=16384) :: line, val
+      character(len=512) :: key
       integer :: unit_cfg, ios, line_no
       logical :: has_kv
 

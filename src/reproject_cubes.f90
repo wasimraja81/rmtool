@@ -203,9 +203,18 @@ program reproject_cubes
    integer :: n_inputs, i
 
    character(len=512) :: cfgfile
-   character(len=512) :: this_arg, cli_key, cli_val
+   ! this_arg/cli_val/raw_cli_infiles hold a WHOLE comma-separated
+   ! infiles= argument, not one path -- up to max_inputs (50) entries,
+   ! each up to 512 chars (infiles(:)'s own per-entry length). 16384
+   ! gives generous headroom over the worst case (~25,600 chars); 512
+   ! here silently truncated a real run's own infiles= argument (found
+   ! via scripts/run_pipeline.sh's symlink-redirection scheme, which
+   ! lengthens every path enough to cross 512 for just 4 real files).
+   character(len=16384) :: this_arg, cli_val
+   character(len=512) :: cli_key
    character(len=16) :: cli_mode
-   character(len=512) :: cli_reffile, raw_cli_infiles
+   character(len=512) :: cli_reffile
+   character(len=16384) :: raw_cli_infiles
    integer :: argc, iarg
    logical :: has_kv
    logical :: have_cfgfile
@@ -2215,7 +2224,8 @@ contains
       character(len=*), intent(inout) :: log_output_file_l
       integer, intent(out) :: status
 
-      character(len=512) :: line, key, val, raw_infiles
+      character(len=16384) :: line, val, raw_infiles
+      character(len=512) :: key
       integer :: unit_cfg, ios, line_no, j, ios_mfr
       logical :: has_kv, seen_mode, seen_reffile, seen_infiles
 

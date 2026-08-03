@@ -114,12 +114,22 @@ if [[ ! -x "${EXE}" ]]; then
   exit 1
 fi
 
-DATA_PATH="$(awk -F= '/^path=/{print $2; exit}' "${CFG_PATH}" | xargs)"
-Q_FILE="$(awk -F= '/^infileQ=/{print $2; exit}' "${CFG_PATH}" | xargs)"
-U_FILE="$(awk -F= '/^infileU=/{print $2; exit}' "${CFG_PATH}" | xargs)"
-OUT_BASE="$(awk -F= '/^outfile=/{print $2; exit}' "${CFG_PATH}" | xargs)"
-AP_MODE="$(awk -F= '/^ap_angle_mode=/{print $2; exit}' "${CFG_PATH}" | xargs)"
-OUTPUT_MODE="$(awk -F= '/^output_mode=/{print $2; exit}' "${CFG_PATH}" | xargs)"
+# [[:space:]]*= (not a bare =) tolerates this project's own common
+# "key                = value" aligned cfg style, not just "key=value"
+# -- same convention already used above for use_gpu/use_gpus and below
+# for dry_run. A bare /^path=/ silently never matched an aligned cfg
+# (found via scripts/run_pipeline.sh's new stages=rmsynth-alone path,
+# T18, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): this script's own
+# CFG_PATH used to always be one run_pipeline.sh had just rewritten
+# these exact keys into tight key=value form via its own
+# cfg_set_inplace, masking the gap until a cfg was fed straight
+# through unmodified.
+DATA_PATH="$(awk -F= '/^path[[:space:]]*=/{print $2; exit}' "${CFG_PATH}" | xargs)"
+Q_FILE="$(awk -F= '/^infileQ[[:space:]]*=/{print $2; exit}' "${CFG_PATH}" | xargs)"
+U_FILE="$(awk -F= '/^infileU[[:space:]]*=/{print $2; exit}' "${CFG_PATH}" | xargs)"
+OUT_BASE="$(awk -F= '/^outfile[[:space:]]*=/{print $2; exit}' "${CFG_PATH}" | xargs)"
+AP_MODE="$(awk -F= '/^ap_angle_mode[[:space:]]*=/{print $2; exit}' "${CFG_PATH}" | xargs)"
+OUTPUT_MODE="$(awk -F= '/^output_mode[[:space:]]*=/{print $2; exit}' "${CFG_PATH}" | xargs)"
 
 if [[ -z "${DATA_PATH}" || -z "${Q_FILE}" || -z "${U_FILE}" || -z "${OUT_BASE}" ]]; then
   echo "[runFile] ERROR: cfg missing one of path/infileQ/infileU/outfile" >&2

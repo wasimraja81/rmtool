@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# scripts/run_pipeline.sh -- end-to-end orchestrator: match_cubes (optional)
-# -> rm_synthesis -> rmclean_cubes (optional), driven by one small pipeline
-# cfg (cfg/pipeline-example.cfg is a documented template). Ticket: the
-# user's own item-4 ask, alongside item 3 ("run a full test on moderately
-# big real data") -- see docs/dev/RMCLEAN_INTEGRATION_PLAN.md's own T4
-# entry and this script's own git history for the design discussion.
+# scripts/run_pipeline.sh -- orchestrator for match_cubes -> rm_synthesis
+# -> rmclean_cubes, driven by one small pipeline cfg (cfg/pipeline-
+# example.cfg is a documented template). Ticket: the user's own item-4
+# ask, alongside item 3 ("run a full test on moderately big real data")
+# -- see docs/dev/RMCLEAN_INTEGRATION_PLAN.md's own T4 entry and this
+# script's own git history for the design discussion.
+#
+# ANY non-empty subset of {match, rmsynth, rmclean} is valid (T18,
+# docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md) -- not just the full chain.
+# Found needed for real: a real multi-band run wanted match_cubes'
+# output on one disk (a slow, high-capacity one, alongside the raw
+# input) and rm_synthesis'/rmclean_cubes' own output on a different,
+# faster one (this script's own single outdir= can't express two
+# different disks for one invocation) -- splitting into a match-only
+# invocation (outdir on the first disk) followed by a rmsynth[,rmclean]-
+# only invocation (outdir on the second, rmsynth_cfg_template's own
+# path=/infileQ=/infileU= pointed at the first invocation's real
+# output) is exactly this case. Whichever stage would normally receive
+# a chained path from an earlier stage uses its own cfg template's own
+# value unmodified instead, whenever that earlier stage is not ALSO
+# present in this same invocation.
 #
 # This script invents NO new algorithmic options. Every stage tool
 # (match_cubes, rm_synthesis, rmclean_cubes) already has its own complete,
@@ -92,11 +107,21 @@ rmsynth_cfg_template, rmsynth_backend, rmsynth_omp_threads,
 rmclean_cfg_template).
 
 Runs, in this fixed relative order, whichever of these are named in the
-cfg's own stages= key:
+cfg's own stages= key -- ANY non-empty subset is valid, not just the
+full match,rmsynth,rmclean sequence (e.g. stages=match alone to prepare
+data now and run rmsynth separately/later on different storage;
+stages=rmclean alone against an existing dirty cube from a prior
+rmsynth-only run):
   match    bin/match_cubes (convolve+reproject), Q and U combined in one
            call so both land on the identical output grid/beam
   rmsynth  bin/rm_synthesis_release_cpu_omp|_gpu_offload_hostomp
   rmclean  bin/rmclean_cubes
+
+Whenever a stage's own inputs would normally come from an earlier stage
+that is NOT present in this same invocation, that stage's own cfg
+template's own path-shaped keys (path=/infileQ=/infileU= for rmsynth;
+ampfile=/phafile=/maskfile=/outfile= for rmclean) are used exactly as
+you wrote them, instead of being overridden with a chained value.
 
 Each stage's own native cfg template is copied into
 <outdir>/<run_name>.provenance/ with just the path-shaped keys
@@ -198,7 +223,15 @@ for s in "${STAGE_LIST[@]}"; do
     *) die "unrecognised stage '${s}' in stages= (expected match, rmsynth, rmclean)" ;;
   esac
 done
-[[ "${DO_RMSYNTH}" -eq 1 ]] || die "stages= must include rmsynth (rmclean depends on its output; match alone is not a full pipeline run -- use bin/match_cubes directly for that)"
+# Any non-empty subset is allowed -- match/rmsynth/rmclean are each
+# independently useful (e.g. match alone to prepare data for a later,
+# separate rmsynth run on different storage; rmclean alone against an
+# existing dirty cube from a prior rmsynth-only run). When a later
+# stage's own inputs would normally come from an earlier stage that
+# ISN'T present in THIS invocation, that stage's own cfg template's
+# own path-shaped keys are used unmodified instead (see the rmsynth/
+# rmclean sections below) -- the same convention rmsynth already used
+# for path/infileQ/infileU whenever match wasn't requested.
 
 OUTDIR="$(cfg_get "${PIPELINE_CFG}" outdir)"
 RUN_NAME="$(cfg_get "${PIPELINE_CFG}" run_name)"
@@ -333,73 +366,78 @@ if [[ "${DO_MATCH}" -eq 1 ]]; then
 fi
 
 # ============================================================
-# Stage: rmsynth (always)
+# Stage: rmsynth (optional)
 # ============================================================
-log "=== rmsynth stage ==="
-RMSYNTH_T0="$(date +%s)"
-RMSYNTH_TEMPLATE="$(cfg_get "${PIPELINE_CFG}" rmsynth_cfg_template)"
-RMSYNTH_BACKEND="$(cfg_get "${PIPELINE_CFG}" rmsynth_backend)"
-RMSYNTH_THREADS="$(cfg_get "${PIPELINE_CFG}" rmsynth_omp_threads)"
-[[ -z "${RMSYNTH_TEMPLATE}" ]] && die "rmsynth_cfg_template= is required"
-[[ -z "${RMSYNTH_BACKEND}" ]] && RMSYNTH_BACKEND="auto"
-[[ -z "${RMSYNTH_THREADS}" ]] && RMSYNTH_THREADS="6"
-if [[ ! -f "${RMSYNTH_TEMPLATE}" ]]; then
-  [[ -f "${ROOT_DIR}/${RMSYNTH_TEMPLATE}" ]] && RMSYNTH_TEMPLATE="${ROOT_DIR}/${RMSYNTH_TEMPLATE}"
-fi
-[[ -f "${RMSYNTH_TEMPLATE}" ]] || die "rmsynth_cfg_template not found: ${RMSYNTH_TEMPLATE}"
-
-if [[ "${DO_RMCLEAN}" -eq 1 ]]; then
-  WMO="$(cfg_get "${RMSYNTH_TEMPLATE}" write_mask_output)"
-  # write_mask_output defaults to TRUE when absent (rm_synthesis_mod.f90's
-  # own cfg%write_mask_output = .true. default) -- only an EXPLICIT
-  # falsy value is a problem.
-  if [[ -n "${WMO}" ]] && ! flag_is_true "${WMO}"; then
-    die "rmsynth_cfg_template (${RMSYNTH_TEMPLATE}) has write_mask_output=${WMO}, but rmclean_cubes requires the MASK cube -- set write_mask_output=y (or remove the key, it defaults to true) in your template, or drop 'rmclean' from stages="
+if [[ "${DO_RMSYNTH}" -eq 1 ]]; then
+  log "=== rmsynth stage ==="
+  RMSYNTH_T0="$(date +%s)"
+  RMSYNTH_TEMPLATE="$(cfg_get "${PIPELINE_CFG}" rmsynth_cfg_template)"
+  RMSYNTH_BACKEND="$(cfg_get "${PIPELINE_CFG}" rmsynth_backend)"
+  RMSYNTH_THREADS="$(cfg_get "${PIPELINE_CFG}" rmsynth_omp_threads)"
+  [[ -z "${RMSYNTH_TEMPLATE}" ]] && die "rmsynth_cfg_template= is required when stages includes rmsynth"
+  [[ -z "${RMSYNTH_BACKEND}" ]] && RMSYNTH_BACKEND="auto"
+  [[ -z "${RMSYNTH_THREADS}" ]] && RMSYNTH_THREADS="6"
+  if [[ ! -f "${RMSYNTH_TEMPLATE}" ]]; then
+    [[ -f "${ROOT_DIR}/${RMSYNTH_TEMPLATE}" ]] && RMSYNTH_TEMPLATE="${ROOT_DIR}/${RMSYNTH_TEMPLATE}"
   fi
+  [[ -f "${RMSYNTH_TEMPLATE}" ]] || die "rmsynth_cfg_template not found: ${RMSYNTH_TEMPLATE}"
+
+  if [[ "${DO_RMCLEAN}" -eq 1 ]]; then
+    WMO="$(cfg_get "${RMSYNTH_TEMPLATE}" write_mask_output)"
+    # write_mask_output defaults to TRUE when absent (rm_synthesis_mod.f90's
+    # own cfg%write_mask_output = .true. default) -- only an EXPLICIT
+    # falsy value is a problem.
+    if [[ -n "${WMO}" ]] && ! flag_is_true "${WMO}"; then
+      die "rmsynth_cfg_template (${RMSYNTH_TEMPLATE}) has write_mask_output=${WMO}, but rmclean_cubes requires the MASK cube -- set write_mask_output=y (or remove the key, it defaults to true) in your template, or drop 'rmclean' from stages="
+    fi
+  fi
+
+  RMSYNTH_CFG="${PROVDIR}/rmsynth.${RUN_TAG}.cfg"
+  cp "${RMSYNTH_TEMPLATE}" "${RMSYNTH_CFG}"
+  RMSYNTH_OUTFILE="${OUTDIR}/${RUN_NAME}"
+  cfg_set_inplace "${RMSYNTH_CFG}" outfile "${RMSYNTH_OUTFILE}"
+  if [[ "${DO_MATCH}" -eq 1 ]]; then
+    cfg_set_inplace "${RMSYNTH_CFG}" path "${MATCH_INPUT_PATH%/}/"
+    cfg_set_inplace "${RMSYNTH_CFG}" infileQ "${RMSYNTH_INFILEQ}"
+    cfg_set_inplace "${RMSYNTH_CFG}" infileU "${RMSYNTH_INFILEU}"
+  fi
+  # else: match did not run in THIS invocation -- use the template's own
+  # path=/infileQ=/infileU= unmodified (e.g. pointing at a previous,
+  # separate match-only run's own real output).
+
+  OUTPUT_MODE="$(cfg_get "${RMSYNTH_CFG}" output_mode)"
+  AP_MODE="$(cfg_get "${RMSYNTH_CFG}" ap_angle_mode)"
+  [[ -z "${OUTPUT_MODE}" ]] && OUTPUT_MODE="ap"
+  [[ -z "${AP_MODE}" ]] && AP_MODE="phase"
+  if [[ "${OUTPUT_MODE}" == "ri" ]]; then
+    RMSYNTH_OUT1="${RMSYNTH_OUTFILE}.REAL.RMCUBE.FITS"
+    RMSYNTH_OUT2="${RMSYNTH_OUTFILE}.IMAG.RMCUBE.FITS"
+  else
+    RMSYNTH_OUT1="${RMSYNTH_OUTFILE}.AMP.RMCUBE.FITS"
+    RMSYNTH_OUT2="${RMSYNTH_OUTFILE}.PHA.RMCUBE.FITS"
+    [[ "${AP_MODE}" == "pol" ]] && RMSYNTH_OUT2="${RMSYNTH_OUTFILE}.POLA.RMCUBE.FITS"
+  fi
+
+  # scratch/run_rmsynthesis_test.sh unconditionally `rm -f`'s these two
+  # cubes before every run (a deliberate dev-test convenience for its own
+  # direct, interactive use) -- check for pre-existing output HERE, before
+  # calling it, so this pipeline's own "never silently delete/overwrite an
+  # existing output" guarantee holds regardless of that runner's own
+  # behaviour.
+  if [[ -e "${RMSYNTH_OUT1}" || -e "${RMSYNTH_OUT2}" ]]; then
+    die "rmsynth output already exists, refusing to proceed (would be deleted and regenerated): ${RMSYNTH_OUT1} / ${RMSYNTH_OUT2}"
+  fi
+
+  RUNNER="${ROOT_DIR}/scratch/run_rmsynthesis_test.sh"
+  [[ -x "${RUNNER}" ]] || die "runner not found or not executable: ${RUNNER}"
+  log "Running: ${RUNNER} ${RMSYNTH_CFG} ${RMSYNTH_THREADS} ${RMSYNTH_BACKEND}"
+  run_logged "${PROVDIR}/rmsynth.${RUN_TAG}.stdout.log" \
+    "${RUNNER}" "${RMSYNTH_CFG}" "${RMSYNTH_THREADS}" "${RMSYNTH_BACKEND}"
+
+  [[ -s "${RMSYNTH_OUT1}" && -s "${RMSYNTH_OUT2}" ]] || die "rmsynth stage did not produce expected output cubes (${RMSYNTH_OUT1}, ${RMSYNTH_OUT2})"
+  STAGE_TIMES+=("rmsynth:$(( $(date +%s) - RMSYNTH_T0 ))s")
+  log "rmsynth stage done: ${RMSYNTH_OUT1}, ${RMSYNTH_OUT2}"
 fi
-
-RMSYNTH_CFG="${PROVDIR}/rmsynth.${RUN_TAG}.cfg"
-cp "${RMSYNTH_TEMPLATE}" "${RMSYNTH_CFG}"
-RMSYNTH_OUTFILE="${OUTDIR}/${RUN_NAME}"
-cfg_set_inplace "${RMSYNTH_CFG}" outfile "${RMSYNTH_OUTFILE}"
-if [[ "${DO_MATCH}" -eq 1 ]]; then
-  cfg_set_inplace "${RMSYNTH_CFG}" path "${MATCH_INPUT_PATH%/}/"
-  cfg_set_inplace "${RMSYNTH_CFG}" infileQ "${RMSYNTH_INFILEQ}"
-  cfg_set_inplace "${RMSYNTH_CFG}" infileU "${RMSYNTH_INFILEU}"
-fi
-
-OUTPUT_MODE="$(cfg_get "${RMSYNTH_CFG}" output_mode)"
-AP_MODE="$(cfg_get "${RMSYNTH_CFG}" ap_angle_mode)"
-[[ -z "${OUTPUT_MODE}" ]] && OUTPUT_MODE="ap"
-[[ -z "${AP_MODE}" ]] && AP_MODE="phase"
-if [[ "${OUTPUT_MODE}" == "ri" ]]; then
-  RMSYNTH_OUT1="${RMSYNTH_OUTFILE}.REAL.RMCUBE.FITS"
-  RMSYNTH_OUT2="${RMSYNTH_OUTFILE}.IMAG.RMCUBE.FITS"
-else
-  RMSYNTH_OUT1="${RMSYNTH_OUTFILE}.AMP.RMCUBE.FITS"
-  RMSYNTH_OUT2="${RMSYNTH_OUTFILE}.PHA.RMCUBE.FITS"
-  [[ "${AP_MODE}" == "pol" ]] && RMSYNTH_OUT2="${RMSYNTH_OUTFILE}.POLA.RMCUBE.FITS"
-fi
-
-# scratch/run_rmsynthesis_test.sh unconditionally `rm -f`'s these two
-# cubes before every run (a deliberate dev-test convenience for its own
-# direct, interactive use) -- check for pre-existing output HERE, before
-# calling it, so this pipeline's own "never silently delete/overwrite an
-# existing output" guarantee holds regardless of that runner's own
-# behaviour.
-if [[ -e "${RMSYNTH_OUT1}" || -e "${RMSYNTH_OUT2}" ]]; then
-  die "rmsynth output already exists, refusing to proceed (would be deleted and regenerated): ${RMSYNTH_OUT1} / ${RMSYNTH_OUT2}"
-fi
-
-RUNNER="${ROOT_DIR}/scratch/run_rmsynthesis_test.sh"
-[[ -x "${RUNNER}" ]] || die "runner not found or not executable: ${RUNNER}"
-log "Running: ${RUNNER} ${RMSYNTH_CFG} ${RMSYNTH_THREADS} ${RMSYNTH_BACKEND}"
-run_logged "${PROVDIR}/rmsynth.${RUN_TAG}.stdout.log" \
-  "${RUNNER}" "${RMSYNTH_CFG}" "${RMSYNTH_THREADS}" "${RMSYNTH_BACKEND}"
-
-[[ -s "${RMSYNTH_OUT1}" && -s "${RMSYNTH_OUT2}" ]] || die "rmsynth stage did not produce expected output cubes (${RMSYNTH_OUT1}, ${RMSYNTH_OUT2})"
-STAGE_TIMES+=("rmsynth:$(( $(date +%s) - RMSYNTH_T0 ))s")
-log "rmsynth stage done: ${RMSYNTH_OUT1}, ${RMSYNTH_OUT2}"
 
 # ============================================================
 # Stage: rmclean (optional)
@@ -414,17 +452,34 @@ if [[ "${DO_RMCLEAN}" -eq 1 ]]; then
   fi
   [[ -f "${RMCLEAN_TEMPLATE}" ]] || die "rmclean_cfg_template not found: ${RMCLEAN_TEMPLATE}"
 
-  MASK_FILE="$(cfg_get "${RMSYNTH_CFG}" mask_cube_file)"
-  [[ -z "${MASK_FILE}" ]] && MASK_FILE="${RMSYNTH_OUTFILE}.MASK.CUBE.FITS"
-  [[ -s "${MASK_FILE}" ]] || die "expected MASK cube missing: ${MASK_FILE} (is write_mask_output=y in ${RMSYNTH_TEMPLATE}?)"
-
   RMCLEAN_CFG="${PROVDIR}/rmclean.${RUN_TAG}.cfg"
   cp "${RMCLEAN_TEMPLATE}" "${RMCLEAN_CFG}"
-  RMCLEAN_OUTFILE="${OUTDIR}/${RUN_NAME}_cleaned"
-  cfg_set_inplace "${RMCLEAN_CFG}" ampfile "${RMSYNTH_OUT1}"
-  cfg_set_inplace "${RMCLEAN_CFG}" phafile "${RMSYNTH_OUT2}"
-  cfg_set_inplace "${RMCLEAN_CFG}" maskfile "${MASK_FILE}"
-  cfg_set_inplace "${RMCLEAN_CFG}" outfile "${RMCLEAN_OUTFILE}"
+
+  if [[ "${DO_RMSYNTH}" -eq 1 ]]; then
+    # rmsynth ran in THIS invocation -- chain its own real output
+    # straight in, overriding whatever the template says.
+    MASK_FILE="$(cfg_get "${RMSYNTH_CFG}" mask_cube_file)"
+    [[ -z "${MASK_FILE}" ]] && MASK_FILE="${RMSYNTH_OUTFILE}.MASK.CUBE.FITS"
+    [[ -s "${MASK_FILE}" ]] || die "expected MASK cube missing: ${MASK_FILE} (is write_mask_output=y in ${RMSYNTH_TEMPLATE}?)"
+    RMCLEAN_OUTFILE="${OUTDIR}/${RUN_NAME}_cleaned"
+    cfg_set_inplace "${RMCLEAN_CFG}" ampfile "${RMSYNTH_OUT1}"
+    cfg_set_inplace "${RMCLEAN_CFG}" phafile "${RMSYNTH_OUT2}"
+    cfg_set_inplace "${RMCLEAN_CFG}" maskfile "${MASK_FILE}"
+    cfg_set_inplace "${RMCLEAN_CFG}" outfile "${RMCLEAN_OUTFILE}"
+  else
+    # rmsynth did NOT run in this invocation -- use the template's own
+    # ampfile=/phafile=/maskfile=/outfile= unmodified (e.g. pointing at
+    # a previous, separate rmsynth-only run's own real output).
+    AMP_FILE="$(cfg_get "${RMCLEAN_CFG}" ampfile)"
+    PHA_FILE="$(cfg_get "${RMCLEAN_CFG}" phafile)"
+    MASK_FILE="$(cfg_get "${RMCLEAN_CFG}" maskfile)"
+    RMCLEAN_OUTFILE="$(cfg_get "${RMCLEAN_CFG}" outfile)"
+    [[ -z "${AMP_FILE}" || -z "${PHA_FILE}" || -z "${MASK_FILE}" || -z "${RMCLEAN_OUTFILE}" ]] && \
+      die "rmclean_cfg_template (${RMCLEAN_TEMPLATE}) must set ampfile=/phafile=/maskfile=/outfile= itself when rmsynth is not also in stages="
+    [[ -s "${AMP_FILE}" ]] || die "rmclean_cfg_template's own ampfile does not exist: ${AMP_FILE}"
+    [[ -s "${PHA_FILE}" ]] || die "rmclean_cfg_template's own phafile does not exist: ${PHA_FILE}"
+    [[ -s "${MASK_FILE}" ]] || die "rmclean_cfg_template's own maskfile does not exist: ${MASK_FILE}"
+  fi
 
   RMCLEAN_EXE="${ROOT_DIR}/bin/rmclean_cubes"
   [[ -x "${RMCLEAN_EXE}" ]] || die "rmclean_cubes not built -- run: make rmclean_cubes"
@@ -453,6 +508,7 @@ fi
   echo "status:       OK"
   echo ""
   echo "outputs:"
+  [[ "${DO_MATCH}" -eq 1 ]] && echo "  match: manifest ${MATCH_MANIFEST} (per-file effective paths -- SKIPPED entries are the original input, PROCESSED entries <input><outsuffix>)"
   [[ "${DO_RMSYNTH}" -eq 1 ]] && echo "  rmsynth: ${RMSYNTH_OUT1}, ${RMSYNTH_OUT2}"
   if [[ "${DO_RMCLEAN}" -eq 1 ]]; then
     for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA RESTORED.AMP RESTORED.PHA; do
