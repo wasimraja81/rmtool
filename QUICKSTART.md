@@ -9,6 +9,7 @@
 6. [Swim-lane plots](#6-swim-lane-plots)
 7. [Architecture notes](#7-architecture-notes)
 8. [Multi-band preprocessing: reproject_cubes, convolve_cubes, match_cubes](#8-multi-band-preprocessing-reproject_cubes-convolve_cubes-match_cubes)
+9. [RM-CLEAN: rmclean_cubes](#9-rm-clean-rmclean_cubes)
 
 ---
 
@@ -363,3 +364,52 @@ Validation scope:
 - Tested in this repo workflow on `NVIDIA GeForce RTX 3050 (6 GiB)`.
 - Not yet validated on AMD/ROCm, Intel GPU offload paths, or older NVIDIA
   offload stacks with differing OpenMP target support.
+
+---
+
+## 9. RM-CLEAN: rmclean_cubes
+
+`rmclean_cubes` runs standalone RM-CLEAN (Högbom-style deconvolution)
+against a dirty AMP/PHA cube pair `rm_synthesis` already wrote,
+producing CLEAN component, residual, and restored cubes.
+
+```bash
+make rmclean_cubes
+
+bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
+  maskfile=out.MASK.CUBE.FITS outfile=out_cleaned \
+  abs_flux_floor=20uJy auto_nsigma=1.0 niter=500 gain=0.1
+```
+
+CLEAN stops on whichever of three independent criteria fires first:
+`niter` (hard iteration cap, always on), `abs_flux_floor=<v>` (stop at
+a literal flux value — accepts a `Jy`/`mJy`/`uJy` suffix, e.g. `10mJy`),
+and `auto_nsigma=<n>` (stop at `n`× each pixel's own noise sigma,
+estimated once per pixel from its own dirty spectrum). Both are
+opt-in — give either, both, or neither.
+
+**Outputs written to `<outfile>`:**
+```
+<outfile>.CLEAN.AMP.RMCUBE.FITS       # CLEAN component amplitude
+<outfile>.CLEAN.PHA.RMCUBE.FITS       # CLEAN component phase
+<outfile>.RESID.AMP.RMCUBE.FITS       # Residual amplitude
+<outfile>.RESID.PHA.RMCUBE.FITS       # Residual phase
+<outfile>.RESTORED.AMP.RMCUBE.FITS    # Restored (components + residual) amplitude
+<outfile>.RESTORED.PHA.RMCUBE.FITS    # Restored phase
+```
+
+Memory/tiling and I/O parallelism (`mem_frac_ram`/`tile_ra`/`tile_dec`/
+`io_read_threads`/`io_write_threads`/`io_overlap`) work exactly like
+`rm_synthesis`'s own keys of the same name (see section 4 above) — a
+cube far larger than available RAM CLEANs in bounded memory on any
+machine, from a laptop to an HPC node.
+
+**If you're migrating an older cfg**: `threshold=`/`threshold_snr=`/
+`noise_percentile=`/`noise_nlos=`/`noise_seed=` have been removed
+entirely — replace with `abs_flux_floor=`/`auto_nsigma=` above.
+
+Full parameter reference (every key, default, and meaning) in
+[docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md#5-rmclean_cubes); a
+fully annotated example config in `cfg/rmclean-example.cfg`; a
+step-by-step walkthrough tying `rm_synthesis` and `rmclean_cubes`
+together in [docs/TUTORIAL.md](docs/TUTORIAL.md).

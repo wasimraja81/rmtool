@@ -1,7 +1,11 @@
 # RM-Synthesis Parallelism and Memory Architecture
 
 This document describes how `rm_synthesis` tiles the sky image, loads it into
-RAM/VRAM, and distributes work across CPU cores or GPU threads.
+RAM/VRAM, and distributes work across CPU cores or GPU threads. Section 5
+covers `rmclean_cubes`'s own parallelism/tiling model, which shares most of
+`rm_synthesis`'s own tile-geometry and I/O-parallelism scheme (same cfg key
+names, same defaults) but differs in its per-pixel compute parallelism and
+its mask-pattern cache — covered there rather than repeated inline above.
 
 ---
 
@@ -423,3 +427,74 @@ HOST_OMP details for staging path:
 **Key invariant:** `cos_arr` and `sin_arr` are pre-computed once, held
 resident in RAM (CPU) or VRAM (GPU), and never recomputed per-pixel or
 per-RM-chunk.
+
+---
+
+## 5 — RM-CLEAN (`rmclean_cubes`) Parallelism
+
+`rmclean_cubes` (`src/rmclean_cubes.f90`) reads a dirty AMP/PHA cube
+pair `rm_synthesis` already wrote, plus the matching mask cube, and
+runs Högbom CLEAN independently on every pixel's own RM spectrum. Its
+tiling and I/O-parallelism scheme is the SAME as `rm_synthesis`'s own
+(section 1 above) — identical cfg key names, identical defaults,
+identical serial-outer-tile-loop/parallel-inner-stage structure:
+
+```
+mem_frac_ram      fraction of system RAM budgeted per tile (default 0.25)
+tile_ra/tile_dec  manual tile-size override; 0/0 = auto (tile_auto=y)
+io_read_threads   N independent read-only FITS handles per input cube
+io_write_threads  N-way parallel output writes (raw stream I/O, bypasses CFITSIO)
+io_overlap        overlap tile N's write with tile N+1's read/compute
+```
+
+Where it differs from `rm_synthesis`:
+
+**Per-pixel, not per-tile-only, compute parallelism.** `rm_synthesis`
+parallelizes across pixels *within* a tile for one shared RM-synthesis
+pass; `rmclean_cubes` does the same (`!$omp parallel do collapse(2)
+schedule(dynamic)` over each tile's own pixels), but each pixel then
+runs its OWN independent Hogbom CLEAN loop — a variable number of
+iterations per pixel (bounded by `niter`, but usually stopping much
+earlier via `abs_flux_floor`/`auto_nsigma` — see
+`docs/TOOLS_REFERENCE.md`), so `schedule(dynamic)` matters more here
+than for `rm_synthesis`'s own uniform per-pixel cost: a static schedule
+would leave fast-converging pixels' threads idle while a few
+slow-converging ones finish.
+
+**Three input cubes tiled together, not two.** `rm_synthesis` tiles 2
+inputs (Q/U) into 2 outputs (AMP/PHA, or REAL/IMAG); `rmclean_cubes`
+tiles 3 inputs (dirty AMP, dirty PHA, mask) into 6 outputs
+(CLEAN/RESID/RESTORED × AMP/PHA). The mask cube joined this tiled
+scheme later than the two float cubes did (`planning/
+RMCLEAN_INTEGRATION_PLAN.md` ticket T10b) — before that, it was held
+whole in memory regardless of tile size, budgeted separately from
+(and invisibly to) `mem_frac_ram`. `plan_rmclean_tile`'s own memory
+formula now accounts for all three inputs plus the 6 (double-buffered)
+outputs in one combined per-pixel byte budget.
+
+**A mask-pattern cache, with no `rm_synthesis` equivalent.** Many
+pixels across a real image share the exact same valid-channel pattern
+(which frequency channels are flagged bad for that sightline) — since
+each pixel's own RMSF (Rotation Measure Spread Function) depends only
+on that pattern, not on the pixel's actual flux, pixels sharing a
+pattern can share one pre-built RMSF table instead of rebuilding it
+per pixel. The cache builds INCREMENTALLY: once per tile, serially,
+scanning that tile's own mask subrange for any pattern not already
+cached, immediately after that tile's own mask read and before that
+tile's own parallel CLEAN loop starts. This is deliberately NOT
+protected by an `!$omp critical` or any other lock — the tile loop's
+own strict outer sequencing (tile N+1 never starts before tile N
+finishes) already guarantees no pixel's own lookup (`cache_lookup_
+readonly`, run from every thread during the parallel loop) can ever
+race an insertion for a pattern first seen in an EARLIER tile. A
+pattern seen for the first time WITHIN the current tile is inserted
+before that same tile's parallel loop begins, so it's already safe by
+the time any thread looks it up. `mask_pattern_cache_max` (default
+4096) caps how many distinct patterns are cached; a real dataset with
+uniform channel flagging across the whole image typically needs only
+1-2 distinct patterns in practice.
+
+Full design/evidence for both differences: `planning/
+RMCLEAN_INTEGRATION_PLAN.md` tickets T4 (original tiled I/O port) and
+T10a/T10b (the mask-read overflow fix and the RAM-aware retiling that
+followed it).

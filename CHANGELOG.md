@@ -10,8 +10,9 @@ complex CLEAN, Gaussian restore) against REAL dirty AMP/PHA cubes
 `rm_synthesis` itself writes, rather than only the synthetic spectra its
 own unit test programs built in memory. Full design rationale, decisions
 recorded with the user, and ticket-by-ticket verification evidence lives
-in `planning/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T4) — this entry is
-a summary, not a replacement for that record.
+in `planning/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T10b done; T11 not
+yet started) — this entry is a summary, not a replacement for that
+record.
 
 ### Added — `rmclean_cubes` standalone tool (ticket T2)
 - New standalone program `src/rmclean_cubes.f90` (own Makefile target
@@ -168,7 +169,9 @@ a summary, not a replacement for that record.
   inputs + 6 outputs (CLEAN/RESID/RESTORED x AMP/PHA). The mask cube
   and its mask-pattern -> RMSF-table cache deliberately stay
   whole-cube-resident (tiny relative to the float cubes; the cache
-  needs one global pre-scan before any pixel is CLEANed).
+  needs one global pre-scan before any pixel is CLEANed). **Superseded
+  by ticket T10b below**: the mask cube is now tiled and the cache
+  builds incrementally instead.
 - Found and root-caused, not assumed: a forced small-tile run differs
   numerically (not just byte-for-byte) from the default single-tile
   run — confirmed to be `gfortran -O3 -march=native`'s own
@@ -216,6 +219,139 @@ a summary, not a replacement for that record.
   `io_read_threads=3` + `io_write_threads=3` together (bit-identical,
   5 reps) — the actual combined stress case, not each mechanism only
   in isolation.
+
+### Added — CLEAN convergence/stop-reason logging + gain-tuning workflow (ticket T7)
+- `clean_complex` now returns a `stop_reason` string and, for one
+  traced pixel (`trace_ix=`/`trace_iy=`, throttled by `log_every=`,
+  default 50), a full per-iteration trend (`peak_val`/`rms_val`/
+  cumulative cleaned flux) — a debugging/tuning aid, not for
+  whole-cube production runs.
+- Per-thread block-progress logging (`m of n blocks processed`) and a
+  run-end aggregate stop-reason summary (counts and percentages per
+  criterion, plus `n_iter_used` mean/min/max), so a real production run
+  reports how it actually converged, not just that it finished.
+- A reusable subimage-based gain-tuning workflow (`rm_synthesis`'s own
+  `subim=y` cutout, not a separate extraction tool) surfaced a real,
+  actionable finding about the OLD stopping-criterion mechanism (see
+  ticket T8 below) — superseded, not contradicted, by that redesign.
+
+### Added — CLEAN stopping-criteria redesign (ticket T8)
+- The old `threshold=`/`threshold_snr=` pair funneled into one
+  overloaded, always-multiplicative `thresh` internal variable that
+  silently broke `threshold=`'s absolute-flux mode (compared `flux^2`
+  against `flux`) and made `threshold_snr=`'s own n-sigma mode a
+  self-referential moving target (compared against the CURRENT,
+  shrinking residual's own rms every iteration, not a fixed noise
+  floor). Found via the T7 gain-sweep workflow, not by inspection.
+- Replaced entirely (not aliased) by three independent, unambiguously-
+  named, freely-combinable criteria: `niter` (hard cap, unchanged),
+  `abs_flux_floor=` (a genuine fixed-flux comparison), `auto_nsigma=`
+  (multiplier x a per-pixel noise sigma, estimated ONCE per pixel from
+  its own dirty spectrum -- not a whole-cube pre-scan, not recomputed
+  per iteration). `threshold=`/`threshold_snr=`/`noise_nlos=`/
+  `noise_percentile=`/`noise_seed=` are all retired.
+- Fixed T7's own over-cleaning finding at the root: re-running T7's
+  subimage with `auto_nsigma=5.0` (the old `threshold_snr=5.0`
+  production value) took tail RMS from 6.89 uJy (3.7x below the true
+  ~25.5 uJy floor) to 25.24 uJy (matching it), converging in a mean of
+  3.89 iterations instead of 233.7.
+
+### Added — `auto_nsigma` correctness: full-spectrum IQR sigma (ticket T9)
+- A second, independent bug found the same day: `auto_nsigma` compared
+  `peak_val - avg_abs`, not `peak_val` directly -- `avg_abs` (the whole
+  residual spectrum's own mean absolute value) is recomputed from the
+  CURRENT, shrinking residual every iteration, the same class of
+  self-referential bug T8 had just fixed for `thresh`. For a large-scale
+  coherent structure (peak roughly equal to average almost everywhere)
+  this collapsed to ~0 and stopped CLEAN early regardless of the true
+  noise level. Fixed by comparing `peak_val` directly, no subtraction.
+- The per-pixel noise-sigma estimator itself went through two more
+  iterations, each measured against real data rather than assumed: a
+  peak-relative exclusion window (T8's own original design) failed for
+  multi-component/extended sightlines; a percentile-subset variant
+  (lowest 20% of bins, truncated-Rayleigh-corrected) was tried, then
+  measured directly against ten real pixels' own independently-known
+  true noise (far-RM-tail ground truth) and found to underperform the
+  simplest option -- the pixel's own FULL dirty amplitude spectrum's
+  interquartile range, converted to sigma via the analytic untruncated
+  Rayleigh-distribution relation (`estimate_iqr_sigma`, fixed factor
+  `IQR/0.90656`). Simpler and more accurate; shipped.
+- cfg defaults finalised, each justified per-file rather than copied:
+  both criteria off unless explicitly opted into; `auto_nsigma`'s own
+  default value is `1.0` (was `5.0` under the old design, no longer
+  needed once the sigma estimate itself is trustworthy);
+  `abs_flux_floor` values always carry an explicit unit suffix now.
+
+### Fixed — 32-bit integer overflow in `read_mask_cube` (ticket T10a)
+- A real, serious, silent data-corruption bug: the mask cube was read
+  in one `FTGPVB` call whose `nelem` argument was computed as
+  `nx*ny*nchan` in ordinary 32-bit integer arithmetic. Any mask cube
+  exceeding 2^31 total elements overflows this silently -- a real ASKAP
+  dataset's own 4501x4501x288 mask cube is 2.7x over that limit,
+  silently truncating the valid-channel read at ~76 of 288 channels for
+  EVERY pixel in the image.
+- This single bug was the root cause of three things independently
+  investigated as separate mysteries on a real full-cube run: a
+  specific pixel appearing to never converge in isolation, the
+  run's own 99.05% niter-cap-hit rate across all 20,259,001 pixels, and
+  spurious CLEAN components with residual exceeding dirty amplitude at
+  supposedly signal-free RM planes.
+- Fixed by switching to `FTGPVBLL`, CFITSIO's own genuinely-64-bit
+  entry point for the identical underlying C call (confirmed directly
+  against this project's own bundled cfitsio-4.3.1 source, not
+  assumed) -- correct at any dataset size, not just today's.
+- `read_mask_cube` was extracted out of `rmclean_cubes`'s own program
+  scope into a new module, `src/rmclean_io_mod.f90`, purely so it could
+  be independently unit-tested (a fixture exceeding 2^31 elements is
+  unavoidably ~2.4GB on disk for a byte-typed cube; kept fast via an
+  OS-level sparse file -- only 3 bytes actually written).
+- A full real-data confirmation run (replacing the flawed pre-fix
+  output): niter-cap hit rate 99.05% -> **0.00%** (not one pixel of
+  20,259,001), mean `n_iter_used` 496.72 -> 55.29, total wall time
+  ~3h39m -> ~81min (~2.7x faster, entirely as a side effect of CLEAN no
+  longer fighting wrong RMSF tables for most of the image), and the
+  signal-free-RM-plane finding reversed to the correct direction
+  (residual now below dirty at both edge planes, was 1890-2443 uJy vs
+  290-361 uJy before the fix).
+
+### Added — RAM-aware, tiled mask handling (ticket T10b)
+- The mask cube is now read through the exact same tiled,
+  `io_read_threads`-aware mechanism as the AMP/PHA float cubes
+  (`read_mask_tile`/`read_mask_chunk`, `FTGSVB`-based -- replacing
+  T10a's `read_mask_cube` outright once its only call site was gone),
+  rather than held whole in memory regardless of image size. `FTGSVB`
+  has no flat pre-multiplied element-count argument at all, so the
+  overflow class T10a fixed cannot recur here by construction.
+- The mask-pattern -> RMSF-table cache moved from one upfront serial
+  pre-scan (needing the whole mask resident first) to an INCREMENTAL
+  scheme: scanned once per tile, serially, right before that tile's own
+  parallel CLEAN loop starts -- no locks needed at all, since the tile
+  loop's own strict sequencing already guarantees a pattern is never
+  looked up before it's inserted.
+- `plan_rmclean_tile`'s own memory-budget formula gained one more term
+  for the mask's own per-pixel footprint (1 byte/voxel x `nchan`), so a
+  big machine still gets a tile large enough to recover the old
+  whole-cube-resident behaviour for free when it fits, and a small
+  machine gets smaller tiles automatically instead of running out of
+  memory.
+- Verified via the strongest test available: a full real-data
+  confirmation run is BYTE-FOR-BYTE IDENTICAL to T10a's own
+  confirmation run across all 6 output cubes, with an exactly-matching
+  aggregate stop-reason summary -- proof this is a pure architectural
+  improvement with zero behavioural change.
+
+### Verification (T7-T10b)
+- Full suite green throughout, growing from 121 to 122 (a new sparse-
+  fixture overflow regression test for T10a) and back to 121 (that test
+  retired once T10b made its own vulnerability class structurally
+  impossible, superseded by the existing forced-tile-vs-default test's
+  own coverage of the new tiled mask path).
+- The `--help`-text-only fix (documenting previously-real-but-
+  undocumented `log_level`/`timing_enabled`/`log_output_file`/
+  `io_overlap` keys on `reproject_cubes`/`convolve_cubes`/`match_cubes`,
+  found during this documentation pass) is unrelated to RM-CLEAN
+  specifically but shipped alongside it; full suite unaffected
+  (121/121, unchanged).
 
 ## [5.0] - `5.0-rc.1` tagged on `develop`; real-scale validation pending before `main`
 

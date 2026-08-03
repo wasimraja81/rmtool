@@ -136,21 +136,24 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 ## Documentation
 
 - **[QUICKSTART.md](QUICKSTART.md)** — Quick reference and build overview
+- **[docs/TUTORIAL.md](docs/TUTORIAL.md)** — Step-by-step walkthrough: build, generate sample data, run the full pipeline, inspect the output
+- **[docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md)** — Complete parameter reference for all 5 tools (what each does, every key, every default, output files)
 - **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
-- **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference
+- **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference (`rm_synthesis` cfg parser specifically)
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
 - **[docs/PARALLELISM.md](docs/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
 - **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
 - **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
 - **[planning/ENCAPSULATION_REFACTOR_PLAN.md](planning/ENCAPSULATION_REFACTOR_PLAN.md)** — Encapsulation refactor plan: config/tile-planner/IO-orchestration derived types, ticket-by-ticket (T0-T5, all adopted)
 - **[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)** — Multi-band Faraday tomography plan: config schema, frequency merge, cross-band geometry/resolution matching (`reproject_cubes`/`convolve_cubes`/`match_cubes`), beam-metadata propagation, ticket-by-ticket (T0-T14, all adopted)
-- **[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)** — RM-CLEAN integration plan: core algorithm module (`rmclean_mod`), standalone tool (`rmclean_cubes`), mask-pattern caching, OpenMP parallelism, model-based peak refinement, memory-budgeted threaded block I/O, ticket-by-ticket (T0-T4, all adopted; GPU explicitly deferred)
+- **[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)** — RM-CLEAN integration plan: core algorithm module (`rmclean_mod`), standalone tool (`rmclean_cubes`), mask-pattern caching, OpenMP parallelism, model-based peak refinement, memory-budgeted threaded/tiled block I/O, stopping-criteria redesign, ticket-by-ticket (T0-T10b done; T11 CLEAN-divergence criteria not yet started; GPU explicitly deferred)
 - **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
 - **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
 - **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
 - **[docs/RELEASE_NOTES_4.0.md](docs/RELEASE_NOTES_4.0.md)** — Detailed release notes for tag 4.0 (maintainability/documentation milestone)
 - **[docs/RELEASE_NOTES_4.1.md](docs/RELEASE_NOTES_4.1.md)** — Detailed release notes for tag 4.1 (diagnostics milestone)
 - **[docs/RELEASE_NOTES_5.0.md](docs/RELEASE_NOTES_5.0.md)** — Detailed release notes for 5.0 (multi-band Faraday tomography milestone; in preparation, not yet tagged)
+- **[docs/RELEASE_NOTES_6.0.md](docs/RELEASE_NOTES_6.0.md)** — Detailed release notes for 6.0 (RM-CLEAN integration milestone; in preparation, not yet tagged)
 
 ## Configuration
 
@@ -735,27 +738,29 @@ wrote, plus its `.MASK.CUBE.FITS`/`CHANFREQ` table:
 ```bash
 make rmclean_cubes
 bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
-  maskfile=out.MASK.CUBE.FITS outfile=out threshold=0.01
-# or threshold=10mJy (converted against the AMP cube's own BUNIT), or
-# threshold_snr=5.0 (CLEAN stops at 5x an auto-estimated noise floor --
-# see below); writes out.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS;
-# --help for the full option list (niter/gain, min_samples_per_fwhm,
-# refine_nsigma, lsq_ref_compute_mode/lsq_ref_report_mode,
-# mask_pattern_cache_max, mem_frac_ram/tile_ra/tile_dec/tile_auto,
-# io_read_threads, io_write_threads, io_overlap)
+  maskfile=out.MASK.CUBE.FITS outfile=out_cleaned \
+  abs_flux_floor=20uJy auto_nsigma=1.0 niter=500 gain=0.1
+# writes out_cleaned.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS;
+# full parameter reference (every key, default, and meaning) in
+# docs/TOOLS_REFERENCE.md -- --help on the binary prints the same list
 ```
 
-`threshold` accepts either an absolute value (native AMP-cube units, or
-converted from a `Jy`/`mJy`/`uJy` suffix with no space, e.g. `10mJy`), or
-`threshold_snr=<N>` as a mutually-exclusive alternative — CLEAN then
-stops at `N` × an auto-estimated noise floor: the median of the lowest
-`noise_percentile` (default 0.15) fraction of bins from `noise_nlos`
-(default 500) random spatial pixels' own full dirty AMP spectra. A real
-source is a narrow peak in an otherwise noise-dominated RM spectrum, so
-any given sightline's own lowest-amplitude bins are overwhelmingly noise
-regardless of whether that sightline happens to contain a source —
-`noise_seed` (default 20250101) keeps the estimate reproducible run to
-run.
+CLEAN stops on any of three independent, freely-combinable criteria,
+checked every iteration: `niter` (a hard iteration cap, always active),
+`abs_flux_floor=<v>` (stop the instant a pixel's own peak amplitude
+drops to/below a literal fixed flux value — a bare number in native
+AMP-cube units, or with a `Jy`/`mJy`/`uJy` suffix, no space, e.g.
+`abs_flux_floor=10mJy`), and `auto_nsigma=<n>` (stop at `n`× that same
+pixel's own noise sigma, estimated once per pixel from its own full
+dirty amplitude spectrum's interquartile range via the analytic
+Rayleigh-distribution relation — dirty amplitude is Rayleigh-, not
+Gaussian-, distributed). `abs_flux_floor` and `auto_nsigma` are each
+independently opt-in; give either, both, or neither (in which case
+CLEAN runs every pixel for the full `niter` iterations, with a printed
+NOTE saying so). **If you have an older cfg**: the earlier
+`threshold=`/`threshold_snr=`/`noise_percentile=`/`noise_nlos=`/
+`noise_seed=` keys have been removed entirely (not aliased) — replace
+with `abs_flux_floor=`/`auto_nsigma=` above.
 
 This tool cannot resample the RM axis — it's fixed by whatever `CDELT3`
 `rm_synthesis` already wrote — so it validates the existing grid instead
@@ -774,14 +779,22 @@ sharing one RMSF table across every pixel with the same valid-channel
 set, rather than rebuilding it per pixel. GPU support is explicitly
 deferred to a later, separate effort.
 
-Memory-budgeted, threaded block I/O (ticket T4) is the same scheme
-`rm_synthesis` already uses: spatial tiles sized by `mem_frac_ram`
+Memory-budgeted, threaded, tiled I/O is the same scheme `rm_synthesis`
+already uses: spatial tiles sized by `mem_frac_ram`
 (`tile_ra`/`tile_dec`/`tile_auto`), parallel readonly chunked tile
 reads (`io_read_threads`), raw-stream-write tile output bypassing
 CFITSIO (`io_write_threads`), and pthread-based double-buffered
 write-behind (`io_overlap`) — so a cube far larger than available RAM
 CLEANs in bounded memory, not just `rm_synthesis`'s own dirty-cube
-synthesis step.
+synthesis step. The mask cube is now read in the same memory-budgeted
+tiles as the AMP/PHA float cubes, rather than held whole in memory
+regardless of size — `mem_frac_ram` budgets all three together, and the
+per-tile mask-pattern cache builds up incrementally as tiles are
+processed (no locking needed: the tile loop's own strict sequencing
+already guarantees a pattern is never looked up before it's cached). A
+big machine still gets the equivalent of one whole-cube-resident mask
+read for free, when it fits the budget; a small machine gets smaller
+tiles automatically instead of running out of memory.
 
 `rm_synthesis` itself can build its dirty AMP/PHA cube at a
 computationally cheaper phase reference than the default (`lsq_ref_mode=
@@ -790,9 +803,10 @@ historical thesis-matching convention, unaffected unless set
 explicitly); whichever reference is actually used is recorded in a new
 `LSQREF` header keyword so `rmclean_cubes` never has to assume one.
 
+Full parameter reference: [docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md).
 Full design detail and verification evidence are documented in
 [planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)
-(tickets T0-T4) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
+(tickets T0-T11) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
 header comments.
 
 ## End-to-End Pipeline

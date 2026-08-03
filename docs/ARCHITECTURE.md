@@ -435,6 +435,64 @@ on this section's own mechanism, not just on `rmclean_cubes`:
   repeated `io_write_threads=4` runs against each tool post-fix, 0
   mismatches; full regression suite green.
 
+#### `rmclean_cubes`'s mask cube joins the same tiling scheme (ticket T10b)
+
+T4 above deliberately left `rmclean_cubes`'s mask cube (and its
+mask-pattern → RMSF-table cache) whole-cube-resident rather than tiled,
+reasoning that the cache's own pre-scan needed one global pass over
+every pixel's mask before any tile could be CLEANed. That reasoning
+held for a while, but the mask read itself turned out to have a real
+bug of its own: reading the whole mask cube in one CFITSIO call
+(`FTGPVB`) computed its element count in ordinary 32-bit arithmetic,
+silently overflowing (and truncating the read) for any mask cube
+exceeding 2^31 total elements — a real dataset's own 4501×4501×288
+mask cube is 2.7x over that limit. Full root-cause and the fix
+(switching that one call to `FTGPVBLL`, CFITSIO's own 64-bit entry
+point) are in `planning/RMCLEAN_INTEGRATION_PLAN.md` ticket T10a.
+
+T10b then asked the harder question directly: why does the mask need a
+separate whole-cube-resident path at all, when the float cubes already
+have a working tiled mechanism regardless of image size? The pre-scan's
+own global-pass requirement turned out to be avoidable — insertion into
+the pattern cache only needs to happen serially *before* the matching
+lookup, not in one pass over the whole image, and the tile loop is
+already strictly sequential (one tile fully processed before the next
+begins). So the cache now builds INCREMENTALLY: each tile's own mask
+subrange is scanned once, serially, immediately after that tile's own
+mask read and before that tile's own parallel CLEAN loop starts. This
+preserves the exact same safety property the original design relied on
+(`cache_lookup_readonly`, run from every OpenMP thread during the
+parallel loop, never races an insertion) with no locks at all — simpler
+than the `!$omp critical`-based design first considered, once reasoned
+through against the loop's actual structure.
+
+The mask cube itself is now read via `read_mask_tile`/`read_mask_chunk`
+(`FTGSVB`, the byte-typed subsection-read entry point) — the same
+tiled, `io_read_threads`-aware mechanism `read_amp_pha_tile`/
+`read_amp_pha_chunk` already use for AMP/PHA (`FTGSVE`). Unlike the
+retired `FTGPVB` call, `FTGSVB`/`FTGSVE` take per-axis extents rather
+than one pre-multiplied flat element count, so neither has any
+equivalent overflow exposure at any image size (confirmed directly
+against this project's own bundled cfitsio-4.3.1 C source: the
+per-axis-extent-to-total-count accumulation happens internally in
+genuine 64-bit arithmetic, regardless of the wrapper's own per-axis
+argument types). `plan_rmclean_tile`'s own memory-budget formula gained
+one more term for the mask's own footprint (1 byte/voxel × `nchan`,
+single-buffered — read-only working data, never written out, unlike
+the 6 double-buffered output arrays) alongside the existing AMP/PHA/
+output-array terms, so a big machine still gets a tile large enough to
+recover the old whole-cube-resident behaviour for free when it fits,
+and a small machine gets smaller tiles automatically instead of running
+out of memory.
+
+Verified via the strongest test available for an architectural change
+with no INTENDED behavioural effect: a complete real full-cube CLEAN
+run with the new tiled mask design is BYTE-FOR-BYTE IDENTICAL to the
+equivalent T10a (whole-cube-resident-but-correctly-read) run across all
+6 output cubes, with an exactly-matching aggregate stop-reason summary
+— proof this is a pure architectural improvement, not a behaviour
+change wearing an architecture-change label.
+
 #### Why `io_read_threads` and `io_write_threads` are separate from `OMP_NUM_THREADS`
 
 Compute threads and IO threads are constrained by different resources:
