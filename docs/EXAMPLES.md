@@ -46,6 +46,13 @@ or both. Each needs a different amount of preprocessing before
 just wastes time, and doing less means `rm_synthesis` will (correctly)
 refuse to run rather than silently combine misaligned data.
 
+All four recipes below are backed by permanent, automated regression
+tests (`tests/run_tests.sh` sections 38-40) — not just commands that
+happened to work once when this document was written. Each test takes
+genuinely mismatched synthetic data, runs it through the exact recipe
+shown, and confirms `rm_synthesis` recovers the known injected sources
+at the end; see `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T15.
+
 ### 2a. Bands already matched — no preprocessing needed
 
 If every band is already on the same sky grid and the same angular
@@ -91,7 +98,7 @@ reference:
 
 ```bash
 make reproject_cubes
-bin/reproject_cubes mode=reference reffile=bandA.Q.fits infiles=bandB.Q.fits,bandB.U.fits
+bin/reproject_cubes mode=reference reffile=bandA.Q.fits infiles=bandB.Q.fits,bandB.U.fits mem_frac_ram=0.25
 ```
 
 This writes `bandB.Q_REPROJ.FITS`/`bandB.U_REPROJ.FITS` on the
@@ -218,50 +225,81 @@ real signal left to remove.
 `mem_frac_ram` is a fraction (0, 0.95] of your machine's **total**
 system RAM (not whatever happens to be free at that moment — see
 README's own "Motivation" section for why that distinction matters on
-a shared machine), budgeted for one tile's own working set. Both
-`rm_synthesis` and `rmclean_cubes` use the same key, same range, same
-auto-tiling policy (full-RA Dec strips, shrinking further only if a
-single full-width row doesn't fit) — but their own per-pixel cost
-differs:
+a shared machine), budgeted for one chunk's own working set. **All
+five tools in this package share the same key, same (0, 0.95] range,
+and the same underlying philosophy** — load data in memory-budgeted
+chunks so a run scales down to fit a small machine and scales up to use
+a big one, never hardcoding "must fit the whole cube in RAM." This
+applies just as much to the three preprocessing tools as it does to
+`rm_synthesis`/`rmclean_cubes`; it's easy to miss because they don't
+show up together in one place elsewhere in the docs, but the source
+confirms it directly (`mem_frac_ram` cfg key, default `0.25`, same
+validation range, in every one of `rm_synthesis_mod.f90`,
+`rmclean_cubes.f90`, `reproject_cubes.f90`, `convolve_cubes.f90`, and
+`match_cubes.f90`).
 
-- **`rm_synthesis`**: budgets the input Q/U spectra plus whichever
-  outputs you've requested (AMP/PHA or REAL/IMAG, mask, nvalid,
-  cubestat maps) per pixel.
-- **`rmclean_cubes`**: budgets 2 input arrays (dirty AMP/PHA) + 6
-  output arrays (CLEAN/RESID/RESTORED × AMP/PHA, each double-buffered
-  for the tile-write-join mechanism) + the mask cube's own per-pixel
-  channel depth — genuinely more per-pixel memory than `rm_synthesis`
-  for a comparable image size, since it carries both the RM-depth float
-  arrays *and* the channel-depth mask in the same tile.
+The two tool families chunk along different axes, though, because
+their per-pixel work is different in shape:
 
-**Practical guidance:**
+- **`rm_synthesis`/`rmclean_cubes`** chunk **spatially** — RA/Dec
+  tiles, each holding the *full* channel/RM depth for its pixels
+  (`tile_ra`/`tile_dec`, auto-tiled full-width strips shrinking further
+  only if a single full-width row doesn't fit). Per-pixel cost: input
+  Q/U spectra plus whichever outputs you've requested for
+  `rm_synthesis` (AMP/PHA or REAL/IMAG, mask, nvalid, cubestat maps);
+  2 input + 6 double-buffered output arrays plus the mask cube's own
+  channel depth for `rmclean_cubes` — genuinely more per-pixel memory
+  than `rm_synthesis` for a comparable image size.
+- **`reproject_cubes`/`convolve_cubes`/`match_cubes`** chunk along the
+  **frequency/plane axis instead** — each block holds the *full*
+  spatial (RA/Dec) extent for a handful of channels
+  (`block_planes`, auto-computed from `mem_frac_ram` × total RAM ÷
+  bytes-per-plane). This makes sense for these tools because
+  reprojection/convolution work independently per channel, so there's
+  no need to also split spatially. One consequence worth knowing:
+  these three tools process blocks strictly one after another and
+  parallelise (OpenMP) only *within* a block — so an unnecessarily
+  small `mem_frac_ram` here doesn't just mean more CFITSIO calls, it
+  also throws away most of the available speedup (each tool prints a
+  WARNING if this happens).
+
+**Practical guidance (applies to all five tools):**
 
 - **Default (`0.25`) is a reasonable starting point** on a shared or
   general-purpose machine — leaves headroom for the OS, other
   processes, and CFITSIO/page-cache overhead that isn't counted in the
   budget itself.
 - **On a dedicated machine running one job at a time**, raising it
-  (`0.5`-`0.7`) lets a smaller image fit in a single tile — check with
-  `dry_run=y` first (below) rather than guessing.
+  (`0.5`-`0.7`) lets a smaller image fit in a single tile/block —
+  check with `dry_run=y` first on `rm_synthesis` (below) rather than
+  guessing; the other four tools print their computed tile/block size
+  to the log on every run, so re-run and read it back if unsure.
 - **On a memory-constrained machine, or if you see host out-of-memory
   errors**, lower it (`0.15` or below). This doesn't fail the run — it
-  just makes tiles smaller and increases the tile count, trading a bit
-  more per-tile overhead for a safer memory ceiling.
-- **Use `dry_run=y`** (rm_synthesis only) before committing to a real
-  run on a large cube: it reads headers, runs the tile planner, writes
-  `tile_autotune.cfg` (a suggested `tile_ra`/`tile_dec` you can copy
-  back into your real cfg) and `runtime_estimate.txt`, then exits — no
-  pixel data touched, no output written. See
-  [docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
-- **GPU runs** budget device memory separately via `mem_frac_vram`/
-  `gpu_vram_mib` — unrelated to `mem_frac_ram`, which still governs the
-  *host*-side tile size on a GPU run.
+  just makes tiles/blocks smaller and increases their count, trading a
+  bit more per-chunk overhead for a safer memory ceiling. For
+  `reproject_cubes`/`convolve_cubes`/`match_cubes` specifically, don't
+  go lower than needed — a `block_planes` that's too small also costs
+  OpenMP speedup (see above), not just extra I/O calls.
+- **`dry_run=y`** exists only on `rm_synthesis`: it reads headers, runs
+  the tile planner, writes `tile_autotune.cfg` (a suggested
+  `tile_ra`/`tile_dec` you can copy back into your real cfg) and
+  `runtime_estimate.txt`, then exits — no pixel data touched, no output
+  written. See [docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
+- **GPU runs** (`rm_synthesis`/`rmclean_cubes` only — the three
+  preprocessing tools have no GPU path) budget device memory separately
+  via `mem_frac_vram`/`gpu_vram_mib` — unrelated to `mem_frac_ram`,
+  which still governs the *host*-side tile size on a GPU run.
 
-Full mechanics (the exact per-pixel byte formula, the auto-tiling
-shrink policy, and the `io_read_threads`/`io_write_threads`/`io_overlap`
-keys that ride alongside tile sizing) are in
-[docs/PARALLELISM.md](PARALLELISM.md) and README's own "Tile Memory
-Planning and I/O Parallelism" section — this section is deliberately
+Full mechanics for `rm_synthesis`/`rmclean_cubes` (the exact per-pixel
+byte formula, the auto-tiling shrink policy, and the
+`io_read_threads`/`io_write_threads`/`io_overlap` keys that ride
+alongside tile sizing) are in [docs/PARALLELISM.md](PARALLELISM.md) and
+README's own "Tile Memory Planning and I/O Parallelism" section. For
+`reproject_cubes`/`convolve_cubes`/`match_cubes`, the equivalent
+per-tool detail (their own `mem_frac_ram`/`io_overlap` keys and exact
+defaults) is in each tool's own section of
+[docs/APP_REFERENCE.md](APP_REFERENCE.md) — this EXAMPLES.md section is deliberately
 just the decision guide, not the full mechanism.
 
 ---

@@ -2056,3 +2056,99 @@ still-open gap -- see T9 below.
   build clean; all 4 `rm_synthesis` build flavours (`scratch/make_all.sh`)
   clean; full `tests/run_tests.sh` 49/49 pass, unaffected (this ticket
   touches neither `rm_synthesis` nor its own test fixtures).
+
+### T15 — End-to-End Preprocessing Test: Genuinely Mismatched Bands, Fixed, Correct Answer Recovered
+
+**Gap found, not assumed:** while writing user-facing documentation
+(`docs/EXAMPLES.md`, a scenario cookbook covering "my bands don't share
+a sky grid/resolution"), the user asked directly whether a multi-band
+*test* backs the recipes being documented -- prompting a check of
+`tests/run_tests.sh`'s actual coverage rather than assuming it existed.
+Confirmed: sections 15-22 test `rm_synthesis`'s own multi-band SCHEMA
+handling in isolation (comma-list parsing, geometry-mismatch REJECTION,
+frequency merge, split-band identity, per-band channel/bad-channel
+handling, GPU/IO-parallelism for multi-band) -- all real, all passing,
+but every one of them uses bands that are either already matched by
+construction, or deliberately mismatched specifically to prove
+`rm_synthesis` correctly REFUSES them. Sections 30/33-36 test
+`reproject_cubes`/`convolve_cubes`/`match_cubes`'s own internal
+correctness (skip-if-already-matched, `io_overlap` consistency) --
+section 33's own `convolve_cubes` test in particular applies a fake
+uniform beam log to a single copy of the same test cube, not two
+genuinely different-resolution inputs. **No test anywhere took
+genuinely mismatched multi-band data, ran it through the preprocessing
+toolchain to fix the mismatch, and confirmed `rm_synthesis` then
+combined the result correctly** -- the actual point of the toolchain,
+never verified end to end as one thing.
+
+**New fixture (`tests/make_test_cubes.py`):** `TEST_BAND2_UNMATCHED.Q/
+U.FITSCUBE` -- the same underlying injected-source signal as the
+existing `TEST_BAND2.Q/U.FITSCUBE` (so the correct post-fix answer is
+exactly `truth.json`'s own `SOURCES`), with the same `CRVAL1` shift
+`TEST_BAND2_MISMATCH` already used for the grid half of the mismatch,
+plus two new flat per-channel ASCII beam logs (`band1_beamlog.txt` at a
+fixed 10", `band2_beamlog.txt` at a genuinely different 20",
+`convolve_cubes`'s own portable format, same convention section 33
+already uses) for the resolution half -- `convolve_cubes` has real
+smoothing work to do on band 1, not a no-op. `band2_beamlog.txt`
+doubles as the resolution mismatch for the ALREADY-grid-matched
+`TEST_BAND2` too, letting the grid and resolution mismatches be tested
+independently as well as together.
+
+**Three new permanent sections (`tests/run_tests.sh` 38-40), each
+isolating one failure mode, each ending in the same real assertion --
+`check_rm_peak.py` against `truth.json` on the final combined
+`rm_synthesis` output, not just "the preprocessing step didn't crash":**
+1. **Grid-only** (§38): `TEST_BAND2_MISMATCH` (existing fixture, no
+   beam mismatch) fixed by `reproject_cubes` alone, then `rm_synthesis`
+   recovers `src_A`/`src_B`.
+2. **Resolution-only** (§39): `TEST_BAND2` (grid-matched) + the new beam
+   logs, fixed by `convolve_cubes` alone (band 1 genuinely smoothed
+   10"->~20", confirmed by the derived common beam in the tool's own
+   log output), then `rm_synthesis` recovers both sources.
+3. **Both together** (§40): `TEST_BAND2_UNMATCHED` + beam logs, fixed by
+   one `match_cubes stages=both order=convolve_reproject` call (all 4
+   files -- both bands' own Q/U -- passed together, so the derived
+   common beam and grid account for every input, not just the
+   mismatched one), then `rm_synthesis` recovers both sources.
+
+**A real mechanical finding while building this, not assumed -- found,
+then fixed, not left as a documented quirk:**
+`reproject_cubes`/`convolve_cubes`/`match_cubes`'s own `strip_fits_ext`
+output-naming helper originally only stripped a trailing `.fits`/
+`.FITS` (hardcoded 5-character check) -- this project's own test
+fixtures use `.FITSCUBE` (9 characters), which didn't match, so the
+real output filename was the FULL original filename with
+`_REPROJ.FITS`/`_CONV.FITS`/`_MATCHED.FITS` simply appended (e.g.
+`TEST_BAND2_MISMATCH.Q.FITSCUBE_REPROJ.FITS`, not an extension swap) --
+confirmed directly by reading the helper's own source rather than
+assumed from the shorter, `.fits`-suffixed examples used elsewhere in
+the docs. Rather than leave this as a documented limitation, all three
+copies of `strip_fits_ext` (`src/reproject_cubes.f90`,
+`src/convolve_cubes.f90`, `src/match_cubes.f90`) were generalized to
+strip whatever the trailing extension actually is (anything after the
+last `.` in the filename's own basename, ignoring any path component),
+not a hardcoded `.fits` check -- so a `.FITSCUBE` input now produces a
+clean `TEST_BAND2_MISMATCH.Q_REPROJ.FITS`, same as a real user's
+`.fits` input always did. All bash-side filename references in
+`tests/run_tests.sh` that depended on the old double-extension
+behaviour (sections 30, 33-36, 38-40) were updated to match, and the
+full suite re-verified at 127/127 after the change -- not just the new
+T15 sections, since sections 30/33-36 (pre-existing, not part of this
+ticket) also construct these tools' own output filenames and would
+otherwise have silently broken. Also caught directly during manual
+verification (before either was ever run inside the permanent suite): a
+`rm -f *MATCHED*` cleanup command deleted `TEST_BAND2_UNMATCHED.*`
+itself (the glob matches "UNMATCHED" as well as the intended
+`*_MATCHED.FITS` outputs) -- recovered immediately since
+`make_test_cubes.py` is fully deterministic, but the permanent test
+sections use exact filenames (`${x}_MATCHED.FITS`), not a bare
+substring glob, specifically to avoid this class of mistake recurring.
+
+**Verification:** all three scenarios manually verified against real
+invocations before being written into the permanent suite (not written
+from assumption), each including a genuine mismatch → tool fixes it →
+`check_rm_peak.py` confirms both known sources recovered at the correct
+RM. Full suite: 127/127 (up from 121) after landing, and 127/127 again
+after the later `strip_fits_ext` generalization and its knock-on
+filename-reference updates across sections 30/33-36/38-40.

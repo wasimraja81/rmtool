@@ -2057,6 +2057,10 @@ if make match_cubes > "$OUT_DIR/match_cubes_build.log" 2>&1; then
 
     mc_ref="$OUT_DIR/mc_skip_ref.Q.FITSCUBE"
     mc_shifted="$OUT_DIR/mc_skip_shifted.Q.FITSCUBE"
+    # strip_fits_ext (src/match_cubes.f90) strips ANY trailing extension,
+    # so the tool's own output name drops .FITSCUBE here.
+    mc_ref_reproj="${mc_ref%.FITSCUBE}_REPROJ.FITS"
+    mc_shifted_reproj="${mc_shifted%.FITSCUBE}_REPROJ.FITS"
     cp tests/data/TEST.Q.FITSCUBE "$mc_ref"
     python3 - "$mc_ref" "$mc_shifted" <<'PYEOF'
 import sys
@@ -2070,12 +2074,12 @@ PYEOF
 
     # --- Positive: reffile=itself already matches -> skip, no output,
     # manifest says SKIPPED ---
-    rm -f "${mc_ref}_REPROJ.FITS" "$OUT_DIR/mc_manifest_pos.txt"
+    rm -f "$mc_ref_reproj" "$OUT_DIR/mc_manifest_pos.txt"
     mc_pos_log="$OUT_DIR/mc_skip_positive.log"
     if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
             infiles="$mc_ref" manifest="$OUT_DIR/mc_manifest_pos.txt" \
             > "$mc_pos_log" 2>&1; then
-        if [[ -f "${mc_ref}_REPROJ.FITS" ]]; then
+        if [[ -f "$mc_ref_reproj" ]]; then
             fail "match_cubes: positive skip test wrote an output file (should have skipped)"
         elif ! grep -q "^SKIP: $mc_ref " "$mc_pos_log"; then
             fail "match_cubes: positive skip test missing SKIP: message (see $mc_pos_log)"
@@ -2090,14 +2094,14 @@ PYEOF
 
     # --- Negative: genuinely offset CRVAL -> processed as normal,
     # manifest says PROCESSED ---
-    rm -f "${mc_shifted}_REPROJ.FITS" "$OUT_DIR/mc_manifest_neg.txt"
+    rm -f "$mc_shifted_reproj" "$OUT_DIR/mc_manifest_neg.txt"
     mc_neg_log="$OUT_DIR/mc_skip_negative.log"
     if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
             infiles="$mc_shifted" manifest="$OUT_DIR/mc_manifest_neg.txt" \
             > "$mc_neg_log" 2>&1; then
-        if [[ ! -s "${mc_shifted}_REPROJ.FITS" ]]; then
+        if [[ ! -s "$mc_shifted_reproj" ]]; then
             fail "match_cubes: negative skip test did not write the expected output"
-        elif ! grep -qP "^${mc_shifted}\tPROCESSED\t${mc_shifted}_REPROJ.FITS$" "$OUT_DIR/mc_manifest_neg.txt"; then
+        elif ! grep -qP "^${mc_shifted}\tPROCESSED\t${mc_shifted_reproj}$" "$OUT_DIR/mc_manifest_neg.txt"; then
             fail "match_cubes: negative skip test manifest missing/wrong PROCESSED line"
         else
             pass "match_cubes: genuinely mismatched input processed as normal (regression guard)"
@@ -2125,7 +2129,7 @@ PYEOF
 
     # --- Safety: a pre-existing manifest path always aborts the whole
     # run too ---
-    rm -f "${mc_shifted}_REPROJ.FITS"
+    rm -f "$mc_shifted_reproj"
     mc_stale_manifest_log="$OUT_DIR/mc_skip_stale_manifest.log"
     if bin/match_cubes stages=reproject footprint_mode=reference reffile="$mc_ref" \
             infiles="$mc_shifted" manifest="$OUT_DIR/mc_manifest_neg.txt" \
@@ -2301,8 +2305,10 @@ if [[ -x bin/convolve_cubes ]]; then
     iob_src="$OUT_DIR/iob_src.Q.FITSCUBE"
     cp "$DATA_DIR/TEST.Q.FITSCUBE" "$iob_src"
 
-    iob_off_out="${iob_src}_off.CONV.FITS"
-    iob_on_out="${iob_src}_on.CONV.FITS"
+    # strip_fits_ext (src/convolve_cubes.f90) strips ANY trailing
+    # extension before appending outsuffix, so .FITSCUBE drops here.
+    iob_off_out="${iob_src%.FITSCUBE}_off.CONV.FITS"
+    iob_on_out="${iob_src%.FITSCUBE}_on.CONV.FITS"
     rm -f "$iob_off_out" "$iob_on_out"
 
     iob_off_log="$OUT_DIR/convolve_io_overlap_off.log"
@@ -2343,8 +2349,10 @@ if [[ -x bin/match_cubes ]]; then
     mciob_src="$OUT_DIR/mciob_src.Q.FITSCUBE"
     cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mciob_src"
 
-    mciob_off_out="${mciob_src}_off.MATCHED.FITS"
-    mciob_on_out="${mciob_src}_on.MATCHED.FITS"
+    # strip_fits_ext (src/match_cubes.f90) strips ANY trailing extension
+    # before appending outsuffix, so .FITSCUBE drops here.
+    mciob_off_out="${mciob_src%.FITSCUBE}_off.MATCHED.FITS"
+    mciob_on_out="${mciob_src%.FITSCUBE}_on.MATCHED.FITS"
     rm -f "$mciob_off_out" "$mciob_on_out"
 
     mciob_off_log="$OUT_DIR/match_io_overlap_off.log"
@@ -2383,9 +2391,12 @@ if [[ -x bin/reproject_cubes ]]; then
     rcio_src="$OUT_DIR/rcio_src.Q.FITSCUBE"
     cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$rcio_src"
 
+    # strip_fits_ext (src/reproject_cubes.f90) strips ANY trailing
+    # extension before appending "_REPROJ.FITS", so .FITSCUBE drops here.
+    rcio_src_reproj="${rcio_src%.FITSCUBE}_REPROJ.FITS"
     rcio_off_out="${rcio_src}_off.FITS"
     rcio_on_out="${rcio_src}_on.FITS"
-    rm -f "${rcio_src}_REPROJ.FITS" "$rcio_off_out" "$rcio_on_out"
+    rm -f "$rcio_src_reproj" "$rcio_off_out" "$rcio_on_out"
 
     rcio_off_log="$OUT_DIR/reproject_io_overlap_off.log"
     rcio_on_log="$OUT_DIR/reproject_io_overlap_on.log"
@@ -2393,12 +2404,12 @@ if [[ -x bin/reproject_cubes ]]; then
     if bin/reproject_cubes mode=reference reffile="$rcio_ref" \
             infiles="$rcio_src" mem_frac_ram=0.1 io_overlap=n \
             > "$rcio_off_log" 2>&1; then
-        mv "${rcio_src}_REPROJ.FITS" "$rcio_off_out"
+        mv "$rcio_src_reproj" "$rcio_off_out"
     fi
     if bin/reproject_cubes mode=reference reffile="$rcio_ref" \
             infiles="$rcio_src" mem_frac_ram=0.1 io_overlap=y \
             > "$rcio_on_log" 2>&1; then
-        mv "${rcio_src}_REPROJ.FITS" "$rcio_on_out"
+        mv "$rcio_src_reproj" "$rcio_on_out"
     fi
 
     if [[ -s "$rcio_off_out" && -s "$rcio_on_out" ]] && \
@@ -2422,9 +2433,12 @@ if [[ -x bin/match_cubes ]]; then
     mcrio_src="$OUT_DIR/mcrio_src.Q.FITSCUBE"
     cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$mcrio_src"
 
+    # strip_fits_ext (src/match_cubes.f90) strips ANY trailing extension
+    # before appending outsuffix, so .FITSCUBE drops here.
+    mcrio_src_reproj="${mcrio_src%.FITSCUBE}_REPROJ.FITS"
     mcrio_off_out="${mcrio_src}_off.FITS"
     mcrio_on_out="${mcrio_src}_on.FITS"
-    rm -f "${mcrio_src}_REPROJ.FITS" "$mcrio_off_out" "$mcrio_on_out"
+    rm -f "$mcrio_src_reproj" "$mcrio_off_out" "$mcrio_on_out"
 
     mcrio_off_log="$OUT_DIR/match_reproject_io_overlap_off.log"
     mcrio_on_log="$OUT_DIR/match_reproject_io_overlap_on.log"
@@ -2432,12 +2446,12 @@ if [[ -x bin/match_cubes ]]; then
     if bin/match_cubes stages=reproject footprint_mode=reference \
             reffile="$mcrio_ref" infiles="$mcrio_src" outsuffix="_REPROJ.FITS" \
             mem_frac_ram=0.1 io_overlap=n > "$mcrio_off_log" 2>&1; then
-        mv "${mcrio_src}_REPROJ.FITS" "$mcrio_off_out"
+        mv "$mcrio_src_reproj" "$mcrio_off_out"
     fi
     if bin/match_cubes stages=reproject footprint_mode=reference \
             reffile="$mcrio_ref" infiles="$mcrio_src" outsuffix="_REPROJ.FITS" \
             mem_frac_ram=0.1 io_overlap=y > "$mcrio_on_log" 2>&1; then
-        mv "${mcrio_src}_REPROJ.FITS" "$mcrio_on_out"
+        mv "$mcrio_src_reproj" "$mcrio_on_out"
     fi
 
     if [[ -s "$mcrio_off_out" && -s "$mcrio_on_out" ]] && \
@@ -2480,6 +2494,243 @@ if [[ -f "$rmclean_o" ]]; then
     fi
 else
     skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN stop-reason test"
+fi
+
+# ---------------------------------------------------------------------------
+# 38-40. Multi-band preprocessing END-TO-END (planning/
+#     MULTI_BAND_TOMOGRAPHY_PLAN.md T15): sections 15/30/33-36 test the
+#     preprocessing tools' own internal correctness (geometry validation,
+#     skip-if-already-matched, io_overlap consistency) in isolation, but
+#     none of them prove the actual point of the toolchain -- take
+#     genuinely mismatched multi-band data, fix it, and get the right
+#     answer out of rm_synthesis. These three sections do exactly that,
+#     each isolating one failure mode: grid-only (reproject_cubes alone),
+#     resolution-only (convolve_cubes alone), and both together
+#     (match_cubes stages=both). TEST_BAND2_UNMATCHED/band1_beamlog.txt/
+#     band2_beamlog.txt (tests/make_test_cubes.py) are dedicated fixtures
+#     for this -- band2's own beam (20") is genuinely different from
+#     band1's (10"), so convolve_cubes has real smoothing work to do, not
+#     a no-op copy.
+# ---------------------------------------------------------------------------
+section "38. Multi-band preprocessing: reproject_cubes fixes a grid-only mismatch, then rm_synthesis recovers the known sources (T15)"
+
+if [[ -x bin/reproject_cubes && -x "$BIN_SERIAL" ]]; then
+    mbpp_grid_band1q="$OUT_DIR/mbpp_grid.TEST.Q.FITSCUBE"
+    mbpp_grid_band1u="$OUT_DIR/mbpp_grid.TEST.U.FITSCUBE"
+    mbpp_grid_band2q="$OUT_DIR/mbpp_grid.TEST_BAND2_MISMATCH.Q.FITSCUBE"
+    mbpp_grid_band2u="$OUT_DIR/mbpp_grid.TEST_BAND2.U.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mbpp_grid_band1q"
+    cp "$DATA_DIR/TEST.U.FITSCUBE" "$mbpp_grid_band1u"
+    cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$mbpp_grid_band2q"
+    cp "$DATA_DIR/TEST_BAND2.U.FITSCUBE" "$mbpp_grid_band2u"
+    # strip_fits_ext (src/reproject_cubes.f90) strips ANY trailing
+    # extension, so the tool's own output name drops .FITSCUBE here --
+    # mirror that with bash's own extension strip rather than
+    # concatenating onto the untouched input name.
+    mbpp_grid_band2q_reproj="${mbpp_grid_band2q%.FITSCUBE}_REPROJ.FITS"
+    rm -f "$mbpp_grid_band2q_reproj"
+
+    mbpp_grid_reproj_log="$OUT_DIR/mbpp_grid_reproject.log"
+    if bin/reproject_cubes mode=reference reffile="$mbpp_grid_band1q" \
+            infiles="$mbpp_grid_band2q" > "$mbpp_grid_reproj_log" 2>&1 && \
+       [[ -s "$mbpp_grid_band2q_reproj" ]]; then
+        pass "reproject_cubes: fixed a genuine grid-only mismatch, wrote output"
+    else
+        fail "reproject_cubes: grid-only mismatch fix failed or wrote no output (see $mbpp_grid_reproj_log)"
+    fi
+
+    if [[ -s "$mbpp_grid_band2q_reproj" ]]; then
+        mbpp_grid_cfg="$OUT_DIR/mbpp_grid_rmsynth.cfg"
+        cat > "$mbpp_grid_cfg" <<CFGEOF
+path                = ${OUT_DIR}/
+infileQ             = $(basename "$mbpp_grid_band1q"),$(basename "$mbpp_grid_band2q_reproj")
+infileU             = $(basename "$mbpp_grid_band1u"),$(basename "$mbpp_grid_band2u")
+outfile             = ${OUT_DIR}/mbpp_grid_out
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        mbpp_grid_rmsynth_log="$OUT_DIR/mbpp_grid_rmsynth.log"
+        "$BIN_SERIAL" "$mbpp_grid_cfg" > "$mbpp_grid_rmsynth_log" 2>&1
+        if [[ -f "${OUT_DIR}/mbpp_grid_out.AMP.RMCUBE.FITS" ]] && \
+           python3 "$TESTS_DIR/check_rm_peak.py" "${OUT_DIR}/mbpp_grid_out.AMP.RMCUBE.FITS" "$TRUTH" > /dev/null 2>&1; then
+            pass "reproject_cubes fix + rm_synthesis: src_A/src_B recovered after fixing a real grid-only mismatch"
+        else
+            fail "reproject_cubes fix + rm_synthesis: RM peak(s) not recovered (see $mbpp_grid_rmsynth_log)"
+        fi
+    else
+        fail "reproject_cubes: grid-only mismatch fix did not produce a usable output; skipping downstream rm_synthesis check"
+    fi
+else
+    skip "reproject_cubes or serial rm_synthesis binary not available; skipping grid-only preprocessing test"
+fi
+
+# ---------------------------------------------------------------------------
+section "39. Multi-band preprocessing: convolve_cubes fixes a resolution-only mismatch, then rm_synthesis recovers the known sources (T15)"
+
+if [[ -x bin/convolve_cubes && -x "$BIN_SERIAL" ]]; then
+    mbpp_res_band1q="$OUT_DIR/mbpp_res.TEST.Q.FITSCUBE"
+    mbpp_res_band1u="$OUT_DIR/mbpp_res.TEST.U.FITSCUBE"
+    mbpp_res_band2q="$OUT_DIR/mbpp_res.TEST_BAND2.Q.FITSCUBE"
+    mbpp_res_band2u="$OUT_DIR/mbpp_res.TEST_BAND2.U.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mbpp_res_band1q"
+    cp "$DATA_DIR/TEST.U.FITSCUBE" "$mbpp_res_band1u"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$mbpp_res_band2q"
+    cp "$DATA_DIR/TEST_BAND2.U.FITSCUBE" "$mbpp_res_band2u"
+    # strip_fits_ext (src/convolve_cubes.f90) strips ANY trailing
+    # extension, so the tool's own output name drops .FITSCUBE here.
+    mbpp_res_band1q_conv="${mbpp_res_band1q%.FITSCUBE}_CONV.FITS"
+    mbpp_res_band1u_conv="${mbpp_res_band1u%.FITSCUBE}_CONV.FITS"
+    mbpp_res_band2q_conv="${mbpp_res_band2q%.FITSCUBE}_CONV.FITS"
+    mbpp_res_band2u_conv="${mbpp_res_band2u%.FITSCUBE}_CONV.FITS"
+    rm -f "$mbpp_res_band1q_conv" "$mbpp_res_band1u_conv" \
+          "$mbpp_res_band2q_conv" "$mbpp_res_band2u_conv"
+
+    mbpp_res_convolve_log="$OUT_DIR/mbpp_res_convolve.log"
+    if bin/convolve_cubes \
+            infiles="$mbpp_res_band1q,$mbpp_res_band1u,$mbpp_res_band2q,$mbpp_res_band2u" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            mem_frac_ram=0.25 > "$mbpp_res_convolve_log" 2>&1 && \
+       [[ -s "$mbpp_res_band1q_conv" && -s "$mbpp_res_band2q_conv" ]]; then
+        pass "convolve_cubes: fixed a genuine resolution-only mismatch (band 1 smoothed 10\"->~20\"), wrote output"
+    else
+        fail "convolve_cubes: resolution-only mismatch fix failed or wrote no output (see $mbpp_res_convolve_log)"
+    fi
+
+    if [[ -s "$mbpp_res_band1q_conv" && -s "$mbpp_res_band2q_conv" ]]; then
+        mbpp_res_cfg="$OUT_DIR/mbpp_res_rmsynth.cfg"
+        cat > "$mbpp_res_cfg" <<CFGEOF
+path                = ${OUT_DIR}/
+infileQ             = $(basename "$mbpp_res_band1q_conv"),$(basename "$mbpp_res_band2q_conv")
+infileU             = $(basename "$mbpp_res_band1u_conv"),$(basename "$mbpp_res_band2u_conv")
+outfile             = ${OUT_DIR}/mbpp_res_out
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        mbpp_res_rmsynth_log="$OUT_DIR/mbpp_res_rmsynth.log"
+        "$BIN_SERIAL" "$mbpp_res_cfg" > "$mbpp_res_rmsynth_log" 2>&1
+        if [[ -f "${OUT_DIR}/mbpp_res_out.AMP.RMCUBE.FITS" ]] && \
+           python3 "$TESTS_DIR/check_rm_peak.py" "${OUT_DIR}/mbpp_res_out.AMP.RMCUBE.FITS" "$TRUTH" > /dev/null 2>&1; then
+            pass "convolve_cubes fix + rm_synthesis: src_A/src_B recovered after fixing a real resolution-only mismatch"
+        else
+            fail "convolve_cubes fix + rm_synthesis: RM peak(s) not recovered (see $mbpp_res_rmsynth_log)"
+        fi
+    else
+        fail "convolve_cubes: resolution-only mismatch fix did not produce usable output; skipping downstream rm_synthesis check"
+    fi
+else
+    skip "convolve_cubes or serial rm_synthesis binary not available; skipping resolution-only preprocessing test"
+fi
+
+# ---------------------------------------------------------------------------
+section "40. Multi-band preprocessing: match_cubes stages=both fixes grid+resolution mismatch together, then rm_synthesis recovers the known sources (T15)"
+
+if [[ -x bin/match_cubes && -x "$BIN_SERIAL" ]]; then
+    mbpp_both_band1q="$OUT_DIR/mbpp_both.TEST.Q.FITSCUBE"
+    mbpp_both_band1u="$OUT_DIR/mbpp_both.TEST.U.FITSCUBE"
+    mbpp_both_band2q="$OUT_DIR/mbpp_both.TEST_BAND2_UNMATCHED.Q.FITSCUBE"
+    mbpp_both_band2u="$OUT_DIR/mbpp_both.TEST_BAND2_UNMATCHED.U.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mbpp_both_band1q"
+    cp "$DATA_DIR/TEST.U.FITSCUBE" "$mbpp_both_band1u"
+    cp "$DATA_DIR/TEST_BAND2_UNMATCHED.Q.FITSCUBE" "$mbpp_both_band2q"
+    cp "$DATA_DIR/TEST_BAND2_UNMATCHED.U.FITSCUBE" "$mbpp_both_band2u"
+    # strip_fits_ext (src/match_cubes.f90) strips ANY trailing
+    # extension, so the tool's own output name drops .FITSCUBE here.
+    mbpp_both_band1q_matched="${mbpp_both_band1q%.FITSCUBE}_MATCHED.FITS"
+    mbpp_both_band1u_matched="${mbpp_both_band1u%.FITSCUBE}_MATCHED.FITS"
+    mbpp_both_band2q_matched="${mbpp_both_band2q%.FITSCUBE}_MATCHED.FITS"
+    mbpp_both_band2u_matched="${mbpp_both_band2u%.FITSCUBE}_MATCHED.FITS"
+    rm -f "$mbpp_both_band1q_matched" "$mbpp_both_band1u_matched" \
+          "$mbpp_both_band2q_matched" "$mbpp_both_band2u_matched"
+
+    mbpp_both_match_log="$OUT_DIR/mbpp_both_match.log"
+    if bin/match_cubes stages=both order=convolve_reproject \
+            footprint_mode=reference reffile="$mbpp_both_band1q" \
+            infiles="$mbpp_both_band1q,$mbpp_both_band1u,$mbpp_both_band2q,$mbpp_both_band2u" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            mem_frac_ram=0.25 > "$mbpp_both_match_log" 2>&1 && \
+       [[ -s "$mbpp_both_band1q_matched" && -s "$mbpp_both_band2q_matched" ]]; then
+        pass "match_cubes stages=both: fixed a genuine grid+resolution mismatch together, wrote output"
+    else
+        fail "match_cubes stages=both: grid+resolution mismatch fix failed or wrote no output (see $mbpp_both_match_log)"
+    fi
+
+    if [[ -s "$mbpp_both_band1q_matched" && -s "$mbpp_both_band2q_matched" ]]; then
+        mbpp_both_cfg="$OUT_DIR/mbpp_both_rmsynth.cfg"
+        cat > "$mbpp_both_cfg" <<CFGEOF
+path                = ${OUT_DIR}/
+infileQ             = $(basename "$mbpp_both_band1q_matched"),$(basename "$mbpp_both_band2q_matched")
+infileU             = $(basename "$mbpp_both_band1u_matched"),$(basename "$mbpp_both_band2u_matched")
+outfile             = ${OUT_DIR}/mbpp_both_out
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        mbpp_both_rmsynth_log="$OUT_DIR/mbpp_both_rmsynth.log"
+        "$BIN_SERIAL" "$mbpp_both_cfg" > "$mbpp_both_rmsynth_log" 2>&1
+        if [[ -f "${OUT_DIR}/mbpp_both_out.AMP.RMCUBE.FITS" ]] && \
+           python3 "$TESTS_DIR/check_rm_peak.py" "${OUT_DIR}/mbpp_both_out.AMP.RMCUBE.FITS" "$TRUTH" > /dev/null 2>&1; then
+            pass "match_cubes stages=both fix + rm_synthesis: src_A/src_B recovered after fixing a real grid+resolution mismatch"
+        else
+            fail "match_cubes stages=both fix + rm_synthesis: RM peak(s) not recovered (see $mbpp_both_rmsynth_log)"
+        fi
+    else
+        fail "match_cubes stages=both: grid+resolution mismatch fix did not produce usable output; skipping downstream rm_synthesis check"
+    fi
+else
+    skip "match_cubes or serial rm_synthesis binary not available; skipping grid+resolution preprocessing test"
 fi
 
 # ---------------------------------------------------------------------------

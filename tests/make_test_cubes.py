@@ -232,6 +232,46 @@ def main() -> None:
     fits.PrimaryHDU(data=q_cube2, header=hdr2_mismatch).writeto(
         q_path2_mismatch, overwrite=True)
 
+    # Deliberately BOTH geometry- AND resolution-mismatched variant of
+    # band 2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md T15): for a genuine
+    # END-TO-END preprocessing test -- reproject_cubes/convolve_cubes/
+    # match_cubes actually fixing real mismatches and rm_synthesis then
+    # recovering the known sources, not just rm_synthesis's own
+    # mismatch-REJECTION path the T1 fixture above exercises. Same
+    # underlying signal as TEST_BAND2 (same q_cube2/u_cube2 -- so the
+    # correct RM answer after fixing is exactly SOURCES above), same
+    # CRVAL1 shift as TEST_BAND2_MISMATCH for the grid half of the
+    # mismatch; both Q and U written since a real preprocessing
+    # workflow needs both polarizations.
+    hdr2_unmatched = make_header(NX, NY, BAND2_N_CHAN, BAND2_F_START, BAND2_F_STEP)
+    hdr2_unmatched["CRVAL1"] = hdr2_unmatched["CRVAL1"] + 5.0
+    q_path2_unmatched = OUTDIR / "TEST_BAND2_UNMATCHED.Q.FITSCUBE"
+    u_path2_unmatched = OUTDIR / "TEST_BAND2_UNMATCHED.U.FITSCUBE"
+    fits.PrimaryHDU(data=q_cube2, header=hdr2_unmatched).writeto(
+        q_path2_unmatched, overwrite=True)
+    fits.PrimaryHDU(data=u_cube2, header=hdr2_unmatched).writeto(
+        u_path2_unmatched, overwrite=True)
+
+    # Flat per-channel ASCII beam logs (convolve_cubes' own portable
+    # format, same convention tests/run_tests.sh's own §33 already uses)
+    # for the resolution half of the mismatch: band 1 at a fixed 10"
+    # beam, band 2 at a genuinely different 20" beam -- convolve_cubes
+    # must actually smooth band 1 up to the common target, not a no-op.
+    # A flat value per band is enough to exercise the mechanism; it
+    # doesn't need to be astrophysically realistic. band2_beamlog
+    # applies equally to TEST_BAND2 (grid-matched) and
+    # TEST_BAND2_UNMATCHED (grid-mismatched too) -- both share the same
+    # BAND2_N_CHAN channel count, and a beam log is just a per-channel
+    # value list, independent of which FITS file it's paired with.
+    band1_beamlog = OUTDIR / "band1_beamlog.txt"
+    with open(band1_beamlog, "w") as f:
+        for ch in range(1, N_CHAN + 1):
+            f.write(f"{ch} 10.0 10.0 0.0\n")
+    band2_beamlog = OUTDIR / "band2_beamlog.txt"
+    with open(band2_beamlog, "w") as f:
+        for ch in range(1, BAND2_N_CHAN + 1):
+            f.write(f"{ch} 20.0 20.0 0.0\n")
+
     manifest = {
         "nx": NX, "ny": NY, "n_chan": N_CHAN,
         "freq_start_hz": F_START, "freq_step_hz": F_STEP,
@@ -244,6 +284,9 @@ def main() -> None:
             "band2_freq_step_hz": BAND2_F_STEP,
             "files_band2": {"Q": str(q_path2), "U": str(u_path2)},
             "files_band2_mismatch": {"Q": str(q_path2_mismatch)},
+            "files_band2_unmatched": {"Q": str(q_path2_unmatched), "U": str(u_path2_unmatched)},
+            "beamlogs": {"band1": str(band1_beamlog),
+                         "band2": str(band2_beamlog)},
         },
         "bad_channel_test": {
             "files_badchan": {"Q": str(q_path_bad), "U": str(u_path_bad)},
@@ -264,6 +307,10 @@ def main() -> None:
     print(f"Wrote {q_path2}")
     print(f"Wrote {u_path2}")
     print(f"Wrote {q_path2_mismatch}")
+    print(f"Wrote {q_path2_unmatched}")
+    print(f"Wrote {u_path2_unmatched}")
+    print(f"Wrote {band1_beamlog}")
+    print(f"Wrote {band2_beamlog}")
     print(f"Wrote {OUTDIR / 'truth.json'}")
 
 

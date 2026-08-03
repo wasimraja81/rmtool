@@ -2385,21 +2385,33 @@ contains
    function strip_fits_ext(filename) result(base)
       !! Output-name helper: verbatim port of convolve_cubes.f90's own --
       !! see there for the full rationale (avoids the double-extension
-      !! "name.fits_REPROJ.FITS" this used to produce).
+      !! "name.fits_REPROJ.FITS" this used to produce). Strips whatever
+      !! the trailing extension actually is, not just ".fits".
       character(len=*), intent(in) :: filename
       character(len=len(filename)) :: base
-      character(len=5) :: tail
-      integer :: n, i
+      integer :: n, i, slash, dot
 
       base = filename
       n = len_trim(filename)
-      if (n.lt.5) return
-      tail = filename(n-4:n)
-      do i = 1, 5
-         tail(i:i) = achar(iachar(tail(i:i)) +&
-         &merge(32, 0, tail(i:i).ge.'A'.and.tail(i:i).le.'Z'))
+      if (n.lt.1) return
+
+      slash = 0
+      do i = n, 1, -1
+         if (filename(i:i).eq.'/') then
+            slash = i
+            exit
+         endif
       enddo
-      if (tail.eq.'.fits') base = filename(1:n-5)
+
+      dot = 0
+      do i = n, slash+1, -1
+         if (filename(i:i).eq.'.') then
+            dot = i
+            exit
+         endif
+      enddo
+
+      if (dot.gt.slash+1) base = filename(1:dot-1)
    end function strip_fits_ext
 
    function cfg_csv_count(str) result(n)

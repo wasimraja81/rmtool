@@ -442,30 +442,42 @@ contains
    end function flag_from_value_convolve
 
    function strip_fits_ext(filename) result(base)
-      !! Output-name helper: infile with a trailing ".fits"/".FITS" (case-
-      !! insensitive) removed, so outsuffix lands where a human expects it
-      !! -- e.g. "cutout-stokesQ.fits" + outsuffix "_CONV.FITS" gives
-      !! "cutout-stokesQ_CONV.FITS", not the double-extension "cutout-
+      !! Output-name helper: infile with its trailing extension (whatever
+      !! follows the last '.' in its basename -- .fits, .FITS, .FITSCUBE,
+      !! ...) removed, so outsuffix lands where a human expects it -- e.g.
+      !! "cutout-stokesQ.fits" + outsuffix "_CONV.FITS" gives "cutout-
+      !! stokesQ_CONV.FITS", not the double-extension "cutout-
       !! stokesQ.fits_CONV.FITS" this used to produce by simply
-      !! concatenating outsuffix onto the raw infile string. A filename
-      !! that does NOT end in .fits (this project's own test fixtures use
-      !! .FITSCUBE, a different extension entirely) is returned unchanged
-      !! -- deliberately narrow (exactly ".fits", not every conceivable
-      !! FITS extension) so this never surprises an existing caller.
+      !! concatenating outsuffix onto the raw infile string. Generic by
+      !! design (not hardcoded to ".fits") so any input extension, this
+      !! project's own .FITSCUBE test fixtures included, is handled the
+      !! same way. A filename with no '.' in its basename (only in a
+      !! parent directory component) is returned unchanged.
       character(len=*), intent(in) :: filename
       character(len=len(filename)) :: base
-      character(len=5) :: tail
-      integer :: n, i
+      integer :: n, i, slash, dot
 
       base = filename
       n = len_trim(filename)
-      if (n.lt.5) return
-      tail = filename(n-4:n)
-      do i = 1, 5
-         tail(i:i) = achar(iachar(tail(i:i)) +&
-         &merge(32, 0, tail(i:i).ge.'A'.and.tail(i:i).le.'Z'))
+      if (n.lt.1) return
+
+      slash = 0
+      do i = n, 1, -1
+         if (filename(i:i).eq.'/') then
+            slash = i
+            exit
+         endif
       enddo
-      if (tail.eq.'.fits') base = filename(1:n-5)
+
+      dot = 0
+      do i = n, slash+1, -1
+         if (filename(i:i).eq.'.') then
+            dot = i
+            exit
+         endif
+      enddo
+
+      if (dot.gt.slash+1) base = filename(1:dot-1)
    end function strip_fits_ext
 
    subroutine parse_args(status)

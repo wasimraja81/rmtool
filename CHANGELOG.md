@@ -353,6 +353,33 @@ record.
   specifically but shipped alongside it; full suite unaffected
   (121/121, unchanged).
 
+### Added — Multi-band preprocessing: end-to-end test coverage (ticket T15, `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md`)
+- Closed a real, unaddressed gap found while writing user-facing
+  documentation: existing multi-band tests either exercised
+  `rm_synthesis`'s own schema/geometry-mismatch REJECTION in isolation,
+  or the preprocessing tools' own internal consistency -- none of them
+  took genuinely mismatched multi-band data, fixed it with
+  `reproject_cubes`/`convolve_cubes`/`match_cubes`, and confirmed
+  `rm_synthesis` then recovered the correct answer. Three new
+  permanent sections now do exactly that, each isolating one failure
+  mode (grid-only, resolution-only, both together via `match_cubes
+  stages=both`), each ending in a real `check_rm_peak.py` assertion
+  against the known injected sources.
+- New dedicated fixture (`tests/make_test_cubes.py`):
+  `TEST_BAND2_UNMATCHED.Q/U.FITSCUBE` plus two flat per-channel beam
+  logs at genuinely different resolutions (10"/20"), so `convolve_cubes`
+  has real smoothing work to do, not a no-op.
+- Generalized `strip_fits_ext` (`src/reproject_cubes.f90`,
+  `src/convolve_cubes.f90`, `src/match_cubes.f90`) to strip any trailing
+  filename extension instead of a hardcoded `.fits`/`.FITS` check. Found
+  while building the tests above: this project's own `.FITSCUBE` test
+  fixtures weren't recognised as having an extension at all, so output
+  filenames doubled up (`name.FITSCUBE_REPROJ.FITS`) instead of swapping
+  cleanly (`name_REPROJ.FITS`) -- cosmetic only, never affected real
+  users with standard `.fits` inputs, but fixed properly rather than
+  left as a quirk. Full suite re-verified at 127/127 after the change.
+- Full suite: 127/127 (up from 121).
+
 ## [5.0] - `5.0-rc.1` tagged on `develop`; real-scale validation pending before `main`
 
 Multi-band Faraday tomography milestone — by far the largest single body
