@@ -262,8 +262,8 @@ $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(CONVOL
 $(CONVOLVE_BUILDDIR)/convolve_cubes.o: $(SRCDIR)/convolve_cubes.f90 $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o | $(CONVOLVE_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(CONVOLVE_BUILDDIR) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
 
-$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS)
+$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(SRCDIR)/printerror.f90 | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS)
 	@echo "✓ Executable created: $@"
 
 # match_cubes: consolidates reproject_cubes and convolve_cubes into one

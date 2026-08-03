@@ -59,7 +59,7 @@
 ! argument-error path, same convention as reproject_cubes.f90/
 ! convolve_cubes.f90).
 program match_cubes
-   use, intrinsic :: iso_fortran_env, only: dp => real64
+   use, intrinsic :: iso_fortran_env, only: dp => real64, int8, int32, int64
    use, intrinsic :: iso_c_binding, only: c_int, c_long, c_ptr, c_funptr,&
    &c_null_ptr, c_funloc, c_loc, c_f_pointer
    use logging_mod
@@ -128,8 +128,15 @@ program match_cubes
    ! LOCAL to that subroutine, called once per input file, not
    ! program-level state).
    type :: block_write_job_t
-      integer :: out_unit = 0, naxis = 0, sky1 = 0, sky2 = 0, freq_axis = 0
-      integer :: naxes(max_axes) = 0
+      ! file_path/datastart (not out_unit): raw Fortran stream I/O at a
+      ! computed byte offset (T19, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.
+      ! md), not a live CFITSIO handle -- see process_one_file_restricted's
+      ! own comment for why. "Restricted" scope guarantees every axis
+      ! other than sky1/sky2/freq_axis is degenerate (size 1), so nx*ny*
+      ! chan_len is always the exact contiguous byte range for this
+      ! block; naxis/sky1/sky2/freq_axis/naxes are no longer needed here.
+      character(len=1024) :: file_path = ' '
+      integer(kind=8) :: datastart = 0_8
       integer :: chan_start = 0, chan_len = 0, nx = 0, ny = 0
       real, pointer :: data(:,:,:) => null()
    end type block_write_job_t
@@ -146,8 +153,13 @@ program match_cubes
    ! with the convolve path's above: one match_cubes run's own stages=
    ! setting is global, so a single run only ever exercises ONE of these
    ! two paths, never both concurrently.
+   ! file_path/datastart (not out_unit): raw Fortran stream I/O at a
+   ! computed byte offset (T19, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+   ! -- see process_one_file_general's own comment for why, same
+   ! rationale/design as reproject_cubes.f90's own block_write_job_t.
    type :: block_write_job_general_t
-      integer :: out_unit = 0
+      character(len=1024) :: file_path = ' '
+      integer(kind=8) :: datastart = 0_8
       integer :: naxes_in(max_axes) = 0, other_axes(max_axes) = 0
       integer :: other_idx(max_axes) = 0, n_other = 0
       integer :: chan_start = 0, chan_len = 0, nx = 0, ny = 0
@@ -2232,6 +2244,7 @@ contains
       integer :: nx_out, ny_out, naxis_out, naxes_out(max_axes)
       integer :: nx_in, ny_in
       integer :: ref_unit, out_unit, fitsstat, blocksize
+      integer(kind=8) :: datastart, headstart_dum, dataend_dum
       logical :: simple, extend
       integer :: beams_unit, beams_status, casambm_status, hdutype_dum
       logical :: casambm_val
@@ -2349,6 +2362,34 @@ contains
          call safe_ftclos(beams_unit, beams_status)
       endif
 
+      ! T19 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): CFITSIO is not
+      ! guaranteed thread-safe even across different file units/handles
+      ! without a specific reentrant build -- confirmed the hard way, a
+      ! real, timing-dependent hang on real WALLABY+EMU data. Fetch this
+      ! file's own pixel-data byte offset ONCE, right here (all header
+      ! writes, including the BEAMS extension copy just above, are
+      ! already done), then close out_unit immediately -- CFITSIO's job
+      ! for this file is done. Every pixel write from here on goes
+      ! through write_one_block_raw_general (plain Fortran stream I/O,
+      ! computed byte offsets), same design as reproject_cubes.f90's own
+      ! write_one_block_raw and this file's own process_one_file_
+      ! restricted/write_freq_block_raw -- CFITSIO is never touched
+      ! concurrently because it is not touched AT ALL during the write
+      ! loop.
+      datastart = 0_8
+      headstart_dum = 0_8
+      dataend_dum = 0_8
+      fitsstat = 0
+      call ftghad(out_unit, headstart_dum, datastart, dataend_dum, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to get data-start offset (FTGHAD) for: ', trim(outfile)
+         call printerror(fitsstat)
+         status = -1
+         call safe_ftclos(out_unit, fitsstat)
+         return
+      endif
+      call safe_ftclos(out_unit, fitsstat)
+
       n_planes = 1
       do k = 1, n_other
          n_planes = n_planes * naxes_in_l(other_axes(k))
@@ -2396,8 +2437,8 @@ contains
       status_par = 0
       nthreads = max(1, min(omp_get_max_threads(), block_planes))
       !$omp parallel num_threads(nthreads) default(none)&
-      !$omp& shared(infile, reffile_l, naxes_in_l, pixaxes_in_l, other_axes,&
-      !$omp& n_other, lbnd_out_d, ubnd_out_d, out_unit, status_par,&
+      !$omp& shared(infile, reffile_l, outfile, naxes_in_l, pixaxes_in_l,&
+      !$omp& other_axes, n_other, lbnd_out_d, ubnd_out_d, datastart, status_par,&
       !$omp& nx_in, ny_in, nx_out, ny_out, block_planes, block_data_in,&
       !$omp& block_data_out, n_groups, axis1_extent, cur_slot, io_overlap_l,&
       !$omp& write_dispatched_ok, write_pending, write_thread_id,&
@@ -2497,7 +2538,8 @@ contains
 
             call timer_start(t_stage)
             if (status_par.eq.0) then
-               write_job_general%out_unit = out_unit
+               write_job_general%file_path = outfile
+               write_job_general%datastart = datastart
                write_job_general%naxes_in(1:max_axes) = naxes_in_l(1:max_axes)
                write_job_general%other_axes(1:max_axes) = other_axes(1:max_axes)
                write_job_general%other_idx(1:max_axes) = other_idx(1:max_axes)
@@ -2542,11 +2584,9 @@ contains
          write(*,*) 'ERROR: failed to resample/write one or more planes for: ',&
          &trim(infile)
          status = -1
-         call safe_ftclos(out_unit, fitsstat)
          return
       endif
 
-      call safe_ftclos(out_unit, fitsstat)
       call log_message('info', 'reproject', 'finished: '//trim(infile))
    end subroutine process_one_file_general
 
@@ -2649,45 +2689,71 @@ contains
       endif
    end subroutine read_one_block
 
-   subroutine write_one_block(out_unit, naxes_in_l, other_axes, other_idx,&
-   &n_other, chan_start, chan_len, nx_out, ny_out, block_data_out, status)
-      integer, intent(in) :: out_unit, n_other
+   subroutine write_one_block_raw_general(file_path, datastart, naxes_in_l,&
+   &other_axes, other_idx, n_other, chan_start, chan_len, nx_out, ny_out,&
+   &block_data_out, status)
+      !! Raw Fortran stream I/O at a computed byte offset -- CFITSIO is
+      !! never touched here at all (T19, docs/dev/MULTI_BAND_
+      !! TOMOGRAPHY_PLAN.md). Verbatim port of reproject_cubes.f90's own
+      !! write_one_block_raw -- see there for the full byte-offset/
+      !! contiguity rationale (this file's general-axis output layout,
+      !! sky at output axes 1,2 full extent, other_axes(1) at output
+      !! axis 3 spanning chan_start:chan_start+chan_len-1, every slower
+      !! other axis fixed at other_idx(2:n_other), is identical). Reuses
+      !! this file's own host_is_big_endian_mc/swap_bytes_r4_inplace_mc
+      !! (process_one_file_restricted's own helpers, further down) --
+      !! not duplicated here.
+      character(len=*), intent(in) :: file_path
+      integer(kind=8), intent(in) :: datastart
       integer, intent(in) :: naxes_in_l(:), other_axes(:), other_idx(:)
-      integer, intent(in) :: chan_start, chan_len, nx_out, ny_out
+      integer, intent(in) :: n_other, chan_start, chan_len, nx_out, ny_out
       real, intent(in) :: block_data_out(:,:,:)
       integer, intent(inout) :: status
 
-      integer :: fpixels_wr(max_axes), lpixels_wr(max_axes)
-      integer :: naxes_wr(max_axes), naxis_wr, k, fitsstat
+      integer :: u, ios, ip, k
+      logical :: need_swap
+      integer(kind=8) :: plane_elems, stride, fixed_offset, byte_pos
+      real, allocatable :: plane_buf(:,:)
 
       if (status.ne.0) return
 
-      naxis_wr = 2 + n_other
-      naxes_wr(1) = nx_out
-      naxes_wr(2) = ny_out
-      fpixels_wr(1) = 1
-      fpixels_wr(2) = 1
-      lpixels_wr(1) = nx_out
-      lpixels_wr(2) = ny_out
-      if (n_other.ge.1) then
-         naxes_wr(3) = naxes_in_l(other_axes(1))
-         fpixels_wr(3) = chan_start
-         lpixels_wr(3) = chan_start + chan_len - 1
-      endif
+      need_swap = .not. host_is_big_endian_mc()
+      plane_elems = int(nx_out,8) * int(ny_out,8)
+
+      stride = plane_elems
+      if (n_other.ge.1) stride = stride * int(naxes_in_l(other_axes(1)),8)
+      fixed_offset = 0_8
       do k = 2, n_other
-         naxes_wr(2+k) = naxes_in_l(other_axes(k))
-         fpixels_wr(2+k) = other_idx(k)
-         lpixels_wr(2+k) = other_idx(k)
+         fixed_offset = fixed_offset + int(other_idx(k)-1,8) * stride
+         stride = stride * int(naxes_in_l(other_axes(k)),8)
       enddo
 
-      fitsstat = 0
-      call FTPSSE(out_unit, 1, naxis_wr, naxes_wr(1:naxis_wr),&
-      &fpixels_wr(1:naxis_wr), lpixels_wr(1:naxis_wr), block_data_out, status)
-      if (status.ne.0) then
-         write(*,*) 'ERROR: failed to write block (planes ', chan_start,&
-         &'-', chan_start+chan_len-1, ') to output'
+      open(newunit=u, file=trim(file_path), access='stream',&
+      &form='unformatted', status='old', action='write', iostat=ios)
+      if (ios.ne.0) then
+         write(*,*) 'ERROR: write_one_block_raw_general: failed to open ',&
+         &trim(file_path)
+         status = -1
+         return
       endif
-   end subroutine write_one_block
+
+      allocate(plane_buf(nx_out,ny_out))
+      do ip = 1, chan_len
+         plane_buf = block_data_out(:,:,ip)
+         if (need_swap) call swap_bytes_r4_inplace_mc(plane_buf, plane_elems)
+         byte_pos = datastart +&
+         &(int(chan_start-1+ip-1,8)*plane_elems + fixed_offset)*4_8 + 1_8
+         write(u, pos=byte_pos, iostat=ios) plane_buf
+         if (ios.ne.0) then
+            write(*,*) 'ERROR: write_one_block_raw_general: write failed (plane ',&
+            &chan_start+ip-1, ') for ', trim(file_path)
+            status = -1
+            exit
+         endif
+      enddo
+      deallocate(plane_buf)
+      close(u)
+   end subroutine write_one_block_raw_general
 
    subroutine do_block_write_general(job)
       !! T4d-style: verbatim port of reproject_cubes.f90's own
@@ -2697,9 +2763,10 @@ contains
       integer :: status_local
 
       status_local = 0
-      call write_one_block(job%out_unit, job%naxes_in(1:max_axes),&
-      &job%other_axes(1:max_axes), job%other_idx(1:max_axes), job%n_other,&
-      &job%chan_start, job%chan_len, job%nx, job%ny, job%data, status_local)
+      call write_one_block_raw_general(trim(job%file_path), job%datastart,&
+      &job%naxes_in(1:max_axes), job%other_axes(1:max_axes),&
+      &job%other_idx(1:max_axes), job%n_other, job%chan_start, job%chan_len,&
+      &job%nx, job%ny, job%data, status_local)
       if (status_local.ne.0) then
          write(*,*) 'ERROR: background write failed for planes ',&
          &job%chan_start, '-', job%chan_start+job%chan_len-1
@@ -2769,6 +2836,11 @@ contains
       integer :: in_unit, ref_unit, out_unit, fitsstat, blocksize
       logical :: simple, extend
       integer :: naxes_out(max_axes)
+      ! T19: this file's own pixel-data byte offset (FTGHAD, fetched
+      ! once), for write_freq_block_raw -- see the comment right before
+      ! its own use, below, for why out_unit is closed immediately after
+      ! header setup instead of kept open for the whole block loop.
+      integer(kind=8) :: datastart, headstart_dum, dataend_dum
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes, block_planes64
       integer :: block_planes, chan_start, chan_len, local_iplane, nthreads
       integer :: cur_slot
@@ -2938,6 +3010,40 @@ contains
          &' to a common resolution', fitsstat)
       endif
       call safe_ftclos(in_unit, fitsstat)
+
+      ! T19 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): CFITSIO is not
+      ! guaranteed thread-safe even across different file units/handles
+      ! without a specific reentrant build -- confirmed the hard way, a
+      ! real, timing-dependent hang on real WALLABY+EMU data: the main
+      ! thread's own next-block read (read_freq_block, CFITSIO) blocked
+      ! concurrently with the background write thread's own write
+      ! (formerly FTPSSE, also CFITSIO), both on what is almost
+      ! certainly an internal CFITSIO lock -- not an environment/
+      ! systemd issue (confirmed absent even with no such wrapper in
+      ! use at all). Fetch this file's own pixel-data byte offset ONCE,
+      ! right here, then close out_unit immediately: CFITSIO's job for
+      ! this file is done until the BEAMS table gets appended, long
+      ! after every block write/join has completed (see the end of this
+      ! subroutine) -- no concurrency risk there. Every pixel write
+      ! between now and then goes through write_freq_block_raw (plain
+      ! Fortran stream I/O, computed byte offsets), exactly mirroring
+      ! rm_synthesis_mod.f90's own io_write_threads>1 design
+      ! (write_rm_chunk_raw) -- CFITSIO is never touched concurrently
+      ! because it is not touched AT ALL during the write loop.
+      datastart = 0_8
+      headstart_dum = 0_8
+      dataend_dum = 0_8
+      fitsstat = 0
+      call ftghad(out_unit, headstart_dum, datastart, dataend_dum, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to get data-start offset (FTGHAD) for: ', trim(outfile)
+         call printerror(fitsstat)
+         status = -1
+         call safe_ftclos(out_unit, fitsstat)
+         return
+      endif
+      call safe_ftclos(out_unit, fitsstat)
+
       call get_mem_total_kb(mem_total_kb)
       ! block_out's own term is x2 (not x1) -- double-buffered for
       ! io_overlap (see below), budgeted whether or not it's actually on.
@@ -3171,12 +3277,8 @@ contains
             endif
          endif
          call timer_stop('block_write_join', t_stage)
-         write_job%out_unit = out_unit
-         write_job%naxis = naxis
-         write_job%sky1 = sky1
-         write_job%sky2 = sky2
-         write_job%freq_axis = freq_axis
-         write_job%naxes = naxes_out
+         write_job%file_path = outfile
+         write_job%datastart = datastart
          write_job%chan_start = chan_start
          write_job%chan_len = chan_len
          write_job%nx = nx_out
@@ -3214,7 +3316,8 @@ contains
       if (status_par.ne.0) then
          write(*,*) 'ERROR: failed to process/write one or more planes for: ', trim(infile)
          status = -1
-         call safe_ftclos(out_unit, fitsstat)
+         ! out_unit is NOT open here -- closed right after FTGHAD, above,
+         ! before the block-write loop ever started.
          return
       endif
 
@@ -3222,8 +3325,19 @@ contains
       ! (stages=convolve or both, alone or chained) -- see
       ! write_beams_table_match's own comment for why, and
       ! convolve_cubes.f90's identical write_beams_table this is a
-      ! verbatim port of.
+      ! verbatim port of. Reopen out_unit now that every block write/
+      ! join above has genuinely finished (block_write_join, right
+      ! before this point, guarantees no writer thread is still active)
+      ! -- CFITSIO writes this extra HDU, which raw stream writes have
+      ! no way to add.
       fitsstat = 0
+      call safe_ftopen(out_unit, trim(outfile), 1, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to reopen output for BEAMS table: ', trim(outfile)
+         call printerror(fitsstat)
+         status = -1
+         return
+      endif
       call FTPKYL(out_unit, 'CASAMBM', .true.,&
       &'Multiple beams per plane (see BEAMS ext)', fitsstat)
       call write_beams_table_match(out_unit, nfreq, isbad, tgt_bmaj,&
@@ -3430,44 +3544,114 @@ contains
       endif
    end subroutine read_freq_block
 
-   subroutine write_freq_block(out_unit, naxis, sky1, sky2, freq_axis,&
-   &naxes_out_l, chan_start, chan_len, nx, ny, block_data, status)
-      integer, intent(in) :: out_unit, naxis, sky1, sky2, freq_axis, naxes_out_l(max_axes)
-      integer, intent(in) :: chan_start, chan_len, nx, ny
+   logical function host_is_big_endian_mc() result(is_be)
+      !! Verbatim port of rm_synthesis_mod.f90's own host_is_big_endian
+      !! -- see there for the full rationale (FITS mandates big-endian;
+      !! every realistic host here is little-endian, so this always
+      !! ends up swapping in practice, but is checked at runtime rather
+      !! than hard-coded so a genuine big-endian host isn't silently
+      !! double-swapped and corrupted).
+      integer(int32) :: probe
+      integer(int8) :: bytes(4)
+
+      probe = 1_int32
+      bytes = transfer(probe, bytes)
+      is_be = (bytes(1) == 0_int8)
+   end function host_is_big_endian_mc
+
+   subroutine swap_bytes_r4_inplace_mc(buf, n)
+      !! Verbatim port of rm_synthesis_mod.f90's own
+      !! swap_bytes_r4_inplace -- reverses the 4 bytes of every real
+      !! element of buf, in place. Self-inverse.
+      integer(kind=int64), intent(in) :: n
+      real, intent(inout) :: buf(n)
+      integer(kind=int64) :: i
+      integer(int8) :: b(4), t
+
+      do i = 1_int64, n
+         b = transfer(buf(i), b)
+         t = b(1); b(1) = b(4); b(4) = t
+         t = b(2); b(2) = b(3); b(3) = t
+         buf(i) = transfer(b, buf(i))
+      end do
+   end subroutine swap_bytes_r4_inplace_mc
+
+   subroutine write_freq_block_raw(file_path, datastart, nx, ny, chan_start,&
+   &chan_len, block_data, status)
+      !! Raw Fortran stream I/O at a computed byte offset -- CFITSIO is
+      !! never touched here at all (see process_one_file_restricted's
+      !! own comment for why: a real, timing-dependent hang, found via
+      !! this exact code path on real WALLABY+EMU data, root-caused to
+      !! two OS threads both inside CFITSIO concurrently -- the main
+      !! thread's own next-block read and this write, on different
+      !! handles, which CFITSIO does not guarantee is safe without a
+      !! specific reentrant build). Verbatim design port of rm_synthesis
+      !! _mod.f90's own write_rm_chunk_raw, simplified for this tool's
+      !! own "restricted" scope: every axis other than sky1/sky2/
+      !! freq_axis is degenerate (size 1) by construction (read_axis_
+      !! info's own requirement), and there is no spatial sub-tiling at
+      !! all in this tool (always the full nx*ny extent) -- so every
+      !! channel plane is exactly nx*ny contiguous elements, planes
+      !! back-to-back in channel order, i.e. always rm_synthesis_mod.
+      !! f90's own "full-width" case, never its "partial-width" one.
+      !!
+      !! Only ever one writer in flight at a time by this whole file's
+      !! own design (block_write_join always runs before the next
+      !! dispatch) -- unlike rm_synthesis' own io_write_threads>1 (N
+      !! genuinely concurrent writers), so no critical section is
+      !! needed around the newunit= open here: there is no other thread
+      !! that could be calling it at the same moment.
+      character(len=*), intent(in) :: file_path
+      integer(kind=8), intent(in) :: datastart
+      integer, intent(in) :: nx, ny, chan_start, chan_len
       real, intent(in) :: block_data(:,:,:)
       integer, intent(inout) :: status
 
-      integer :: fpixels_wr(max_axes), lpixels_wr(max_axes), fitsstat
+      integer :: u, ios, ip
+      logical :: need_swap
+      integer(kind=8) :: plane_stride_bytes, plane_elems, byte_pos
+      real, allocatable :: plane_buf(:,:)
 
       if (status.ne.0) return
 
-      fpixels_wr(1:naxis) = 1
-      lpixels_wr(1:naxis) = 1
-      lpixels_wr(sky1) = nx
-      lpixels_wr(sky2) = ny
-      fpixels_wr(freq_axis) = chan_start
-      lpixels_wr(freq_axis) = chan_start + chan_len - 1
+      need_swap = .not. host_is_big_endian_mc()
+      plane_elems = int(nx,8) * int(ny,8)
+      plane_stride_bytes = plane_elems * 4_8
 
-      fitsstat = 0
-      call FTPSSE(out_unit, 1, naxis, naxes_out_l(1:naxis), fpixels_wr(1:naxis),&
-      &lpixels_wr(1:naxis), block_data, status)
-      if (status.ne.0) then
-         write(*,*) 'ERROR: failed to write block (planes ', chan_start, '-',&
-         &chan_start+chan_len-1, ') to output'
+      open(newunit=u, file=trim(file_path), access='stream',&
+      &form='unformatted', status='old', action='write', iostat=ios)
+      if (ios.ne.0) then
+         write(*,*) 'ERROR: write_freq_block_raw: failed to open ', trim(file_path)
+         status = -1
+         return
       endif
-   end subroutine write_freq_block
+
+      allocate(plane_buf(nx,ny))
+      do ip = 1, chan_len
+         plane_buf = block_data(:,:,ip)
+         if (need_swap) call swap_bytes_r4_inplace_mc(plane_buf, plane_elems)
+         byte_pos = datastart + int(chan_start-1+ip-1,8)*plane_stride_bytes + 1_8
+         write(u, pos=byte_pos, iostat=ios) plane_buf
+         if (ios.ne.0) then
+            write(*,*) 'ERROR: write_freq_block_raw: write failed (plane ',&
+            &chan_start+ip-1, ') for ', trim(file_path)
+            status = -1
+            exit
+         endif
+      enddo
+      deallocate(plane_buf)
+      close(u)
+   end subroutine write_freq_block_raw
 
    subroutine do_block_write(job)
-      !! T4d-style: verbatim port of convolve_cubes.f90's own
-      !! do_block_write -- see write_convolved_file's own comment there
-      !! for the full single-writer-at-a-time rationale.
+      !! T19 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): raw stream write,
+      !! not CFITSIO -- see write_freq_block_raw's own comment.
       type(block_write_job_t), intent(inout) :: job
       integer :: status_local
 
       status_local = 0
-      call write_freq_block(job%out_unit, job%naxis, job%sky1, job%sky2,&
-      &job%freq_axis, job%naxes, job%chan_start, job%chan_len, job%nx,&
-      &job%ny, job%data, status_local)
+      call write_freq_block_raw(trim(job%file_path), job%datastart,&
+      &job%nx, job%ny, job%chan_start, job%chan_len, job%data, status_local)
       if (status_local.ne.0) then
          write(*,*) 'ERROR: background write failed for channels ',&
          &job%chan_start, '-', job%chan_start+job%chan_len-1

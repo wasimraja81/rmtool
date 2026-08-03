@@ -2311,3 +2311,104 @@ fully separate `run_pipeline.sh` invocations. Full suite: 132/132
 (unaffected -- this script is not part of `tests/run_tests.sh`'s own
 automated coverage, verified instead via its existing manual smoketest
 cfg convention).
+
+### T19 — `io_overlap=y` Hang: CFITSIO Concurrency Hazard, Fixed with Raw Stream Writes
+
+**Gap found running the real WALLABY+EMU `match` stage (`stages=both`)
+for real:** the run stalled mid-write with `io_overlap=y` -- output file
+size unchanged, every OS thread asleep (`S` state), zero CPU, zero disk
+I/O, indefinitely, well after real progress had already happened (so
+not a startup/config problem). Never seen on the synthetic test
+fixtures because it is timing-dependent: `io_overlap=y`'s whole point
+is to overlap the CURRENT block's write (on a background pthread) with
+the NEXT block's read (on the main thread) -- on the small, fast
+fixtures used by `tests/run_tests.sh`, one side always finishes before
+the other genuinely overlaps in wall-clock time; on the real, slow
+`/data1` disk and large real cubes, they do. Root cause: the background
+write pthread's own CFITSIO call (`FTPSSE` on `out_unit`) and the main
+thread's own next-block read (fresh CFITSIO calls, on a different
+input unit, inside `read_freq_block`/`read_one_block`) genuinely
+executing concurrently -- CFITSIO is not guaranteed thread-safe across
+*any* two of its own calls from different OS threads at the same time,
+even on different file units, without a specific reentrant build
+(confirmed: this build links the ordinary, non-reentrant `libcfitsio`).
+The two threads block on what is almost certainly an internal CFITSIO
+lock. A real, structural hazard, not a performance question --
+`io_overlap=n` (dropping the background write thread entirely) would
+have made it go away, but only by removing the overlap, not the actual
+unsafe pattern; rejected as a workaround for exactly that reason.
+
+**Fix:** applied `rm_synthesis_mod.f90`'s own already-working
+`io_write_threads>1` design (T6, `docs/dev/
+IO_PARALLEL_OPTIMISATION_PLAN.md`) to every affected write path.
+CFITSIO is used only once per output file, single-threaded, to create
+the file, write every header keyword (including the CASAMBM/BEAMS
+extension copy where present), and fetch the data section's own byte
+offset via `FTGHAD` -- then the handle is closed immediately.
+Every pixel write from that point on goes through plain Fortran stream
+I/O (`open(access='stream', form='unformatted')` + `write(u,
+pos=byte_pos)` at a computed byte offset, with explicit host-endianness
+handling since CFITSIO's own big-endian conversion no longer runs).
+CFITSIO is therefore never touched concurrently, because after header
+setup it is not touched AT ALL during the write loop -- nothing to
+lock, rather than a lock relied on to make concurrent access safe
+(the same reasoning `write_reprojected_file`'s own block-batching
+comment already used for a related, earlier concurrency concern).
+Fixed in all four affected write paths:
+- `convolve_cubes.f90`'s `write_convolved_file` (single fixed
+  `freq_axis`, contiguous plane-per-plane byte offset --
+  `write_freq_block_raw`).
+- `match_cubes.f90`'s `process_one_file_restricted` (`stages=convolve`/
+  `stages=both`, same single-`freq_axis` design, its own
+  `write_freq_block_raw`).
+- `reproject_cubes.f90`'s `write_reprojected_file` (the canonical
+  general N-other-axes design -- `write_one_block_raw`).
+- `match_cubes.f90`'s `process_one_file_general` (`stages=reproject`
+  alone, a verbatim port of the above -- `write_one_block_raw_general`,
+  reusing `process_one_file_restricted`'s own
+  `host_is_big_endian_mc`/`swap_bytes_r4_inplace_mc` rather than a
+  third copy).
+
+For the two general-axis paths, the byte offset is not simply
+`(chan_start-1)*nx*ny*4` (that only holds for a single fixed freq
+axis): output axis 3 (`other_axes(1)`) is the one that varies within a
+block, every slower axis (`other_axes(2:n_other)`) is held fixed for
+the whole call, and axes 1,2 (sky) are always written at full extent.
+Since FITS/Fortran arrays are both axis-1-fastest, this means the
+`fixed_offset` contribution from the slower, fixed axes is a constant
+per call (`sum over k=2..n_other of (other_idx(k)-1) * stride(axis
+2+k)`, with `stride` accumulated as the running product of every
+faster axis's own extent), and only the `chan_start` term varies block
+to block -- computed once per `write_one_block_raw[_general]` call, not
+re-derived per plane.
+
+A Makefile gap was found and fixed in the process:
+`$(CONVOLVE_EXECUTABLE)`'s link recipe was missing `$(SRCDIR)/
+printerror.f90` (unlike `reproject_cubes`/`match_cubes`'s own recipes,
+which already had it) -- pre-existing, masked because the only
+`printerror` call site that existed before this fix was apparently
+optimized away as unreachable; the new, genuinely-reachable `FTGHAD`
+error path exposed it as a link failure.
+
+**Not a hang risk in the first place:** `rmclean_cubes.f90`'s own
+`io_overlap` already defaults its background-write path through the
+same raw-stream design whenever `io_write_threads>1`; only its
+`io_write_threads=1` (default) + `io_overlap=y` combination still
+calls `FTPSSE` from the background thread and could in principle hit
+an equivalent hazard. Out of scope for this ticket (not exercised by
+the real WALLABY+EMU run, which reaches `rmclean_cubes` as a separate,
+later invocation) -- noted here for whoever picks up `rmclean_cubes`
+next, not fixed.
+
+**Verification:** full suite 132/132 throughout (unchanged), including
+sections 33/34/35/36's own `io_overlap=y` bit-identical-output checks
+for all four write paths -- these only ever verified correctness of
+the write itself (byte-for-byte identical to `io_overlap=n`), which the
+old `FTPSSE`-based code already got right; they do not, and structurally
+cannot, exercise the real hang (small fixtures never genuinely overlap
+in wall-clock time). The actual concurrency fix's own confidence comes
+from the design itself, not a timing-dependent regression test: CFITSIO
+is provably never called concurrently because it is never called at
+all once the write loop starts. The real, final verification is the
+WALLABY+EMU run itself, relaunched with `io_overlap=y` restored (see
+`cfg/pipeline-multiband-wallaby-emu-match.cfg`).
