@@ -70,7 +70,7 @@ existed because the project's `.f90` free-form versions had superseded
 them without anyone deleting the originals -- only the `.f90` files were
 ever actually compiled (pulled into `rm_synthesis.f90` via a plain
 Fortran `include`). Every doc that referenced the removed files or the
-CMake path (`README.md`, `BUILD.md`, `docs/ARCHITECTURE.md`,
+CMake path (`README.md`, `BUILD.md`, `docs/user/ARCHITECTURE.md`,
 `cfg/CONFIG_README.md`) has been corrected.
 
 ## Validation

@@ -18,7 +18,7 @@ before they shipped (see "README Motivation section" below).
 
 ## Highlights
 
-### Encapsulation refactor (`planning/ENCAPSULATION_REFACTOR_PLAN.md`, tickets T0-T5)
+### Encapsulation refactor (`docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`, tickets T0-T5)
 
 - **Config encapsulation.** All ~56 config values (paths, tiling/memory
   knobs, RM sampling, masking, GPU, I/O-parallelism, logging/timing) are
@@ -41,7 +41,7 @@ before they shipped (see "README Motivation section" below).
   `populate_write_job` call — the synchronisation code immediately
   around it (the join-before-reuse/join-before-dispatch invariants that
   guard against the two historical production SIGSEGVs documented in
-  `docs/ARCHITECTURE.md`) was left completely untouched, in its exact
+  `docs/user/ARCHITECTURE.md`) was left completely untouched, in its exact
   original order, confirmed via `git diff` inspection before any test
   was run.
 
@@ -115,7 +115,7 @@ sounding assertions:
   confirmed data integrity, and passed the structural
   no-overlapping-tile-writes check (9/9 tile writes, zero overlapping
   start/done windows) — the same invariant the historical SIGSEGV
-  postmortem in `docs/ARCHITECTURE.md` was written to guard, now
+  postmortem in `docs/user/ARCHITECTURE.md` was written to guard, now
   empirically re-confirmed at real scale rather than only by code
   inspection.
 - Swim-lane fix verified against two real logs: one that previously
@@ -146,7 +146,7 @@ sounding assertions:
 
 ## What's next (beyond this tag)
 
-- No further encapsulation tickets are queued; `planning/ENCAPSULATION_REFACTOR_PLAN.md`'s
+- No further encapsulation tickets are queued; `docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`'s
   full ticket list (T0-T5) is complete.
 - GPU staging/async pipeline code remains explicitly out of scope for
   refactoring until a structural race-detection test exists for it (see

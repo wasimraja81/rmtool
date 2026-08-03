@@ -8,7 +8,7 @@ files it produces, and one runnable example.
 This document is the single source of truth for "what does parameter X
 do" across all 5 tools. `README.md` and `QUICKSTART.md` give shorter,
 task-oriented walkthroughs and link here for the full detail;
-[docs/EXAMPLES.md](EXAMPLES.md) walks through choosing and combining
+[docs/user/EXAMPLES.md](EXAMPLES.md) walks through choosing and combining
 these parameters for real-world scenarios (multi-band, RM-CLEAN
 stopping criteria, memory tuning, and more). `--help` on any tool
 prints the same information this document does, generated from the
@@ -466,7 +466,7 @@ printed saying so.
 |---|---|---|
 | `mask_pattern_cache_max` | `4096` | Pixels sharing the same valid-channel mask pattern share one RMSF table, built once during an incremental per-tile pre-scan; past this many distinct patterns, additional patterns fall back to a one-off table per pixel (a performance safety valve, not a correctness issue). |
 
-**Memory/tiling (identical scheme/defaults to `rm_synthesis`, now covering the mask cube too — see `docs/PARALLELISM.md`):**
+**Memory/tiling (identical scheme/defaults to `rm_synthesis`, now covering the mask cube too — see `docs/user/PARALLELISM.md`):**
 
 | Key | Default | Meaning |
 |---|---|---|

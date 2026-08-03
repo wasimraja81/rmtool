@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Check the Sec 10 thesis-grounded multi-band scenario
-(planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 10; Raja 2014 Table 6.1/6.2):
+(docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 10; Raja 2014 Table 6.1/6.2):
 point source + Faraday-thick top-hat + F2/F3 pair, recovered from P-band
 alone, L-band alone, and the P+L combined synthesis.
 

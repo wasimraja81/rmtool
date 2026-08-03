@@ -30,7 +30,7 @@
 #      to completion (T2 replaced the earlier "not yet implemented" stop);
 #      mismatched-geometry config is loudly refused; inconsistent per-band
 #      list lengths are rejected at config-parse time
-#      (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+#      (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 #  16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
 #      (Raja 2014 Table 6.1/6.2): P-band alone, L-band alone, and P+L
 #      combined, for a point source + Faraday-thick top-hat + F2/F3 pair.
@@ -61,7 +61,7 @@
 #      writes
 #  22. io_read_threads>1 for multi-band (T9) – same config, 7 tiles,
 #      io_read_threads=4, bit-identical to the same single-tile reference
-#  23. RM-CLEAN thesis scenario (planning/RMCLEAN_INTEGRATION_PLAN.md T1) –
+#  23. RM-CLEAN thesis scenario (docs/dev/RMCLEAN_INTEGRATION_PLAN.md T1) –
 #      single line-of-sight reproduction of Raja (2014) Chapter 6 Figures
 #      6.1/6.2/6.3 (Table 6.1/6.2 exact): point source + Faraday-thick
 #      top-hat, cleaned from P-band alone, L-band alone, and P+L combined.
@@ -859,7 +859,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 15. Multi-band tomography (T1) – comma-list config schema + geometry
-#     validation (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md). Fortran's bare
+#     validation (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md). Fortran's bare
 #     `stop` always exits 0 in this codebase (every existing error path
 #     uses it, matching the pattern already relied on elsewhere in this
 #     script), so these checks are log-content based, not exit-code based.
@@ -944,7 +944,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 16. Multi-band frequency merge (T2) – Sec 10 thesis-grounded scenario
-#     (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md; Raja 2014 Table 6.1/6.2):
+#     (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md; Raja 2014 Table 6.1/6.2):
 #     P-band (300/30 MHz) alone, L-band (1200/120 MHz) alone, and the P+L
 #     combined synthesis, for a point source + Faraday-thick top-hat +
 #     the F2/F3 close-pair addition.
@@ -1021,7 +1021,7 @@ CFGEOF
             fail "Sec 10 scenario: one or more expected behaviours not observed (see check_thesis_scenario.py output above)"
         fi
 
-        # T4 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): multi-tile multi-band
+        # T4 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): multi-tile multi-band
         # must produce bit-identical output to the single-tile run above --
         # tiling must not change the scientific answer.
         thesis_plmt_cfg="$OUT_DIR/thesis_pl_multitile.cfg"
@@ -1066,7 +1066,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 17. Split-band identity test (T5, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+# 17. Split-band identity test (T5, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
 #     the single most direct, mechanical regression check for the
 #     frequency-merge architecture -- splitting TEST.Q/U.FITSCUBE into two
 #     CONTIGUOUS halves (no gap) and running them as a 2-band multi-band
@@ -1135,7 +1135,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 18. Per-band channel sub-range selection (T6, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+# 18. Per-band channel sub-range selection (T6, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
 #     band 1 = TEST_SPLIT_LO (unrestricted, its own full 100-channel range),
 #     band 2 = the FULL undivided TEST.Q/U.FITSCUBE (200 channels) with
 #     subim_chan_blc/trc restricting it, per-band, down to exactly channels
@@ -1205,7 +1205,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 19. Per-band bad-channel files (T7, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+# 19. Per-band bad-channel files (T7, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
 #     raw channel 150 (1-indexed, into the undivided 200-channel TEST cube)
 #     flagged via a plain single-band badchan_file must reproduce,
 #     bit-identically, a 2-band split run (TEST_SPLIT_LO + TEST_SPLIT_HI)
@@ -1319,7 +1319,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 20. GPU offload for multi-band (T8, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+# 20. GPU offload for multi-band (T8, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
 #     the same split-band 2-band config as T5/section 17, run through the
 #     GPU binary instead of serial. Mirrors the existing single-band GPU
 #     tests exactly: non-staged run checked via rtol=2e-3 against the CPU
@@ -1428,7 +1428,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 21. io_overlap for multi-band (T9, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+# 21. io_overlap for multi-band (T9, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
 #     the T5 split-band 2-band config, forced into 7 tiles (32 Dec rows / 5
 #     per tile, uneven remainder -- same shape as test 13's single-band
 #     case) with io_overlap=y. Must be bit-identical to the existing
@@ -1725,7 +1725,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 28. RM-CLEAN matched-filter peak refinement (planning/
+# 28. RM-CLEAN matched-filter peak refinement (docs/dev/
 #     RMCLEAN_INTEGRATION_PLAN.md T3, T3-Phase 1): validates
 #     refine_peak_matched_filter/rmsf_point_direct against
 #     peak_interp_parabolic across two independent point-source
@@ -1768,7 +1768,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 29. rmclean_cubes: standalone RM-CLEAN tool driven against a REAL
-#     rm_synthesis dirty AMP/PHA/MASK cube (planning/
+#     rm_synthesis dirty AMP/PHA/MASK cube (docs/dev/
 #     RMCLEAN_INTEGRATION_PLAN.md T2) -- built via its own Makefile
 #     target (`make rmclean_cubes`), not the ad hoc gfortran calls
 #     sections 22-28 use for rmclean_mod's own unit tests. Also exercises
@@ -2466,7 +2466,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 37. RM-CLEAN clean_complex stop-reason (stopped_by_threshold) +
-#     per-iteration trace outputs (planning/RMCLEAN_INTEGRATION_PLAN.md,
+#     per-iteration trace outputs (docs/dev/RMCLEAN_INTEGRATION_PLAN.md,
 #     T6-adjacent convergence diagnostic)
 # ---------------------------------------------------------------------------
 section "37. RM-CLEAN clean_complex stop-reason + iteration trace"
@@ -2497,7 +2497,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 38-40. Multi-band preprocessing END-TO-END (planning/
+# 38-40. Multi-band preprocessing END-TO-END (docs/dev/
 #     MULTI_BAND_TOMOGRAPHY_PLAN.md T15): sections 15/30/33-36 test the
 #     preprocessing tools' own internal correctness (geometry validation,
 #     skip-if-already-matched, io_overlap consistency) in isolation, but

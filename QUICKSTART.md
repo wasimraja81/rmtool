@@ -286,19 +286,19 @@ pip install astropy numpy
 Design and interpretation notes for memory strategy, RM chunking, and
 CPU/GPU timeline diagnostics are documented in:
 
-- [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
+- [docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
 
 ---
 
 ## 7. Architecture notes
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) -- master architecture
+- [docs/user/ARCHITECTURE.md](docs/user/ARCHITECTURE.md) -- master architecture
   document (start here); includes the IO parallelism design
   (`io_read_threads`/`io_write_threads`/`io_overlap`) and their postmortems.
-- [docs/PARALLELISM.md](docs/PARALLELISM.md) -- memory/execution
+- [docs/user/PARALLELISM.md](docs/user/PARALLELISM.md) -- memory/execution
   decomposition deep-dive, including the thread-pool interplay between
   `OMP_NUM_THREADS` and the I/O thread keys.
-- [docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
+- [docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
   -- timeline/RM-chunking and swim-lane interpretation deep-dive.
 
 Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
@@ -341,7 +341,7 @@ bin/match_cubes stages=both order=convolve_reproject \
 `BEAMS` table, or a portable ASCII/CSV beam log — see `cfg/
 example_beamLog.txt`/`.csv`) and target-beam derivation are covered in
 the README's "Multi-Band Preprocessing Toolchain" section and, in full
-design/verification detail, in `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md`
+design/verification detail, in `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md`
 (tickets T10-T14). All three tools propagate `CASAMBM`/`BEAMS` beam
 metadata through to their outputs, the same way `rm_synthesis` does for
 its own.
@@ -409,9 +409,9 @@ machine, from a laptop to an HPC node.
 entirely — replace with `abs_flux_floor=`/`auto_nsigma=` above.
 
 Full parameter reference (every key, default, and meaning) in
-[docs/APP_REFERENCE.md](docs/APP_REFERENCE.md#5-rmclean_cubes); a
+[docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md#5-rmclean_cubes); a
 fully annotated example config in `cfg/rmclean-example.cfg`; a
 step-by-step walkthrough tying `rm_synthesis` and `rmclean_cubes`
-together in [docs/TUTORIAL.md](docs/TUTORIAL.md); a decision guide for
+together in [docs/user/TUTORIAL.md](docs/user/TUTORIAL.md); a decision guide for
 choosing between `abs_flux_floor`/`auto_nsigma` in
-[docs/EXAMPLES.md](docs/EXAMPLES.md#3-choosing-rm-clean-stopping-criteria).
+[docs/user/EXAMPLES.md](docs/user/EXAMPLES.md#3-choosing-rm-clean-stopping-criteria).

@@ -14,8 +14,8 @@ asynchronous tile-write overlap so a tile's write can proceed on a
 background thread concurrently with the next tile's read/compute, and the
 crash/correctness work that came with building all three. Three real,
 production-scale bugs were found and fixed during this cycle rather than
-in the field — all are documented in detail in `docs/ARCHITECTURE.md` and
-`planning/IO_PARALLEL_OPTIMISATION_PLAN.md`, since they carry lessons
+in the field — all are documented in detail in `docs/user/ARCHITECTURE.md` and
+`docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md`, since they carry lessons
 (about CFITSIO's threading model, its own internal bookkeeping, and what
 bit-identical output tests can and can't catch) that matter for anyone
 extending this code later.
@@ -146,7 +146,7 @@ that run:
 | CPU mask | 12.1s | 0% |
 
 (Percentages sum past 100% because stages genuinely overlap in wall time —
-see `docs/ARCHITECTURE.md` for the full breakdown.) Despite write now
+see `docs/user/ARCHITECTURE.md` for the full breakdown.) Despite write now
 dominating wall time, `io_overlap` still delivered a measured **~37% wall-
 time reduction** versus a fully-serial equivalent, in the same range
 predicted from earlier serial-read profiling — just achieved by hiding
@@ -175,7 +175,7 @@ tiles, now with `io_write_threads=8` added on top of the settings above:
 (*The plotter's own derived "CPU compute" figure runs slightly higher than
 this — a long-standing, pre-existing gap between log-timestamp-derived
 duration and the Fortran binary's internal stopwatch, unrelated to T6; see
-`docs/ARCHITECTURE.md`.)
+`docs/user/ARCHITECTURE.md`.)
 
 Write dropped by **~23x** — from 96% of wall time down to 6%, exactly the
 result T6 was built for. `tile_prep`'s absolute cost barely moved (733.5s
@@ -184,7 +184,7 @@ worry that 8 background write threads would meaningfully steal cycles
 from the concurrent compute pool during `io_overlap`'s overlap window —
 read/write threads are I/O-bound (mostly blocked on the actual disk
 operation), so the extra threads cost little even stacked on a
-fully-subscribed compute pool (see `docs/PARALLELISM.md`, "Thread-pool
+fully-subscribed compute pool (see `docs/user/PARALLELISM.md`, "Thread-pool
 interplay"). `tile_prep`'s *share* rose only because the denominator
 (total wall time) shrank so much everywhere else.
 

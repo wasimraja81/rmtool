@@ -180,7 +180,7 @@ Two rules, guarding two different hazards:
    separated. Rule 1 alone does not guarantee this (see postmortem
    below); rule 2 is what actually does. It remains in force unconditionally
    today under T6's raw-write path too — see the "Handle safety" note in
-   `docs/ARCHITECTURE.md` for why that's now stricter than strictly
+   `docs/user/ARCHITECTURE.md` for why that's now stricter than strictly
    necessary (but still cheap) rather than load-bearing.
 
 Both slots are joined unconditionally after the tile loop ends, since the
@@ -388,5 +388,5 @@ Pending validation:
   the actual write-throughput improvement from T6 — everything above is
   correctness validation on small dev-machine test data, not a
   production timing result. The Setonix run that motivated T6 (write at
-  96% of wall time, see `docs/ARCHITECTURE.md`) is the case this should
+  96% of wall time, see `docs/user/ARCHITECTURE.md`) is the case this should
   be measured against.

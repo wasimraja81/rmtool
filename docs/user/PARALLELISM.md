@@ -19,8 +19,8 @@ is), but each tile's read, write, and the boundary between consecutive
 tiles can each independently be made concurrent via three orthogonal cfg
 keys — `io_read_threads`, `io_write_threads`, and `io_overlap`. All three
 default to the fully serial behaviour below; see
-`docs/ARCHITECTURE.md` ("Parallel read/write" and "Async read/write
-overlap") and `planning/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full
+`docs/user/ARCHITECTURE.md` ("Parallel read/write" and "Async read/write
+overlap") and `docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full
 design, safety history, and postmortems.
 
 ```
@@ -132,7 +132,7 @@ that many threads is no longer negligible.
 | `OMP_NUM_THREADS` | All available cores | The only thread type here that's genuinely CPU-bound and wants a dedicated core continuously |
 | `io_read_threads` | Storage stripe count (e.g. `lfs getstripe`, typically 4–16) | Runs before compute starts, same thread — effectively free to raise |
 | `io_write_threads` | Same ballpark (4–16), not close to your full core count | Runs concurrently with the next tile's compute if `io_overlap=y`; I/O-bound so contention is mild at modest values |
-| `io_overlap` | `y` on parallel/networked storage with spare RAM; `n` on a single disk or tight RAM | Determines whether write(N) and read/compute(N+1) run concurrently at all — see `docs/ARCHITECTURE.md` ("When `io_overlap=y` can be detrimental") for the full RAM/disk-speed decision matrix |
+| `io_overlap` | `y` on parallel/networked storage with spare RAM; `n` on a single disk or tight RAM | Determines whether write(N) and read/compute(N+1) run concurrently at all — see `docs/user/ARCHITECTURE.md` ("When `io_overlap=y` can be detrimental") for the full RAM/disk-speed decision matrix |
 
 #### HPC scheduler sizing: request more CPUs than `OMP_NUM_THREADS`
 
@@ -334,7 +334,7 @@ binary, `use_async_pipeline` is unconditionally `.false.` regardless of
 staging, and each sub-block runs synchronously instead (`gpu send`/
 `gpu recv` notes, rendered as the swim-lane plotter's "GPU compute
 (synchronous fallback)" — see "Swim-lane plotting behaviour" in
-`docs/ARCHITECTURE.md`). Confirmed directly while regenerating this
+`docs/user/ARCHITECTURE.md`). Confirmed directly while regenerating this
 repo's own example plots: the plain `gpu_offload` binary produced zero
 async markers on a staged run, and switching only the binary (same cfg,
 same forced-small `gpu_vram_mib`) to `gpu_offload_hostomp` was what
@@ -456,7 +456,7 @@ schedule(dynamic)` over each tile's own pixels), but each pixel then
 runs its OWN independent Hogbom CLEAN loop — a variable number of
 iterations per pixel (bounded by `niter`, but usually stopping much
 earlier via `abs_flux_floor`/`auto_nsigma` — see
-`docs/APP_REFERENCE.md`), so `schedule(dynamic)` matters more here
+`docs/user/APP_REFERENCE.md`), so `schedule(dynamic)` matters more here
 than for `rm_synthesis`'s own uniform per-pixel cost: a static schedule
 would leave fast-converging pixels' threads idle while a few
 slow-converging ones finish.

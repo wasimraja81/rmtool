@@ -135,26 +135,28 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 
 ## Documentation
 
+### For users
+
 - **[QUICKSTART.md](QUICKSTART.md)** — Quick reference and build overview
-- **[docs/TUTORIAL.md](docs/TUTORIAL.md)** — Step-by-step walkthrough: build, generate sample data, run the full pipeline, inspect the output
-- **[docs/EXAMPLES.md](docs/EXAMPLES.md)** — Recipes for real scenarios: single-band vs. multi-band (matched/mismatched grid/resolution), choosing RM-CLEAN stopping criteria, memory/IO tuning, GPU vs. CPU, subimage extraction
-- **[docs/APP_REFERENCE.md](docs/APP_REFERENCE.md)** — Complete parameter reference for all 5 tools (what each does, every key, every default, output files)
-- **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
+- **[BUILD.md](BUILD.md)** — Comprehensive build system documentation, release tagging policy
+- **[docs/user/TUTORIAL.md](docs/user/TUTORIAL.md)** — Step-by-step walkthrough: build, generate sample data, run the full pipeline, inspect the output
+- **[docs/user/EXAMPLES.md](docs/user/EXAMPLES.md)** — Recipes for real scenarios: single-band vs. multi-band (matched/mismatched grid/resolution), choosing RM-CLEAN stopping criteria, memory/IO tuning, GPU vs. CPU, subimage extraction
+- **[docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md)** — Complete parameter reference for all 5 tools (what each does, every key, every default, output files)
 - **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference (`rm_synthesis` cfg parser specifically)
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
-- **[docs/PARALLELISM.md](docs/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
-- **[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
-- **[planning/IO_PARALLEL_OPTIMISATION_PLAN.md](planning/IO_PARALLEL_OPTIMISATION_PLAN.md)** — IO optimisation plan: parallel read/write, async overlap, and genuine write-throughput parallelism (T0-T6 all adopted)
-- **[planning/ENCAPSULATION_REFACTOR_PLAN.md](planning/ENCAPSULATION_REFACTOR_PLAN.md)** — Encapsulation refactor plan: config/tile-planner/IO-orchestration derived types, ticket-by-ticket (T0-T5, all adopted)
-- **[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)** — Multi-band Faraday tomography plan: config schema, frequency merge, cross-band geometry/resolution matching (`reproject_cubes`/`convolve_cubes`/`match_cubes`), beam-metadata propagation, end-to-end preprocessing tests, ticket-by-ticket (T0-T15, all adopted)
-- **[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)** — RM-CLEAN integration plan: core algorithm module (`rmclean_mod`), standalone tool (`rmclean_cubes`), mask-pattern caching, OpenMP parallelism, model-based peak refinement, memory-budgeted threaded/tiled block I/O, stopping-criteria redesign, ticket-by-ticket (T0-T10b done; T11 CLEAN-divergence criteria not yet started; GPU explicitly deferred)
-- **[CHANGELOG.md](CHANGELOG.md)** — Release history and key changes by version
-- **[docs/RELEASE_NOTES_2.0.md](docs/RELEASE_NOTES_2.0.md)** — Detailed release notes for tag 2.0
-- **[docs/RELEASE_NOTES_3.0.md](docs/RELEASE_NOTES_3.0.md)** — Detailed release notes for tag 3.0 (IO-efficiency milestone)
-- **[docs/RELEASE_NOTES_4.0.md](docs/RELEASE_NOTES_4.0.md)** — Detailed release notes for tag 4.0 (maintainability/documentation milestone)
-- **[docs/RELEASE_NOTES_4.1.md](docs/RELEASE_NOTES_4.1.md)** — Detailed release notes for tag 4.1 (diagnostics milestone)
-- **[docs/RELEASE_NOTES_5.0.md](docs/RELEASE_NOTES_5.0.md)** — Detailed release notes for 5.0 (multi-band Faraday tomography milestone; in preparation, not yet tagged)
-- **[docs/RELEASE_NOTES_6.0.md](docs/RELEASE_NOTES_6.0.md)** — Detailed release notes for 6.0 (RM-CLEAN integration milestone; in preparation, not yet tagged)
+- **[docs/user/ARCHITECTURE.md](docs/user/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
+- **[docs/user/PARALLELISM.md](docs/user/PARALLELISM.md)** — Parallelism and memory decomposition deep-dive
+- **[docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)** — Architecture rationale: tiling, RM chunking, CPU/GPU parallelization, offload strategy
+- **[docs/user/RELEASE_NOTES_1.0.md](docs/user/RELEASE_NOTES_1.0.md)** — R1.0 "Confluent Brahmaputra": what this release is and what's validated
+
+### Project history (internal)
+
+This package's engineering history — ticket-by-ticket planning docs and
+the internal pre-`R1.0` development changelog — is kept for the record
+rather than deleted, but isn't part of the day-to-day user path:
+[docs/dev/](docs/dev/) (planning docs) and
+[docs/dev/ARCHIVED/](docs/dev/ARCHIVED/) (superseded internal release
+notes and changelog, versions `1.0`–`6.0`, none of them ever tagged as
+a public release).
 
 ## Configuration
 
@@ -397,7 +399,7 @@ its byte offset (computed once via `FTGHAD`), relying only on the POSIX
 guarantee that concurrent writes to disjoint byte ranges of one file are
 safe — CFITSIO itself is closed for these two files as soon as that byte
 offset is fetched, before any tile write happens, so there's no shared
-handle left to corrupt. See `docs/ARCHITECTURE.md` ("Parallel write —
+handle left to corrupt. See `docs/user/ARCHITECTURE.md` ("Parallel write —
 `io_write_threads`") for the full root cause and the design.
 
 **`io_overlap`'s writes are still serialized against each other, by
@@ -411,7 +413,7 @@ image whose height isn't an exact multiple of the tile size — could
 dispatch its write before the previous tile's write had finished,
 corrupting CFITSIO's shared handle state at the time. Fixed and
 re-validated end-to-end on the exact case that crashed; see the T5
-postmortem in `docs/ARCHITECTURE.md` / `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`.)
+postmortem in `docs/user/ARCHITECTURE.md` / `docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md`.)
 This doesn't reduce the actual overlap benefit — tile N+1's
 read/mask/prep/compute/cubestat already run fully concurrently with
 write(N) regardless; only *dispatch* of write(N+1) waits for write(N) to
@@ -438,7 +440,7 @@ blocked on the actual disk/network operation rather than burning CPU, so
 a modest value (stripe count, typically 4–16) costs little even stacked
 on top of a fully-subscribed compute pool — just don't set it close to
 your full core count. Full mechanics (which threads share libgomp's pool
-and which don't) in `docs/PARALLELISM.md` ("Thread-pool interplay").
+and which don't) in `docs/user/PARALLELISM.md` ("Thread-pool interplay").
 
 **`io_overlap` is not a free win — check your RAM and disk before turning
 it on.** It doubles the RAM used by the per-tile output buffers (to let a
@@ -453,7 +455,7 @@ waiting on I/O:
 
 Rule of thumb: if you're RAM-constrained *and* not on a parallel
 filesystem (Lustre, multi-server NFS, cloud block storage), leave
-`io_overlap=n`. Full reasoning in `docs/ARCHITECTURE.md` under "When
+`io_overlap=n`. Full reasoning in `docs/user/ARCHITECTURE.md` under "When
 `io_overlap=y` can be detrimental" — when in doubt, time a short run both
 ways on your actual target machine; the swim-lane plotter (below) renders
 I/O read and I/O write as separate lanes specifically to make this cheap
@@ -461,8 +463,8 @@ to check.
 
 ## Recent Performance Enhancements
 
-`3.0`'s IO-efficiency milestone (T0-T6, see `docs/RELEASE_NOTES_3.0.md` and
-`planning/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full history):
+`3.0`'s IO-efficiency milestone (T0-T6, see `docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md` and
+`docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full history):
 
 - **Parallel reads** (`io_read_threads`): N independent read-only CFITSIO
   handles per input cube, each reading a disjoint channel range concurrently.
@@ -487,14 +489,14 @@ Real Setonix production validation (13308×11870 pixels, 288 channels,
 
 Write dropped ~23x — from 96% of wall time to 6% — by far the largest
 single lever in the tool to date. Full before/after breakdown by stage in
-`docs/RELEASE_NOTES_3.0.md`.
+`docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md`.
 
 Validation summary:
 - Build matrix: all four `OMP/GPU` variants compile with zero warnings.
 - Tests: `28/28` passing.
 - Production: end-to-end validated on real Setonix hardware against real
   ASKAP/EMU data — the exact case that originally crashed (see the T4/T5
-  postmortems in `docs/ARCHITECTURE.md`) now completes without error.
+  postmortems in `docs/user/ARCHITECTURE.md`) now completes without error.
 
 ## GPU Acceleration
 
@@ -553,7 +555,7 @@ dropped in favour of just `Threads active` (a count) -- the full ID list
 stopped being useful information once thread counts got into the teens.
 
 Design rationale and diagnostic interpretation notes are documented in
-[docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md).
+[docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md).
 
 Example swim-lane plots, current as of the I/O throughput (MB/s) panel and
 the "CPU stage" row's compute segment (both described above):
@@ -561,17 +563,17 @@ the "CPU stage" row's compute segment (both described above):
 Pipeline/stage-overlap view (async, double-buffered GPU dispatch --
 `gpu_offload_hostomp` binary, staged VRAM sub-blocks):
 
-![Swim-lane GPU async example](docs/images/swimlane_gpu_example.png)
+![Swim-lane GPU async example](docs/user/images/swimlane_gpu_example.png)
 
 Pipeline/stage-overlap view (synchronous-fallback GPU dispatch -- a tile
 that fits in one VRAM sub-block, so there's no double-buffering to overlap):
 
-![Swim-lane pipeline example](docs/images/swimlane_pipeline_example.png)
+![Swim-lane pipeline example](docs/user/images/swimlane_pipeline_example.png)
 
 CPU thread-detail view (`io_read_threads`/`io_write_threads`/`io_overlap`
 all active):
 
-![Swim-lane CPU thread example](docs/images/swimlane_cpu_thread_example.png)
+![Swim-lane CPU thread example](docs/user/images/swimlane_cpu_thread_example.png)
 
 ### GPU Validation Scope For Swim-Lane Diagnostics
 
@@ -726,7 +728,7 @@ it.
 
 Full design detail, verification evidence, and the underlying computation
 modules (`src/gaussft.f90`, `src/commonbeam.f90`) are documented in
-[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+[docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md](docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 (tickets T10-T14) and in each source file's own header comment.
 
 ## RM-CLEAN
@@ -743,7 +745,7 @@ bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
   abs_flux_floor=20uJy auto_nsigma=1.0 niter=500 gain=0.1
 # writes out_cleaned.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS;
 # full parameter reference (every key, default, and meaning) in
-# docs/APP_REFERENCE.md -- --help on the binary prints the same list
+# docs/user/APP_REFERENCE.md -- --help on the binary prints the same list
 ```
 
 CLEAN stops on any of three independent, freely-combinable criteria,
@@ -804,9 +806,9 @@ historical thesis-matching convention, unaffected unless set
 explicitly); whichever reference is actually used is recorded in a new
 `LSQREF` header keyword so `rmclean_cubes` never has to assume one.
 
-Full parameter reference: [docs/APP_REFERENCE.md](docs/APP_REFERENCE.md).
+Full parameter reference: [docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md).
 Full design detail and verification evidence are documented in
-[planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)
+[docs/dev/RMCLEAN_INTEGRATION_PLAN.md](docs/dev/RMCLEAN_INTEGRATION_PLAN.md)
 (tickets T0-T11) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own
 header comments.
 
@@ -883,8 +885,11 @@ rmtool/
 │   └── legacy/                Older standalone FITS utilities, not part of the build
 ├── cfg/                        Configuration files, examples, and ARCHIVED/ (63 historical configs);
 │                                example_beamLog.txt/.csv for convolve_cubes' ASCII beam format
-├── docs/                       Architecture, parallelism, and design deep-dives; release notes
-├── planning/                   IO optimisation plan and ticket history
+├── docs/
+│   ├── user/                   User-facing docs: tutorial, examples, app reference,
+│   │                            architecture/parallelism deep-dives, release notes
+│   └── dev/                    Internal ticket-by-ticket planning history, and
+│       └── ARCHIVED/            superseded pre-R1.0 release notes/changelog
 ├── scripts/                    Swim-lane plotting and benchmark tooling
 ├── tests/                      Regression suite (tests/run_tests.sh)
 ├── TODO/                       Historical development logs and assessments

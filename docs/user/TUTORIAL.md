@@ -16,7 +16,7 @@ make rmclean_cubes
 
 This produces `bin/rm_synthesis_release_cpu_omp` (also symlinked as
 `bin/rm_synthesis`) and `bin/rmclean_cubes`. See
-[QUICKSTART.md](../QUICKSTART.md) if `make` fails — it covers
+[QUICKSTART.md](../../QUICKSTART.md) if `make` fails — it covers
 prerequisites and every build variant.
 
 ## 2. Generate a small synthetic dataset
@@ -83,7 +83,7 @@ bin/rm_synthesis_release_cpu_omp tutorial-rmsynth.cfg
 This writes `tutorial_out.AMP.RMCUBE.FITS`, `tutorial_out.PHA.RMCUBE.FITS`,
 `tutorial_out.MASK.CUBE.FITS`, and `tutorial_out.NVALID.MAP.FITS` — the
 dirty (pre-CLEAN) RM cube. Every key here is explained in full in
-[docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis); the same
+[docs/user/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis); the same
 annotated example lives at `cfg/rmsynth-e2e-smalltest.cfg`.
 
 **Check the known sources were recovered:**
@@ -117,7 +117,7 @@ subtracting them), and `tutorial_cleaned.RESTORED.AMP/PHA.RMCUBE.FITS`
 final, publication-style result). CLEAN stops per-pixel on whichever of
 `abs_flux_floor`/`auto_nsigma`/`niter` fires first; every key is
 explained in full in
-[docs/APP_REFERENCE.md](APP_REFERENCE.md#5-rmclean_cubes).
+[docs/user/APP_REFERENCE.md](APP_REFERENCE.md#5-rmclean_cubes).
 
 For this small, low-noise synthetic cube, expect a stop-reason summary
 close to:
@@ -178,19 +178,19 @@ scripts/run_pipeline.sh cfg/pipeline-example.cfg
 `cfg/pipeline-example.cfg` is a fully annotated template — edit its
 paths for your own data, or see `cfg/pipeline-e2e-smalltest.cfg` for a
 complete working example using this same synthetic fixture. See
-[README.md](../README.md#end-to-end-pipeline) for the full chaining/
+[README.md](../../README.md#end-to-end-pipeline) for the full chaining/
 provenance behaviour.
 
 ## Where to go next
 
-- [docs/EXAMPLES.md](EXAMPLES.md) — recipes for real scenarios: multi-
+- [docs/user/EXAMPLES.md](EXAMPLES.md) — recipes for real scenarios: multi-
   band with matched/mismatched grid or resolution, choosing RM-CLEAN
   stopping criteria, memory/IO tuning, GPU vs. CPU, subimage extraction.
-- [docs/APP_REFERENCE.md](APP_REFERENCE.md) — every parameter,
+- [docs/user/APP_REFERENCE.md](APP_REFERENCE.md) — every parameter,
   every tool, fully explained.
-- [QUICKSTART.md](../QUICKSTART.md) — build variants, GPU builds, the
+- [QUICKSTART.md](../../QUICKSTART.md) — build variants, GPU builds, the
   full validation test suite, running on real data.
-- [README.md](../README.md) — motivation, feature overview, multi-band
+- [README.md](../../README.md) — motivation, feature overview, multi-band
   preprocessing toolchain, tile memory/IO-parallelism tuning.
 - `cfg/rmsynth.cfg`, `cfg/rmclean-example.cfg` — fully annotated
   templates to copy and adapt for real data.

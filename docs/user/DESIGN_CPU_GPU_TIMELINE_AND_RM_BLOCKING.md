@@ -1,7 +1,7 @@
 # Design Note: Memory, Parallelisation, and Offload Strategy
 
 > Canonical-source note:
-> - The master release architecture document is `docs/ARCHITECTURE.md`.
+> - The master release architecture document is `docs/user/ARCHITECTURE.md`.
 > - Planning/proposal material is kept under `planning/`.
 > - This file is retained as a focused deep-dive view for timeline/RM-chunking details.
 
@@ -109,7 +109,7 @@ The primary driver is scalable processing for very large cubes under constrained
   below, which is categorical) so a dip or spike lines up with the Gantt
   bar directly above it. One flat segment per I/O interval at that
   interval's average MB/s (`bytes / duration`), not a continuously sampled
-  signal -- see `docs/ARCHITECTURE.md` ("Swim-lane plotting behaviour").
+  signal -- see `docs/user/ARCHITECTURE.md` ("Swim-lane plotting behaviour").
 - `Stage time totals` -- bottom panel, horizontal bar chart of total
   wall-clock seconds per stage, largest on top, labelled with seconds and
   % of the run's total wall time. Percentages can sum past 100% when
@@ -202,7 +202,7 @@ The primary driver is scalable processing for very large cubes under constrained
 
 This section predates, and is superseded by, the `3.0` IO-efficiency
 milestone (`io_read_threads`/`io_write_threads`/`io_overlap`, T0-T6) --
-see `docs/RELEASE_NOTES_3.0.md` and `CHANGELOG.md` for what's actually
+see `docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md` and `docs/dev/ARCHIVED/CHANGELOG.md` for what's actually
 most recent; this file's scope is timeline/RM-chunking, not I/O.
 
 ## Future Work

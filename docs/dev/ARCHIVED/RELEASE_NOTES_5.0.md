@@ -5,8 +5,8 @@ validation against the complete 23GB ASKAP cube still pending before an
 actual `main` release. T13 (`match_cubes`) and T14 (`CASAMBM`/`BEAMS`
 propagation for the cross-band toolchain) landed on
 `multi-band-tomography` after that tag and are covered below, but not yet
-merged back to `develop` or re-tagged.** See `CHANGELOG.md`'s own `[5.0]`
-entry and `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T14) for
+merged back to `develop` or re-tagged.** See `docs/dev/ARCHIVED/CHANGELOG.md`'s own `[5.0]`
+entry and `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T14) for
 the living record this document summarizes.
 
 ## Summary
@@ -203,7 +203,7 @@ it.
 - `reproject_cubes`, `gaussft_mod`, `commonbeam_mod`, and `convolve_cubes`
   each independently verified against real ASKAP data, independently
   computed ground truth (Python/astropy, `radio_beam`), or both — see
-  `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` tickets T10-T11 for the full
+  `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md` tickets T10-T11 for the full
   evidence trail.
 - `rm_synthesis` beam-metadata propagation verified by injection (real
   BMAJ/BMIN/BPA, `CASAMBM=T`/`BEAMS`, mismatched multi-band beams) and by
@@ -215,7 +215,7 @@ it.
   alone byte-identical to the corresponding standalone tool) and chaining
   equivalence (both chain orders bit-identical to the two old standalone
   tools run back-to-back through a real disk intermediate) — see
-  `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T13.
+  `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T13.
 - Toolchain-wide `CASAMBM`/`BEAMS` propagation verified against the real
   5-column CASA layout confirmed on a real ASKAP cube's own `BEAMS`
   table: `reproject_cubes` output table byte-identical to the input's
@@ -232,7 +232,7 @@ it.
   before), and every new multi-band code path is gated behind "more than
   one band" checks that are dead code for `nbands=1`.
 - `rm_synthesis`'s Q/U/I/mask input cubes are now opened `READONLY`
-  instead of `READWRITE` (a fix, not a new feature — see `CHANGELOG.md`).
+  instead of `READWRITE` (a fix, not a new feature — see `docs/dev/ARCHIVED/CHANGELOG.md`).
   No behavioural change for any correct usage; closes a real, if latent,
   risk to input data.
 - Two new standalone binaries (`reproject_cubes`, `convolve_cubes`) with
@@ -261,7 +261,7 @@ it.
 - `rm_synthesis` beam-metadata propagation and input-safety fixes;
   matching `CASAMBM`/`BEAMS` propagation across the whole preprocessing
   toolchain (`reproject_cubes`/`convolve_cubes`/`match_cubes`).
-- Full documentation pass: README, `docs/ARCHITECTURE.md`, `BUILD.md`,
+- Full documentation pass: README, `docs/user/ARCHITECTURE.md`, `BUILD.md`,
   `QUICKSTART.md`, `cfg/CONFIG_README.md` all updated to cover the new
   toolchain (previously undocumented anywhere, including the earlier
   `reproject_cubes` work).

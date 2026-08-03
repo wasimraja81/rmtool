@@ -5,7 +5,7 @@ set -euo pipefail
 # -> rm_synthesis -> rmclean_cubes (optional), driven by one small pipeline
 # cfg (cfg/pipeline-example.cfg is a documented template). Ticket: the
 # user's own item-4 ask, alongside item 3 ("run a full test on moderately
-# big real data") -- see planning/RMCLEAN_INTEGRATION_PLAN.md's own T4
+# big real data") -- see docs/dev/RMCLEAN_INTEGRATION_PLAN.md's own T4
 # entry and this script's own git history for the design discussion.
 #
 # This script invents NO new algorithmic options. Every stage tool

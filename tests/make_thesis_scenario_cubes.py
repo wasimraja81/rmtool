@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Synthetic P-band / L-band Q/U cube generator reproducing the multi-band
-tomography scenario in planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 10,
+tomography scenario in docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 10,
 grounded in Raja (2014) "Faraday Slicing Polarized Radio Sources",
 Chapter 6 Table 6.1/6.2.
 

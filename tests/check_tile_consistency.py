@@ -10,7 +10,7 @@ differently depending on the runtime memory alignment of clean_complex's
 own stack-allocated arguments -- which genuinely differs between tile
 sizes (different automatic-array footprints in the enclosing call frames),
 even though every value going INTO clean_complex is bit-identical (verified
-directly, planning/RMCLEAN_INTEGRATION_PLAN.md ticket T4a). Confirmed this
+directly, docs/dev/RMCLEAN_INTEGRATION_PLAN.md ticket T4a). Confirmed this
 is a real, pre-existing floating-point reassociation effect (not a tiling
 logic bug): the SAME two tile configurations produce byte-identical output
 when built at -O0 (no auto-vectorization). PHA at near-zero AMP is

@@ -4,12 +4,16 @@
 
 ### Release Tagging Policy
 
-- Official release tags use `MAJOR.MINOR` format (for example: `1.0`, `1.1`, `2.0`, `3.0`).
-- Current formal release: `4.1` (on `main`).
-- `5.0` (multi-band Faraday tomography) is release-ready on the
-  `multi-band-tomography` branch — see
-  [docs/RELEASE_NOTES_5.0.md](docs/RELEASE_NOTES_5.0.md) — but not yet
-  merged to `develop`/`main` or tagged.
+- Public release tags use `R<major>.<minor>` format (for example: `R1.0`,
+  `R1.1`, `R2.0`), each carrying a short alias (e.g. `R1.0` is
+  "Confluent Brahmaputra") — see
+  [docs/user/RELEASE_NOTES_1.0.md](docs/user/RELEASE_NOTES_1.0.md) for
+  the current release.
+- `R1.0` is the package's first public release. Earlier `1.0`–`6.0`
+  version numbers were this project's own internal development
+  progression, never tagged as a public release — that history is kept
+  for the record in [docs/dev/ARCHIVED/](docs/dev/ARCHIVED/) but is not
+  part of the public release line.
 
 ### Building with Make
 

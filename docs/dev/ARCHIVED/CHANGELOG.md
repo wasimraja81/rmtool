@@ -10,7 +10,7 @@ complex CLEAN, Gaussian restore) against REAL dirty AMP/PHA cubes
 `rm_synthesis` itself writes, rather than only the synthetic spectra its
 own unit test programs built in memory. Full design rationale, decisions
 recorded with the user, and ticket-by-ticket verification evidence lives
-in `planning/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T10b done; T11 not
+in `docs/dev/RMCLEAN_INTEGRATION_PLAN.md` (tickets T0-T10b done; T11 not
 yet started) — this entry is a summary, not a replacement for that
 record.
 
@@ -353,7 +353,7 @@ record.
   specifically but shipped alongside it; full suite unaffected
   (121/121, unchanged).
 
-### Added — Multi-band preprocessing: end-to-end test coverage (ticket T15, `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md`)
+### Added — Multi-band preprocessing: end-to-end test coverage (ticket T15, `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md`)
 - Closed a real, unaddressed gap found while writing user-facing
   documentation: existing multi-band tests either exercised
   `rm_synthesis`'s own schema/geometry-mismatch REJECTION in isolation,
@@ -395,7 +395,7 @@ actually be combined that way; and beam metadata (`BMAJ`/`BMIN`/`BPA`,
 — rather than silently dropped at any stage. Full design rationale,
 decisions recorded with the user, and ticket-by-ticket verification
 evidence for all of this lives in
-`planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T14) — this entry is
+`docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md` (tickets T0-T14) — this entry is
 a summary, not a replacement for that record.
 
 ### Added — multi-band RM synthesis (`rm_synthesis`, tickets T1-T9)
@@ -655,7 +655,7 @@ model for a research (not HPC-expert) audience.
 - The per-tile write dispatch's field assembly is now a named
   `populate_write_job` call; the synchronisation code around it (the
   join-before-reuse/join-before-dispatch invariants documented in
-  `docs/ARCHITECTURE.md`, the two safeguards behind a real historical
+  `docs/user/ARCHITECTURE.md`, the two safeguards behind a real historical
   production SIGSEGV) is untouched, in its exact original order.
 - Read-side byte-count and thread-split arithmetic in the tile loop moved
   into two small named helpers (`compute_tile_read_bytes`,
@@ -669,7 +669,7 @@ model for a research (not HPC-expert) audience.
   `io_read_threads=4`, `io_write_threads=2`, real ASKAP-style cube) —
   confirmed data integrity and passed the structural
   no-overlapping-tile-writes check, the same invariant the historical
-  postmortem in `docs/ARCHITECTURE.md` was written to guard.
+  postmortem in `docs/user/ARCHITECTURE.md` was written to guard.
 
 ### Fixed
 - Swim-lane plotter (`scripts/plot_tile_async_swimlane.py`): the
@@ -695,7 +695,7 @@ tile-write overlap, and the crash/correctness work that came with
 building them. All planned tickets (T0-T6) are done and validated
 end-to-end on real Setonix production hardware, including T6's actual
 write-throughput gain (see Validation below). See
-`docs/RELEASE_NOTES_3.0.md` for the full writeup.
+`docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md` for the full writeup.
 
 ### Added
 - `io_read_threads` cfg key: N independent read-only CFITSIO handles per
@@ -798,14 +798,14 @@ write-throughput gain (see Validation below). See
   gain measured directly -- `io_write_threads=8` dropped write from
   2479.9s (96% of wall time) to 108.3s (6%), a ~23x reduction, taking
   total wall time from 2586.7s to 1945.4s (~25% faster end-to-end). Full
-  before/after table in `docs/RELEASE_NOTES_3.0.md`.
+  before/after table in `docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md`.
 
 ## [2.0] - 2026-07-17
 
 ### Added
 - Formalized release-cycle documentation:
-  - Added this `CHANGELOG.md`.
-  - Added `docs/RELEASE_NOTES_2.0.md`.
+  - Added this `docs/dev/ARCHIVED/CHANGELOG.md`.
+  - Added `docs/dev/ARCHIVED/RELEASE_NOTES_2.0.md`.
 
 ### Changed
 - Tile planner memory accounting split in `src/rm_synthesis.f90`:

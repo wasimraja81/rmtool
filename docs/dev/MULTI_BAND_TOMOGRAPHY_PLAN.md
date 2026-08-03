@@ -4,7 +4,7 @@ Branch: `multi-band-tomography` (from `develop`)
 
 **Status: T0-T14 all merged to `develop` and tagged `5.0-rc.1` (real-scale
 validation pending before an actual `main` release -- see
-`CHANGELOG.md`'s `[5.0]` entry and `docs/RELEASE_NOTES_5.0.md`). T13
+`docs/dev/ARCHIVED/CHANGELOG.md`'s `[5.0]` entry and `docs/dev/ARCHIVED/RELEASE_NOTES_5.0.md`). T13
 (`match_cubes`) and T14 (`CASAMBM`/`BEAMS` propagation for the cross-band
 toolchain) were implemented and verified on `multi-band-tomography` and
 merged into `develop` via `5e2291f` -- confirmed directly against git
@@ -132,7 +132,7 @@ Evidence, all from `src/rm_synthesis.f90` and `src/myfits_info.f90` on
 
 ## 4. Parallelism framework: what carries over, what doesn't
 
-Reference: `docs/PARALLELISM.md`, `docs/ARCHITECTURE.md`.
+Reference: `docs/user/PARALLELISM.md`, `docs/user/ARCHITECTURE.md`.
 
 **There is no MPI, and no multi-process/multi-node decomposition of any
 kind** (`grep -rniE "mpi_init|use mpi|mpif" src/ Makefile build.sh` — zero
@@ -265,7 +265,7 @@ maintained pipeline. The correctness gate is therefore the **primary and
 only** mechanism ensuring requirement 2a: every existing `tests/*.cfg` and
 `cfg/*.cfg` file, run unedited against the new code, must produce
 **bit-identical output** to the current `develop` baseline (the same "zero
-change in observable behaviour" bar `planning/ENCAPSULATION_REFACTOR_PLAN.md`
+change in observable behaviour" bar `docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`
 already applies to structural refactors in this codebase). Two
 implementation practices worth carrying into the ticket that does this
 work, to keep the single-entry-list case as close to "no extra floating
@@ -336,7 +336,7 @@ proves expensive in practice.
    breakdown is a nice-to-have, not a blocker.
 
 Each phase should get its own ticket(s) in the style of
-`planning/ENCAPSULATION_REFACTOR_PLAN.md` / `IO_PARALLEL_OPTIMISATION_PLAN.md`
+`docs/dev/ENCAPSULATION_REFACTOR_PLAN.md` / `IO_PARALLEL_OPTIMISATION_PLAN.md`
 (Objective/Scope/Change Set/Correctness Gate/Rollback Criteria/Effort).
 **T0 and T1 (covering the start of phase 1) are now written — see §9.** Later
 tickets (phase 1's remainder, phases 2-5) are deliberately not written yet;
@@ -510,12 +510,12 @@ resolved, plus one follow-up decision (0) reached after the rest:
 - Any change to the numerical RM-synthesis kernel itself
   (`extract_general_setup`, `tile_extract_gpu_rm_blocked`) beyond how many
   channels it's handed — same guardrail this repo already applies in
-  `planning/ENCAPSULATION_REFACTOR_PLAN.md`.
+  `docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`.
 
 ## 9. Tickets
 
 Ticket format follows this repo's existing convention
-(`planning/ENCAPSULATION_REFACTOR_PLAN.md`, `planning/IO_PARALLEL_OPTIMISATION_PLAN.md`):
+(`docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`, `docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md`):
 Objective / Scope / Change Set / Correctness Gate / Rollback Criteria /
 Effort, each getting an **Evidence (...)** section appended once done.
 
@@ -527,7 +527,7 @@ Effort, each getting an **Evidence (...)** section appended once done.
   `develop` behaviour before any multi-band code changes land, so every
   later ticket's bit-identical correctness gate (§5, §7 decision 0) has a
   concrete baseline to diff against — the same purpose T0 served in
-  `planning/ENCAPSULATION_REFACTOR_PLAN.md`, adapted for this branch. This
+  `docs/dev/ENCAPSULATION_REFACTOR_PLAN.md`, adapted for this branch. This
   step matters more here than it did there: that effort's baseline was a
   safety net for a refactor with no algorithmic change intended anywhere;
   this effort's own §7 decision 0 explicitly gave up the "bit-identical by
@@ -1530,7 +1530,7 @@ still-open gap -- see T9 below.
   optional enhancement, and matters for large multi-band cubes.
 - **Objective:** remove the blanket
   `cfg%io_read_threads.gt.1 .or. cfg%io_overlap` stop-check for
-  `nbands>1` ([rm_synthesis.f90:932-936](../src/rm_synthesis.f90#L932-L936)),
+  `nbands>1` ([rm_synthesis.f90:932-936](../../src/rm_synthesis.f90#L932-L936)),
   following the same discipline as T6/T7/T8: investigate by code
   inspection first (is the restriction genuinely necessary, or was it
   over-cautious like channel subimaging/GPU turned out to be?), scope
@@ -1546,12 +1546,12 @@ still-open gap -- see T9 below.
 - **Evidence (2026-07-22):** Investigated by code inspection before
   touching anything, per the user's direct challenge to justify the
   restriction. Found: the `io_read_threads` parallel channel-split read
-  ([rm_synthesis.f90:3391-3404](../src/rm_synthesis.f90#L3391-L3404))
+  ([rm_synthesis.f90:3391-3404](../../src/rm_synthesis.f90#L3391-L3404))
   only ever touches the *reference* band's own channel range and buffer
   offset -- the other bands' reads happen afterward, sequentially,
   entirely outside that parallel region, so there is no data race to
   introduce. The `io_overlap` ping-pong double-buffering
-  ([rm_synthesis.f90:2350-2364](../src/rm_synthesis.f90#L2350-L2364)) is
+  ([rm_synthesis.f90:2350-2364](../../src/rm_synthesis.f90#L2350-L2364)) is
   sized from `nz_out`, already the correct post-merge multi-band total at
   that point in the program, and the write-dispatch logic
   (`populate_write_job`) operates purely on already-merged output tile
@@ -1781,7 +1781,7 @@ still-open gap -- see T9 below.
     since RM synthesis itself does not depend on beam metadata for
     correctness.
   - `rwmode` changed from 1 to 0 for units 21/22/40/45. Also brings
-    this file in line with `docs/ARCHITECTURE.md`'s own documented
+    this file in line with `docs/user/ARCHITECTURE.md`'s own documented
     CFITSIO lesson (a real historical SIGSEGV, see its "History:
     `io_write_threads>1` was unsafe" postmortem): CFITSIO aliases
     repeat `READWRITE` opens of an already-open file onto one shared
@@ -2060,7 +2060,7 @@ still-open gap -- see T9 below.
 ### T15 — End-to-End Preprocessing Test: Genuinely Mismatched Bands, Fixed, Correct Answer Recovered
 
 **Gap found, not assumed:** while writing user-facing documentation
-(`docs/EXAMPLES.md`, a scenario cookbook covering "my bands don't share
+(`docs/user/EXAMPLES.md`, a scenario cookbook covering "my bands don't share
 a sky grid/resolution"), the user asked directly whether a multi-band
 *test* backs the recipes being documented -- prompting a check of
 `tests/run_tests.sh`'s actual coverage rather than assuming it existed.

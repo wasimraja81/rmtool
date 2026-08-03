@@ -31,7 +31,7 @@ Standalone tools, own binaries, independent of the Core Runtime build graph
 above -- prepare mismatched-geometry/mismatched-resolution bands for a
 multi-band `rm_synthesis` run. See "Cross-Band Preprocessing Toolchain"
 below for the architecture, and
-[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](../planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+[docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md](../dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 (tickets T10-T14) for full design/verification detail.
 - `src/reproject_cubes.f90`: reprojects cubes onto a common sky grid
   (Starlink AST + `astResampleR`).
@@ -53,7 +53,7 @@ below for the architecture, and
 ### RM-CLEAN
 Standalone tool, own binary, independent of the Core Runtime build graph --
 post-processes a REAL dirty AMP/PHA cube `rm_synthesis` itself wrote. See
-[planning/RMCLEAN_INTEGRATION_PLAN.md](../planning/RMCLEAN_INTEGRATION_PLAN.md)
+[docs/dev/RMCLEAN_INTEGRATION_PLAN.md](../dev/RMCLEAN_INTEGRATION_PLAN.md)
 (tickets T0-T2) for full design/verification detail.
 - `src/rmclean.f90` (`rmclean_mod`): pure computation, no FITS I/O of its
   own -- Högbom-style complex CLEAN, Gaussian restore, RMSF/dirty-beam
@@ -384,7 +384,7 @@ tile geometry, `io_read_threads`, `io_write_threads`, `io_overlap` —
 generalized from `rm_synthesis`'s 2 named pixel-cube outputs (AMP/PHA)
 to `rmclean_cubes`'s 2 inputs + 6 outputs (CLEAN/RESID/RESTORED x
 AMP/PHA). Full design/evidence in
-`planning/RMCLEAN_INTEGRATION_PLAN.md` T4a-T4d. Two things found while
+`docs/dev/RMCLEAN_INTEGRATION_PLAN.md` T4a-T4d. Two things found while
 validating that port are worth recording here since they bear directly
 on this section's own mechanism, not just on `rmclean_cubes`:
 
@@ -448,7 +448,7 @@ silently overflowing (and truncating the read) for any mask cube
 exceeding 2^31 total elements — a real dataset's own 4501×4501×288
 mask cube is 2.7x over that limit. Full root-cause and the fix
 (switching that one call to `FTGPVBLL`, CFITSIO's own 64-bit entry
-point) are in `planning/RMCLEAN_INTEGRATION_PLAN.md` ticket T10a.
+point) are in `docs/dev/RMCLEAN_INTEGRATION_PLAN.md` ticket T10a.
 
 T10b then asked the harder question directly: why does the mask need a
 separate whole-cube-resident path at all, when the float cubes already
@@ -597,7 +597,7 @@ read/write threads are I/O-bound (mostly blocked on the actual
 disk/network operation) rather than CPU-bound like compute, so the OS
 scheduler gives compute the core time whenever a read/write thread is
 blocked — but it is genuine core oversubscription, not something the
-runtime silently avoids. See `docs/PARALLELISM.md` ("Thread-pool
+runtime silently avoids. See `docs/user/PARALLELISM.md` ("Thread-pool
 interplay") for the full breakdown and a thread-count rule of thumb.
 
 **Double buffering.** `p_tile_arr`, `phi_tile_arr`, `mask_tile_arr`,
@@ -1019,7 +1019,7 @@ same at-a-glance baseline record the 2.0 entry provides:
 - Real Setonix production validation: write dropped from 96% to 6% of
   wall time (~23x reduction) with `io_write_threads=8`; total wall time
   fell ~25% end-to-end on a 13308×11870×288 ASKAP/EMU workload. Full
-  before/after breakdown in `docs/RELEASE_NOTES_3.0.md`.
+  before/after breakdown in `docs/dev/ARCHIVED/RELEASE_NOTES_3.0.md`.
 - Swim-lane plotter: separate I/O read/write lanes, stage-totals bar
   panel, I/O throughput (MB/s) panel, complete CPU-stage row (mask/prep/
   compute/cubestat), working GPU synchronous-fallback rendering.
@@ -1041,7 +1041,7 @@ is exactly the kind of silent correctness gap this project's design
 philosophy exists to close (loudly refuse or visibly warn, never silently
 produce a misleading answer). Full design rationale, decisions, and
 verification evidence are recorded in
-[planning/MULTI_BAND_TOMOGRAPHY_PLAN.md](../planning/MULTI_BAND_TOMOGRAPHY_PLAN.md)
+[docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md](../dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 (tickets T10-T14); this section is the architecture summary, not a
 duplicate of that record.
 

@@ -35,7 +35,7 @@ N_CHAN  = 200
 F_START = 550.0e6   # Hz
 F_STEP  =   1.0e6   # Hz
 
-# Multi-band tomography (T1 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+# Multi-band tomography (T1 ticket, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
 # a second synthetic band, same RA/Dec geometry (NX/NY/CRVAL/CRPIX/CDELT)
 # and the same injected SOURCES as the primary band above, but a distinct
 # frequency range -- for exercising the new N-band geometry-validation
@@ -171,7 +171,7 @@ def main() -> None:
     fits.PrimaryHDU(data=q_cube, header=hdr).writeto(q_path, overwrite=True)
     fits.PrimaryHDU(data=u_cube, header=hdr).writeto(u_path, overwrite=True)
 
-    # Multi-band tomography (T5 ticket, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+    # Multi-band tomography (T5 ticket, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
     # split the primary band's own already-built arrays (not regenerated)
     # into two CONTIGUOUS halves, channels 1..100 and 101..200 -- for the
     # split-band identity test (contiguous multi-band split must reproduce
@@ -233,7 +233,7 @@ def main() -> None:
         q_path2_mismatch, overwrite=True)
 
     # Deliberately BOTH geometry- AND resolution-mismatched variant of
-    # band 2 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md T15): for a genuine
+    # band 2 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md T15): for a genuine
     # END-TO-END preprocessing test -- reproject_cubes/convolve_cubes/
     # match_cubes actually fixing real mismatches and rm_synthesis then
     # recovering the known sources, not just rm_synthesis's own

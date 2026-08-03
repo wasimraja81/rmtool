@@ -4,8 +4,8 @@ Status: **T0-T10b done on the `rmclean-integration` branch; T11 (CLEAN
 divergence/noise-wasting-compute stopping criteria) planned, not yet
 started. Not yet merged to `develop`/`main`, and no git tag has been cut
 — this document is prepared ahead of that decision, not a record of one
-already made.** See `CHANGELOG.md`'s own `[Unreleased] - RM-CLEAN
-integration` entry and `planning/RMCLEAN_INTEGRATION_PLAN.md` (the full
+already made.** See `docs/dev/ARCHIVED/CHANGELOG.md`'s own `[Unreleased] - RM-CLEAN
+integration` entry and `docs/dev/RMCLEAN_INTEGRATION_PLAN.md` (the full
 ticket-by-ticket record, including every dead end and how it was found)
 for the living record this document summarizes.
 
@@ -214,10 +214,10 @@ instead of running out of memory.
   regression fixture built directly from the real dataset that exposed
   the mask-read bug.
 - Full documentation pass: `README.md`, `QUICKSTART.md`,
-  `docs/ARCHITECTURE.md`, `docs/PARALLELISM.md`, `CHANGELOG.md`, and
-  three new docs — `docs/APP_REFERENCE.md` (complete parameter
-  reference for all 5 tools), `docs/TUTORIAL.md` (a step-by-step
-  walkthrough), and `docs/EXAMPLES.md` (a scenario cookbook: multi-band
+  `docs/user/ARCHITECTURE.md`, `docs/user/PARALLELISM.md`, `docs/dev/ARCHIVED/CHANGELOG.md`, and
+  three new docs — `docs/user/APP_REFERENCE.md` (complete parameter
+  reference for all 5 tools), `docs/user/TUTORIAL.md` (a step-by-step
+  walkthrough), and `docs/user/EXAMPLES.md` (a scenario cookbook: multi-band
   with matched/mismatched grid or resolution, choosing RM-CLEAN
   stopping criteria, memory/IO tuning, GPU vs. CPU, subimage
   extraction) — RM-CLEAN had previously been documented only in the

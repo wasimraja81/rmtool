@@ -178,7 +178,7 @@ clean-all:
 	@echo "✓ Cleaned all build artifacts for every mode"
 
 # reproject_cubes: standalone pre-rm-synthesis geometry-matching tool
-# (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md). Reprojects two or more FITS
+# (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md). Reprojects two or more FITS
 # cubes onto a common grid -- not tied to the multi-band-tomography "band"
 # concept specifically, minimum input is just two cubes. Independent of
 # the main rm_synthesis build graph -- own binary, own AST/OpenMP
@@ -310,7 +310,7 @@ $(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbea
 # rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
 # rmclean.f90, pure computation, no FITS I/O of its own -- mirrors
 # gaussft_mod/commonbeam_mod's own split) against real dirty AMP/PHA
-# cubes rm_synthesis itself wrote. planning/RMCLEAN_INTEGRATION_PLAN.md
+# cubes rm_synthesis itself wrote. docs/dev/RMCLEAN_INTEGRATION_PLAN.md
 # T2. Needs FFTW_LIBS (rmclean_mod's own restore/interp FFTW calls) plus
 # CFITSIO_LIB -- no AST dependency, this tool never resamples anything.
 RMCLEAN_CUBES_BINDIR ?= bin

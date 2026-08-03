@@ -1,6 +1,6 @@
 # Examples: Choosing and Combining Parameters for Real Scenarios
 
-[docs/TUTORIAL.md](TUTORIAL.md) walks through one linear path end to
+[docs/user/TUTORIAL.md](TUTORIAL.md) walks through one linear path end to
 end. This document is different: a set of independent recipes for
 specific situations — "my bands don't share a sky grid," "I don't know
 whether to stop CLEAN on flux or on sigma," "how much memory should I
@@ -29,9 +29,9 @@ out explicitly rather than faked.
 If you have exactly one Q cube and one U cube, already on the same sky
 grid at the same resolution, you don't need any of the preprocessing
 tools below — just `rm_synthesis` directly. See
-[docs/TUTORIAL.md](TUTORIAL.md) for the full walkthrough (build,
+[docs/user/TUTORIAL.md](TUTORIAL.md) for the full walkthrough (build,
 generate a test cube, run, inspect the output) and
-[docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis) for every
+[docs/user/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis) for every
 config key. The rest of this document assumes you've already done that
 once and are now facing a more specific situation.
 
@@ -51,7 +51,7 @@ tests (`tests/run_tests.sh` sections 38-40) — not just commands that
 happened to work once when this document was written. Each test takes
 genuinely mismatched synthetic data, runs it through the exact recipe
 shown, and confirms `rm_synthesis` recovers the known injected sources
-at the end; see `planning/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T15.
+at the end; see `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T15.
 
 ### 2a. Bands already matched — no preprocessing needed
 
@@ -113,7 +113,7 @@ infileU = bandA.U.fits,bandB.U_REPROJ.FITS
 `mode=reference` pins the output grid to the reference file's own
 extent (what was done above); use `mode=intersection`/`mode=union` if
 you'd rather shrink to the overlap or grow to cover every input
-instead — see [docs/APP_REFERENCE.md](APP_REFERENCE.md#2-reproject_cubes).
+instead — see [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#2-reproject_cubes).
 
 ### 2c. Resolution mismatched, sky grid already matched — `convolve_cubes` only
 
@@ -136,7 +136,7 @@ pass `beamfiles=path/to/beamlog.txt,path/to/beamlog2.txt` instead (see
 `cfg/example_beamLog.txt`/`.csv` for the plain-text format). Output:
 `bandA.Q_CONV.FITS`, `bandB.Q_CONV.FITS` (do the same for the U files),
 each now sharing one common beam, ready for `rm_synthesis`. Full
-parameter list: [docs/APP_REFERENCE.md](APP_REFERENCE.md#3-convolve_cubes).
+parameter list: [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#3-convolve_cubes).
 
 ### 2d. Both mismatched — `match_cubes`, chained through memory
 
@@ -158,7 +158,7 @@ filtering ahead of interpolation avoids baking in aliasing error, and
 is usually cheaper too. Run Q and U through the same call together
 where possible so both land on the identical output grid by
 construction. Full detail:
-[docs/APP_REFERENCE.md](APP_REFERENCE.md#4-match_cubes).
+[docs/user/APP_REFERENCE.md](APP_REFERENCE.md#4-match_cubes).
 
 **Rule of thumb:** if you're not sure which situation you're in, just
 try `rm_synthesis` directly first (2a) — it will refuse loudly and
@@ -178,7 +178,7 @@ actually know about your data:
 |---|---|---|
 | You know your noise floor in physical flux units (e.g. from a previous run, or the survey's own sensitivity documentation) | `abs_flux_floor=<value>` alone | A direct, unambiguous "stop below this flux" — no per-pixel estimation involved, so it can't be fooled by an unusual sightline. |
 | You don't know the noise floor ahead of time, or it varies significantly across the image | `auto_nsigma=<n>` alone | Estimates each pixel's own noise from its own dirty spectrum — adapts automatically, no prior knowledge needed. |
-| Production runs on real data (recommended default) | **Both together** | Whichever fires first wins per pixel. `auto_nsigma` handles the typical case; `abs_flux_floor` is a safety net for the pixels where the per-pixel sigma estimate itself is untrustworthy (it can be biased for individual pixels even though it's accurate on average — see `planning/RMCLEAN_INTEGRATION_PLAN.md` ticket T9). |
+| Production runs on real data (recommended default) | **Both together** | Whichever fires first wins per pixel. `auto_nsigma` handles the typical case; `abs_flux_floor` is a safety net for the pixels where the per-pixel sigma estimate itself is untrustworthy (it can be biased for individual pixels even though it's accurate on average — see `docs/dev/RMCLEAN_INTEGRATION_PLAN.md` ticket T9). |
 | You're debugging, or want to see the FULL iteration history regardless of convergence | Neither — `niter` alone | CLEAN runs every pixel for the full `niter` budget; combine with `trace_ix`/`trace_iy`/`log_every` to inspect one pixel's own per-iteration trend. |
 
 **A worked example**, anchored to this dataset's own measured noise
@@ -285,7 +285,7 @@ their per-pixel work is different in shape:
   the tile planner, writes `tile_autotune.cfg` (a suggested
   `tile_ra`/`tile_dec` you can copy back into your real cfg) and
   `runtime_estimate.txt`, then exits — no pixel data touched, no output
-  written. See [docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
+  written. See [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
 - **GPU runs** (`rm_synthesis`/`rmclean_cubes` only — the three
   preprocessing tools have no GPU path) budget device memory separately
   via `mem_frac_vram`/`gpu_vram_mib` — unrelated to `mem_frac_ram`,
@@ -294,12 +294,12 @@ their per-pixel work is different in shape:
 Full mechanics for `rm_synthesis`/`rmclean_cubes` (the exact per-pixel
 byte formula, the auto-tiling shrink policy, and the
 `io_read_threads`/`io_write_threads`/`io_overlap` keys that ride
-alongside tile sizing) are in [docs/PARALLELISM.md](PARALLELISM.md) and
+alongside tile sizing) are in [docs/user/PARALLELISM.md](PARALLELISM.md) and
 README's own "Tile Memory Planning and I/O Parallelism" section. For
 `reproject_cubes`/`convolve_cubes`/`match_cubes`, the equivalent
 per-tool detail (their own `mem_frac_ram`/`io_overlap` keys and exact
 defaults) is in each tool's own section of
-[docs/APP_REFERENCE.md](APP_REFERENCE.md) — this EXAMPLES.md section is deliberately
+[docs/user/APP_REFERENCE.md](APP_REFERENCE.md) — this EXAMPLES.md section is deliberately
 just the decision guide, not the full mechanism.
 
 ---
@@ -335,7 +335,7 @@ actually hurt):
 - **CPU (OpenMP)** — `make OMP=1 GPU=0`, then any binary without a
   `gpu_offload` tag. Use this unless you specifically have a GPU
   available and a large enough cube that offload is worth the setup.
-  This is what [docs/TUTORIAL.md](TUTORIAL.md) uses throughout.
+  This is what [docs/user/TUTORIAL.md](TUTORIAL.md) uses throughout.
 - **GPU offload** — `make GPU=1`, `use_gpu=y` in your cfg. On the
   hardware validated to date, GPU throughput is bounded by host-device
   transfer bandwidth more than raw GPU compute — worth it for large
@@ -378,4 +378,4 @@ excluding a known-bad edge of the band without a separate
 result on the cutout, set `subim=n` (or delete the `subim_*` keys
 entirely — they're ignored when `subim=n`) and run the full cube.
 
-Full key list: [docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
+Full key list: [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
