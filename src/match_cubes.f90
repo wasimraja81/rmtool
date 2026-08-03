@@ -49,7 +49,7 @@
 !    [order=convolve_reproject|reproject_convolve]
 !    infiles=<file1>[,<file2>...]
 !    [footprint_mode=intersection|union|reference] [reffile=<reference_file>]
-!    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]
+!    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]
 !    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]
 !    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>] [outsuffix=<suffix>]
 !    [npts=<n>] [khachiyan_tol=<tol>] [manifest=<path>]
@@ -170,8 +170,10 @@ program match_cubes
    character(len=512) :: reffile
    logical :: seen_footprint_mode, seen_reffile
 
-   character(len=512) :: badchan_file
-   logical :: have_badchan_file
+   ! badchan_file: one entry per infile, same comma-list convention as
+   ! beamfiles -- genuinely per-band (T16, planning/MULTI_BAND_TOMOGRAPHY_
+   ! PLAN.md), unlike the single shared list this used to be.
+   character(len=512) :: badchan_file(max_inputs)
    logical :: have_target
    real(dp) :: target_bmaj, target_bmin, target_bpa
    real(dp) :: max_common_bmaj
@@ -321,12 +323,6 @@ program match_cubes
       allocate(bmaj_f(max_inputs, max_channels), bmin_f(max_inputs, max_channels))
       allocate(bpa_f(max_inputs, max_channels), isbad_f(max_inputs, max_channels))
 
-      n_badchan = 0
-      if (have_badchan_file) then
-         call read_badchan_file(badchan_file, badchan_list, n_badchan, status)
-         if (status.ne.0) stop 1
-      endif
-
       do i = 1, n_inputs
          call read_axis_info(infiles(i), naxis_f(i), sky1_f(i), sky2_f(i),&
          &freq_axis_f(i), naxes_f(i,:), cdelt1_f(i), cdelt2_f(i), status)
@@ -349,6 +345,11 @@ program match_cubes
             stop 1
          endif
 
+         n_badchan = 0
+         if (len_trim(badchan_file(i)).gt.0) then
+            call read_badchan_file(badchan_file(i), badchan_list, n_badchan, status)
+            if (status.ne.0) stop 1
+         endif
          call apply_badchan_list(badchan_list, n_badchan, nfreq_f(i), isbad_f(i,1:nfreq_f(i)))
 
          write(*,'(A,A,A,I0,A,I0,A)') 'Read ', trim(infiles(i)), ': ', nfreq_f(i),&
@@ -607,7 +608,7 @@ contains
    subroutine parse_args(status)
       integer, intent(out) :: status
       character(len=512) :: this_arg, cli_key, cli_val, cfgfile
-      character(len=512) :: raw_infiles, raw_beamfiles
+      character(len=512) :: raw_infiles, raw_beamfiles, raw_badchan_file
       integer :: argc, iarg
       logical :: has_kv, have_cfgfile, seen_infiles, seen_stages
 
@@ -624,7 +625,6 @@ contains
       seen_footprint_mode = .false.
       reffile = ' '
       seen_reffile = .false.
-      have_badchan_file = .false.
       badchan_file = ' '
       have_target = .false.
       target_bmaj = 0.0d0
@@ -641,6 +641,7 @@ contains
       khachiyan_tol = 1.0d-5
       raw_infiles = ' '
       raw_beamfiles = ' '
+      raw_badchan_file = ' '
       have_cfgfile = .false.
       seen_infiles = .false.
 
@@ -676,14 +677,14 @@ contains
                return
             endif
             call apply_kv(trim(cli_key), trim(cli_val), raw_infiles,&
-            &raw_beamfiles, seen_infiles, seen_stages, status)
+            &raw_beamfiles, raw_badchan_file, seen_infiles, seen_stages, status)
             if (status.ne.0) return
             iarg = iarg + 1
          endif
       enddo
 
       if (have_cfgfile) call read_cfg_file(cfgfile, raw_infiles, raw_beamfiles,&
-      &seen_infiles, seen_stages, status)
+      &raw_badchan_file, seen_infiles, seen_stages, status)
       if (status.ne.0) return
 
       if (.not. seen_infiles .or. .not. seen_stages) then
@@ -739,6 +740,18 @@ contains
             call cfg_csv_get_item(raw_beamfiles, i, beamfiles(i))
          enddo
       endif
+      if (len_trim(raw_badchan_file).gt.0) then
+         if (cfg_csv_count(raw_badchan_file).ne.n_inputs) then
+            write(*,*) 'ERROR: badchan_file must list exactly ', n_inputs,&
+            &' entries (one per infile; leave an entry empty -- e.g.',&
+            &' ",file2.txt" -- for a file with no manual bad-channel list)'
+            status = -1
+            return
+         endif
+         do i = 1, n_inputs
+            call cfg_csv_get_item(raw_badchan_file, i, badchan_file(i))
+         enddo
+      endif
 
       if ((trim(stages).eq.'reproject' .or. trim(stages).eq.'both')) then
          if (.not. seen_footprint_mode) then
@@ -771,10 +784,10 @@ contains
       endif
    end subroutine parse_args
 
-   subroutine apply_kv(key, val, raw_infiles, raw_beamfiles, seen_infiles,&
-   &seen_stages, status)
+   subroutine apply_kv(key, val, raw_infiles, raw_beamfiles, raw_badchan_file,&
+   &seen_infiles, seen_stages, status)
       character(len=*), intent(in) :: key, val
-      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles
+      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles, raw_badchan_file
       logical, intent(inout) :: seen_infiles, seen_stages
       integer, intent(out) :: status
       integer :: ios
@@ -804,8 +817,7 @@ contains
          reffile = val
          seen_reffile = .true.
       case ('badchan_file')
-         badchan_file = val
-         have_badchan_file = .true.
+         raw_badchan_file = val
       case ('target_bmaj')
          read(val, *, iostat=ios) target_bmaj
          if (ios.ne.0) then
@@ -874,10 +886,10 @@ contains
       end select
    end subroutine apply_kv
 
-   subroutine read_cfg_file(cfgfile, raw_infiles, raw_beamfiles, seen_infiles,&
-   &seen_stages, status)
+   subroutine read_cfg_file(cfgfile, raw_infiles, raw_beamfiles, raw_badchan_file,&
+   &seen_infiles, seen_stages, status)
       character(len=*), intent(in) :: cfgfile
-      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles
+      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles, raw_badchan_file
       logical, intent(inout) :: seen_infiles, seen_stages
       integer, intent(out) :: status
       character(len=512) :: line, key, val
@@ -899,7 +911,7 @@ contains
          call cfg_split_key_value(line, key, val, has_kv)
          if (.not. has_kv) cycle
          call apply_kv(trim(key), trim(val), raw_infiles, raw_beamfiles,&
-         &seen_infiles, seen_stages, status)
+         &raw_badchan_file, seen_infiles, seen_stages, status)
          if (status.ne.0) then
             write(*,*) '  (at line ', line_no, ' in ', trim(cfgfile), ')'
             close(unit_cfg)
@@ -918,7 +930,7 @@ contains
       write(*,'(A)') '    [order=convolve_reproject|reproject_convolve]'
       write(*,'(A)') '    infiles=<file1>[,<file2>...]'
       write(*,'(A)') '    [footprint_mode=intersection|union|reference] [reffile=<file>]'
-      write(*,'(A)') '    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]'
+      write(*,'(A)') '    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]'
       write(*,'(A)') '    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]'
       write(*,'(A)') '    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]'
       write(*,'(A)') '    [outsuffix=<suffix>] [npts=<n>] [khachiyan_tol=<tol>]'

@@ -2152,3 +2152,70 @@ from assumption), each including a genuine mismatch → tool fixes it →
 RM. Full suite: 127/127 (up from 121) after landing, and 127/127 again
 after the later `strip_fits_ext` generalization and its knock-on
 filename-reference updates across sections 30/33-36/38-40.
+
+### T16 — `badchan_file` Made Genuinely Per-Band in `convolve_cubes`/`match_cubes`
+
+**Gap found the hard way, while preparing the real WALLABY+EMU
+multi-band validation run (the first genuinely large-scale exercise of
+this whole toolchain -- see R1.0's own "what's next"):** WALLABY has
+one real bad channel (index 1), EMU has two (indices 161, 178),
+confirmed directly from each cube's own real CASA BEAMS binary table,
+not assumed. The first attempt to pass this to `match_cubes` used a
+single combined `badchan_file` listing all three indices -- which,
+read directly from `apply_badchan_list`'s own source, applies every
+listed index identically to *every* infile, bounded only by that
+infile's own channel count. For WALLABY (144 channels) and EMU (288
+channels) this meant EMU's own perfectly good channel 1 would also get
+excluded, purely as a side effect of sharing one list across bands with
+different channel numbering. This was caught and rejected before any
+real run happened -- the workaround was judged unacceptable, not a
+tolerable rounding error, and the fix was done properly instead of
+shipped as a documented quirk.
+
+**A second finding, this one reassuring rather than a bug:** neither
+`convolve_cubes` nor `match_cubes` actually needed a manual
+`badchan_file` for this specific case at all. `read_beams_table`
+already auto-detects a bad channel per file, directly from that file's
+own BEAMS table (BMAJ or BMIN < 1e-6 arcsec -- CASA's own ~1.18e-38
+sentinel for a flagged channel), independently for every infile, with
+no cross-band contamination possible. The bad channel's pixel data is
+written as NaN (not garbage), the output's own BEAMS table re-flags it
+the same way for any downstream tool, `reproject_cubes` passes NaN as
+`astResampleR`'s own `badval` (excluded from the resampling kernel, not
+blended into neighbours), and `rm_synthesis` does its own independent
+per-pixel/per-channel NaN/Inf detection on the actual Q/U data. The
+whole chain already handles real BEAMS-table-flagged bad channels
+correctly and safely end to end with zero manual configuration.
+
+**Why fix `badchan_file` anyway, if auto-detection already covers it:**
+a CASA BEAMS table is *a* source of bad-channel information, not the
+only one -- RFI or other known-bad channels may never show up as a
+degenerate beam entry at all. `rm_synthesis` already had a genuine,
+independent, per-band manual override for exactly this (`badchan_file`/
+`global_badchan_file`, comma-separated, one file per band, count
+validated against band count). `convolve_cubes`/`match_cubes` only had
+the single-shared-list version -- verified directly by reading both
+files' own `parse_args`/`apply_kv` (`character(len=512) :: badchan_file`,
+a scalar, not `beamfiles`' own `character(len=512) :: beamfiles
+(max_inputs)` array), not assumed from the `--help` text alone, since
+the `--help` text itself was ambiguous on this point.
+
+**Fix:** `badchan_file` in `src/convolve_cubes.f90` and
+`src/match_cubes.f90` (independent copies, adapted not shared, same
+convention as `strip_fits_ext`'s own three copies) changed from a
+scalar to a comma-separated, one-entry-per-infile list -- exactly
+mirroring `beamfiles`' own existing CSV-per-infile convention (same
+`raw_*` staging variable, same post-parse `cfg_csv_count`/
+`cfg_csv_get_item` split, same "must list exactly as many entries as
+infiles" validation, empty entries allowed for an infile with no
+manual list of its own). Each infile's own bad-channel reading moved
+from once before the per-infile loop to inside it, keyed on that
+infile's own list entry.
+
+**Verification:** manually verified first -- two synthetic bands, each
+given a distinct, deliberately different bad-channel index, confirmed
+each output cube's own designated channel (and only that one) came out
+as an all-NaN plane, for both `convolve_cubes` and `match_cubes`
+independently. Then locked in as a permanent regression (`tests/
+run_tests.sh` section 41, both tools). Full suite: 129/129 (up from
+127).

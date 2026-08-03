@@ -254,7 +254,7 @@ slices as separate `infiles`.
 
 ```bash
 bin/convolve_cubes infiles=<file1>[,<file2>...] [outsuffix=<suffix>]
-    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]
+    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]
     [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]
     [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]
     [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n]
@@ -271,7 +271,7 @@ Same `key=value`-only, no-positional-args convention as `reproject_cubes`.
 | `infiles` | — | yes | 1–50 comma-separated FITS cube paths. |
 | `outsuffix` | `_CONV.FITS` | no | Appended to each infile's own path (trailing `.fits`/`.FITS` stripped first). |
 | `beamfiles` | `auto` for every input | no | Comma list, one entry per infile, in order. Each entry is either the literal word `auto` (read that infile's own CASA BEAMS table) or a path to an ASCII/CSV beam-log file (`channel bmaj_arcsec bmin_arcsec bpa_deg`, 1-indexed, `#`-comments allowed). If given, must list exactly as many entries as `infiles`. |
-| `badchan_file` | none | no | One channel index per line, 1-indexed — same convention as `rm_synthesis`'s `global_badchan_file`. |
+| `badchan_file` | none | no | Comma list, one entry per infile, in order — genuinely per-band (each infile's own list is independent; leave an entry blank, e.g. `,file2.txt`, for an infile with none of its own). If given, must list exactly as many entries as `infiles`. Each file is one channel index per line, 1-indexed — same convention as `rm_synthesis`'s `global_badchan_file`. Independent of, and in addition to, the automatic per-file bad-channel detection already done from each infile's own CASA BEAMS table (a degenerate near-zero beam entry); use this for channels known bad for reasons a beam table alone wouldn't capture (e.g. RFI). |
 | `target_bmaj` / `target_bmin` / `target_bpa` | none (auto-derive) | no | Explicit target beam (arcsec/arcsec/deg) — give all three together to skip automatic common-beam derivation entirely. |
 | `max_common_bmaj` | none | no | If the AUTO-derived common beam's BMAJ exceeds this (arcsec), refuse to proceed. Ignored when an explicit target is given. |
 | `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/convolve/write block of planes. |
@@ -317,7 +317,7 @@ bin/match_cubes stages=reproject|convolve|both
     [order=convolve_reproject|reproject_convolve]
     infiles=<file1>[,<file2>...]
     [footprint_mode=intersection|union|reference] [reffile=<file>]
-    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]
+    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]
     [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]
     [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>] [outsuffix=<suffix>]
     [npts=<n>] [khachiyan_tol=<tol>] [manifest=<path>] [io_overlap=y|n]

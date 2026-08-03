@@ -82,7 +82,7 @@
 ! pure -ix = East (since CDELT1<0 here), correct.
 !
 ! Usage: convolve_cubes infiles=<file1>[,<file2>...] [outsuffix=<suffix>]
-!    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]
+!    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]
 !    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]
 !    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]
 !    [npts=<n>] [khachiyan_tol=<tol>]
@@ -176,8 +176,13 @@ program convolve_cubes
    character(len=512) :: infiles(max_inputs), beamfiles(max_inputs)
    integer :: n_inputs
    character(len=64) :: outsuffix
-   character(len=512) :: badchan_file
-   logical :: have_badchan_file
+   ! badchan_file: one entry per infile, same comma-list convention as
+   ! beamfiles -- each infile gets its own independent bad-channel list
+   ! (empty entry = none for that infile). Genuinely per-band, unlike the
+   ! single shared list this used to be (T16, planning/MULTI_BAND_
+   ! TOMOGRAPHY_PLAN.md): a bad-channel index used to apply identically to
+   ! every infile regardless of that infile's own channel numbering.
+   character(len=512) :: badchan_file(max_inputs)
    logical :: have_target
    real(dp) :: target_bmaj, target_bmin, target_bpa
    real(dp) :: max_common_bmaj
@@ -233,12 +238,6 @@ program convolve_cubes
    allocate(bmaj_f(max_inputs, max_channels), bmin_f(max_inputs, max_channels))
    allocate(bpa_f(max_inputs, max_channels), isbad_f(max_inputs, max_channels))
 
-   n_badchan = 0
-   if (have_badchan_file) then
-      call read_badchan_file(badchan_file, badchan_list, n_badchan, status)
-      if (status.ne.0) stop 1
-   endif
-
    do i = 1, n_inputs
       call read_axis_info(infiles(i), naxis_f(i), sky1_f(i), sky2_f(i),&
       &freq_axis_f(i), naxes_f(i,:), cdelt1_f(i), cdelt2_f(i), status)
@@ -261,6 +260,11 @@ program convolve_cubes
          stop 1
       endif
 
+      n_badchan = 0
+      if (len_trim(badchan_file(i)).gt.0) then
+         call read_badchan_file(badchan_file(i), badchan_list, n_badchan, status)
+         if (status.ne.0) stop 1
+      endif
       call apply_badchan_list(badchan_list, n_badchan, nfreq_f(i), isbad_f(i,1:nfreq_f(i)))
 
       write(*,'(A,A,A,I0,A,I0,A)') 'Read ', trim(infiles(i)), ': ', nfreq_f(i),&
@@ -483,14 +487,13 @@ contains
    subroutine parse_args(status)
       integer, intent(out) :: status
       character(len=512) :: this_arg, cli_key, cli_val, cfgfile
-      character(len=512) :: raw_infiles, raw_beamfiles
+      character(len=512) :: raw_infiles, raw_beamfiles, raw_badchan_file
       integer :: argc, iarg, ios
       logical :: has_kv, have_cfgfile, seen_infiles
 
       status = 0
       n_inputs = 0
       outsuffix = '_CONV.FITS'
-      have_badchan_file = .false.
       badchan_file = ' '
       have_target = .false.
       target_bmaj = 0.0d0
@@ -507,6 +510,7 @@ contains
       khachiyan_tol = 1.0d-5
       raw_infiles = ' '
       raw_beamfiles = ' '
+      raw_badchan_file = ' '
       have_cfgfile = .false.
       seen_infiles = .false.
 
@@ -542,14 +546,14 @@ contains
                return
             endif
             call apply_kv(trim(cli_key), trim(cli_val), raw_infiles,&
-            &raw_beamfiles, seen_infiles, status)
+            &raw_beamfiles, raw_badchan_file, seen_infiles, status)
             if (status.ne.0) return
             iarg = iarg + 1
          endif
       enddo
 
       if (have_cfgfile) call read_cfg_file(cfgfile, raw_infiles, raw_beamfiles,&
-      &seen_infiles, status)
+      &raw_badchan_file, seen_infiles, status)
       if (status.ne.0) return
 
       if (.not. seen_infiles) then
@@ -580,6 +584,18 @@ contains
             call cfg_csv_get_item(raw_beamfiles, i, beamfiles(i))
          enddo
       endif
+      if (len_trim(raw_badchan_file).gt.0) then
+         if (cfg_csv_count(raw_badchan_file).ne.n_inputs) then
+            write(*,*) 'ERROR: badchan_file must list exactly ', n_inputs,&
+            &' entries (one per infile; leave an entry empty -- e.g.',&
+            &' ",file2.txt" -- for a file with no manual bad-channel list)'
+            status = -1
+            return
+         endif
+         do i = 1, n_inputs
+            call cfg_csv_get_item(raw_badchan_file, i, badchan_file(i))
+         enddo
+      endif
 
       if (mem_frac_ram.le.0.0 .or. mem_frac_ram.gt.0.95) then
          write(*,*) 'ERROR: mem_frac_ram must be > 0 and <= 0.95, got ', mem_frac_ram
@@ -594,9 +610,10 @@ contains
       endif
    end subroutine parse_args
 
-   subroutine apply_kv(key, val, raw_infiles, raw_beamfiles, seen_infiles, status)
+   subroutine apply_kv(key, val, raw_infiles, raw_beamfiles, raw_badchan_file,&
+   &seen_infiles, status)
       character(len=*), intent(in) :: key, val
-      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles
+      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles, raw_badchan_file
       logical, intent(inout) :: seen_infiles
       integer, intent(out) :: status
       integer :: ios
@@ -611,8 +628,7 @@ contains
       case ('outsuffix')
          outsuffix = val
       case ('badchan_file')
-         badchan_file = val
-         have_badchan_file = .true.
+         raw_badchan_file = val
       case ('target_bmaj')
          read(val, *, iostat=ios) target_bmaj
          if (ios.ne.0) then
@@ -681,9 +697,10 @@ contains
       end select
    end subroutine apply_kv
 
-   subroutine read_cfg_file(cfgfile, raw_infiles, raw_beamfiles, seen_infiles, status)
+   subroutine read_cfg_file(cfgfile, raw_infiles, raw_beamfiles, raw_badchan_file,&
+   &seen_infiles, status)
       character(len=*), intent(in) :: cfgfile
-      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles
+      character(len=*), intent(inout) :: raw_infiles, raw_beamfiles, raw_badchan_file
       logical, intent(inout) :: seen_infiles
       integer, intent(out) :: status
       character(len=512) :: line, key, val
@@ -705,7 +722,7 @@ contains
          call cfg_split_key_value(line, key, val, has_kv)
          if (.not. has_kv) cycle
          call apply_kv(trim(key), trim(val), raw_infiles, raw_beamfiles,&
-         &seen_infiles, status)
+         &raw_badchan_file, seen_infiles, status)
          if (status.ne.0) then
             write(*,*) '  (at line ', line_no, ' in ', trim(cfgfile), ')'
             close(unit_cfg)
@@ -720,7 +737,7 @@ contains
       write(*,'(A)') ''
       write(*,'(A)') 'Usage:'
       write(*,'(A)') '  convolve_cubes infiles=<file1>[,<file2>...] [outsuffix=<suffix>]'
-      write(*,'(A)') '    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file>]'
+      write(*,'(A)') '    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]'
       write(*,'(A)') '    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]'
       write(*,'(A)') '    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]'
       write(*,'(A)') '    [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n]'
@@ -744,10 +761,16 @@ contains
       write(*,'(A)') '  entirely to use ''auto'' for every infile. See'//&
       &' cfg/example_beamLog.txt and cfg/example_beamLog.csv for ready examples.'
       write(*,'(A)') ''
-      write(*,'(A)') 'badchan_file: same one-integer-per-line, 1-indexed convention as'//&
-      &' rm_synthesis''s own global_badchan_file -- these channels, and any channel'
-      write(*,'(A)') '  with a degenerate (near-zero) beam entry, are written as all-NaN'//&
-      &' planes, not convolved.'
+      write(*,'(A)') 'badchan_file: per-infile bad-channel list, in the same order as'//&
+      &' infiles (comma-separated, one entry per infile -- leave an entry empty,'
+      write(*,'(A)') '  e.g. ",file2.txt", for an infile with no manual list of its own).'//&
+      &' Each file is the same one-integer-per-line, 1-indexed convention as'
+      write(*,'(A)') '  rm_synthesis''s own global_badchan_file. Independent of, and in'//&
+      &' addition to, automatic bad-channel detection from each infile''s own'
+      write(*,'(A)') '  BEAMS table (a degenerate near-zero beam entry) -- use this for'//&
+      &' channels known bad for reasons a beam table alone would not capture'
+      write(*,'(A)') '  (e.g. RFI). Either way, a bad channel is written as an all-NaN'//&
+      &' plane, not convolved.'
       write(*,'(A)') ''
       write(*,'(A)') 'target_bmaj/target_bmin/target_bpa: explicit target beam (all three'//&
       &' required together) -- skips automatic common-beam derivation entirely.'

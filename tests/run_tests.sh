@@ -2734,6 +2734,112 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 41. convolve_cubes/match_cubes: badchan_file is genuinely per-band (T16,
+#     docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md) -- a real bug found while
+#     preparing a real multi-band run: badchan_file used to be a single
+#     shared list applied identically to every infile regardless of that
+#     infile's own channel numbering, so band A's own bad channel would
+#     also get (incorrectly) excluded from band B, and vice versa. Fixed
+#     to be a comma list, one entry per infile, exactly like beamfiles.
+#     Verifies each band's own designated bad channel is excluded from
+#     THAT band's own output, and NOT from the other band's.
+# ---------------------------------------------------------------------------
+section "41. convolve_cubes/match_cubes: badchan_file is genuinely per-band (T16)"
+
+if [[ -x bin/convolve_cubes ]]; then
+    pbbc_band1="$OUT_DIR/pbbc_band1.Q.FITSCUBE"
+    pbbc_band2="$OUT_DIR/pbbc_band2.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$pbbc_band1"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$pbbc_band2"
+    pbbc_band1_badchan="$OUT_DIR/pbbc_band1_badchan.txt"
+    pbbc_band2_badchan="$OUT_DIR/pbbc_band2_badchan.txt"
+    printf '13\n' > "$pbbc_band1_badchan"
+    printf '77\n' > "$pbbc_band2_badchan"
+    # strip_fits_ext strips ANY trailing extension, so .FITSCUBE drops here.
+    # target beam (30") deliberately exceeds BOTH band1_beamlog.txt (10")
+    # and band2_beamlog.txt (20") native beams, so neither is skipped as
+    # already-matching -- both must genuinely convolve and write output.
+    pbbc_band1_conv="${pbbc_band1%.FITSCUBE}_CONV.FITS"
+    pbbc_band2_conv="${pbbc_band2%.FITSCUBE}_CONV.FITS"
+    rm -f "$pbbc_band1_conv" "$pbbc_band2_conv"
+
+    pbbc_convolve_log="$OUT_DIR/pbbc_convolve.log"
+    if bin/convolve_cubes infiles="$pbbc_band1,$pbbc_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            badchan_file="$pbbc_band1_badchan,$pbbc_band2_badchan" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$pbbc_convolve_log" 2>&1; then
+        pbbc_band1_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbc_band1_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        pbbc_band2_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbc_band2_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        if [[ "$pbbc_band1_bad_planes" == "13" && "$pbbc_band2_bad_planes" == "77" ]]; then
+            pass "convolve_cubes: badchan_file is genuinely per-band (band1 only chan 13 bad, band2 only chan 77 bad, no cross-contamination)"
+        else
+            fail "convolve_cubes: badchan_file per-band check failed (band1 bad=[$pbbc_band1_bad_planes], expected 13; band2 bad=[$pbbc_band2_bad_planes], expected 77) (see $pbbc_convolve_log)"
+        fi
+    else
+        fail "convolve_cubes: per-band badchan_file run failed (see $pbbc_convolve_log)"
+    fi
+else
+    skip "bin/convolve_cubes not built; skipping per-band badchan_file test"
+fi
+
+if [[ -x bin/match_cubes ]]; then
+    pbbcm_band1="$OUT_DIR/pbbcm_band1.Q.FITSCUBE"
+    pbbcm_band2="$OUT_DIR/pbbcm_band2.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$pbbcm_band1"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$pbbcm_band2"
+    pbbcm_band1_badchan="$OUT_DIR/pbbcm_band1_badchan.txt"
+    pbbcm_band2_badchan="$OUT_DIR/pbbcm_band2_badchan.txt"
+    printf '13\n' > "$pbbcm_band1_badchan"
+    printf '77\n' > "$pbbcm_band2_badchan"
+    # strip_fits_ext strips ANY trailing extension, so .FITSCUBE drops here.
+    # target beam (30") deliberately exceeds both native beams so neither
+    # band is skipped as already-matching.
+    pbbcm_band1_conv="${pbbcm_band1%.FITSCUBE}_CONV.FITS"
+    pbbcm_band2_conv="${pbbcm_band2%.FITSCUBE}_CONV.FITS"
+    rm -f "$pbbcm_band1_conv" "$pbbcm_band2_conv"
+
+    pbbcm_convolve_log="$OUT_DIR/pbbcm_convolve.log"
+    if bin/match_cubes stages=convolve infiles="$pbbcm_band1,$pbbcm_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            badchan_file="$pbbcm_band1_badchan,$pbbcm_band2_badchan" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$pbbcm_convolve_log" 2>&1; then
+        pbbcm_band1_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbcm_band1_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        pbbcm_band2_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbcm_band2_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        if [[ "$pbbcm_band1_bad_planes" == "13" && "$pbbcm_band2_bad_planes" == "77" ]]; then
+            pass "match_cubes: badchan_file is genuinely per-band (band1 only chan 13 bad, band2 only chan 77 bad, no cross-contamination)"
+        else
+            fail "match_cubes: badchan_file per-band check failed (band1 bad=[$pbbcm_band1_bad_planes], expected 13; band2 bad=[$pbbcm_band2_bad_planes], expected 77) (see $pbbcm_convolve_log)"
+        fi
+    else
+        fail "match_cubes: per-band badchan_file run failed (see $pbbcm_convolve_log)"
+    fi
+else
+    skip "bin/match_cubes not built; skipping per-band badchan_file test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"
