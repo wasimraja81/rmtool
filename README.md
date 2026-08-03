@@ -137,7 +137,8 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed build instructions.
 
 - **[QUICKSTART.md](QUICKSTART.md)** — Quick reference and build overview
 - **[docs/TUTORIAL.md](docs/TUTORIAL.md)** — Step-by-step walkthrough: build, generate sample data, run the full pipeline, inspect the output
-- **[docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md)** — Complete parameter reference for all 5 tools (what each does, every key, every default, output files)
+- **[docs/EXAMPLES.md](docs/EXAMPLES.md)** — Recipes for real scenarios: single-band vs. multi-band (matched/mismatched grid/resolution), choosing RM-CLEAN stopping criteria, memory/IO tuning, GPU vs. CPU, subimage extraction
+- **[docs/APP_REFERENCE.md](docs/APP_REFERENCE.md)** — Complete parameter reference for all 5 tools (what each does, every key, every default, output files)
 - **[BUILD.md](BUILD.md)** — Comprehensive build system documentation
 - **[cfg/CONFIG_README.md](cfg/CONFIG_README.md)** — Configuration file reference (`rm_synthesis` cfg parser specifically)
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Master architecture document for implemented codebase design
@@ -742,7 +743,7 @@ bin/rmclean_cubes ampfile=out.AMP.RMCUBE.FITS phafile=out.PHA.RMCUBE.FITS \
   abs_flux_floor=20uJy auto_nsigma=1.0 niter=500 gain=0.1
 # writes out_cleaned.CLEAN/.RESID/.RESTORED.AMP/PHA.RMCUBE.FITS;
 # full parameter reference (every key, default, and meaning) in
-# docs/TOOLS_REFERENCE.md -- --help on the binary prints the same list
+# docs/APP_REFERENCE.md -- --help on the binary prints the same list
 ```
 
 CLEAN stops on any of three independent, freely-combinable criteria,
@@ -803,7 +804,7 @@ historical thesis-matching convention, unaffected unless set
 explicitly); whichever reference is actually used is recorded in a new
 `LSQREF` header keyword so `rmclean_cubes` never has to assume one.
 
-Full parameter reference: [docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md).
+Full parameter reference: [docs/APP_REFERENCE.md](docs/APP_REFERENCE.md).
 Full design detail and verification evidence are documented in
 [planning/RMCLEAN_INTEGRATION_PLAN.md](planning/RMCLEAN_INTEGRATION_PLAN.md)
 (tickets T0-T11) and in `src/rmclean.f90`/`src/rmclean_cubes.f90`'s own

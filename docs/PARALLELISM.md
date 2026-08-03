@@ -456,7 +456,7 @@ schedule(dynamic)` over each tile's own pixels), but each pixel then
 runs its OWN independent Hogbom CLEAN loop — a variable number of
 iterations per pixel (bounded by `niter`, but usually stopping much
 earlier via `abs_flux_floor`/`auto_nsigma` — see
-`docs/TOOLS_REFERENCE.md`), so `schedule(dynamic)` matters more here
+`docs/APP_REFERENCE.md`), so `schedule(dynamic)` matters more here
 than for `rm_synthesis`'s own uniform per-pixel cost: a static schedule
 would leave fast-converging pixels' threads idle while a few
 slow-converging ones finish.

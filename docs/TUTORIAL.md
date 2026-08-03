@@ -83,7 +83,7 @@ bin/rm_synthesis_release_cpu_omp tutorial-rmsynth.cfg
 This writes `tutorial_out.AMP.RMCUBE.FITS`, `tutorial_out.PHA.RMCUBE.FITS`,
 `tutorial_out.MASK.CUBE.FITS`, and `tutorial_out.NVALID.MAP.FITS` — the
 dirty (pre-CLEAN) RM cube. Every key here is explained in full in
-[docs/TOOLS_REFERENCE.md](TOOLS_REFERENCE.md#1-rm_synthesis); the same
+[docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis); the same
 annotated example lives at `cfg/rmsynth-e2e-smalltest.cfg`.
 
 **Check the known sources were recovered:**
@@ -117,7 +117,7 @@ subtracting them), and `tutorial_cleaned.RESTORED.AMP/PHA.RMCUBE.FITS`
 final, publication-style result). CLEAN stops per-pixel on whichever of
 `abs_flux_floor`/`auto_nsigma`/`niter` fires first; every key is
 explained in full in
-[docs/TOOLS_REFERENCE.md](TOOLS_REFERENCE.md#5-rmclean_cubes).
+[docs/APP_REFERENCE.md](APP_REFERENCE.md#5-rmclean_cubes).
 
 For this small, low-noise synthetic cube, expect a stop-reason summary
 close to:
@@ -183,7 +183,10 @@ provenance behaviour.
 
 ## Where to go next
 
-- [docs/TOOLS_REFERENCE.md](TOOLS_REFERENCE.md) — every parameter,
+- [docs/EXAMPLES.md](EXAMPLES.md) — recipes for real scenarios: multi-
+  band with matched/mismatched grid or resolution, choosing RM-CLEAN
+  stopping criteria, memory/IO tuning, GPU vs. CPU, subimage extraction.
+- [docs/APP_REFERENCE.md](APP_REFERENCE.md) — every parameter,
   every tool, fully explained.
 - [QUICKSTART.md](../QUICKSTART.md) — build variants, GPU builds, the
   full validation test suite, running on real data.

@@ -1,0 +1,343 @@
+# Examples: Choosing and Combining Parameters for Real Scenarios
+
+[docs/TUTORIAL.md](TUTORIAL.md) walks through one linear path end to
+end. This document is different: a set of independent recipes for
+specific situations — "my bands don't share a sky grid," "I don't know
+whether to stop CLEAN on flux or on sigma," "how much memory should I
+give this." Jump straight to whichever one matches what you're facing.
+
+Every command below has actually been run against this repository's own
+synthetic test fixtures and produces the output shown — none of this is
+hypothetical. Where a scenario needs data this repo doesn't ship (e.g.
+two bands with genuinely different angular resolution), that's called
+out explicitly rather than faked.
+
+## Contents
+
+1. [Single-band quickstart](#1-single-band-quickstart)
+2. [Multi-band: which preprocessing do I need?](#2-multi-band-which-preprocessing-do-i-need)
+3. [Choosing RM-CLEAN stopping criteria](#3-choosing-rm-clean-stopping-criteria)
+4. [Memory tuning (`mem_frac_ram`)](#4-memory-tuning-mem_frac_ram)
+5. [I/O parallelism: quick picks](#5-io-parallelism-quick-picks)
+6. [GPU vs. CPU: which build should I use?](#6-gpu-vs-cpu-which-build-should-i-use)
+7. [Subimage extraction: iterate fast before committing to a full run](#7-subimage-extraction-iterate-fast-before-committing-to-a-full-run)
+
+---
+
+## 1. Single-band quickstart
+
+If you have exactly one Q cube and one U cube, already on the same sky
+grid at the same resolution, you don't need any of the preprocessing
+tools below — just `rm_synthesis` directly. See
+[docs/TUTORIAL.md](TUTORIAL.md) for the full walkthrough (build,
+generate a test cube, run, inspect the output) and
+[docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis) for every
+config key. The rest of this document assumes you've already done that
+once and are now facing a more specific situation.
+
+---
+
+## 2. Multi-band: which preprocessing do I need?
+
+Real multi-band data comes in four combinations: your bands might
+already share a sky grid and resolution, or be missing one, the other,
+or both. Each needs a different amount of preprocessing before
+`rm_synthesis` will accept them together — doing more than necessary
+just wastes time, and doing less means `rm_synthesis` will (correctly)
+refuse to run rather than silently combine misaligned data.
+
+### 2a. Bands already matched — no preprocessing needed
+
+If every band is already on the same sky grid and the same angular
+resolution, just list them as comma-separated values directly —
+`rm_synthesis` merges the channels itself, no separate tool needed:
+
+```cfg
+infileQ = bandA.fits,bandB.fits
+infileU = bandA_U.fits,bandB_U.fits
+```
+
+Every other per-band key (`resiQ`/`slopeQ`/`resiU`/`slopeU`/
+`badchan_file`/`subim_chan_blc`/`subim_chan_trc`/`subim_chan_inc`) also
+accepts a comma list, one entry per band, in the same order. This is
+genuinely verified, not assumed — run against this repo's own two-band
+test fixture (`tests/data/TEST.Q.FITSCUBE` + `tests/data/
+TEST_BAND2.Q.FITSCUBE`, which share the same sky grid by construction):
+
+```bash
+bin/rm_synthesis_release_cpu_omp cfg/rmsynth-e2e-multiband-smalltest.cfg
+```
+
+completes cleanly, no preprocessing step involved.
+
+### 2b. Sky grid mismatched, resolution already matched — `reproject_cubes` only
+
+If your bands were observed at different pointings (or just have
+slightly different pixel grids for any reason) but the same angular
+resolution, feeding them to `rm_synthesis` directly gets refused
+loudly rather than silently misaligned — this is deliberate, not a bug
+to work around:
+
+```
+ERROR: RA WCS mismatch for band            2
+Reference CRVAL1/CRPIX1/CDELT1 =    180.000000              17  -1.00000005E-03
+Band            2  CRVAL1/CRPIX1/CDELT1 =    185.000000              17  -1.00000005E-03
+Quitting now...
+```
+
+Fix it with `reproject_cubes` first — reproject the mismatched band
+(both its Q and U files) onto whichever band you're treating as the
+reference:
+
+```bash
+make reproject_cubes
+bin/reproject_cubes mode=reference reffile=bandA.Q.fits infiles=bandB.Q.fits,bandB.U.fits
+```
+
+This writes `bandB.Q_REPROJ.FITS`/`bandB.U_REPROJ.FITS` on the
+reference's own grid. Point `rm_synthesis` at those instead of the
+originals:
+
+```cfg
+infileQ = bandA.Q.fits,bandB.Q_REPROJ.FITS
+infileU = bandA.U.fits,bandB.U_REPROJ.FITS
+```
+
+`mode=reference` pins the output grid to the reference file's own
+extent (what was done above); use `mode=intersection`/`mode=union` if
+you'd rather shrink to the overlap or grow to cover every input
+instead — see [docs/APP_REFERENCE.md](APP_REFERENCE.md#2-reproject_cubes).
+
+### 2c. Resolution mismatched, sky grid already matched — `convolve_cubes` only
+
+If your bands share a sky grid but were taken at different angular
+resolutions (a very common real case — different frequencies naturally
+have different native beams), convolve every band down to one common
+resolution before combining them:
+
+```bash
+make convolve_cubes
+bin/convolve_cubes infiles=bandA.Q.fits,bandB.Q.fits mem_frac_ram=0.25
+```
+
+With no `target_bmaj`/`target_bmin`/`target_bpa` given, the common
+target beam is auto-derived as the smallest beam every good channel of
+every input can actually be deconvolved from — you don't need to work
+this out by hand. This reads per-channel beams from each input's own
+CASA-style `BEAMS` table automatically; if your data doesn't carry one,
+pass `beamfiles=path/to/beamlog.txt,path/to/beamlog2.txt` instead (see
+`cfg/example_beamLog.txt`/`.csv` for the plain-text format). Output:
+`bandA.Q_CONV.FITS`, `bandB.Q_CONV.FITS` (do the same for the U files),
+each now sharing one common beam, ready for `rm_synthesis`. Full
+parameter list: [docs/APP_REFERENCE.md](APP_REFERENCE.md#3-convolve_cubes).
+
+### 2d. Both mismatched — `match_cubes`, chained through memory
+
+If your bands differ in *both* sky grid and resolution, you need both
+steps — and `match_cubes` runs them back-to-back without writing an
+intermediate FITS file to disk at all, which matters once your cubes
+are tens or hundreds of GB each:
+
+```bash
+make match_cubes
+bin/match_cubes stages=both order=convolve_reproject \
+  footprint_mode=reference reffile=bandA.Q.fits \
+  infiles=bandB.Q.fits mem_frac_ram=0.25
+```
+
+`order=convolve_reproject` (the default) convolves to common
+resolution *before* resampling onto the common grid — low-pass
+filtering ahead of interpolation avoids baking in aliasing error, and
+is usually cheaper too. Run Q and U through the same call together
+where possible so both land on the identical output grid by
+construction. Full detail:
+[docs/APP_REFERENCE.md](APP_REFERENCE.md#4-match_cubes).
+
+**Rule of thumb:** if you're not sure which situation you're in, just
+try `rm_synthesis` directly first (2a) — it will refuse loudly and
+tell you exactly what mismatched (WCS or otherwise), rather than
+silently producing a wrong answer. Let that error message tell you
+whether you need 2b, 2c, or 2d.
+
+---
+
+## 3. Choosing RM-CLEAN stopping criteria
+
+`rmclean_cubes` gives you three independent, combinable ways to decide
+when a pixel is "clean enough." Which one(s) to use depends on what you
+actually know about your data:
+
+| Your situation | Use | Why |
+|---|---|---|
+| You know your noise floor in physical flux units (e.g. from a previous run, or the survey's own sensitivity documentation) | `abs_flux_floor=<value>` alone | A direct, unambiguous "stop below this flux" — no per-pixel estimation involved, so it can't be fooled by an unusual sightline. |
+| You don't know the noise floor ahead of time, or it varies significantly across the image | `auto_nsigma=<n>` alone | Estimates each pixel's own noise from its own dirty spectrum — adapts automatically, no prior knowledge needed. |
+| Production runs on real data (recommended default) | **Both together** | Whichever fires first wins per pixel. `auto_nsigma` handles the typical case; `abs_flux_floor` is a safety net for the pixels where the per-pixel sigma estimate itself is untrustworthy (it can be biased for individual pixels even though it's accurate on average — see `planning/RMCLEAN_INTEGRATION_PLAN.md` ticket T9). |
+| You're debugging, or want to see the FULL iteration history regardless of convergence | Neither — `niter` alone | CLEAN runs every pixel for the full `niter` budget; combine with `trace_ix`/`trace_iy`/`log_every` to inspect one pixel's own per-iteration trend. |
+
+**A worked example**, anchored to this dataset's own measured noise
+floor (`cfg/rmclean-jennifer.e2e.cfg`'s actual reasoning, not an
+invented number):
+
+```cfg
+# abs_flux_floor anchored to this dataset's own independently-measured
+# ~25.5 uJy/beam noise floor, with a small margin below it
+abs_flux_floor = 20uJy
+auto_nsigma    = 1.0
+niter          = 500
+gain           = 0.1
+```
+
+**How `abs_flux_floor` values work:** a bare number is native AMP-cube
+units (whatever `BUNIT` your dirty cube carries — often Jy/beam); or
+give it with a `Jy`/`mJy`/`uJy` suffix, **no space**
+(`abs_flux_floor=10mJy`), and it's converted against the cube's own
+`BUNIT` automatically.
+
+**On `gain`:** the default `0.1` is a conventional, conservative Hogbom
+CLEAN loop gain — larger values (`0.2`-`0.3`) converge in fewer
+iterations but risk overshooting for blended/extended structure;
+smaller values (`0.05`) are more careful but need a correspondingly
+larger `niter`. If a real run's own stop-reason summary shows an
+unexpectedly large fraction of pixels hitting the `niter` cap, that's
+usually a sign either `niter` is too low or `gain` is too conservative
+for the structure in your data — check the summary rmclean_cubes
+prints at the end of every run before assuming your data itself is the
+problem.
+
+**If pixels are exhausting `niter`** (the run-end summary shows a large
+`hit niter cap` percentage): either raise `niter`, or check whether
+`abs_flux_floor`/`auto_nsigma` are set sensibly for your data's own
+noise level — a floor set too low, or an `auto_nsigma` multiplier set
+too small, asks CLEAN to keep going past the point where there's any
+real signal left to remove.
+
+---
+
+## 4. Memory tuning (`mem_frac_ram`)
+
+`mem_frac_ram` is a fraction (0, 0.95] of your machine's **total**
+system RAM (not whatever happens to be free at that moment — see
+README's own "Motivation" section for why that distinction matters on
+a shared machine), budgeted for one tile's own working set. Both
+`rm_synthesis` and `rmclean_cubes` use the same key, same range, same
+auto-tiling policy (full-RA Dec strips, shrinking further only if a
+single full-width row doesn't fit) — but their own per-pixel cost
+differs:
+
+- **`rm_synthesis`**: budgets the input Q/U spectra plus whichever
+  outputs you've requested (AMP/PHA or REAL/IMAG, mask, nvalid,
+  cubestat maps) per pixel.
+- **`rmclean_cubes`**: budgets 2 input arrays (dirty AMP/PHA) + 6
+  output arrays (CLEAN/RESID/RESTORED × AMP/PHA, each double-buffered
+  for the tile-write-join mechanism) + the mask cube's own per-pixel
+  channel depth — genuinely more per-pixel memory than `rm_synthesis`
+  for a comparable image size, since it carries both the RM-depth float
+  arrays *and* the channel-depth mask in the same tile.
+
+**Practical guidance:**
+
+- **Default (`0.25`) is a reasonable starting point** on a shared or
+  general-purpose machine — leaves headroom for the OS, other
+  processes, and CFITSIO/page-cache overhead that isn't counted in the
+  budget itself.
+- **On a dedicated machine running one job at a time**, raising it
+  (`0.5`-`0.7`) lets a smaller image fit in a single tile — check with
+  `dry_run=y` first (below) rather than guessing.
+- **On a memory-constrained machine, or if you see host out-of-memory
+  errors**, lower it (`0.15` or below). This doesn't fail the run — it
+  just makes tiles smaller and increases the tile count, trading a bit
+  more per-tile overhead for a safer memory ceiling.
+- **Use `dry_run=y`** (rm_synthesis only) before committing to a real
+  run on a large cube: it reads headers, runs the tile planner, writes
+  `tile_autotune.cfg` (a suggested `tile_ra`/`tile_dec` you can copy
+  back into your real cfg) and `runtime_estimate.txt`, then exits — no
+  pixel data touched, no output written. See
+  [docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).
+- **GPU runs** budget device memory separately via `mem_frac_vram`/
+  `gpu_vram_mib` — unrelated to `mem_frac_ram`, which still governs the
+  *host*-side tile size on a GPU run.
+
+Full mechanics (the exact per-pixel byte formula, the auto-tiling
+shrink policy, and the `io_read_threads`/`io_write_threads`/`io_overlap`
+keys that ride alongside tile sizing) are in
+[docs/PARALLELISM.md](PARALLELISM.md) and README's own "Tile Memory
+Planning and I/O Parallelism" section — this section is deliberately
+just the decision guide, not the full mechanism.
+
+---
+
+## 5. I/O parallelism: quick picks
+
+Three independent keys — `io_read_threads`, `io_write_threads`,
+`io_overlap` — all default to fully serial. Quick picks, not the full
+reasoning (see README's own "Tile Memory Planning and I/O Parallelism"
+section for the complete rule-of-thumb table and when `io_overlap` can
+actually hurt):
+
+- **Single local disk, small-to-medium cube**: leave everything at
+  default. Parallel I/O mostly helps parallel/shared storage.
+- **Lustre, multi-server NFS, or cloud block storage**: try
+  `io_read_threads`/`io_write_threads` set to roughly your storage's
+  stripe count (often 4-16) — a single I/O stream rarely saturates
+  that kind of storage.
+- **RAM-constrained** *and* not on parallel storage: leave
+  `io_overlap=n` — it doubles the per-tile output buffer RAM for a
+  benefit that mostly doesn't exist on a single physical drive anyway.
+- **Dedicated machine, parallel storage, RAM to spare**: this is where
+  `io_overlap=y` genuinely helps — hides tile N's write behind tile
+  N+1's read/compute.
+- **Always give `OMP_NUM_THREADS` all your cores** — it's the only
+  genuinely CPU-bound thread count here; the I/O thread keys are mostly
+  waiting on disk/network, not competing for compute.
+
+---
+
+## 6. GPU vs. CPU: which build should I use?
+
+- **CPU (OpenMP)** — `make OMP=1 GPU=0`, then any binary without a
+  `gpu_offload` tag. Use this unless you specifically have a GPU
+  available and a large enough cube that offload is worth the setup.
+  This is what [docs/TUTORIAL.md](TUTORIAL.md) uses throughout.
+- **GPU offload** — `make GPU=1`, `use_gpu=y` in your cfg. On the
+  hardware validated to date, GPU throughput is bounded by host-device
+  transfer bandwidth more than raw GPU compute — worth it for large
+  cubes, less clear-cut for small ones where transfer overhead
+  dominates. `rmclean_cubes` has no GPU support at all yet (CPU-only,
+  OpenMP one-thread-per-pixel) — this choice only applies to
+  `rm_synthesis`.
+- **Same cfg file works on both** — leave `use_gpu=n` on a CPU-only
+  binary (default behaviour), or leave it `y` anyway: a CPU-only binary
+  prints a warning and falls back to CPU rather than failing.
+- Full detail: README's own "GPU Acceleration" and "GPU Runtime
+  Behaviour" sections.
+
+---
+
+## 7. Subimage extraction: iterate fast before committing to a full run
+
+Before running RM synthesis on a genuinely large cube, it's often worth
+testing your config on a small spatial cutout first — a wrong
+`beg_rm`/`end_rm`/`nrm` choice, or a config typo, is much cheaper to
+discover on a 9×9-pixel subimage than after an hour-long full run.
+`subim=y` plus a pixel range does this without any separate cutout
+tool:
+
+```cfg
+subim         = y
+subim_ra_blc  = 8
+subim_ra_trc  = 16
+subim_dec_blc = 6
+subim_dec_trc = 14
+```
+
+(1-indexed, inclusive on both ends — the example above extracts a
+9×9-pixel region.) Verified directly: running this against a 32×32
+test cube produces exactly a 9×9×(RM depth) output cube, nothing more.
+Channel-axis subsetting works the same way via
+`subim_chan_blc`/`subim_chan_trc`/`subim_chan_inc` — useful for
+excluding a known-bad edge of the band without a separate
+`badchan_file` entry per channel. Once you're satisfied with the
+result on the cutout, set `subim=n` (or delete the `subim_*` keys
+entirely — they're ignored when `subim=n`) and run the full cube.
+
+Full key list: [docs/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis).

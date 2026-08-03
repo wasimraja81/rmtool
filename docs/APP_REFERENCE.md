@@ -1,4 +1,4 @@
-# Tools Reference
+# App Reference
 
 Complete, current parameter reference for every command-line tool in
 rmtool: what each one does, exactly how to invoke it, every parameter
@@ -7,10 +7,13 @@ files it produces, and one runnable example.
 
 This document is the single source of truth for "what does parameter X
 do" across all 5 tools. `README.md` and `QUICKSTART.md` give shorter,
-task-oriented walkthroughs and link here for the full detail; `--help`
-on any tool prints the same information this document does, generated
-from the same source. If the two ever disagree, trust `--help` (it's
-generated from the running binary) and please report the doc as stale.
+task-oriented walkthroughs and link here for the full detail;
+[docs/EXAMPLES.md](EXAMPLES.md) walks through choosing and combining
+these parameters for real-world scenarios (multi-band, RM-CLEAN
+stopping criteria, memory tuning, and more). `--help` on any tool
+prints the same information this document does, generated from the
+same source. If the two ever disagree, trust `--help` (it's generated
+from the running binary) and please report the doc as stale.
 
 ## Contents
 

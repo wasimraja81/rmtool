@@ -409,7 +409,9 @@ machine, from a laptop to an HPC node.
 entirely — replace with `abs_flux_floor=`/`auto_nsigma=` above.
 
 Full parameter reference (every key, default, and meaning) in
-[docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md#5-rmclean_cubes); a
+[docs/APP_REFERENCE.md](docs/APP_REFERENCE.md#5-rmclean_cubes); a
 fully annotated example config in `cfg/rmclean-example.cfg`; a
 step-by-step walkthrough tying `rm_synthesis` and `rmclean_cubes`
-together in [docs/TUTORIAL.md](docs/TUTORIAL.md).
+together in [docs/TUTORIAL.md](docs/TUTORIAL.md); a decision guide for
+choosing between `abs_flux_floor`/`auto_nsigma` in
+[docs/EXAMPLES.md](docs/EXAMPLES.md#3-choosing-rm-clean-stopping-criteria).

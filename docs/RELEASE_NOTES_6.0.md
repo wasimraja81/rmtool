@@ -214,11 +214,15 @@ instead of running out of memory.
   regression fixture built directly from the real dataset that exposed
   the mask-read bug.
 - Full documentation pass: `README.md`, `QUICKSTART.md`,
-  `docs/ARCHITECTURE.md`, `docs/PARALLELISM.md`, `CHANGELOG.md`, and a
-  new `docs/TOOLS_REFERENCE.md` (complete parameter reference for all 5
-  tools) and `docs/TUTORIAL.md` (a step-by-step walkthrough) — RM-CLEAN
-  had previously been documented only in the dev-facing planning
-  ticket doc, never brought into the user-facing docs.
+  `docs/ARCHITECTURE.md`, `docs/PARALLELISM.md`, `CHANGELOG.md`, and
+  three new docs — `docs/APP_REFERENCE.md` (complete parameter
+  reference for all 5 tools), `docs/TUTORIAL.md` (a step-by-step
+  walkthrough), and `docs/EXAMPLES.md` (a scenario cookbook: multi-band
+  with matched/mismatched grid or resolution, choosing RM-CLEAN
+  stopping criteria, memory/IO tuning, GPU vs. CPU, subimage
+  extraction) — RM-CLEAN had previously been documented only in the
+  dev-facing planning ticket doc, never brought into the user-facing
+  docs.
 
 ## What's next (beyond this release)
 
