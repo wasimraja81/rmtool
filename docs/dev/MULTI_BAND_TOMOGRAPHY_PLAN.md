@@ -2392,11 +2392,12 @@ error path exposed it as a link failure.
 
 **Not a hang risk in the first place:** `rmclean_cubes.f90`'s own
 `io_overlap` already defaults its background-write path through the
-same raw-stream design whenever `io_write_threads>1`; only its
-`io_write_threads=1` (default) + `io_overlap=y` combination still
-calls `FTPSSE` from the background thread and could in principle hit
-an equivalent hazard. Out of scope for this ticket (not exercised by
-the real WALLABY+EMU run, which reaches `rmclean_cubes` as a separate,
+same raw-stream design whenever `nwriters>1` (renamed from
+`io_write_threads`, T12, `docs/dev/RMCLEAN_INTEGRATION_PLAN.md`); only
+its `nwriters=1` (default) + `io_overlap=y` combination still calls
+`FTPSSE` from the background thread and could in principle hit an
+equivalent hazard. Out of scope for this ticket (not exercised by the
+real WALLABY+EMU run, which reaches `rmclean_cubes` as a separate,
 later invocation) -- noted here for whoever picks up `rmclean_cubes`
 next, not fixed.
 
@@ -2412,3 +2413,89 @@ is provably never called concurrently because it is never called at
 all once the write loop starts. The real, final verification is the
 WALLABY+EMU run itself, relaunched with `io_overlap=y` restored (see
 `cfg/pipeline-multiband-wallaby-emu-match.cfg`).
+
+### T20 -- Second Real Deadlock: Concurrent AST Object Creation, Fixed with a Critical Section
+
+**Gap found relaunching the real WALLABY+EMU `match` stage after T19:**
+band 1 (WALLABY Q, `stages=both`) completed correctly (T19's own fix
+holding up), but the run then deadlocked at the very start of band 2
+(EMU Q) -- zero CPU, zero disk I/O, indefinitely, a second real hang
+distinct from T19's. A live `gdb` thread dump (`thread apply all bt`
+on all 6 threads, non-destructive attach/detach) showed every thread,
+including the main one, parked in `pthread_mutex_lock` deep inside
+`libstarlink_ast.so.9`, called from `ast_read_` <- `load_wcs` <-
+`process_one_file_restricted` -- the per-thread WCS-Mapping setup step
+that runs once at the start of processing each file (`stages=both`/
+`stages=reproject`, wherever reprojection is part of the run;
+`convolve_cubes.f90` never touches AST at all and was never exposed to
+this). Two threads waited on each of two distinct internal AST
+mutexes, the classic shape of a real deadlock, not just slow
+contention. Never triggered on the synthetic test fixtures (a timing-
+dependent race needing genuine concurrent `ast_read_` calls, which
+only reliably happens with real, larger FITS headers) -- and never
+triggered on band 1 either, purely by luck of thread scheduling.
+
+**Why per-thread Mapping creation exists in the first place:** each
+thread builds its own private pixel-to-pixel Mapping from scratch
+(own `ast_begin` context, own `load_wcs`/`extract_sky_mapping`/
+`compose_pix2pix` calls) rather than sharing one Mapping built by the
+caller, because AST's own documented multi-threading model (SUN/211
+Sec 4.12, "AST Objects within Multi-threaded Applications") requires
+`astLock`/`astUnlock` to hand an Object from the thread that created
+it to another thread -- and this Fortran binding exports neither
+(confirmed directly against `libstarlink_ast.so.9`'s own symbol table:
+no `ast_lock_`/`ast_unlock_`/`ast_thread_` at all, only the internal
+`astLockId_`/`astUnlockId_`/`astCheckLock_`/`astThreadId_` C-level
+helpers, none of them exposed as Fortran-callable wrappers).
+
+**An initial fix attempt was tried and reverted:** build the Mapping
+ONCE, single-threaded, then hand each worker thread its own
+independent `ast_copy` (confirmed via a standalone test program that
+`ast_copy(obj, status)` -- the inherited-status convention every other
+AST call in this codebase already uses -- returns a genuinely distinct,
+valid object). This is exactly what AST's own docs prescribe for
+objects needed by multiple threads (SUN/211 Sec 4.13, "Copying
+Objects": "a deep copy of the Object should be taken for each thread,
+using astCopy"). It does not work in this Fortran binding: AST enforces
+per-thread object OWNERSHIP at runtime regardless of how an object was
+obtained, and the docs' own prescribed procedure requires the
+`astUnlock`/`astLock` handoff around that copy -- which, per the above,
+isn't available. Confirmed the hard way: every worker thread other
+than the one that ran `ast_copy` itself raised `astResampler`'s own
+"Invalid Object pointer given ... currently owned by another thread"
+error the moment it tried to use its "own" copy. Two real regression
+tests caught this immediately (T15's own grid-only-mismatch and long-
+`infiles=` sections), which is exactly why the test suite is run after
+every change, not just at the end.
+
+**Actual fix:** each thread still builds its own private Mapping from
+scratch, unchanged -- but the creation step itself
+(`ast_begin`/`load_wcs`/`extract_sky_mapping`/`compose_pix2pix`) is now
+wrapped in a named `!$omp critical (ast_setup)` section, serializing
+just that one step. This directly targets the actual, confirmed root
+cause (6 threads calling `ast_read_` genuinely simultaneously,
+contending on `libstarlink_ast.so.9`'s own internal object-creation
+bookkeeping, shared across all threads regardless of how independent
+the resulting objects are) without needing any cross-thread object
+sharing at all -- each thread's Mapping remains entirely its own,
+squarely inside what this AST binding actually supports. The real
+per-plane resampling (`ast_resampler`, already proven safe under
+genuine concurrency by band 1's own successful completion) is
+untouched and stays fully parallel; only the brief, one-time-per-file
+setup window is now one-thread-at-a-time instead of six-at-once.
+Applied to all three affected call sites: `reproject_cubes.f90`'s
+`write_reprojected_file` (the canonical source), `match_cubes.f90`'s
+`process_one_file_general` (`stages=reproject` alone), and
+`match_cubes.f90`'s `process_one_file_restricted` (`stages=both`,
+inside its own `do_reproject_l`-gated per-block setup).
+
+**Verification:** full suite 132/132 after each of the three call
+sites (reproject_cubes fixed and tested first, then match_cubes' two
+call sites). The real, load-bearing verification: the actual real
+WALLABY+EMU `match` run, relaunched clean from scratch with both T19's
+`io_overlap=y` and this fix in place, genuinely completed band 1
+(WALLABY Q, `finished:`/`OK: wrote` logged, confirmed via `gdb`/
+`/proc/<pid>/io`/`iostat` that the earlier "stall" reports during this
+run were real, active work, not a hang) and moved cleanly into band 2
+(EMU Q) -- the exact transition that deadlocked every time before this
+fix, now passed cleanly.

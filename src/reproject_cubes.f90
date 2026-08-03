@@ -728,7 +728,9 @@ contains
       real, allocatable, target :: block_data_in(:,:,:), block_data_out(:,:,:,:)
 
       ! Per-OpenMP-thread private AST working set (see the parallel
-      ! region below for why each thread builds its own).
+      ! region below, T20, for why each thread still builds its own,
+      ! and why the creation step -- not the objects themselves -- is
+      ! what needs the critical section).
       integer :: t_status, t_wcs_ref, t_skymap_ref, t_skyframe_ref
       integer :: t_naxes_ref(max_axes), t_pixaxes_ref(2)
       integer :: t_wcs_in, t_skymap_in, t_skyframe_in
@@ -978,27 +980,44 @@ contains
       !$omp& lbnd_in, ubnd_in, lbnd_o, ubnd_o, badval, params_dummy,&
       !$omp& iblock, tid_local, t_thread_start, t_thread_elapsed, thread_msg)
 
-      ! Each thread builds its OWN private input->reference pixel
-      ! Mapping from scratch (own ast_begin context, own load_wcs/
-      ! extract_sky_mapping/compose_pix2pix calls) rather than sharing or
-      ! cloning one Mapping built by the caller. SUN/211 Sec 4.12 ("AST
-      ! Objects within Multi-threaded Applications") requires astLock/
-      ! astUnlock to hand an AST Object from the thread that created it
-      ! to another thread; this Fortran binding doesn't export
-      ! ast_lock_/ast_unlock_ (checked libstarlink_ast.so.9's actual
-      ! symbol table) -- only ast_copy_ is present, useless on its own
-      ! without the paired lock handoff. Every thread's whole AST object
-      ! graph is therefore self-created and never shared, squarely
-      ! inside AST's documented thread-safe model without needing
-      ! lock/unlock at all. CFITSIO unit numbers used for this (in
-      ! load_wcs) come from fitsio_unit_mod's safe_ftopen (CFITSIO's own
-      ! FTGIOU+FTOPEN, both inside one critical section), so each thread
-      ! gets a genuinely distinct unit with no collision risk regardless of
-      ! thread count (see load_wcs's own comment for the earlier version
-      ! that hand-picked a unit offset and what it actually broke: a
-      ! plain unit collision, not an AST/CFITSIO concurrency limit).
+      ! T20 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): each thread still
+      ! builds its OWN private input->reference pixel Mapping from
+      ! scratch (own ast_begin context, own load_wcs/extract_sky_
+      ! mapping/compose_pix2pix calls) -- an earlier attempt to build
+      ! ONE Mapping and hand out ast_copy'd clones to every thread was
+      ! tried and reverted: AST enforces per-thread object OWNERSHIP at
+      ! runtime regardless of how the object was obtained (confirmed
+      ! directly -- ast_resampler raised "Invalid Object pointer given
+      ! ... currently owned by another thread" for every thread other
+      ! than the one that ran ast_copy itself). SUN/211 Sec 4.12 ("AST
+      ! Objects within Multi-threaded Applications") documents the
+      ! correct handoff as astUnlock (by the creating thread) then
+      ! astLock (by the receiving thread) around any ast_copy -- but
+      ! this Fortran binding exports neither (checked directly against
+      ! libstarlink_ast.so.9's own symbol table: no ast_lock_/
+      ! ast_unlock_/ast_thread_ at all), so that handoff genuinely isn't
+      ! available here, and per-thread private objects are the only
+      ! option this binding supports.
+      !
+      ! What DOES need protecting: the earlier, real WALLABY+EMU
+      ! deadlock (found via a live gdb backtrace: all 6 threads parked
+      ! on two of libstarlink_ast.so.9's own internal mutexes, all
+      ! inside ast_read_) was never about object OWNERSHIP -- it was 6
+      ! threads calling ast_read_ genuinely simultaneously, contending
+      ! on the library's own internal object-creation bookkeeping
+      ! (shared across all threads regardless of how independent the
+      ! resulting objects are). The `!$omp critical` below serializes
+      ! just that creation step -- each thread still ends up with its
+      ! own, self-created, properly-owned object, exactly as before;
+      ! only the brief window where 6 threads used to call ast_read_/
+      ! compose_pix2pix at the exact same instant is now one-at-a-time.
+      ! The actual per-plane resampling (ast_resampler, in the block
+      ! loop below) is untouched and stays fully parallel -- it was
+      ! never the problem (band 1 of the real run completed its own
+      ! ~44GB output correctly before band 2's setup step deadlocked).
       iblock = 0
       t_status = 0
+      !$omp critical (ast_setup)
       call ast_begin(t_status)
       call load_wcs(reffile, t_wcs_ref, t_naxes_ref, t_status)
       call extract_sky_mapping(t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
@@ -1008,6 +1027,7 @@ contains
       &t_pixaxes_in, t_status)
       call compose_pix2pix(t_skymap_in, t_skyframe_in, t_skymap_ref,&
       &t_skyframe_ref, t_map_in2ref, t_status)
+      !$omp end critical (ast_setup)
       if (t_status.ne.0) then
          !$omp atomic write
          status_par = -1

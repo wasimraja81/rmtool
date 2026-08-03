@@ -2450,8 +2450,24 @@ contains
       !$omp& lbnd_in, ubnd_in, lbnd_o, ubnd_o, badval, params_dummy,&
       !$omp& iblock, tid_local, t_thread_start, t_thread_elapsed, thread_msg)
 
+      ! T20 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): each thread still
+      ! builds its OWN private Mapping (AST enforces per-thread object
+      ! ownership at runtime, and this Fortran binding exports neither
+      ! astLock nor astUnlock to hand one off -- see reproject_cubes.
+      ! f90's own write_reprojected_file for the full account of why a
+      ! build-once-and-copy design was tried and reverted). The `!$omp
+      ! critical` below only serializes the CREATION step (load_wcs/
+      ! extract_sky_mapping/compose_pix2pix) -- the real, confirmed
+      ! (via gdb) cause of the real WALLABY+EMU deadlock was 6 threads
+      ! calling ast_read_ genuinely simultaneously, contending on
+      ! libstarlink_ast.so.9's own internal object-creation bookkeeping,
+      ! not object ownership. Each thread still ends up with its own,
+      ! properly-owned object; the actual per-plane resampling (ast_
+      ! resampler, below) stays fully parallel and untouched -- it was
+      ! never the problem.
       iblock = 0
       t_status = 0
+      !$omp critical (ast_setup)
       call ast_begin(t_status)
       call load_wcs(reffile_l, t_wcs_ref, t_naxes_ref, t_status)
       call extract_sky_mapping(t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
@@ -2461,6 +2477,7 @@ contains
       &t_pixaxes_in, t_status)
       call compose_pix2pix(t_skymap_in, t_skyframe_in, t_skymap_ref,&
       &t_skyframe_ref, t_map_in2ref, t_status)
+      !$omp end critical (ast_setup)
       if (t_status.ne.0) then
          !$omp atomic write
          status_par = -1
@@ -3137,6 +3154,13 @@ contains
             ! Own private AST Mapping per thread -- required, see
             ! process_one_file_general's own comment on why (this Fortran
             ! AST binding has no lock/unlock for cross-thread sharing).
+            ! T20 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the creation
+            ! step itself (not the resulting per-thread objects) is what
+            ! deadlocks under genuine concurrency -- see process_one_
+            ! file_general's own T20 comment for the full account.
+            ! Critical section serializes just this setup; the actual
+            ! per-plane resampling below stays fully parallel.
+            !$omp critical (ast_setup)
             call ast_begin(t_status)
             call load_wcs(reffile_l, t_wcs_ref, t_naxes_ref, t_status)
             call extract_sky_mapping(t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
@@ -3146,6 +3170,7 @@ contains
             &t_pixaxes_in, t_status)
             call compose_pix2pix(t_skymap_in, t_skyframe_in, t_skymap_ref,&
             &t_skyframe_ref, t_map_in2ref, t_status)
+            !$omp end critical (ast_setup)
             if (t_status.ne.0) then
                !$omp atomic write
                status_par = -1
