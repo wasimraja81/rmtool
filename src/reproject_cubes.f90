@@ -779,6 +779,7 @@ contains
       character(len=160) :: thread_msg
 
       if (status.ne.0) return
+      call timer_reset_file_stages()
       call log_message('info', 'reproject', 'starting: '//trim(infile))
 
       naxis = 0
@@ -1193,6 +1194,7 @@ contains
       endif
 
       call log_message('info', 'reproject', 'finished: '//trim(infile))
+      call timer_report_file_summary(infile)
    end subroutine write_reprojected_file
 
    subroutine copy_axis_keywords(src_unit, src_axis, dst_unit, dst_axis,&

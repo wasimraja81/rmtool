@@ -19,6 +19,7 @@ module logging_mod
    private
    public :: init_logging, log_message, log_note, level_from_name_logging
    public :: timer_start, timer_stop, timer_report_summary
+   public :: timer_reset_file_stages, timer_report_file_summary
    public :: flag_from_value_logging
 
    integer, parameter :: LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3
@@ -30,6 +31,14 @@ module logging_mod
    integer, save :: logger_unit = 6
    integer, save :: logger_level = LOG_INFO
    real(dp), save :: stage_totals(max_stages_logging) = 0.0_dp
+   ! file_stage_totals: T22 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md) --
+   ! a SEPARATE accumulator from stage_totals above, always updated
+   ! (never gated behind timing_enabled_glob) and reset per file via
+   ! timer_reset_file_stages, so timer_report_file_summary can print a
+   ! per-file INFO-level stage breakdown unconditionally, without
+   ! changing stage_totals/timer_report_summary's own existing,
+   ! timing_enabled-gated, whole-run behaviour at all.
+   real(dp), save :: file_stage_totals(max_stages_logging) = 0.0_dp
    character(len=24), save :: stage_names(max_stages_logging) = ' '
    integer, save :: n_stages_registered = 0
 
@@ -179,14 +188,23 @@ contains
    end subroutine timer_start
 
    subroutine timer_stop(stage_name, t0)
+      !! Always accumulates into file_stage_totals (T22, docs/dev/
+      !! MULTI_BAND_TOMOGRAPHY_PLAN.md) -- cheap (one wall-clock read +
+      !! one atomic add) regardless of timing_enabled, so
+      !! timer_report_file_summary always has real data to print.
+      !! stage_totals (the OLD, whole-run accumulator feeding
+      !! timer_report_summary) keeps its exact original,
+      !! timing_enabled-gated behaviour, unchanged.
       character(len=*), intent(in) :: stage_name
       real(dp), intent(in) :: t0
       integer :: stage_id
       real(dp) :: dt
 
-      if (.not. timing_enabled_glob) return
       dt = max(0.0_dp, wall_time_seconds() - t0)
       stage_id = register_stage(stage_name)
+      !$omp atomic
+      file_stage_totals(stage_id) = file_stage_totals(stage_id) + dt
+      if (.not. timing_enabled_glob) return
       !$omp atomic
       stage_totals(stage_id) = stage_totals(stage_id) + dt
    end subroutine timer_stop
@@ -213,6 +231,45 @@ contains
          call log_timing_line_logging(trim(line))
       enddo
    end subroutine timer_report_summary
+
+   subroutine timer_reset_file_stages()
+      !! T22 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): call once before
+      !! starting a new file's own block loop, so the next
+      !! timer_report_file_summary reflects just that file, not a
+      !! running total across every file processed so far. Does not
+      !! touch stage_totals/n_stages_registered/stage_names -- those
+      !! keep accumulating across the whole run for
+      !! timer_report_summary's own, separate, end-of-run report.
+      file_stage_totals = 0.0_dp
+   end subroutine timer_reset_file_stages
+
+   subroutine timer_report_file_summary(file_label)
+      !! T22 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): prints file_
+      !! stage_totals unconditionally at INFO level (never gated behind
+      !! timing_enabled, unlike timer_report_summary) -- answers "where
+      !! did the time for THIS file go" without needing debug-level
+      !! per-block/per-thread detail. No-op if nothing was ever timed
+      !! for this file (e.g. a skipped/already-matched file).
+      character(len=*), intent(in) :: file_label
+      integer :: i
+      real(dp) :: total_t, pct
+      character(len=200) :: line
+
+      total_t = 0.0_dp
+      do i = 1, n_stages_registered
+         total_t = total_t + file_stage_totals(i)
+      enddo
+      if (total_t.le.0.0_dp) return
+
+      call log_timing_line_logging('Stage timing for '//trim(file_label)//' (seconds):')
+      do i = 1, n_stages_registered
+         pct = 0.0_dp
+         if (total_t.gt.0.0_dp) pct = 100.0_dp * file_stage_totals(i) / total_t
+         write(line, '(A24,1X,F12.3,1X,F8.2)') trim(stage_names(i)),&
+         &file_stage_totals(i), pct
+         call log_timing_line_logging(trim(line))
+      enddo
+   end subroutine timer_report_file_summary
 
    subroutine log_timing_line_logging(message)
       character(len=*), intent(in) :: message

@@ -2574,3 +2574,159 @@ fixtures) added alongside the existing `io_overlap` ones -- one per
 tool/path: `convolve_cubes` (§43), `match_cubes` `stages=convolve`
 (§44), `reproject_cubes` (§45), `match_cubes` `stages=reproject`
 (§46). Full suite: 136/136.
+
+### T22 -- Per-File Stage-Timing Visibility at INFO Level, and a Genuine Convolve-vs-Reproject Split for `match_cubes`
+
+**Gap:** watching the real WALLABY+EMU `match` run, there was no way
+to tell where its own wall-clock time was actually going -- `log_level`/
+`timing_enabled` defaulted to `info`/`n`, and at that level `logging_
+mod.f90`'s existing `log_message('debug', 'tile_thread', ...)` per-
+block/per-thread lines (the only timing detail that existed at all)
+are gated behind `debug`, several times noisier than wanted for a
+simple "which stage dominates" question, and were never emitted at all
+for this run. Separately, `match_cubes.f90`'s `process_one_file_
+restricted` (`stages=both`) wraps its ENTIRE per-plane loop -- both
+`convolve_to_beam` AND (when `do_reproject_l`) `ast_resampler` -- in
+one lumped `'block_convolve'` timer, so even turning on the existing
+`timing_enabled` end-of-run summary couldn't have separated "time in
+convolution" from "time in reprojection" for exactly the run in
+question.
+
+**Fix, two parts:**
+1. **`logging_mod.f90`:** added a second, always-on accumulator
+   (`file_stage_totals`, entirely separate from the existing
+   `stage_totals`/`timing_enabled`-gated one, which keeps its exact
+   original behaviour unchanged) plus two new subroutines,
+   `timer_reset_file_stages()` (call once before starting a file) and
+   `timer_report_file_summary(file_label)` (prints unconditionally at
+   `[info] [timing]` level, no-op if nothing was timed). `timer_stop`
+   now always updates `file_stage_totals` (one wall-clock read + one
+   atomic add -- negligible next to the FFT/AST compute it's timing)
+   regardless of `timing_enabled`. Wired into `convolve_cubes.f90`,
+   both of `match_cubes.f90`'s write paths, and `reproject_cubes.f90`
+   -- reset right before each file's `starting:` log line, reported
+   right after its `finished:` line. Deliberately NOT wired into
+   `rmclean_cubes.f90`: that tool processes one amp/pha image pair per
+   invocation, not a loop over multiple input files, so the "per-file"
+   framing doesn't apply -- it already has its own end-of-run summary
+   via the existing, unchanged `timer_report_summary()`/
+   `timing_enabled`.
+2. **`match_cubes.f90`'s `process_one_file_restricted`:** added
+   `timer_start`/`timer_stop('convolve_compute', ...)` and
+   `('reproject_compute', ...)` directly around each of the file's
+   three `convolve_to_beam`/`ast_resampler` call sites (`stages=
+   convolve` alone, and both orderings of `stages=both` --
+   `convolve_reproject`/`reproject_convolve`), using new per-thread-
+   private `t_conv_local`/`t_resamp_local` start times. The existing
+   outer `'block_convolve'` timer is untouched (still a real, useful
+   bound on the whole per-block parallel loop's own wall-clock time) --
+   this adds a finer split alongside it, not a replacement.
+
+**Worth being honest about (not fixed, by design):**
+`convolve_compute`/`reproject_compute` are summed ACROSS every
+worker thread (each thread's own accumulated time, atomic-added into
+one shared total) -- a genuine "which stage costs the most total
+CPU-seconds" signal, directly useful for "where did the time go." The
+other stages (`block_read`/`block_write`/`block_write_join`/the outer
+`block_convolve`) are single-thread wall-clock measurements, taken
+outside the parallel region. Both are correct on their own terms, but
+they are not on the same basis -- the report's own "pct" column sums
+all registered stages together as if they were, so (for example) a
+well-parallelised `convolve_compute`+`reproject_compute` total can
+legitimately exceed the outer `block_convolve` wall-clock figure when
+several threads ran concurrently. Confirmed directly on a real test
+run (6+ threads available, no `OMP_NUM_THREADS` cap set): `convolve_
+compute`=0.009s + `reproject_compute`=0.132s (thread-summed) against
+`block_convolve`=0.069s (wall-clock) for the exact same per-plane
+loop -- not a bug, just two different units sharing one column. A
+reader wanting genuine wall-clock breakdown should treat `block_*`
+entries as the wall-clock bound and `*_compute` entries as "which
+compute stage dominates," not literally add every row to 100%.
+
+**Verification:** full suite 136/136, unaffected (pure additive
+logging, no behaviour/output change -- confirmed via the existing
+`nwriters`/`io_overlap` bit-identical tests still passing bit-for-bit).
+Manually confirmed the new per-file summary appears by default (no
+flags needed) on a real `stages=both` run of the small mismatched-band
+fixture, correctly showing `reproject_compute` (62%) dominating
+`convolve_compute` (4%) for that case.
+
+### T23 -- Real Output Is 100% NaN: `convolve_to_beam` Has No NaN Handling (found, root-caused, fix DEFERRED pending design decision -- not started)
+
+**Gap found:** after the real WALLABY+EMU `match` run finally completed
+end-to-end (all 4 bands, exit code 0 -- see T19/T20's own verification
+notes above), a direct check of the real output (`~/venv/rmtool/bin/
+python3` + astropy, per [[reference_python_venv]]) found every single
+channel of every one of the 4 real output files 100% NaN -- not just
+the 1-2 channels genuinely auto-detected as bad. All 4 files (both
+Stokes, both bands) deleted afterward to reclaim ~268GB (2026-08-04);
+none of this real output is usable.
+
+**Root-caused, not guessed** (per [[feedback_verify_code_behavior_before_asserting]]):
+1. Raw-byte inspection of the disk file (`struct.unpack`, bypassing
+   astropy) showed the identical canonical big-endian quiet-NaN pattern
+   (`7f c0 00 00`) repeated for every pixel, in both a genuinely-bad
+   channel and a channel never flagged bad -- ruling out a byte-swap/
+   endianness bug (T19's own write path): a corrupted real value would
+   produce *varied* bit patterns per pixel, not one repeated canonical
+   encoding. The value handed to the writer genuinely is NaN.
+2. The real BEAMS table's own values (checked directly) are sane
+   (~9-10 arcsec, correct `TUNIT=arcsec` convention, matching what the
+   code assumes) -- not a units-mismatch bug.
+3. The raw *input* data (before any processing) is genuinely clean for
+   non-bad channels -- real flux values, ~7-8% NaN (real ASKAP edge-
+   of-primary-beam blanking, a completely normal feature of real survey
+   data), not corrupted.
+4. A real-scale repro (14 real channels at the full real spatial extent,
+   so `nx_pad=11664` matches exactly, built from the actual WALLABY
+   file + its real BEAMS table) reproduced 100% NaN output even with
+   `OMP_NUM_THREADS=1` -- ruling out any FFTW concurrent-plan-execution
+   theory; the bug is deterministic, not timing-dependent.
+
+**Actual root cause:** `convolve_to_beam` (`src/gaussft.f90`) performs
+the whole convolution as a single global 2D FFT (`cimg = FFT(image)`,
+multiply by the analytically-defined Gaussian-ratio kernel, inverse
+FFT) with no NaN handling at all. A 2D FFT is a genuinely global
+transform -- every output pixel depends on *every* input pixel -- so a
+single NaN anywhere in the plane propagates through the transform and
+poisons the entire output, not just nearby pixels. Every synthetic test
+fixture used throughout this project (127+ tests) is fully finite, so
+this was never exercised; only genuinely real ASKAP data (which is
+essentially always partially blanked) triggers it. Confirmed this
+predates all of today's other tickets (T19-T22) -- a latent bug in
+`gaussft_mod.f90` since it was first written, unrelated to any of
+today's changes.
+
+**Design investigation (real-world precedent checked, not
+re-derived from scratch):** `rm_synthesis.f90`'s own NaN handling
+(`specQ(idx)/=specQ(idx)`, `rm_synthesis.f90:3955-3997`) doesn't
+directly transfer -- RM synthesis is a per-pixel transform along the
+frequency axis (zero spatial coupling between pixels), so masking a
+bad `(pixel,channel)` only drops one term from that one pixel's own
+sum. Spatial FFT convolution has no such luxury -- it mixes pixels
+together by definition. Checked the actual, real-world precedent
+instead: RACS-tools (`AlecThomson/RACS-tools`, `racs_tools/
+convolve_uv.py`'s `convolve()`), a peer-used tool solving this exact
+problem for the same class of ASKAP data with the same analytic-FFT-
+Gaussian technique. Its actual approach (read directly from source,
+not guessed): zero-fill NaN pixels, convolve once, then separately
+convolve the binary NaN mask through the *same* kernel and re-NaN only
+the output pixels where the mask-convolution shows the kernel footprint
+was **entirely** filler (`mask_conv >= 1`, within float tolerance) --
+partially-contaminated boundary pixels are left with the plain,
+uncorrected zero-fill result, with no renormalization attempted.
+
+**Status: DEFERRED, not implemented.** Extensive design discussion
+covered: zero-fill vs mean-fill as the substitution value (mean-fill is
+unbiased only in expectation under a missing-at-random assumption --
+disproved as *exact* via a concrete counterexample: a 4-pixel 1D case
+where mean-fill and the true hidden value give provably different
+convolved results at a valid neighbouring pixel); whether a second
+("mask") FFT pass can be avoided (no, if an exact per-pixel weighted
+renormalization is wanted -- knowing how much of a pixel's kernel
+footprint was real vs filler requires convolving the mask itself,
+regardless of what fill value was used); and the real-world RACS-tools
+precedent (zero-fill, no renormalization, mask-FFT used only to decide
+a binary re-NaN threshold). Final approach not yet chosen -- picking up
+this ticket next requires the user's own decision on which of these
+tradeoffs to adopt before writing any code.

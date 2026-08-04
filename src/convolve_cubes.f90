@@ -1446,6 +1446,7 @@ contains
       real(dp) :: t_stage
 
       status = 0
+      call timer_reset_file_stages()
       call log_message('info', 'convolve', 'starting: '//trim(infile))
       nx = naxes(sky1)
       ny = naxes(sky2)
@@ -1729,6 +1730,7 @@ contains
 
       call safe_ftclos(out_unit, fitsstat)
       call log_message('info', 'convolve', 'finished: '//trim(infile))
+      call timer_report_file_summary(infile)
    end subroutine write_convolved_file
 
    subroutine do_block_write(job)

@@ -2300,6 +2300,7 @@ contains
       character(len=160) :: thread_msg
 
       if (status.ne.0) return
+      call timer_reset_file_stages()
       call log_message('info', 'reproject', 'starting: '//trim(infile))
 
       naxis = 0
@@ -2629,6 +2630,7 @@ contains
       endif
 
       call log_message('info', 'reproject', 'finished: '//trim(infile))
+      call timer_report_file_summary(infile)
    end subroutine process_one_file_general
 
    subroutine read_one_block(filename, naxes_in_l, pixaxes_in_l, other_axes,&
@@ -2939,6 +2941,13 @@ contains
       integer :: iblock, tid_local
       real(dp) :: t_thread_start, t_thread_elapsed
       character(len=160) :: thread_msg
+      ! T22 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-thread private
+      ! start times for convolve-vs-reproject sub-stage timing, split
+      ! out of the single lumped 'block_convolve' timer below (which
+      ! wraps BOTH convolve_to_beam and ast_resampler for stages=both,
+      ! giving no way to tell which one dominates a real run's own
+      ! wall-clock time -- exactly what motivated this).
+      real(dp) :: t_conv_local, t_resamp_local
       ! ALLOCATABLE, not automatic/stack -- see convolve_cubes.f90's own
       ! write_convolved_file's identical comment: for a real full-size
       ! image these are ~160MB (real(dp)) or ~80MB (real) EACH, and as
@@ -2970,6 +2979,7 @@ contains
       real(dp) :: t_stage
 
       status = 0
+      call timer_reset_file_stages()
       call log_message('info', 'convolve', 'starting: '//trim(infile))
       nx_in = naxes(sky1)
       ny_in = naxes(sky2)
@@ -3203,7 +3213,8 @@ contains
          !$omp& t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
          !$omp& t_naxes_in2, t_pixaxes_in, t_map_in2ref, lbnd_in, ubnd_in,&
          !$omp& lbnd_o, ubnd_o, badval_sp, params_dummy, nbad,&
-         !$omp& tid_local, t_thread_start, t_thread_elapsed, thread_msg)
+         !$omp& tid_local, t_thread_start, t_thread_elapsed, thread_msg,&
+         !$omp& t_conv_local, t_resamp_local)
 
          tid_local = omp_get_thread_num()
          t_thread_start = omp_get_wtime()
@@ -3255,10 +3266,12 @@ contains
                ! convolve_cubes.
                if (.not. allocated(plane_native)) allocate(plane_native(nx_in,ny_in))
                plane_native = real(block_in(:,:,local_iplane), dp)
+               call timer_start(t_conv_local)
                call convolve_to_beam(plan_fwd, plan_bwd, plane_native, nx_in, ny_in, nx_pad, ny_pad,&
                &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
                &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
                &tgt_bpa_pixel_native, plane_native, k)
+               call timer_stop('convolve_compute', t_conv_local)
                block_out(:,:,local_iplane,cur_slot) = real(plane_native)
                if (k.ne.0) then
                   !$omp atomic write
@@ -3286,10 +3299,12 @@ contains
                if (.not. allocated(plane_native_sp)) allocate(plane_native_sp(nx_in,ny_in))
                if (.not. allocated(plane_out_sp)) allocate(plane_out_sp(nx_out,ny_out))
                plane_native = real(block_in(:,:,local_iplane), dp)
+               call timer_start(t_conv_local)
                call convolve_to_beam(plan_fwd, plan_bwd, plane_native, nx_in, ny_in, nx_pad, ny_pad,&
                &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
                &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
                &tgt_bpa_pixel_native, plane_native, k)
+               call timer_stop('convolve_compute', t_conv_local)
                if (k.ne.0) then
                   !$omp atomic write
                   status_par = -1
@@ -3302,11 +3317,13 @@ contains
                ! single-precision scratch arrays declared above.
                plane_native_sp = real(plane_native)
                badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
+               call timer_start(t_resamp_local)
                nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
                &plane_native_sp, plane_native_sp,&
                &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
                &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
                &plane_out_sp, plane_out_sp, t_status)
+               call timer_stop('reproject_compute', t_resamp_local)
                if (t_status.ne.0) then
                   !$omp atomic write
                   status_par = -1
@@ -3318,11 +3335,13 @@ contains
                ! grid, then convolve there using the OUTPUT grid's own
                ! (reference) dx/dy.
                badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
+               call timer_start(t_resamp_local)
                nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
                &block_in(:,:,local_iplane), block_in(:,:,local_iplane),&
                &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
                &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
                &block_out(:,:,local_iplane,cur_slot), block_out(:,:,local_iplane,cur_slot), t_status)
+               call timer_stop('reproject_compute', t_resamp_local)
                if (t_status.ne.0) then
                   !$omp atomic write
                   status_par = -1
@@ -3330,10 +3349,12 @@ contains
                endif
                if (.not. allocated(plane_out_arr)) allocate(plane_out_arr(nx_out,ny_out))
                plane_out_arr = real(block_out(:,:,local_iplane,cur_slot), dp)
+               call timer_start(t_conv_local)
                call convolve_to_beam(plan_fwd, plan_bwd, plane_out_arr, nx_out, ny_out, nx_pad, ny_pad,&
                &ref_dx_deg, ref_dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
                &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
                &tgt_bpa_pixel_out, plane_out_arr, k)
+               call timer_stop('convolve_compute', t_conv_local)
                if (k.ne.0) then
                   !$omp atomic write
                   status_par = -1
@@ -3438,6 +3459,7 @@ contains
 
       call safe_ftclos(out_unit, fitsstat)
       call log_message('info', 'convolve', 'finished: '//trim(infile))
+      call timer_report_file_summary(infile)
    end subroutine process_one_file_restricted
 
    subroutine write_beams_table_match(unit, nfreq, isbad, tgt_bmaj,&
