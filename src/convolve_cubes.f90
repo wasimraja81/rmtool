@@ -141,6 +141,7 @@ program convolve_cubes
       character(len=1024) :: file_path = ' '
       integer(kind=8) :: datastart = 0_8
       integer :: chan_start = 0, chan_len = 0, nx = 0, ny = 0
+      integer :: nwriters_eff = 1
       real, pointer :: data(:,:,:) => null()
    end type block_write_job_t
    ! target+save: must remain valid (untouched, undeallocated) from
@@ -203,9 +204,20 @@ program convolve_cubes
    ! is double-buffered so read+compute for the NEXT block can proceed
    ! immediately, but only one background write is ever in flight on
    ! out_unit at a time -- concurrent CFITSIO handle use from two threads
-   ! is unsafe, same hazard rm_synthesis_mod.f90's own io_write_threads
+   ! is unsafe, same hazard rm_synthesis_mod.f90's own nwriters
    ! doc comment describes).
    logical :: io_overlap
+   ! nwriters (default 1, T21 docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+   ! split one block's own chan_len planes into nwriters_eff disjoint
+   ! chunks, each written concurrently via write_freq_block_raw -- same
+   ! key name/clamp formula as rm_synthesis/rmclean_cubes' own nwriters
+   ! (T6/T12): max(1, min(nwriters, omp_get_max_threads())), further
+   ! bounded by chan_len itself inside write_convolved_file. Orthogonal
+   ! to io_overlap -- io_overlap decides WHEN a block's write runs
+   ! (inline vs. overlapped with the next block's read+compute);
+   ! nwriters decides how many concurrent writers do that write once
+   ! dispatched. See do_block_write's own comment for how they compose.
+   integer :: nwriters
    integer :: npts
    real(dp) :: khachiyan_tol
 
@@ -348,7 +360,8 @@ program convolve_cubes
       &naxis_f(i), sky1_f(i), sky2_f(i), freq_axis_f(i), naxes_f(i,:),&
       &cdelt1_f(i), cdelt2_f(i), nfreq_f(i), bmaj_f(i,1:nfreq_f(i)),&
       &bmin_f(i,1:nfreq_f(i)), bpa_f(i,1:nfreq_f(i)), isbad_f(i,1:nfreq_f(i)),&
-      &common_bmaj, common_bmin, common_bpa, mem_frac_ram, io_overlap, status)
+      &common_bmaj, common_bmin, common_bpa, mem_frac_ram, io_overlap,&
+      &nwriters, status)
       if (status.ne.0) then
          write(*,*) 'ERROR: failed to write convolved output for: ', trim(infiles(i))
          stop 1
@@ -517,6 +530,7 @@ contains
       max_common_bmaj = 0.0d0
       mem_frac_ram = 0.25
       io_overlap = .false.
+      nwriters = 1
       log_level = 'info'
       timing_enabled = .false.
       log_output_file = ' '
@@ -684,6 +698,13 @@ contains
          endif
       case ('io_overlap')
          io_overlap = flag_from_value_convolve(val)
+      case ('nwriters')
+         read(val, *, iostat=ios) nwriters
+         if (ios.ne.0 .or. nwriters.lt.1) then
+            write(*,*) 'ERROR: nwriters must be an integer >= 1'
+            status = -1
+            return
+         endif
       case ('log_level')
          log_level = trim(val)
       case ('timing_enabled')
@@ -755,7 +776,7 @@ contains
       write(*,'(A)') '    [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]'
       write(*,'(A)') '    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]'
       write(*,'(A)') '    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]'
-      write(*,'(A)') '    [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n]'
+      write(*,'(A)') '    [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n] [nwriters=<n>]'
       write(*,'(A)') '  convolve_cubes --config <cfgfile>'
       write(*,'(A)') '  convolve_cubes --help | -h'
       write(*,'(A)') ''
@@ -807,6 +828,13 @@ contains
       &' overlapped with the NEXT block''s own read+convolve, instead of blocking'
       write(*,'(A)') '  on the write before starting it. Only one background write is'//&
       &' ever in flight at a time.'
+      write(*,'(A)') ''
+      write(*,'(A)') 'nwriters (default 1): split one block''s own planes into this many'//&
+      &' disjoint concurrent writers -- same key/clamp as rm_synthesis'' and'
+      write(*,'(A)') '  rmclean_cubes'' own nwriters (max(1, min(nwriters, OMP thread count))).'//&
+      &' Orthogonal to io_overlap: io_overlap decides WHEN a block''s write runs'
+      write(*,'(A)') '  (inline vs. overlapped with the next block''s read+convolve);'//&
+      &' nwriters decides how many concurrent writers do it once dispatched.'
       write(*,'(A)') ''
       write(*,'(A)') 'Optional keys (CLI or config, logging/timing):'
       write(*,'(A)') '  log_level       = error|warn|info|debug (default info)'
@@ -1356,7 +1384,8 @@ contains
 
    subroutine write_convolved_file(infile, outfile, naxis, sky1, sky2,&
    &freq_axis, naxes, cdelt1, cdelt2, nfreq, bmaj_in, bmin_in, bpa_in,&
-   &isbad, tgt_bmaj, tgt_bmin, tgt_bpa, mem_frac_ram, io_overlap_l, status)
+   &isbad, tgt_bmaj, tgt_bmin, tgt_bpa, mem_frac_ram, io_overlap_l,&
+   &nwriters, status)
       use, intrinsic :: ieee_arithmetic
       use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
       use gaussft_mod, only: plan_convolution, convolve_to_beam, destroy_convolution_plan
@@ -1369,7 +1398,9 @@ contains
       real(dp), intent(in) :: tgt_bmaj, tgt_bmin, tgt_bpa
       real, intent(in) :: mem_frac_ram
       logical, intent(in) :: io_overlap_l
+      integer, intent(in) :: nwriters
       integer, intent(out) :: status
+      integer :: nwriters_eff
 
       integer :: nx, ny, nx_pad, ny_pad, in_unit, out_unit, fitsstat, blocksize
       logical :: simple, extend
@@ -1550,6 +1581,12 @@ contains
       write_failed = .false.
       status_par = 0
       nthreads = max(1, min(omp_get_max_threads(), block_planes))
+      ! nwriters_eff: same clamp formula as rm_synthesis/rmclean_cubes'
+      ! own nwriters (T7/T12) -- never changed at rename time, kept
+      ! identical here (see do_block_write's own comment for why writer
+      ! threads piggyback on cores genuinely idle at write-dispatch time
+      ! rather than meaningfully contending with the OMP compute pool).
+      nwriters_eff = max(1, min(nwriters, omp_get_max_threads()))
       chan_start = 1
       iblock = 0
       do while (chan_start.le.nfreq)
@@ -1622,6 +1659,7 @@ contains
          write_job%datastart = datastart
          write_job%chan_start = chan_start
          write_job%chan_len = chan_len
+         write_job%nwriters_eff = max(1, min(nwriters_eff, chan_len))
          write_job%nx = nx
          write_job%ny = ny
          write_job%data => block_out(:,:,1:chan_len,cur_slot)
@@ -1705,12 +1743,51 @@ contains
       !! there is no synchronous caller left to hand a status to -- same
       !! convention rm_synthesis's own do_tile_write uses.
       type(block_write_job_t), intent(inout) :: job
-      integer :: status_local
+      integer :: status_local, wk, wbase, wrem, wlen_k, woff_k, wchan_start_k
+      logical :: any_failed
 
-      status_local = 0
-      call write_freq_block_raw(trim(job%file_path), job%datastart,&
-      &job%nx, job%ny, job%chan_start, job%chan_len, job%data, status_local)
-      if (status_local.ne.0) then
+      any_failed = .false.
+      if (job%nwriters_eff.le.1) then
+         status_local = 0
+         call write_freq_block_raw(trim(job%file_path), job%datastart,&
+         &job%nx, job%ny, job%chan_start, job%chan_len, job%data, status_local)
+         if (status_local.ne.0) any_failed = .true.
+      else
+         ! nwriters_eff>1 (T21, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+         ! split this block's own chan_len channels into nwriters_eff
+         ! disjoint, contiguous chunks -- same even-split scheme
+         ! (base+remainder) as rm_synthesis_mod.f90's own do_tile_write.
+         ! Each chunk is written by its own write_freq_block_raw call
+         ! (its own byte range, its own slice of job%data), concurrently,
+         ! via a plain nested !$omp parallel do -- reusing OMP's own
+         ! thread-spawning rather than managing raw pthreads directly.
+         ! This composes cleanly with io_overlap: when io_overlap=y, THIS
+         ! whole call already runs on one background pthread (see
+         ! block_write_thread_entry below), which itself becomes the
+         ! "master" of this nested parallel region.
+         wbase = job%chan_len / job%nwriters_eff
+         wrem = mod(job%chan_len, job%nwriters_eff)
+         !$omp parallel do num_threads(job%nwriters_eff) default(none)&
+         !$omp& shared(job, wbase, wrem, any_failed)&
+         !$omp& private(wk, wlen_k, woff_k, wchan_start_k, status_local)
+         do wk = 0, job%nwriters_eff-1
+            wlen_k = wbase + merge(1, 0, wk.lt.wrem)
+            woff_k = wk*wbase + min(wk, wrem)
+            wchan_start_k = job%chan_start + woff_k
+            status_local = 0
+            if (wlen_k.gt.0) then
+               call write_freq_block_raw(trim(job%file_path), job%datastart,&
+               &job%nx, job%ny, wchan_start_k, wlen_k,&
+               &job%data(:,:,woff_k+1:woff_k+wlen_k), status_local)
+               if (status_local.ne.0) then
+                  !$omp atomic write
+                  any_failed = .true.
+               endif
+            endif
+         enddo
+         !$omp end parallel do
+      endif
+      if (any_failed) then
          write(*,*) 'ERROR: background write failed for channels ',&
          &job%chan_start, '-', job%chan_start+job%chan_len-1
          write_failed = .true.

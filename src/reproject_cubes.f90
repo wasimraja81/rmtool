@@ -178,6 +178,7 @@ program reproject_cubes
       integer :: naxes_in(max_axes) = 0, other_axes(max_axes) = 0
       integer :: other_idx(max_axes) = 0, n_other = 0
       integer :: chan_start = 0, chan_len = 0, nx = 0, ny = 0
+      integer :: nwriters_eff = 1
       real, pointer :: data(:,:,:) => null()
    end type block_write_job_t
    type(block_write_job_t), target, save :: write_job
@@ -246,6 +247,14 @@ program reproject_cubes
    ! mem_frac_ram just above.
    logical :: io_overlap, cli_io_overlap
    logical :: cli_seen_io_overlap
+   ! nwriters (default 1, T21 docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+   ! same key/clamp formula as rm_synthesis/rmclean_cubes' own nwriters
+   ! (T7/T12) and convolve_cubes'/match_cubes' own copy of this option.
+   ! Same CLI-then-cfg-then-override merge pattern as mem_frac_ram/
+   ! io_overlap above.
+   integer :: nwriters, cli_nwriters
+   logical :: cli_seen_nwriters
+   integer :: ios_nw
    ! Logging & timing (planning-doc ticket) -- log_level/timing_enabled/
    ! log_output_file themselves declared near the top of this program
    ! (alongside the `use logging_mod`); only their CLI-override
@@ -290,6 +299,8 @@ program reproject_cubes
    mem_frac_ram = 0.25
    cli_seen_io_overlap = .false.
    io_overlap = .false.
+   cli_seen_nwriters = .false.
+   nwriters = 1
    cli_seen_log_level = .false.
    log_level = 'info'
    cli_seen_timing_enabled = .false.
@@ -360,6 +371,18 @@ program reproject_cubes
             endif
             cli_io_overlap = flag_from_value_reproject(cli_val)
             cli_seen_io_overlap = .true.
+         case ('nwriters')
+            if (cli_seen_nwriters) then
+               write(*,*) 'ERROR: nwriters given more than once on the command line'
+               stop 1
+            endif
+            read(cli_val, *, iostat=ios_nw) cli_nwriters
+            if (ios_nw.ne.0 .or. cli_nwriters.lt.1) then
+               write(*,*) 'ERROR: nwriters must be an integer >= 1, got "',&
+               &trim(cli_val), '"'
+               stop 1
+            endif
+            cli_seen_nwriters = .true.
          case ('log_level')
             if (cli_seen_log_level) then
                write(*,*) 'ERROR: log_level given more than once on the command line'
@@ -396,7 +419,7 @@ program reproject_cubes
    seen_infiles = .false.
    if (have_cfgfile) then
       call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&
-      &mem_frac_ram, io_overlap, log_level, timing_enabled, log_output_file,&
+      &mem_frac_ram, io_overlap, nwriters, log_level, timing_enabled, log_output_file,&
       &status)
       if (status.ne.0) stop 1
       seen_mode = .true.
@@ -425,6 +448,7 @@ program reproject_cubes
    endif
    if (cli_seen_mem_frac_ram) mem_frac_ram = cli_mem_frac_ram
    if (cli_seen_io_overlap) io_overlap = cli_io_overlap
+   if (cli_seen_nwriters) nwriters = cli_nwriters
    if (cli_seen_log_level) log_level = cli_log_level
    if (cli_seen_timing_enabled) timing_enabled = cli_timing_enabled
    if (cli_seen_log_output_file) log_output_file = cli_log_output_file
@@ -630,7 +654,7 @@ program reproject_cubes
       call write_reprojected_file(reffile, infiles(i),&
       &trim(strip_fits_ext(infiles(i)))//'_REPROJ.FITS', pixaxes_ref,&
       &naxes_in, pixaxes_in, lbnd_out, ubnd_out, mem_frac_ram, io_overlap,&
-      &status)
+      &nwriters, status)
       if (status.ne.0) then
          write(*,*) 'ERROR: failed to write reprojected output for: ',&
          &trim(infiles(i))
@@ -663,7 +687,7 @@ contains
 
    subroutine write_reprojected_file(reffile, infile, outfile, pixaxes_ref,&
    &naxes_in, pixaxes_in, lbnd_out_d, ubnd_out_d, mem_frac_ram, io_overlap_l,&
-   &status)
+   &nwriters, status)
       !! Create outfile and write every reprojected plane of infile into
       !! it. Output axis layout: the 2 sky axes always occupy OUTPUT
       !! positions 1,2 (matching what rm_synthesis's own tile-read I/O
@@ -705,13 +729,14 @@ contains
       double precision, intent(in) :: lbnd_out_d(2), ubnd_out_d(2)
       real, intent(in) :: mem_frac_ram
       logical, intent(in) :: io_overlap_l
+      integer, intent(in) :: nwriters
       integer, intent(inout) :: status
 
       integer :: cur_slot
       logical :: write_dispatched_ok
       integer :: naxis, k, other_axes(max_axes), n_other
       integer :: other_idx(max_axes), remainder, radix
-      integer :: n_planes, status_par, nthreads
+      integer :: n_planes, status_par, nthreads, nwriters_eff
       integer :: nx_out, ny_out, naxis_out, naxes_out(max_axes)
       integer :: nx_in, ny_in
       integer :: ref_unit, out_unit, fitsstat, blocksize
@@ -966,13 +991,14 @@ contains
       write_failed = .false.
       status_par = 0
       nthreads = max(1, min(omp_get_max_threads(), block_planes))
+      nwriters_eff = max(1, min(nwriters, omp_get_max_threads()))
       !$omp parallel num_threads(nthreads) default(none)&
       !$omp& shared(infile, reffile, outfile, naxes_in, pixaxes_in, other_axes,&
       !$omp& n_other, lbnd_out_d, ubnd_out_d, datastart, status_par,&
       !$omp& nx_in, ny_in, nx_out, ny_out, block_planes, block_data_in,&
       !$omp& block_data_out, n_groups, axis1_extent, cur_slot,&
       !$omp& io_overlap_l, write_dispatched_ok, write_pending,&
-      !$omp& write_thread_id, write_failed, write_job, t_stage)&
+      !$omp& write_thread_id, write_failed, write_job, t_stage, nwriters_eff)&
       !$omp& private(t_status, t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
       !$omp& t_naxes_ref, t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
       !$omp& t_naxes_in, t_pixaxes_in, t_map_in2ref, other_idx, remainder,&
@@ -1124,6 +1150,7 @@ contains
                write_job%n_other = n_other
                write_job%chan_start = chan_start
                write_job%chan_len = chan_len
+               write_job%nwriters_eff = max(1, min(nwriters_eff, chan_len))
                write_job%nx = nx_out
                write_job%ny = ny_out
                write_job%data => block_data_out(:,:,1:chan_len,cur_slot)
@@ -1891,14 +1918,48 @@ contains
       !! would race; write_failed is the safe, checked-after-join
       !! handoff instead).
       type(block_write_job_t), intent(inout) :: job
-      integer :: status_local
+      integer :: status_local, wk, wbase, wrem, wlen_k, woff_k, wchan_start_k
+      logical :: any_failed
 
-      status_local = 0
-      call write_one_block_raw(trim(job%file_path), job%datastart,&
-      &job%naxes_in(1:max_axes), job%other_axes(1:max_axes),&
-      &job%other_idx(1:max_axes), job%n_other, job%chan_start, job%chan_len,&
-      &job%nx, job%ny, job%data, status_local)
-      if (status_local.ne.0) then
+      any_failed = .false.
+      if (job%nwriters_eff.le.1) then
+         status_local = 0
+         call write_one_block_raw(trim(job%file_path), job%datastart,&
+         &job%naxes_in(1:max_axes), job%other_axes(1:max_axes),&
+         &job%other_idx(1:max_axes), job%n_other, job%chan_start, job%chan_len,&
+         &job%nx, job%ny, job%data, status_local)
+         if (status_local.ne.0) any_failed = .true.
+      else
+         ! nwriters_eff>1 (T21, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+         ! same even-split scheme as convolve_cubes.f90's/match_cubes.f90's
+         ! own copies -- splits along other_axes(1) (the axis varying
+         ! within this block), every slower axis already fixed for the
+         ! whole job.
+         wbase = job%chan_len / job%nwriters_eff
+         wrem = mod(job%chan_len, job%nwriters_eff)
+         !$omp parallel do num_threads(job%nwriters_eff) default(none)&
+         !$omp& shared(job, wbase, wrem, any_failed)&
+         !$omp& private(wk, wlen_k, woff_k, wchan_start_k, status_local)
+         do wk = 0, job%nwriters_eff-1
+            wlen_k = wbase + merge(1, 0, wk.lt.wrem)
+            woff_k = wk*wbase + min(wk, wrem)
+            wchan_start_k = job%chan_start + woff_k
+            status_local = 0
+            if (wlen_k.gt.0) then
+               call write_one_block_raw(trim(job%file_path), job%datastart,&
+               &job%naxes_in(1:max_axes), job%other_axes(1:max_axes),&
+               &job%other_idx(1:max_axes), job%n_other, wchan_start_k, wlen_k,&
+               &job%nx, job%ny, job%data(:,:,woff_k+1:woff_k+wlen_k),&
+               &status_local)
+               if (status_local.ne.0) then
+                  !$omp atomic write
+                  any_failed = .true.
+               endif
+            endif
+         enddo
+         !$omp end parallel do
+      endif
+      if (any_failed) then
          write(*,*) 'ERROR: background write failed for planes ',&
          &job%chan_start, '-', job%chan_start+job%chan_len-1
          write_failed = .true.
@@ -2302,6 +2363,14 @@ contains
       write(*,'(A)') '  threads is unsafe) -- still overlaps the write with the'//&
       &' following block''s read+compute, which is where the dead time is.'
       write(*,'(A)') ''
+      write(*,'(A)') 'Optional key (CLI or config, default 1):'
+      write(*,'(A)') '  nwriters = split one block''s own planes into this many disjoint'//&
+      &' concurrent writers -- same key/clamp as rm_synthesis'' and'
+      write(*,'(A)') '  rmclean_cubes'' own nwriters (max(1, min(nwriters, OMP thread'//&
+      &' count))). Orthogonal to io_overlap: io_overlap decides WHEN a'
+      write(*,'(A)') '  block''s write runs; nwriters decides how many concurrent'//&
+      &' writers do it once dispatched.'
+      write(*,'(A)') ''
       write(*,'(A)') 'Optional keys (CLI or config, logging/timing):'
       write(*,'(A)') '  log_level       = error|warn|info|debug (default info)'
       write(*,'(A)') '  timing_enabled  = y|n -- print a stage timing summary (default n)'
@@ -2310,7 +2379,7 @@ contains
    end subroutine print_usage
 
    subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&
-   &mem_frac_ram, io_overlap_l, log_level_l, timing_enabled_l,&
+   &mem_frac_ram, io_overlap_l, nwriters_l, log_level_l, timing_enabled_l,&
    &log_output_file_l, status)
       !! Parse a --config key=value file: three required keys, mode,
       !! reffile, and infiles (comma-separated, same csv-list convention
@@ -2330,6 +2399,7 @@ contains
       integer, intent(out) :: n_inputs
       real, intent(inout) :: mem_frac_ram
       logical, intent(inout) :: io_overlap_l
+      integer, intent(inout) :: nwriters_l
       character(len=*), intent(inout) :: log_level_l
       logical, intent(inout) :: timing_enabled_l
       character(len=*), intent(inout) :: log_output_file_l
@@ -2337,7 +2407,7 @@ contains
 
       character(len=16384) :: line, val, raw_infiles
       character(len=512) :: key
-      integer :: unit_cfg, ios, line_no, j, ios_mfr
+      integer :: unit_cfg, ios, line_no, j, ios_mfr, ios_nw
       logical :: has_kv, seen_mode, seen_reffile, seen_infiles
 
       status = 0
@@ -2382,6 +2452,15 @@ contains
             endif
          case ('io_overlap')
             io_overlap_l = flag_from_value_reproject(val)
+         case ('nwriters')
+            read(val, *, iostat=ios_nw) nwriters_l
+            if (ios_nw.ne.0 .or. nwriters_l.lt.1) then
+               write(*,*) 'ERROR: nwriters must be an integer >= 1, at line ',&
+               &line_no, ' in ', trim(cfgfile)
+               status = -1
+               close(unit_cfg)
+               return
+            endif
          case ('log_level')
             log_level_l = trim(val)
          case ('timing_enabled')

@@ -2918,6 +2918,166 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 43. convolve_cubes: nwriters>1 bit-identical to nwriters=1 (T21)
+# ---------------------------------------------------------------------------
+section "43. convolve_cubes: nwriters>1 bit-identical to nwriters=1 (io_overlap=y)"
+
+if [[ -x bin/convolve_cubes ]]; then
+    nwc_beamfile="$OUT_DIR/nwc_beamlog.txt"
+    awk 'BEGIN { for (i=1;i<=200;i++) print i, 10.0, 10.0, 0.0 }' > "$nwc_beamfile"
+
+    nwc_src="$OUT_DIR/nwc_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$nwc_src"
+
+    nwc_1_out="${nwc_src%.FITSCUBE}_nw1.CONV.FITS"
+    nwc_4_out="${nwc_src%.FITSCUBE}_nw4.CONV.FITS"
+    rm -f "$nwc_1_out" "$nwc_4_out"
+
+    nwc_1_log="$OUT_DIR/convolve_nwriters1.log"
+    nwc_4_log="$OUT_DIR/convolve_nwriters4.log"
+
+    if bin/convolve_cubes infiles="$nwc_src" beamfiles="$nwc_beamfile" \
+            outsuffix="_nw1.CONV.FITS" target_bmaj=20.0 target_bmin=20.0 \
+            target_bpa=0.0 mem_frac_ram=0.1 io_overlap=y nwriters=1 \
+            > "$nwc_1_log" 2>&1 && \
+       bin/convolve_cubes infiles="$nwc_src" beamfiles="$nwc_beamfile" \
+            outsuffix="_nw4.CONV.FITS" target_bmaj=20.0 target_bmin=20.0 \
+            target_bpa=0.0 mem_frac_ram=0.1 io_overlap=y nwriters=4 \
+            > "$nwc_4_log" 2>&1; then
+        if [[ -s "$nwc_1_out" && -s "$nwc_4_out" ]] && \
+           cmp -s "$nwc_1_out" "$nwc_4_out"; then
+            pass "convolve_cubes: nwriters=4 bit-identical to nwriters=1"
+        else
+            fail "convolve_cubes: nwriters=4 output differs from nwriters=1 (see $nwc_1_log / $nwc_4_log)"
+        fi
+    else
+        fail "convolve_cubes: nwriters=1/4 run(s) failed (see $nwc_1_log / $nwc_4_log)"
+    fi
+else
+    skip "bin/convolve_cubes not built; skipping nwriters bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 44. match_cubes: nwriters>1 bit-identical to nwriters=1 (stages=convolve, T21)
+# ---------------------------------------------------------------------------
+section "44. match_cubes: nwriters>1 bit-identical to nwriters=1 (stages=convolve)"
+
+if [[ -x bin/match_cubes ]]; then
+    mcnw_beamfile="$OUT_DIR/mcnw_beamlog.txt"
+    awk 'BEGIN { for (i=1;i<=200;i++) print i, 10.0, 10.0, 0.0 }' > "$mcnw_beamfile"
+
+    mcnw_src="$OUT_DIR/mcnw_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mcnw_src"
+
+    mcnw_1_out="${mcnw_src%.FITSCUBE}_nw1.MATCHED.FITS"
+    mcnw_4_out="${mcnw_src%.FITSCUBE}_nw4.MATCHED.FITS"
+    rm -f "$mcnw_1_out" "$mcnw_4_out"
+
+    mcnw_1_log="$OUT_DIR/match_nwriters1.log"
+    mcnw_4_log="$OUT_DIR/match_nwriters4.log"
+
+    if bin/match_cubes stages=convolve infiles="$mcnw_src" \
+            beamfiles="$mcnw_beamfile" outsuffix="_nw1.MATCHED.FITS" \
+            target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 \
+            mem_frac_ram=0.1 io_overlap=y nwriters=1 \
+            > "$mcnw_1_log" 2>&1 && \
+       bin/match_cubes stages=convolve infiles="$mcnw_src" \
+            beamfiles="$mcnw_beamfile" outsuffix="_nw4.MATCHED.FITS" \
+            target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 \
+            mem_frac_ram=0.1 io_overlap=y nwriters=4 \
+            > "$mcnw_4_log" 2>&1; then
+        if [[ -s "$mcnw_1_out" && -s "$mcnw_4_out" ]] && \
+           cmp -s "$mcnw_1_out" "$mcnw_4_out"; then
+            pass "match_cubes: nwriters=4 bit-identical to nwriters=1 (stages=convolve)"
+        else
+            fail "match_cubes: nwriters=4 output differs from nwriters=1 (see $mcnw_1_log / $mcnw_4_log)"
+        fi
+    else
+        fail "match_cubes: nwriters=1/4 run(s) failed (see $mcnw_1_log / $mcnw_4_log)"
+    fi
+else
+    skip "bin/match_cubes not built; skipping nwriters bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 45. reproject_cubes: nwriters>1 bit-identical to nwriters=1 (T21)
+# ---------------------------------------------------------------------------
+section "45. reproject_cubes: nwriters>1 bit-identical to nwriters=1"
+
+if [[ -x bin/reproject_cubes ]]; then
+    rcnw_ref="$DATA_DIR/TEST.Q.FITSCUBE"
+    rcnw_src="$OUT_DIR/rcnw_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$rcnw_src"
+
+    rcnw_src_reproj="${rcnw_src%.FITSCUBE}_REPROJ.FITS"
+    rcnw_1_out="${rcnw_src}_nw1.FITS"
+    rcnw_4_out="${rcnw_src}_nw4.FITS"
+    rm -f "$rcnw_src_reproj" "$rcnw_1_out" "$rcnw_4_out"
+
+    rcnw_1_log="$OUT_DIR/reproject_nwriters1.log"
+    rcnw_4_log="$OUT_DIR/reproject_nwriters4.log"
+
+    if bin/reproject_cubes mode=reference reffile="$rcnw_ref" \
+            infiles="$rcnw_src" mem_frac_ram=0.1 io_overlap=y nwriters=1 \
+            > "$rcnw_1_log" 2>&1; then
+        mv "$rcnw_src_reproj" "$rcnw_1_out"
+    fi
+    if bin/reproject_cubes mode=reference reffile="$rcnw_ref" \
+            infiles="$rcnw_src" mem_frac_ram=0.1 io_overlap=y nwriters=4 \
+            > "$rcnw_4_log" 2>&1; then
+        mv "$rcnw_src_reproj" "$rcnw_4_out"
+    fi
+
+    if [[ -s "$rcnw_1_out" && -s "$rcnw_4_out" ]] && \
+       cmp -s "$rcnw_1_out" "$rcnw_4_out"; then
+        pass "reproject_cubes: nwriters=4 bit-identical to nwriters=1"
+    else
+        fail "reproject_cubes: nwriters=4 output differs from (or is missing vs) nwriters=1 (see $rcnw_1_log / $rcnw_4_log)"
+    fi
+else
+    skip "bin/reproject_cubes not built; skipping nwriters bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
+# 46. match_cubes: nwriters>1 bit-identical to nwriters=1 (stages=reproject, T21)
+# ---------------------------------------------------------------------------
+section "46. match_cubes: nwriters>1 bit-identical to nwriters=1 (stages=reproject)"
+
+if [[ -x bin/match_cubes ]]; then
+    mcrnw_ref="$DATA_DIR/TEST.Q.FITSCUBE"
+    mcrnw_src="$OUT_DIR/mcrnw_src.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST_BAND2_MISMATCH.Q.FITSCUBE" "$mcrnw_src"
+
+    mcrnw_src_reproj="${mcrnw_src%.FITSCUBE}_REPROJ.FITS"
+    mcrnw_1_out="${mcrnw_src}_nw1.FITS"
+    mcrnw_4_out="${mcrnw_src}_nw4.FITS"
+    rm -f "$mcrnw_src_reproj" "$mcrnw_1_out" "$mcrnw_4_out"
+
+    mcrnw_1_log="$OUT_DIR/match_reproject_nwriters1.log"
+    mcrnw_4_log="$OUT_DIR/match_reproject_nwriters4.log"
+
+    if bin/match_cubes stages=reproject footprint_mode=reference \
+            reffile="$mcrnw_ref" infiles="$mcrnw_src" outsuffix="_REPROJ.FITS" \
+            mem_frac_ram=0.1 io_overlap=y nwriters=1 > "$mcrnw_1_log" 2>&1; then
+        mv "$mcrnw_src_reproj" "$mcrnw_1_out"
+    fi
+    if bin/match_cubes stages=reproject footprint_mode=reference \
+            reffile="$mcrnw_ref" infiles="$mcrnw_src" outsuffix="_REPROJ.FITS" \
+            mem_frac_ram=0.1 io_overlap=y nwriters=4 > "$mcrnw_4_log" 2>&1; then
+        mv "$mcrnw_src_reproj" "$mcrnw_4_out"
+    fi
+
+    if [[ -s "$mcrnw_1_out" && -s "$mcrnw_4_out" ]] && \
+       cmp -s "$mcrnw_1_out" "$mcrnw_4_out"; then
+        pass "match_cubes: nwriters=4 bit-identical to nwriters=1 (stages=reproject)"
+    else
+        fail "match_cubes: nwriters=4 output differs from (or is missing vs) nwriters=1 (see $mcrnw_1_log / $mcrnw_4_log)"
+    fi
+else
+    skip "bin/match_cubes not built; skipping nwriters bit-identical test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

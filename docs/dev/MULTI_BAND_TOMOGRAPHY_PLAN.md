@@ -2498,4 +2498,79 @@ WALLABY+EMU `match` run, relaunched clean from scratch with both T19's
 `/proc/<pid>/io`/`iostat` that the earlier "stall" reports during this
 run were real, active work, not a hang) and moved cleanly into band 2
 (EMU Q) -- the exact transition that deadlocked every time before this
-fix, now passed cleanly.
+fix, now passed cleanly. The full real run went on to complete all 4
+bands (Q/U x WALLABY/EMU), ~9h15m total, manifest written, pipeline
+exit code 0 -- the definitive end-to-end confirmation of both T19 and
+T20 together.
+
+### T21 -- `nwriters`: Configurable N-Way Concurrent Block Writers for `convolve_cubes`/`match_cubes`/`reproject_cubes`
+
+**Motivation:** while watching the real WALLABY+EMU `match` run, a live
+`perf`/`/proc/<pid>/io` profile of one write-heavy window showed the
+majority of sampled CPU cycles inside the block write itself (raw
+stream I/O copying a multi-GB buffer into the page cache), with zero
+actual bytes reaching the physical block device in the same window --
+i.e. real, measured CPU cost, not disk latency, for a single giant
+per-block write. `rm_synthesis_mod.f90`/`rmclean_cubes.f90` already
+solved exactly this with `nwriters` (T6, renamed from
+`io_write_threads`, T7/T12 above): split one block/tile's own planes
+into N disjoint concurrent writers instead of one. `convolve_cubes.f90`/
+`match_cubes.f90`/`reproject_cubes.f90` had no equivalent option --
+only `io_overlap` (whether a block's write overlaps the NEXT block's
+read+compute), never how many writers do that write once dispatched.
+Explicitly scoped as **configurable, not forced**: on a genuinely
+rotational disk (confirmed this machine's own `/data1` earlier this
+session), concurrent writes are not obviously a win and may hurt --
+the point is giving the user the choice, defaulting to the existing,
+already-proven serial behaviour (`nwriters=1`).
+
+**Design, mirrored exactly from `rm_synthesis_mod.f90`'s own
+`do_tile_write`:** `nwriters_eff = max(1, min(nwriters,
+omp_get_max_threads()))`, further bounded by the current block's own
+`chan_len` (never more writers than planes in a single block). When
+`nwriters_eff>1`, the block's planes are split into
+`nwriters_eff` disjoint, contiguous chunks via the same even-split
+(base+remainder) scheme `do_tile_write` already uses, each chunk
+written by its own `write_freq_block_raw`/`write_one_block_raw[_general]`
+call (T19's own raw-stream writers, already safe for concurrent,
+disjoint-byte-range use) inside a plain nested `!$omp parallel do
+num_threads(nwriters_eff)` -- reusing OpenMP's own thread-spawning
+rather than managing raw pthreads directly. This composes cleanly with
+`io_overlap`: when `io_overlap=y`, the whole block-write call already
+runs on one background pthread (T19's own `block_write_dispatch_async`),
+which itself becomes the "master" of this nested parallel region --
+`io_overlap` decides WHEN a block's write runs, `nwriters` decides how
+many concurrent writers do it once dispatched, and the two knobs are
+otherwise independent, same as in `rm_synthesis`.
+
+**The clamp formula itself was explicitly discussed and left
+unchanged** (not switched to a spare-core-headroom formula capping at
+`omp_get_num_procs() - omp_get_max_threads()`): in practice the writer
+thread(s) piggyback on cores that are genuinely idle at write-dispatch
+time (either the physical cores outside this machine's own
+`OMP_NUM_THREADS=6` convention, or the OMP worker threads' own idle
+window between one block's `!$omp end parallel`/`!$omp end do` and the
+next block's first compute region, while the next block's
+single-threaded read runs) -- see T7/T12's own entry for the fuller
+account of why real contention is lower than a naive thread-count sum
+suggests.
+
+**Applied to:** `convolve_cubes.f90`'s `write_convolved_file`/
+`do_block_write`; `match_cubes.f90`'s `process_one_file_restricted`
+(`stages=convolve`/`both`) and `process_one_file_general`
+(`stages=reproject` alone), each with their own `do_block_write`/
+`do_block_write_general`; `reproject_cubes.f90`'s
+`write_reprojected_file`/`do_block_write` (the general-axis case,
+splitting along `other_axes(1)`, the axis varying within a block, with
+every slower axis already fixed for the whole write job). Same
+`nwriters` cfg key (CLI and `--config`), same default (1), same
+`--help` text pattern, across all three -- and now consistent with
+`rm_synthesis`/`rmclean_cubes`' own `nwriters` (T7/T12), closing the
+naming gap that motivated the rename in the first place.
+
+**Verification:** full suite, 4 new bit-identical regression tests
+(`nwriters=4` vs `nwriters=1`, `io_overlap=y`, on the existing small
+fixtures) added alongside the existing `io_overlap` ones -- one per
+tool/path: `convolve_cubes` (§43), `match_cubes` `stages=convolve`
+(§44), `reproject_cubes` (§45), `match_cubes` `stages=reproject`
+(§46). Full suite: 136/136.
