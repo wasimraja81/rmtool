@@ -2786,3 +2786,37 @@ writes a valid suggested cfg (`io_overlap=`/`nwriters=` present) and
 genuinely processes no data (checked: the real output file that a live
 run would have produced does not exist afterward). Full suite:
 139/139.
+
+### T25 -- Explicit `target_bmaj`/`target_bmin`/`target_bpa` Never Validated as a Real Deconvolution Target (found during T23's own investigation, not started)
+
+**Gap found** while confirming a premise for T23's own NaN-handling
+design (that `convolve_to_beam`'s kernel is always positive/well-
+behaved in real space, which the design relies on): checked both
+`convolve_cubes.f90` and `match_cubes.f90` directly for their own
+`have_target` (explicit `target_bmaj=`/`target_bmin=`/`target_bpa=`)
+branch, and neither calls `deconvolve_is_valid`
+(`commonbeam.f90:578`, the ported MIRIAD "gaupar" validity check) on
+it at all -- unlike the auto-derived common-beam path
+(`find_common_beam`), which validates every candidate before ever
+returning it. So a user-supplied explicit target beam that isn't
+actually deconvolvable from some channel's real native beam (target
+smaller than native in some direction, or otherwise invalid) currently
+passes through with no check, and `convolve_to_beam`'s own kernel
+exponent (`g_arg - dg_arg`) can go *positive* instead of negative at
+high frequencies for that channel -- turning the intended low-pass
+smoothing kernel into an unbounded high-frequency amplifier, which
+would silently produce garbage (most likely Inf/NaN) output with no
+warning at all.
+
+**Not the cause of T23's own real-run NaN bug** -- confirmed directly:
+the real WALLABY+EMU run's own log ("Derived common beam from 858 good
+channels...") shows it went through the auto-derived (validated) path,
+not an explicit target -- these are two genuinely separate gaps, found
+back to back but with independent causes and independent fixes.
+
+**Fix (not started):** call `deconvolve_is_valid` on the explicit
+target beam against every input channel's own native beam, in both
+`convolve_cubes.f90` and `match_cubes.f90`'s `have_target` branch,
+matching exactly what `find_common_beam` already does for the
+auto-derived path -- fail loudly (a real `ERROR:`, not silent garbage)
+naming the specific offending channel/file, before any FFT ever runs.
