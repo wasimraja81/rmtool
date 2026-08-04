@@ -46,7 +46,7 @@ module gaussft_mod
    !! planner functions are not thread-safe and must never run inside a
    !! parallel region, but a single plan, once created, is safe to
    !! EXECUTE concurrently from multiple threads via the "new-array
-   !! execute" form (dfftw_execute_dft with explicit in/out arguments,
+   !! execute" form (sfftw_execute_dft with explicit in/out arguments,
    !! as convolve_to_beam uses below) as long as each concurrent call
    !! supplies its own distinct arrays -- true here, since image/
    !! image_out/the internal work arrays are all local to each call.
@@ -54,11 +54,30 @@ module gaussft_mod
    !! threads calling convolve_to_beam concurrently against the SAME
    !! shared plan, each on its own image/beam pair, matches a serial
    !! run of the same 16 calls exactly.
-   use, intrinsic :: iso_fortran_env, only: dp => real64
+   use, intrinsic :: iso_fortran_env, only: dp => real64, sp => real32
    implicit none
    private
    public :: plan_convolution, convolve_to_beam, destroy_convolution_plan,&
    &next_fast_fft_size
+
+   ! T27 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the FFT buffers
+   ! (plan_convolution's own scratch, and convolve_to_beam's cimg/cmsk/
+   ! g_final/c_d/c_m below) are single precision (sp) -- FITS flux data
+   ! is already written to disk as BITPIX=-32 (see write_convolved_file/
+   ! write_matched_file's own FTPHPR calls), so there is no real
+   ! dynamic-range/precision argument for carrying it at double
+   ! precision through the FFT, and halving these (the largest, padded-
+   ! size) arrays roughly halves convolve_to_beam's own peak per-plane
+   ! memory. The one place this does NOT apply: the kernel exponent
+   ! itself (g_arg/dg_arg below, a DIFFERENCE of two potentially large
+   ! terms before exp()) stays real(dp) throughout its own computation,
+   ! only cast down to sp at the point g_final is actually stored --
+   ! single precision there risks catastrophic cancellation in the
+   ! subtraction, which halving a bulk data array never does. image/
+   ! image_out (convolve_to_beam's own dummy arguments) deliberately
+   ! stay real(dp) -- the precision reduction is entirely internal to
+   ! this module, so no caller (match_cubes.f90/convolve_cubes.f90)
+   ! needs to change at all.
 
    real(dp), parameter :: pi = 3.14159265358979323846_dp
    real(dp), parameter :: deg2rad = pi/180.0_dp
@@ -109,7 +128,7 @@ contains
       integer(kind=8), intent(out) :: plan_fwd, plan_bwd
       integer, intent(out) :: nx_pad, ny_pad
 
-      complex(dp), allocatable :: scratch(:,:)
+      complex(sp), allocatable :: scratch(:,:)
 
       nx_pad = next_fast_fft_size(nx)
       ny_pad = next_fast_fft_size(ny)
@@ -122,10 +141,15 @@ contains
       ! alignment, though a non-ESTIMATE plan might not be as fast on a
       ! differently-aligned array than the one it was planned with --
       ! irrelevant for ESTIMATE, which never does alignment-specific
-      ! optimisation in the first place).
+      ! optimisation in the first place). sfftw_* (single precision,
+      ! T27) -- the plan's own precision must match whatever array it
+      ! will later execute against (convolve_to_beam's cimg/cmsk, both
+      ! complex(sp)); a plan created via dfftw_* cannot be executed
+      ! against a complex(sp) array (undefined behaviour, not a clean
+      ! error) so this scratch array is complex(sp) too, matching.
       allocate(scratch(nx_pad, ny_pad))
-      call dfftw_plan_dft_2d(plan_fwd, nx_pad, ny_pad, scratch, scratch, fftw_forward, fftw_estimate)
-      call dfftw_plan_dft_2d(plan_bwd, nx_pad, ny_pad, scratch, scratch, fftw_backward, fftw_estimate)
+      call sfftw_plan_dft_2d(plan_fwd, nx_pad, ny_pad, scratch, scratch, fftw_forward, fftw_estimate)
+      call sfftw_plan_dft_2d(plan_bwd, nx_pad, ny_pad, scratch, scratch, fftw_backward, fftw_estimate)
       deallocate(scratch)
    end subroutine plan_convolution
 
@@ -165,8 +189,8 @@ contains
    subroutine destroy_convolution_plan(plan_fwd, plan_bwd)
       integer(kind=8), intent(inout) :: plan_fwd, plan_bwd
 
-      call dfftw_destroy_plan(plan_fwd)
-      call dfftw_destroy_plan(plan_bwd)
+      call sfftw_destroy_plan(plan_fwd)
+      call sfftw_destroy_plan(plan_bwd)
    end subroutine destroy_convolution_plan
 
    subroutine convolve_to_beam(plan_fwd, plan_bwd, image, nx, ny, nx_pad,&
@@ -246,10 +270,10 @@ contains
       real(dp) :: ur, vr, ur_in, vr_in, g_arg, dg_arg
       real(dp) :: nanval
       real(dp), allocatable :: u(:), v(:)
-      real(dp), allocatable :: c_d(:,:), c_m(:,:)
+      real(sp), allocatable :: c_d(:,:), c_m(:,:)
       logical, allocatable :: nan_mask(:,:)
       logical :: has_nan
-      complex(dp), allocatable :: cimg(:,:), cmsk(:,:), g_final(:,:)
+      complex(sp), allocatable :: cimg(:,:), cmsk(:,:), g_final(:,:)
       integer :: ix, iy
 
       status = 0
@@ -290,19 +314,24 @@ contains
             vr_in = u(ix)*sin_bpa_in + v(iy)*cos_bpa_in
             dg_arg = -2.0_dp*pi**2 * ((sx_in*ur_in)**2 + (sy_in*vr_in)**2)
 
-            g_final(ix,iy) = g_ratio * exp(cmplx(g_arg - dg_arg, 0.0_dp, dp))
+            ! Exponent computed and combined entirely in dp above (g_arg
+            ! - dg_arg is a difference of two potentially large terms --
+            ! single precision here would risk real cancellation error);
+            ! only the finished value is cast down to sp (T27) at the
+            ! point of storage.
+            g_final(ix,iy) = cmplx(g_ratio * exp(cmplx(g_arg - dg_arg, 0.0_dp, dp)), kind=sp)
          enddo
       enddo
       deallocate(u, v)
 
       allocate(cimg(nx_pad, ny_pad))
-      cimg = cmplx(0.0_dp, 0.0_dp, dp)
+      cimg = cmplx(0.0_sp, 0.0_sp, sp)
       if (has_nan) then
-         cimg(1:nx, 1:ny) = cmplx(merge(0.0_dp, image, nan_mask), 0.0_dp, dp)
+         cimg(1:nx, 1:ny) = cmplx(merge(0.0_dp, image, nan_mask), 0.0_dp, sp)
       else
-         cimg(1:nx, 1:ny) = cmplx(image, 0.0_dp, dp)
+         cimg(1:nx, 1:ny) = cmplx(image, 0.0_dp, sp)
       endif
-      call dfftw_execute_dft(plan_fwd, cimg, cimg)
+      call sfftw_execute_dft(plan_fwd, cimg, cimg)
 
       cimg = cimg*g_final
 
@@ -311,14 +340,18 @@ contains
       ! ifft2 -- numpy just applies the 1/N inside ifft2 for you; FFTW
       ! leaves it to the caller, matching its own documented convention).
       ! Cropped back from the same top-left corner the image was placed
-      ! at above.
+      ! at above. Division itself stays in dp (nx_pad*ny_pad cast to dp
+      ! before dividing) even though cimg's own bits are only sp-precise
+      ! -- preserves the exact same normalisation pathway as before this
+      ! module went single precision (T27), rather than also changing
+      ! how the division itself is computed.
       if (.not. has_nan) then
          deallocate(g_final)
-         call dfftw_execute_dft(plan_bwd, cimg, cimg)
+         call sfftw_execute_dft(plan_bwd, cimg, cimg)
          image_out = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
          deallocate(cimg)
       else
-         call dfftw_execute_dft(plan_bwd, cimg, cimg)
+         call sfftw_execute_dft(plan_bwd, cimg, cimg)
          allocate(c_d(nx, ny))
          c_d = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
          deallocate(cimg)
@@ -331,12 +364,12 @@ contains
          ! for why g_ratio isn't unit gain -- so divide it out once here
          ! to get a clean 0..1 fraction.
          allocate(cmsk(nx_pad, ny_pad))
-         cmsk = cmplx(0.0_dp, 0.0_dp, dp)
-         cmsk(1:nx, 1:ny) = cmplx(merge(0.0_dp, 1.0_dp, nan_mask), 0.0_dp, dp)
-         call dfftw_execute_dft(plan_fwd, cmsk, cmsk)
+         cmsk = cmplx(0.0_sp, 0.0_sp, sp)
+         cmsk(1:nx, 1:ny) = cmplx(merge(0.0_dp, 1.0_dp, nan_mask), 0.0_dp, sp)
+         call sfftw_execute_dft(plan_fwd, cmsk, cmsk)
          cmsk = cmsk*g_final
          deallocate(g_final)
-         call dfftw_execute_dft(plan_bwd, cmsk, cmsk)
+         call sfftw_execute_dft(plan_bwd, cmsk, cmsk)
 
          allocate(c_m(nx, ny))
          c_m = real(cmsk(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp) / g_ratio

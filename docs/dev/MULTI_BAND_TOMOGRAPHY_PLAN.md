@@ -2847,3 +2847,218 @@ target beam against every input channel's own native beam, in both
 matching exactly what `find_common_beam` already does for the
 auto-derived path -- fail loudly (a real `ERROR:`, not silent garbage)
 naming the specific offending channel/file, before any FFT ever runs.
+
+### T26 -- `mem_frac_ram` Block-Sizing Ignored `convolve_to_beam`'s Own Transient Memory, Causing Real Swap on a 62.7GB Host (found, root-caused, fixed, verified -- committed)
+
+**Gap found:** while investigating whether this workload could be
+ported to a RAM-constrained host (a Raspberry Pi 5, 8GB), computed
+`convolve_to_beam`'s own peak per-plane working memory directly from
+its actual allocate/deallocate sequence (`src/gaussft.f90`) at
+WALLABY's real resolution (`nx=11559, ny=11655`, FFT-padded to
+`11664x11664` -- both taken directly from the live real run's own
+log) -- came to **~7.05GB for a single plane, single thread**. Checked
+this against the real, currently-running WALLABY+EMU `match_cubes`
+process's actual memory (`/proc/<pid>/status`, `free -h`) rather than
+trust the arithmetic alone: `VmPeak=71.65GB` against this machine's
+**62.7GB** of physical RAM, with `VmSwap=3.47GB` for the process alone
+and **12GB of system-wide swap in active use** -- the run has been
+surviving by swapping, not by actually fitting, the entire time.
+
+**Root cause:** `bytes_per_plane` (the formula `block_planes` --
+`mem_frac_ram`'s own block-sizing knob -- is derived from, in both
+`match_cubes.f90:process_one_file_restricted` and
+`convolve_cubes.f90:write_convolved_file`) only ever budgeted the raw
+single-precision I/O block buffer (`4 * (nx*ny + 2*nx_out*ny_out)`
+bytes). It had **no knowledge at all** of `convolve_to_beam`'s own
+NaN-aware-path (T23) transient working set -- a native-size NaN mask,
+two padded-size `complex(dp)` FFT buffers alive at once, two
+native-size `real(dp)` buffers, plus the caller's own native-size
+`plane_native` held for the whole call. That transient cost is
+**per OpenMP thread** (all thread-private locals, not shared) and is
+entirely separate from, and additive to, the I/O block buffer -- so no
+`mem_frac_ram` setting protected against it; the budget calculation
+was simply blind to roughly half (or more, at high thread counts) of
+the real peak memory a run would actually touch.
+
+**Fix:** derived the exact peak transient cost by tracing every
+allocate/deallocate in `convolve_to_beam` (`gaussft.f90`): `20*(nx*ny)
++ 32*(nx_pad*ny_pad)` bytes per thread, where `nx*ny` is the native
+grid convolution actually runs on (`nx_in`/`ny_in`, or `nx_out`/`ny_out`
+for `order=reproject_convolve`) and `nx_pad*ny_pad` is its FFT-padded
+size (`next_fast_fft_size`). In both `match_cubes.f90` and
+`convolve_cubes.f90`, this is now computed *before* `bytes_per_plane`
+is sized, `omp_get_max_threads()` copies of it are reserved out of the
+`mem_frac_ram` budget first, and `block_planes` is sized from whatever
+budget remains -- clamping to 1 plane (with a clear `WARNING:`) if the
+per-thread transient cost alone already exceeds the budget, rather
+than silently proceeding to overcommit RAM regardless of
+`mem_frac_ram`. `match_cubes.f90`'s own `conv_nx`/`conv_ny` (and the
+`nx_pad`/`ny_pad` they imply) determination was moved earlier in the
+subroutine, ahead of the memory budget that now needs it (previously
+computed just before `plan_convolution`, well after the old budget
+calculation) -- `next_fast_fft_size` is cheap and pure, so computing it
+once here and again (identically) inside `plan_convolution` moments
+later is harmless redundancy, not a behaviour change.
+
+**Verification:** full suite unchanged, 142/142 (no test fixture is
+large enough to exercise this path differently -- the fix only changes
+behaviour once the transient cost is large relative to the
+`mem_frac_ram` budget, which none of the small synthetic fixtures
+trigger). Directly computed what the fix now produces for the real
+run's own actual settings (`mem_frac_ram=0.25`, `OMP_NUM_THREADS=6`,
+WALLABY's real dimensions): reserved transient cost for 6 threads
+(42.29GB) already exceeds the entire 16.64GB budget -- exactly
+reproducing the real overshoot that was directly measured via
+`VmPeak`/`VmSwap` above, confirming the fix catches the actual
+observed failure mode, not just a theoretical one. Same computation
+shows the actual safe range on this 62.7GB host at `mem_frac_ram=0.25`
+is only 1-2 threads before the transient cost alone stops fitting --
+useful, concrete guidance for both this machine's own future real runs
+and for the original Raspberry Pi 5 (8GB) sizing question that
+prompted this investigation.
+
+**Refined (same ticket, follow-up):** the original fix above was
+all-or-nothing -- reserve `omp_get_max_threads()` copies of the
+transient cost, and if that doesn't fit, floor straight to 1
+plane/serial, even when some smaller thread count in between (e.g. 3
+of the 6 requested) would genuinely have fit. Replaced with a plain
+decrementing search in both files: start at `omp_get_max_threads()`,
+step down while that many threads' own reserved transient cost is
+`>=` the `mem_frac_ram` budget, floor at 1. The result
+(`omp_threads_cap`) is what actually caps real OpenMP concurrency now
+-- `nthreads = min(omp_threads_cap, block_planes)` (previously
+`min(omp_get_max_threads(), block_planes)`), which feeds directly into
+`!$omp parallel num_threads(nthreads)`, so this is a genuine cap on
+threads actually spawned, not just an I/O-buffer sizing knob. Re-ran
+the real numbers with T27's own (now smaller, single-precision)
+transient cost: on this 62.7GB host at `mem_frac_ram=0.25`,
+`omp_threads_cap` comes out to **3** for WALLABY's own dimensions and
+**2** for EMU's (EMU is natively larger, `14300x12395` vs WALLABY's
+`11559x11655`, so its own transient cost per thread is higher and its
+safe thread count lower) -- confirmed these differ per file, not a
+single fixed number, by construction (see the "known gap" note below
+for why that per-file correctness doesn't yet extend to an *upfront*
+multi-file estimate). Full suite re-verified after this refinement,
+142/142.
+
+**On the formula's own two `16`s (raised directly, worth being precise
+about rather than treating as one coefficient):** `16*(nx*ny) +
+16*(nx_pad*ny_pad)` is two DIFFERENT sums that happen to both equal
+16, not one halved-and-reused number. Native-size term: `nan_mask`
+(4B, `logical`) + `c_d`-or-`c_m` (4B, now `real(sp)` per T27) + the
+CALLER's own `plane_native`/`plane_in` (8B, `real(dp)` -- deliberately
+NOT converted, so `convolve_to_beam`'s external interface didn't need
+to change) = 16. Padded-size term: `g_final` (8B, now `complex(sp)`) +
+`cimg`-or-`cmsk` (8B, now `complex(sp)`) = 16. The padded term
+genuinely halved (32->16, both contributors converted to single
+precision); the native term only partly halved (20->16), held back by
+`plane_native` staying double precision -- converting that too (a
+caller-side change, not just `gaussft_mod`'s own internals) would drop
+the native term further, to 8. Not implemented.
+
+**Known gap, not yet addressed (raised directly by the user, worth
+recording precisely rather than glossing over):** `block_planes`/
+`omp_threads_cap` are computed **live, once per file**, at the exact
+moment `process_one_file_restricted`/`write_convolved_file` begins
+that file -- confirmed via source that this uses each file's own true
+`naxes_f(i,:)` (populated during this tool's own per-file header
+pre-scan), not the reference file's dimensions and not just the first
+file in `infiles=` -- so the *live* calculation is genuinely per-file
+correct, not a "look at one file and assume" shortcut. What's
+genuinely missing: there is no **upfront, whole-batch preview** --
+nothing surveys every file in `infiles=` before real processing starts
+and reports (or plans around) the per-file thread/memory picture for
+the WHOLE run in advance. A user only discovers a given file's own
+`omp_threads_cap` (and whether it had to be reduced) via the warning
+printed right as that file begins -- potentially hours into a run, for
+a file near the end of the processing order. `dry_run=y` (T24) does
+not help here either: it only checks the *disk type* of the first
+`infiles=` entry for its own `io_overlap`/`nwriters` suggestion, and
+never touches the convolve memory/thread question at all. A genuinely
+thorough prep step would read every file's header (NAXIS-only, cheap --
+same pattern already used for the reference file's own WCS-only read)
+during `dry_run=y`, compute each file's own `transient_bytes_per_thread`/
+`omp_threads_cap`, and report the full per-file breakdown up front --
+deliberately NOT collapsed to one worst-case number for the whole
+batch, since that would needlessly throttle the smaller files (WALLABY
+at 3 threads) down to the biggest file's own more conservative number
+(EMU at 2). Not started.
+
+### T27 -- `gaussft_mod`'s FFT Buffers/Intermediates Now Single Precision Internally (implemented, verified -- committed)
+
+**Motivation:** raised alongside T26's own investigation, while
+assessing how to make this workload fit a RAM-constrained host (the
+Raspberry Pi 5, 8GB, that prompted T26). `convolve_to_beam`'s NaN-aware
+path (T23) carried every array -- the FFT buffers, the validity mask,
+the intermediate data/mask-convolution results -- at `real(dp)`/
+`complex(dp)`, despite FITS output already being written at
+`BITPIX=-32` (`FTPHPR(..., -32, ...)`, both `write_convolved_file` and
+`write_matched_file`) -- there was never a real dynamic-range/precision
+argument for double precision flux data in the first place, and it
+was costing roughly double the memory of the alternative for no
+accuracy the pipeline's own output actually keeps.
+
+**Design:** `gaussft_mod`'s FFT buffers (`cimg`, `cmsk`, `g_final`) and
+intermediate real arrays (`c_d`, `c_m`) are now `complex(sp)`/`real(sp)`
+(`sp => real32`) internally, executed via FFTW's single-precision
+legacy Fortran entry points (`sfftw_plan_dft_2d`/`sfftw_execute_dft`/
+`sfftw_destroy_plan`, from `libfftw3f` -- a genuinely separate library
+from `libfftw3`, confirmed present on this system via `nm -D` before
+committing to the plan, and added to `Makefile`'s shared `FFTW_LIBS`).
+One deliberate exception, not swept into the blanket precision
+reduction: the kernel exponent itself (`g_arg - dg_arg`) is a
+DIFFERENCE of two potentially large terms before `exp()` -- exactly
+the shape of computation vulnerable to catastrophic cancellation in
+single precision -- so `g_arg`/`dg_arg` and their combination stay
+`real(dp)` throughout, with only the finished kernel value cast down
+to `sp` at the point `g_final` is actually stored. `convolve_to_beam`'s
+own external interface (`image`/`image_out`, both dummy arguments)
+deliberately stays `real(dp)` -- the precision reduction is entirely
+internal to this module, so neither `match_cubes.f90` nor
+`convolve_cubes.f90` needed a single line changed to pick this up.
+
+**Verified peak-memory effect** (WALLABY's real dimensions, same
+method as T26): per-thread transient cost dropped from **7.05GB to
+4.33GB** (-38.5%). On this 62.7GB host at `mem_frac_ram=0.25`, that
+moves the actual safe thread count from ~1-2 (T26's own finding,
+pre-T27) to ~3 -- a real, usable improvement, not just a memory-safety
+margin.
+
+**T26's own budget formula had to be updated too, not left stale:**
+its hardcoded byte multipliers (`20*(nx*ny) + 32*(nx_pad*ny_pad)`)
+were derived from `gaussft_mod`'s PRE-T27 double-precision array
+sizes. Left unchanged, T26's own budget would have kept reserving
+memory for a cost that no longer existed -- safe (over-conservative),
+but silently wasteful, working against the very optimisation T27 was
+for. Re-derived and updated in both `match_cubes.f90` and
+`convolve_cubes.f90` to `16*(nx*ny) + 16*(nx_pad*ny_pad)` (see either
+file's own comment for the coefficient derivation) -- flagged there
+explicitly as NOT computed from `gaussft_mod`'s own type declarations,
+so it will drift stale again if those kinds ever change a third time,
+unless re-derived by hand alongside any future change.
+
+**Verification:** full suite, 142/142, including one real, EXPECTED
+tolerance update rather than a silent pass: `tests/test_gaussft_padding
+.f90`'s "target beam == native beam is a no-op" check compares an FFT
+round-trip to `image` bit-for-bit up to a tolerance, previously
+`1.0e-9` (calibrated for the old double-precision FFT) -- now measures
+`~3.1e-8`, well within single precision's own `~1.19e-7` epsilon and
+NOT achievable at the old tolerance by design, so the tolerance was
+loosened to `1.0e-6` (comfortably above the observed error, still tight
+enough to catch a real fault) with a comment explaining why. The
+OTHER check in the same test (`auto-pad-inside-convolve_to_beam
+matches manual pre-padding`, comparing two invocations of the same new
+code against each other rather than against a fixed absolute
+tolerance) still matches to the bit (`max|diff|=0.000E+00`) --
+confirming the padding logic itself is untouched, only the absolute
+precision ceiling changed, exactly as intended.
+
+**Not yet done (assessed, not implemented):** computing `g_final`
+(and/or the NaN mask) analytically per-pixel inline, instead of
+materialising them as full padded-size arrays, as a further, OPTIONAL
+low-RAM code path -- discussed as worthwhile specifically for
+severely memory-constrained hosts (the original Pi 5 motivation) but
+deliberately not implemented alongside T27, since it would duplicate
+`convolve_to_beam`'s own per-pixel loop under a runtime/compile-time
+switch rather than being a drop-in replacement. Left as a distinct,
+separately-scoped future ticket.

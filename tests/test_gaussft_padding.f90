@@ -162,8 +162,15 @@ contains
          ok = .false.
          return
       endif
+      ! Tolerance loosened from the original 1.0e-9 (T27, docs/dev/
+      ! MULTI_BAND_TOMOGRAPHY_PLAN.md): convolve_to_beam's FFT buffers
+      ! are now single precision internally, so the achievable round-trip
+      ! accuracy is bounded by float32 epsilon (~1.19e-7), not double
+      ! precision -- 1.0e-9 is no longer achievable by design, not a
+      ! regression. 1.0e-6 stays comfortably above the actually-observed
+      ! error (~3.1e-8) while still tight enough to catch a real fault.
       max_abs_diff_identity = maxval(abs(out_identity - image_native))
-      if (max_abs_diff_identity.lt.1.0e-9_dp) then
+      if (max_abs_diff_identity.lt.1.0e-6_dp) then
          print '(A,A,ES10.3,A)', '[PASS] target beam == native beam is a',&
          &' no-op (max|diff|=', max_abs_diff_identity, ')'
       else

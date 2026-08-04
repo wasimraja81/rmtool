@@ -201,6 +201,8 @@ background-thread write overlap.
 
 ```bash
 bin/reproject_cubes mode=<intersection|union|reference> reffile=<reference_file> infiles=<file>[,<file>...]
+    [mem_frac_ram=<fraction>] [io_overlap=y|n] [nwriters=<n>]
+    [log_level=<level>] [timing_enabled=y|n] [log_output_file=<path>] [dry_run=y|n]
 bin/reproject_cubes --config <cfgfile>
 bin/reproject_cubes --config <cfgfile> mode=<...> [reffile=<...>] [infiles=<...>]
 bin/reproject_cubes --help | -h
@@ -220,9 +222,11 @@ No positional arguments — every value is `key=value` (no spaces around
 | `infiles` | — | yes | Comma-separated list of 1–50 input FITS cube paths. |
 | `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/resample/write block of planes. Threads parallelize only *within* one block, never across blocks — too small a value both increases CFITSIO call count and discards most of the OpenMP speedup (a WARNING is printed if this looks likely). |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+resample. Only one background write is ever in flight. |
-| `log_level` | `info` | no | `error\|warn\|info\|debug`. |
-| `timing_enabled` | `n` | no | Print a stage timing summary. |
+| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
+| `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `block_convolve`/`reproject_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/process/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
+| `timing_enabled` | `n` | no | Print a whole-run (all files combined) stage timing summary at exit, in addition to the always-on per-file summary described under `log_level` above. |
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
+| `dry_run` | `n` | no | `y`: check the first `infiles=` entry's own target disk (rotational vs. SSD/NVMe, via `/sys/block/.../queue/rotational`), print a suggested `io_overlap`/`nwriters` starting point for that disk type, write it to `reproject_cubes_dryrun.cfg`, then exit — no pixel data read, no output written. |
 
 ### Output files
 
@@ -257,7 +261,8 @@ bin/convolve_cubes infiles=<file1>[,<file2>...] [outsuffix=<suffix>]
     [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]
     [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]
     [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]
-    [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n]
+    [npts=<n>] [khachiyan_tol=<tol>] [io_overlap=y|n] [nwriters=<n>]
+    [log_level=<level>] [timing_enabled=y|n] [log_output_file=<path>] [dry_run=y|n]
 bin/convolve_cubes --config <cfgfile>
 bin/convolve_cubes --help | -h
 ```
@@ -278,9 +283,11 @@ Same `key=value`-only, no-positional-args convention as `reproject_cubes`.
 | `npts` | `2000` | no | Boundary points sampled per beam (≥12), passed to `commonbeam_mod`'s `find_common_beam`. |
 | `khachiyan_tol` | `1.0e-5` | no | Khachiyan-algorithm convergence tolerance for the common-beam fit. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+convolve. |
-| `log_level` | `info` | no | `error\|warn\|info\|debug`. |
-| `timing_enabled` | `n` | no | Print a stage timing summary. |
+| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
+| `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `convolve_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/convolve/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
+| `timing_enabled` | `n` | no | Print a whole-run (all files combined) stage timing summary at exit, in addition to the always-on per-file summary described under `log_level` above. |
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
+| `dry_run` | `n` | no | `y`: check the first `infiles=` entry's own target disk (rotational vs. SSD/NVMe, via `/sys/block/.../queue/rotational`), print a suggested `io_overlap`/`nwriters` starting point for that disk type, write it to `convolve_cubes_dryrun.cfg`, then exit — no pixel data read, no output written. |
 
 ### Output files
 
@@ -320,7 +327,8 @@ bin/match_cubes stages=reproject|convolve|both
     [beamfiles=<spec1>[,<spec2>...]] [badchan_file=<file1>[,<file2>...]]
     [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]
     [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>] [outsuffix=<suffix>]
-    [npts=<n>] [khachiyan_tol=<tol>] [manifest=<path>] [io_overlap=y|n]
+    [npts=<n>] [khachiyan_tol=<tol>] [manifest=<path>] [io_overlap=y|n] [nwriters=<n>]
+    [log_level=<level>] [timing_enabled=y|n] [log_output_file=<path>] [dry_run=y|n]
 bin/match_cubes --config <cfgfile>
 bin/match_cubes --help | -h
 ```
@@ -346,9 +354,11 @@ Same `key=value`-only convention as the other two.
 | `khachiyan_tol` | `1.0e-5` | no | Used when `stages` includes `convolve` — same as `convolve_cubes`. |
 | `manifest` | none | no | Path to write a tab-separated `<infile> SKIPPED\|PROCESSED <effective_path>` record, one line per input. Aborts if the manifest path already exists. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+process. |
-| `log_level` | `info` | no | `error\|warn\|info\|debug`. |
-| `timing_enabled` | `n` | no | Print a stage timing summary. |
+| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
+| `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `convolve_compute`, `reproject_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/process/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
+| `timing_enabled` | `n` | no | Print a whole-run (all files combined) stage timing summary at exit, in addition to the always-on per-file summary described under `log_level` above. |
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
+| `dry_run` | `n` | no | `y`: check the first `infiles=` entry's own target disk (rotational vs. SSD/NVMe, via `/sys/block/.../queue/rotational`), print a suggested `io_overlap`/`nwriters` starting point for that disk type, write it to `match_cubes_dryrun.cfg`, then exit — no pixel data read, no output written. |
 
 ### Output files
 

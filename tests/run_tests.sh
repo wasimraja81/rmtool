@@ -2271,7 +2271,7 @@ gfp_log="$OUT_DIR/test_gaussft_padding.log"
 if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
         -O3 -fopenmp -J"$OUT_DIR" \
         src/gaussft.f90 "$TESTS_DIR/test_gaussft_padding.f90" \
-        -o "$gfp_bin" -lfftw3 2>"$OUT_DIR/gaussft_padding_build.log"; then
+        -o "$gfp_bin" -lfftw3 -lfftw3f 2>"$OUT_DIR/gaussft_padding_build.log"; then
     if "$gfp_bin" > "$gfp_log" 2>&1; then
         while IFS= read -r line; do
             if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then

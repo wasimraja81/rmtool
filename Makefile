@@ -233,7 +233,15 @@ $(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDI
 # resampling). No -I/-L needed for FFTW3, same reasoning as AST_LIBS
 # above: apt installs fftw3.f/libfftw3.so into standard system paths
 # gfortran/ld already search by default.
-FFTW_LIBS := -lfftw3
+# -lfftw3f (single-precision FFTW, a separate library from -lfftw3)
+# added alongside it: gaussft_mod's convolve_to_beam does its own FFT
+# work in single precision internally (T27, docs/dev/
+# MULTI_BAND_TOMOGRAPHY_PLAN.md) via the sfftw_* legacy Fortran entry
+# points, which live in libfftw3f, not libfftw3. Harmless to also link
+# into rmclean_cubes (the other consumer of FFTW_LIBS, via rmclean_mod's
+# own double-precision-only FFTW calls) -- an unused library on the link
+# line costs nothing at runtime.
+FFTW_LIBS := -lfftw3 -lfftw3f
 CONVOLVE_BINDIR ?= bin
 CONVOLVE_BUILDDIR := build/convolve_cubes
 CONVOLVE_EXECUTABLE := $(CONVOLVE_BINDIR)/convolve_cubes

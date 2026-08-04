@@ -2916,7 +2916,8 @@ contains
    &mem_frac_ram_l, io_overlap_l, nwriters_l, status)
       use, intrinsic :: ieee_arithmetic
       use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
-      use gaussft_mod, only: plan_convolution, convolve_to_beam, destroy_convolution_plan
+      use gaussft_mod, only: plan_convolution, convolve_to_beam,&
+      &destroy_convolution_plan, next_fast_fft_size
       character(len=*), intent(in) :: infile, outfile, reffile_l
       logical, intent(in) :: do_reproject_l, convolve_first_l
       integer, intent(in) :: naxis, sky1, sky2, freq_axis, naxes(max_axes)
@@ -2944,7 +2945,9 @@ contains
       ! header setup instead of kept open for the whole block loop.
       integer(kind=8) :: datastart, headstart_dum, dataend_dum
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes, block_planes64
+      integer(kind=8) :: transient_bytes_per_thread, mem_safe_bytes_io
       integer :: block_planes, chan_start, chan_len, local_iplane, nthreads
+      integer :: omp_threads_cap
       integer :: cur_slot
       logical :: write_dispatched_ok
       real, allocatable, target :: block_in(:,:,:), block_out(:,:,:,:)
@@ -3154,13 +3157,99 @@ contains
       endif
       call safe_ftclos(out_unit, fitsstat)
 
+      ! Convolution happens on the native grid for order=convolve_reproject
+      ! (or always, for stages=convolve alone, where nx_out/ny_out were
+      ! already set equal to nx_in/ny_in above) -- but on the OUTPUT grid
+      ! for order=reproject_convolve, which can be a genuinely different
+      ! size (footprint_mode=intersection/union crops or grows it).
+      ! Determined here (moved ahead of the block/memory budget below,
+      ! which needs nx_pad/ny_pad) rather than right before
+      ! plan_convolution's own call further down.
+      if (.not. do_reproject_l .or. convolve_first_l) then
+         conv_nx = nx_in
+         conv_ny = ny_in
+      else
+         conv_nx = nx_out
+         conv_ny = ny_out
+      endif
+      nx_pad = next_fast_fft_size(conv_nx)
+      ny_pad = next_fast_fft_size(conv_ny)
+
       call get_mem_total_kb(mem_total_kb)
       ! block_out's own term is x2 (not x1) -- double-buffered for
       ! io_overlap (see below), budgeted whether or not it's actually on.
       bytes_per_plane = int(4,8) * (int(nx_in,8)*int(ny_in,8) +&
       &2_8*int(nx_out,8)*int(ny_out,8))
       mem_safe_bytes = int(real(mem_frac_ram_l,8) * real(mem_total_kb,8) * 1024.0d0, 8)
-      block_planes64 = max(1_8, mem_safe_bytes / bytes_per_plane)
+
+      ! T26 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the block I/O buffer
+      ! (bytes_per_plane above) is NOT the only memory a plane in flight
+      ! needs -- convolve_to_beam's own NaN-aware path (src/gaussft.f90)
+      ! allocates several full-size temporaries of its own (a native-size
+      ! NaN mask, two padded-size complex FFT buffers alive at once, two
+      ! native-size real buffers), on top of this caller's own native-size
+      ! plane_native array (real(dp)) held for the whole call. Confirmed
+      ! for real on the real WALLABY+EMU run: VmPeak hit 71.65GB against a
+      ! 62.7GB host with block_planes=14 and OMP_NUM_THREADS=6, entirely
+      ! from this gap (system swap climbed to 12GB).
+      !
+      ! 16*(conv_nx*conv_ny) + 16*(nx_pad*ny_pad) bytes, PER THREAD
+      ! actively convolving a plane (thread-private locals, not shared).
+      ! The two 16s are NOT the same "16" -- each is its own sum, per
+      ! T27 (gaussft_mod's FFT buffers/intermediates now single
+      ! precision internally):
+      !   native-size term  = nan_mask(4, logical) + c_d-or-c_m(4,
+      !                        real(sp)) + this caller's own
+      !                        plane_native(8, real(dp) -- deliberately
+      !                        NOT converted, so convolve_to_beam's
+      !                        external interface stays unchanged) = 16
+      !   padded-size term  = g_final(8, complex(sp)) + cimg-or-cmsk(8,
+      !                        complex(sp)) = 16
+      ! The padded term genuinely halved (32->16, both contributors
+      ! converted to sp); the native term only partly halved (20->16),
+      ! held back by plane_native's own real(dp) -- converting that too
+      ! (a caller-side change, not just gaussft_mod's own internals)
+      ! would drop the native term further, to 8. NOT computed from
+      ! gaussft_mod's own type declarations, so this drifts stale if
+      ! those kinds change again (as it did once already across T27,
+      ! caught and re-derived here) -- re-derive by hand, don't assume.
+      ! Solve for the largest safe thread count (down from the full
+      ! omp_get_max_threads() requested, never below 1) whose reserved
+      ! transient cost still leaves a positive I/O budget -- refined
+      ! (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md, T26 follow-up) from the
+      ! original all-or-nothing check (either the full requested thread
+      ! count fit, or block_planes floored straight to 1/serial even
+      ! when, say, 3 of 6 threads would genuinely have fit). A plain
+      ! decrementing search rather than a closed-form division: thread
+      ! counts are always small (a handful to a few dozen at most), so
+      ! there is no performance reason to prefer a division's rounding
+      ! subtleties over an easy-to-verify loop.
+      transient_bytes_per_thread = 16_8*int(conv_nx,8)*int(conv_ny,8) +&
+      &16_8*int(nx_pad,8)*int(ny_pad,8)
+      omp_threads_cap = omp_get_max_threads()
+      do while (omp_threads_cap.gt.1 .and.&
+      &int(omp_threads_cap,8)*transient_bytes_per_thread.ge.mem_safe_bytes)
+         omp_threads_cap = omp_threads_cap - 1
+      enddo
+      if (omp_threads_cap.lt.omp_get_max_threads()) then
+         write(*,'(A,I0,A,I0,A,F0.2,A)') 'WARNING: mem_frac_ram budget only'//&
+         &' supports ', omp_threads_cap, ' of the ', omp_get_max_threads(),&
+         &' requested OMP thread(s) for convolution (',&
+         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
+         &' GB/thread) -- reducing to avoid overcommitting RAM. Raise'//&
+         &' mem_frac_ram, reduce OMP_NUM_THREADS yourself, or add RAM to use more.'
+      endif
+      mem_safe_bytes_io = mem_safe_bytes -&
+      &int(omp_threads_cap,8)*transient_bytes_per_thread
+      if (mem_safe_bytes_io.le.0_8) then
+         write(*,'(A,F0.2,A)') 'WARNING: convolve working memory alone (',&
+         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
+         &' GB) exceeds the mem_frac_ram budget even at 1 thread -- block'//&
+         &' shrunk to 1 plane, but even that may not fit; raise mem_frac_ram'//&
+         &' or add more RAM.'
+         mem_safe_bytes_io = bytes_per_plane
+      endif
+      block_planes64 = max(1_8, mem_safe_bytes_io / bytes_per_plane)
       block_planes64 = min(block_planes64, max_elements_per_block /&
       &max(1_8, max(int(nx_in,8)*int(ny_in,8), int(nx_out,8)*int(ny_out,8))))
       block_planes64 = max(1_8, block_planes64)
@@ -3169,11 +3258,11 @@ contains
 
       write(*,'(A,A,A,I0,A,I0,A)') 'Writing ', trim(outfile), ': ', nfreq,&
       &' plane(s), in blocks of up to ', block_planes, ' plane(s)'
-      if (block_planes.lt.omp_get_max_threads()) then
+      if (block_planes.lt.omp_threads_cap) then
          write(*,'(A,I0,A,I0,A)') 'WARNING: mem_frac_ram limits blocks to ',&
-         &block_planes, ' plane(s), below the ', omp_get_max_threads(),&
-         &' threads available -- parallelism is reduced; raise mem_frac_ram',&
-         &' for full speedup if memory allows.'
+         &block_planes, ' plane(s), below the ', omp_threads_cap,&
+         &' memory-safe thread(s) -- parallelism is further reduced; raise',&
+         &' mem_frac_ram for full speedup if memory allows.'
       endif
 
       allocate(block_in(nx_in, ny_in, block_planes))
@@ -3182,20 +3271,9 @@ contains
       ! FFTW's plan is sized for one specific (nx,ny) and MUST NOT be
       ! executed against arrays of a different size (silent heap
       ! corruption, not a clean error -- caught the hard way via a
-      ! munmap_chunk() crash before this fix). Convolution happens on the
-      ! native grid for order=convolve_reproject (or always, for
-      ! stages=convolve alone, where nx_out/ny_out were already set equal
-      ! to nx_in/ny_in above) -- but on the OUTPUT grid for
-      ! order=reproject_convolve, which can be a genuinely different size
-      ! (footprint_mode=intersection/union crops or grows it). Plan
-      ! whichever grid convolution will actually run on.
-      if (.not. do_reproject_l .or. convolve_first_l) then
-         conv_nx = nx_in
-         conv_ny = ny_in
-      else
-         conv_nx = nx_out
-         conv_ny = ny_out
-      endif
+      ! munmap_chunk() crash before this fix). conv_nx/conv_ny (and the
+      ! resulting nx_pad/ny_pad) were already determined above, ahead of
+      ! the memory budget that needs them.
       call plan_convolution(conv_nx, conv_ny, plan_fwd, plan_bwd, nx_pad, ny_pad)
       if (nx_pad.ne.conv_nx .or. ny_pad.ne.conv_ny) then
          write(*,'(A,I0,A,I0,A,I0,A,I0,A)') 'Convolution FFT padded from ',&
@@ -3207,7 +3285,11 @@ contains
       write_pending = .false.
       write_failed = .false.
       status_par = 0
-      nthreads = max(1, min(omp_get_max_threads(), block_planes))
+      ! omp_threads_cap (not omp_get_max_threads()) -- the memory-safe
+      ! cap solved for above; using the raw thread count here would
+      ! silently reopen the exact overcommit this whole calculation
+      ! exists to prevent.
+      nthreads = max(1, min(omp_threads_cap, block_planes))
       nwriters_eff = max(1, min(nwriters_l, omp_get_max_threads()))
       chan_start = 1
       iblock = 0

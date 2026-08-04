@@ -1408,7 +1408,8 @@ contains
    &nwriters, status)
       use, intrinsic :: ieee_arithmetic
       use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
-      use gaussft_mod, only: plan_convolution, convolve_to_beam, destroy_convolution_plan
+      use gaussft_mod, only: plan_convolution, convolve_to_beam,&
+      &destroy_convolution_plan, next_fast_fft_size
       character(len=*), intent(in) :: infile, outfile
       integer, intent(in) :: naxis, sky1, sky2, freq_axis, naxes(max_axes)
       real(dp), intent(in) :: cdelt1, cdelt2
@@ -1430,7 +1431,9 @@ contains
       ! its own use, below.
       integer(kind=8) :: datastart, headstart_dum, dataend_dum
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes, block_planes64
+      integer(kind=8) :: transient_bytes_per_thread, mem_safe_bytes_io
       integer :: block_planes, chan_start, chan_len, local_iplane, nthreads
+      integer :: omp_threads_cap
       integer :: cur_slot
       logical :: write_dispatched_ok
       real, allocatable, target :: block_in(:,:,:), block_out(:,:,:,:)
@@ -1550,6 +1553,8 @@ contains
       call safe_ftclos(out_unit, fitsstat)
 
       block_planes64 = 0
+      nx_pad = next_fast_fft_size(nx)
+      ny_pad = next_fast_fft_size(ny)
       call get_mem_total_kb(mem_total_kb)
       ! *3 not *2: block_in (1x) + block_out's own 2 double-buffer slots
       ! (io_overlap's own read+compute/write overlap, see below) --
@@ -1557,7 +1562,61 @@ contains
       ! on never silently blows past mem_frac_ram.
       bytes_per_plane = int(4,8) * int(nx,8) * int(ny,8) * 3_8
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) * 1024.0d0, 8)
-      block_planes64 = max(1_8, mem_safe_bytes / bytes_per_plane)
+
+      ! T26 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): same gap fixed in
+      ! match_cubes.f90 -- bytes_per_plane above only budgets the block
+      ! I/O buffer, not convolve_to_beam's own NaN-aware-path transient
+      ! working set (a native-size NaN mask, two padded-size complex FFT
+      ! buffers alive at once, two native-size real buffers, on top of
+      ! this caller's own native-size plane_in, real(dp), held for the
+      ! whole call), entirely un-budgeted by the block buffer above.
+      ! 16*(nx*ny) + 16*(nx_pad*ny_pad) bytes, PER THREAD actively
+      ! convolving a plane (thread-private locals, not shared). The two
+      ! 16s are NOT the same "16" -- each is its own sum (see
+      ! match_cubes.f90's own identical comment for the full per-array
+      ! breakdown: native term = nan_mask(4) + c_d-or-c_m(4, now sp) +
+      ! this caller's own plane_in(8, real(dp), deliberately not
+      ! converted) = 16; padded term = g_final(8, sp) + cimg-or-cmsk(8,
+      ! sp) = 16 -- the padded term genuinely halved, the native term
+      ! only partly halved, held back by plane_in's own real(dp)). NOT
+      ! computed from gaussft_mod's own type declarations, so it needs
+      ! re-deriving by hand if those kinds ever change again. Solve for
+      ! the largest safe thread count (down
+      ! from the full omp_get_max_threads() requested, never below 1) --
+      ! refined (T26 follow-up) from an earlier all-or-nothing version
+      ! that either fit the full requested thread count or floored
+      ! straight to 1 plane/serial, even when some smaller thread count
+      ! in between would genuinely have fit. Plain decrementing search,
+      ! not a closed-form division -- thread counts are always small, so
+      ! there's no performance reason to prefer a division's rounding
+      ! subtleties over an easy-to-verify loop. See match_cubes.f90's own
+      ! identical logic for the full derivation.
+      transient_bytes_per_thread = 16_8*int(nx,8)*int(ny,8) +&
+      &16_8*int(nx_pad,8)*int(ny_pad,8)
+      omp_threads_cap = omp_get_max_threads()
+      do while (omp_threads_cap.gt.1 .and.&
+      &int(omp_threads_cap,8)*transient_bytes_per_thread.ge.mem_safe_bytes)
+         omp_threads_cap = omp_threads_cap - 1
+      enddo
+      if (omp_threads_cap.lt.omp_get_max_threads()) then
+         write(*,'(A,I0,A,I0,A,F0.2,A)') 'WARNING: mem_frac_ram budget only'//&
+         &' supports ', omp_threads_cap, ' of the ', omp_get_max_threads(),&
+         &' requested OMP thread(s) for convolution (',&
+         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
+         &' GB/thread) -- reducing to avoid overcommitting RAM. Raise'//&
+         &' mem_frac_ram, reduce OMP_NUM_THREADS yourself, or add RAM to use more.'
+      endif
+      mem_safe_bytes_io = mem_safe_bytes -&
+      &int(omp_threads_cap,8)*transient_bytes_per_thread
+      if (mem_safe_bytes_io.le.0_8) then
+         write(*,'(A,F0.2,A)') 'WARNING: convolve working memory alone (',&
+         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
+         &' GB) exceeds the mem_frac_ram budget even at 1 thread -- block'//&
+         &' shrunk to 1 plane, but even that may not fit; raise mem_frac_ram'//&
+         &' or add more RAM.'
+         mem_safe_bytes_io = bytes_per_plane
+      endif
+      block_planes64 = max(1_8, mem_safe_bytes_io / bytes_per_plane)
       block_planes64 = min(block_planes64,&
       &max_elements_per_block / max(1_8, int(nx,8)*int(ny,8)))
       block_planes64 = max(1_8, block_planes64)
@@ -1566,11 +1625,11 @@ contains
 
       write(*,'(A,A,A,I0,A,I0,A)') 'Writing ', trim(outfile), ': ', nfreq,&
       &' plane(s), in blocks of up to ', block_planes, ' plane(s)'
-      if (block_planes.lt.omp_get_max_threads()) then
+      if (block_planes.lt.omp_threads_cap) then
          write(*,'(A,I0,A,I0,A)') 'WARNING: mem_frac_ram limits blocks to ',&
-         &block_planes, ' plane(s), below the ', omp_get_max_threads(),&
-         &' threads available -- parallelism is reduced; raise mem_frac_ram',&
-         &' for full speedup if memory allows.'
+         &block_planes, ' plane(s), below the ', omp_threads_cap,&
+         &' memory-safe thread(s) -- parallelism is further reduced; raise',&
+         &' mem_frac_ram for full speedup if memory allows.'
       endif
 
       allocate(block_in(nx, ny, block_planes))
@@ -1601,7 +1660,11 @@ contains
       write_pending = .false.
       write_failed = .false.
       status_par = 0
-      nthreads = max(1, min(omp_get_max_threads(), block_planes))
+      ! omp_threads_cap (not omp_get_max_threads()) -- the memory-safe
+      ! cap solved for above; using the raw thread count here would
+      ! silently reopen the exact overcommit this whole calculation
+      ! exists to prevent.
+      nthreads = max(1, min(omp_threads_cap, block_planes))
       ! nwriters_eff: same clamp formula as rm_synthesis/rmclean_cubes'
       ! own nwriters (T7/T12) -- never changed at rename time, kept
       ! identical here (see do_block_write's own comment for why writer
