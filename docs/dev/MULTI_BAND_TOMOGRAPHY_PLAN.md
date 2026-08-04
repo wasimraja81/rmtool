@@ -2730,3 +2730,59 @@ precedent (zero-fill, no renormalization, mask-FFT used only to decide
 a binary re-NaN threshold). Final approach not yet chosen -- picking up
 this ticket next requires the user's own decision on which of these
 tradeoffs to adopt before writing any code.
+
+### T24 -- `dry_run`: Disk-Type-Aware `io_overlap`/`nwriters` Advisory for `convolve_cubes`/`match_cubes`/`reproject_cubes`
+
+**Motivation:** raised alongside T21's own `nwriters` work -- given
+`nwriters`/`io_overlap`'s correct setting genuinely depends on the
+target disk's own physical characteristics (a real, confirmed-rotational
+disk vs. SSD/NVMe -- this machine's own `/data1` vs. `/home` being the
+concrete example throughout this session), and given `rm_synthesis`
+already has an established `dry_run` precedent (planning-only pass,
+writes a suggested `tile_autotune.cfg`, touches no real data) for a
+different kind of advisory (tile/memory/VRAM sizing) -- extend the same
+convention to these three tools for I/O-parallelism settings, rather
+than expecting every user to independently rediscover this session's
+own disk-type reasoning (T7/T12/T21's own "why nwriters is safe on
+spare cores, not free of contention on a spinning disk" discussion).
+
+**Design:** `dry_run` cfg key (same name as `rm_synthesis`' own),
+default `n`. When `y`: checks the first `infiles=` entry's own target
+disk via `/sys/block/<dev>/queue/rotational`, resolved from the path's
+own mount point -- the exact same, already-verified mechanism (`df`
+--output=source` + `basename` + NVMe `pN`-suffix-aware parent-device
+resolution) this session used interactively to confirm `/data1` is
+genuinely rotational and `/home` is NVMe, reused here rather than a
+parallel, untested reimplementation. Shells out via
+`execute_command_line` (Fortran has no direct block-device-resolution
+API) with its stdout captured to a plain file in the current working
+directory -- never `/tmp` or any other system directory, applying this
+project's own standing scratch-file convention to the tool's own
+runtime behaviour too, since HPC compute nodes often restrict or omit
+`/tmp` entirely. Prints the detected disk type and a suggestion
+(`io_overlap=n, nwriters=1` for spinning; `io_overlap=y, nwriters=2`
+for SSD/NVMe), and writes a `<tool_name>_dryrun.cfg` the user can copy
+values from or pass directly on the command line -- mirroring
+`rm_synthesis`' own `tile_autotune.cfg` shape. Explicitly advisory
+only: does not change `nwriters`' own clamp formula (T7/T12's own
+already-settled decision), just suggests a starting value within it.
+Processes no real file when `dry_run=y` -- returns immediately after
+writing the suggestion.
+
+Implemented identically (adapt, don't share, per this project's own
+module convention) in `convolve_cubes.f90`, `match_cubes.f90`, and
+`reproject_cubes.f90` -- `reproject_cubes.f90`'s own CLI-then-cfg-then-
+override dual-parse structure needed the extra `cli_dry_run`/
+`cli_seen_dry_run` plumbing the other two tools' shared `apply_kv`
+design doesn't.
+
+**Verification:** manually confirmed against real ground truth on this
+machine -- `/data1/tmp/multi-band/...` correctly reports "spinning
+(rotational=1)"/suggests `io_overlap=n nwriters=1`; a path under
+`scratch/` (NVMe) correctly reports "non-rotational (rotational=0)"/
+suggests `io_overlap=y nwriters=2` -- for all three tools. New
+regression test (`tests/run_tests.sh` §47) locks in that `dry_run=y`
+writes a valid suggested cfg (`io_overlap=`/`nwriters=` present) and
+genuinely processes no data (checked: the real output file that a live
+run would have produced does not exist afterward). Full suite:
+139/139.

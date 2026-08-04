@@ -255,6 +255,13 @@ program reproject_cubes
    integer :: nwriters, cli_nwriters
    logical :: cli_seen_nwriters
    integer :: ios_nw
+   ! dry_run (default n, T24 docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+   ! same key name as rm_synthesis' own dry_run -- checks the target
+   ! output disk's rotational status and writes a suggested
+   ! reproject_cubes_dryrun.cfg instead of processing any real file.
+   ! Same CLI-then-cfg-then-override merge pattern as the others above.
+   logical :: dry_run, cli_dry_run
+   logical :: cli_seen_dry_run
    ! Logging & timing (planning-doc ticket) -- log_level/timing_enabled/
    ! log_output_file themselves declared near the top of this program
    ! (alongside the `use logging_mod`); only their CLI-override
@@ -301,6 +308,8 @@ program reproject_cubes
    io_overlap = .false.
    cli_seen_nwriters = .false.
    nwriters = 1
+   cli_seen_dry_run = .false.
+   dry_run = .false.
    cli_seen_log_level = .false.
    log_level = 'info'
    cli_seen_timing_enabled = .false.
@@ -383,6 +392,13 @@ program reproject_cubes
                stop 1
             endif
             cli_seen_nwriters = .true.
+         case ('dry_run')
+            if (cli_seen_dry_run) then
+               write(*,*) 'ERROR: dry_run given more than once on the command line'
+               stop 1
+            endif
+            cli_dry_run = flag_from_value_reproject(cli_val)
+            cli_seen_dry_run = .true.
          case ('log_level')
             if (cli_seen_log_level) then
                write(*,*) 'ERROR: log_level given more than once on the command line'
@@ -419,7 +435,7 @@ program reproject_cubes
    seen_infiles = .false.
    if (have_cfgfile) then
       call read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&
-      &mem_frac_ram, io_overlap, nwriters, log_level, timing_enabled, log_output_file,&
+      &mem_frac_ram, io_overlap, nwriters, dry_run, log_level, timing_enabled, log_output_file,&
       &status)
       if (status.ne.0) stop 1
       seen_mode = .true.
@@ -449,6 +465,7 @@ program reproject_cubes
    if (cli_seen_mem_frac_ram) mem_frac_ram = cli_mem_frac_ram
    if (cli_seen_io_overlap) io_overlap = cli_io_overlap
    if (cli_seen_nwriters) nwriters = cli_nwriters
+   if (cli_seen_dry_run) dry_run = cli_dry_run
    if (cli_seen_log_level) log_level = cli_log_level
    if (cli_seen_timing_enabled) timing_enabled = cli_timing_enabled
    if (cli_seen_log_output_file) log_output_file = cli_log_output_file
@@ -475,6 +492,11 @@ program reproject_cubes
       stop 1
    endif
    call log_message('info', 'startup', 'reproject_cubes run started')
+
+   if (dry_run) then
+      call run_dry_run_check(infiles(1), 'reproject_cubes')
+      stop
+   endif
 
    status = 0
    call ast_begin(status)
@@ -2373,6 +2395,12 @@ contains
       write(*,'(A)') '  block''s write runs; nwriters decides how many concurrent'//&
       &' writers do it once dispatched.'
       write(*,'(A)') ''
+      write(*,'(A)') 'Optional key (CLI or config, default n):'
+      write(*,'(A)') '  dry_run = y|n -- check the target output disk''s own rotational'//&
+      &' status and write a suggested reproject_cubes_dryrun.cfg'
+      write(*,'(A)') '  (io_overlap/nwriters), instead of processing any real file.'//&
+      &' Advisory only. Touches no data.'
+      write(*,'(A)') ''
       write(*,'(A)') 'Optional keys (CLI or config, logging/timing):'
       write(*,'(A)') '  log_level       = error|warn|info|debug (default info)'
       write(*,'(A)') '  timing_enabled  = y|n -- print a stage timing summary (default n)'
@@ -2381,7 +2409,7 @@ contains
    end subroutine print_usage
 
    subroutine read_reproject_cfg(cfgfile, mode, reffile, infiles, n_inputs,&
-   &mem_frac_ram, io_overlap_l, nwriters_l, log_level_l, timing_enabled_l,&
+   &mem_frac_ram, io_overlap_l, nwriters_l, dry_run_l, log_level_l, timing_enabled_l,&
    &log_output_file_l, status)
       !! Parse a --config key=value file: three required keys, mode,
       !! reffile, and infiles (comma-separated, same csv-list convention
@@ -2402,6 +2430,7 @@ contains
       real, intent(inout) :: mem_frac_ram
       logical, intent(inout) :: io_overlap_l
       integer, intent(inout) :: nwriters_l
+      logical, intent(inout) :: dry_run_l
       character(len=*), intent(inout) :: log_level_l
       logical, intent(inout) :: timing_enabled_l
       character(len=*), intent(inout) :: log_output_file_l
@@ -2463,6 +2492,8 @@ contains
                close(unit_cfg)
                return
             endif
+         case ('dry_run')
+            dry_run_l = flag_from_value_reproject(val)
          case ('log_level')
             log_level_l = trim(val)
          case ('timing_enabled')
@@ -2657,5 +2688,116 @@ contains
       enddo
       if (cur == idx) item = adjustl(str(p0:n))
    end subroutine cfg_csv_get_item
+
+   subroutine run_dry_run_check(target_path, tool_name)
+      !! dry_run=y (T24, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): planning-
+      !! only pass, mirroring rm_synthesis' own dry_run/tile_autotune.cfg
+      !! convention -- touches no real data, just checks the target output
+      !! disk's own rotational status (via /sys/block/<dev>/queue/
+      !! rotational, resolved from target_path's own mount point) and
+      !! writes a suggested <tool_name>_dryrun.cfg with recommended
+      !! io_overlap/nwriters settings. Advisory only: this project's own
+      !! nwriters clamp formula was deliberately left tied to
+      !! omp_get_max_threads(), not disk type (see T7/T12's own
+      !! discussion) -- this dry-run pass suggests a starting VALUE within
+      !! that clamp, it does not change the clamp itself. See match_cubes.
+      !! f90's own copy of this subroutine for the full rationale (adapt,
+      !! don't share, per this project's own module convention).
+      character(len=*), intent(in) :: target_path, tool_name
+
+      character(len=600) :: shell_cmd
+      character(len=64) :: capture_file
+      character(len=16) :: rot_str
+      integer :: capture_unit, ios_cap, exitstat_cmd, cfg_unit
+      integer :: rot_val
+      logical :: is_rotational, have_answer
+
+      write(capture_file, '(A,I0,A)') '.dryrun_rotational_', getpid_wrap(), '.tmp'
+
+      write(shell_cmd, '(A,A,A,A,A)')&
+      &'dev=$(df --output=source ''', trim(target_path), ''' 2>/dev/null | tail -1); ',&
+      &'base=$(basename "$dev"); ',&
+      &'if echo "$base" | grep -Eq ''^nvme[0-9]+n[0-9]+p[0-9]+$''; then parent="${base%p*}"; '//&
+      &'elif echo "$base" | grep -Eq ''^nvme[0-9]+n[0-9]+$''; then parent="$base"; '//&
+      &'else parent=$(echo "$base" | sed -E ''s/[0-9]+$//''); fi; '//&
+      &'cat "/sys/block/$parent/queue/rotational" 2>/dev/null > '//trim(capture_file)
+
+      call execute_command_line(trim(shell_cmd), wait=.true., exitstat=exitstat_cmd)
+
+      have_answer = .false.
+      rot_val = -1
+      open(newunit=capture_unit, file=trim(capture_file), status='old',&
+      &action='read', iostat=ios_cap)
+      if (ios_cap.eq.0) then
+         read(capture_unit, '(A)', iostat=ios_cap) rot_str
+         close(capture_unit, status='delete')
+         if (ios_cap.eq.0) then
+            read(rot_str, *, iostat=ios_cap) rot_val
+            if (ios_cap.eq.0 .and. (rot_val.eq.0 .or. rot_val.eq.1)) have_answer = .true.
+         endif
+      else
+         close(capture_unit, status='delete', iostat=ios_cap)
+      endif
+
+      is_rotational = (rot_val.eq.1)
+
+      write(*,'(A)') 'dry_run=y: no files will be processed.'
+      write(*,'(A,A)') 'Target path checked: ', trim(target_path)
+      if (.not. have_answer) then
+         write(*,'(A)') 'Could not determine the target disk''s rotational status'//&
+         &' (df/sysfs check failed or path not found) -- no suggestion made.'
+         return
+      endif
+      if (is_rotational) then
+         write(*,'(A)') 'Target disk: spinning (rotational=1).'
+         write(*,'(A)') 'Suggestion: io_overlap=n, nwriters=1 -- on a single spinning'//&
+         &' disk, concurrent reads/writes contend for the same physical head;'
+         write(*,'(A)') '  see docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md T24 for the full'//&
+         &' reasoning (this is advisory, not enforced).'
+      else
+         write(*,'(A)') 'Target disk: non-rotational (SSD/NVMe, rotational=0).'
+         write(*,'(A)') 'Suggestion: io_overlap=y, nwriters=2 -- concurrent I/O is'//&
+         &' generally safe on SSD/NVMe; nwriters starts conservative (this machine''s'
+         write(*,'(A)') '  own spare-core headroom outside OMP_NUM_THREADS), raise it'//&
+         &' if your own machine has more idle cores available.'
+      endif
+
+      open(newunit=cfg_unit, file=trim(tool_name)//'_dryrun.cfg', status='replace',&
+      &action='write', iostat=ios_cap)
+      if (ios_cap.ne.0) then
+         write(*,'(A)') 'WARNING: could not write suggested cfg file.'
+         return
+      endif
+      write(cfg_unit, '(A)') '# Autogenerated by '//trim(tool_name)//' dry_run=y'
+      write(cfg_unit, '(A)') '# Target path checked: '//trim(target_path)
+      if (is_rotational) then
+         write(cfg_unit, '(A)') '# Target disk: spinning (rotational=1)'
+         write(cfg_unit, '(A)') 'io_overlap=n'
+         write(cfg_unit, '(A)') 'nwriters=1'
+      else
+         write(cfg_unit, '(A)') '# Target disk: non-rotational (SSD/NVMe, rotational=0)'
+         write(cfg_unit, '(A)') 'io_overlap=y'
+         write(cfg_unit, '(A)') 'nwriters=2'
+      endif
+      write(cfg_unit, '(A)') '# Copy these KEY=VALUE lines into your own cfg, or pass'
+      write(cfg_unit, '(A)') '# them directly on the command line.'
+      close(cfg_unit)
+      write(*,'(A)') 'Wrote suggested settings to '//trim(tool_name)//'_dryrun.cfg'
+   end subroutine run_dry_run_check
+
+   integer function getpid_wrap() result(pid)
+      !! Wraps the getpid() C library call (via iso_c_binding) purely to
+      !! make the dry_run capture-file name collision-proof if multiple
+      !! dry_run invocations somehow overlap in the same directory --
+      !! not needed for correctness of a single run, just cheap safety.
+      use, intrinsic :: iso_c_binding, only: c_int
+      interface
+         function c_getpid() bind(C, name="getpid") result(r)
+            import :: c_int
+            integer(c_int) :: r
+         end function c_getpid
+      end interface
+      pid = int(c_getpid())
+   end function getpid_wrap
 
 end program reproject_cubes

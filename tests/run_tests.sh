@@ -3078,6 +3078,81 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 47. convolve_cubes/match_cubes/reproject_cubes: dry_run touches no data (T24)
+# ---------------------------------------------------------------------------
+section "47. convolve_cubes/match_cubes/reproject_cubes: dry_run touches no data"
+
+dr_src="$OUT_DIR/dr_src.Q.FITSCUBE"
+cp "$DATA_DIR/TEST.Q.FITSCUBE" "$dr_src"
+dr_beamfile="$OUT_DIR/dr_beamlog.txt"
+awk 'BEGIN { for (i=1;i<=200;i++) print i, 10.0, 10.0, 0.0 }' > "$dr_beamfile"
+
+if [[ -x bin/convolve_cubes ]]; then
+    rm -f convolve_cubes_dryrun.cfg "${dr_src%.FITSCUBE}.CONV.FITS"
+    dr_cv_log="$OUT_DIR/dryrun_convolve.log"
+    if bin/convolve_cubes infiles="$dr_src" beamfiles="$dr_beamfile" \
+            target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 dry_run=y \
+            > "$dr_cv_log" 2>&1; then
+        if [[ -s convolve_cubes_dryrun.cfg ]] && \
+           grep -q "^io_overlap=" convolve_cubes_dryrun.cfg && \
+           grep -q "^nwriters=" convolve_cubes_dryrun.cfg && \
+           [[ ! -e "${dr_src%.FITSCUBE}.CONV.FITS" ]]; then
+            pass "convolve_cubes: dry_run=y wrote a suggested cfg and touched no data"
+        else
+            fail "convolve_cubes: dry_run=y did not behave as expected (see $dr_cv_log)"
+        fi
+    else
+        fail "convolve_cubes: dry_run=y run failed (see $dr_cv_log)"
+    fi
+    rm -f convolve_cubes_dryrun.cfg
+else
+    skip "bin/convolve_cubes not built; skipping dry_run test"
+fi
+
+if [[ -x bin/match_cubes ]]; then
+    rm -f match_cubes_dryrun.cfg "${dr_src%.FITSCUBE}_MATCHED.FITS"
+    dr_mc_log="$OUT_DIR/dryrun_match.log"
+    if bin/match_cubes stages=convolve infiles="$dr_src" beamfiles="$dr_beamfile" \
+            target_bmaj=20.0 target_bmin=20.0 target_bpa=0.0 dry_run=y \
+            > "$dr_mc_log" 2>&1; then
+        if [[ -s match_cubes_dryrun.cfg ]] && \
+           grep -q "^io_overlap=" match_cubes_dryrun.cfg && \
+           grep -q "^nwriters=" match_cubes_dryrun.cfg && \
+           [[ ! -e "${dr_src%.FITSCUBE}_MATCHED.FITS" ]]; then
+            pass "match_cubes: dry_run=y wrote a suggested cfg and touched no data"
+        else
+            fail "match_cubes: dry_run=y did not behave as expected (see $dr_mc_log)"
+        fi
+    else
+        fail "match_cubes: dry_run=y run failed (see $dr_mc_log)"
+    fi
+    rm -f match_cubes_dryrun.cfg
+else
+    skip "bin/match_cubes not built; skipping dry_run test"
+fi
+
+if [[ -x bin/reproject_cubes ]]; then
+    rm -f reproject_cubes_dryrun.cfg "${dr_src%.FITSCUBE}_REPROJ.FITS"
+    dr_rc_log="$OUT_DIR/dryrun_reproject.log"
+    if bin/reproject_cubes mode=reference reffile="$DATA_DIR/TEST.Q.FITSCUBE" \
+            infiles="$dr_src" dry_run=y > "$dr_rc_log" 2>&1; then
+        if [[ -s reproject_cubes_dryrun.cfg ]] && \
+           grep -q "^io_overlap=" reproject_cubes_dryrun.cfg && \
+           grep -q "^nwriters=" reproject_cubes_dryrun.cfg && \
+           [[ ! -e "${dr_src%.FITSCUBE}_REPROJ.FITS" ]]; then
+            pass "reproject_cubes: dry_run=y wrote a suggested cfg and touched no data"
+        else
+            fail "reproject_cubes: dry_run=y did not behave as expected (see $dr_rc_log)"
+        fi
+    else
+        fail "reproject_cubes: dry_run=y run failed (see $dr_rc_log)"
+    fi
+    rm -f reproject_cubes_dryrun.cfg
+else
+    skip "bin/reproject_cubes not built; skipping dry_run test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

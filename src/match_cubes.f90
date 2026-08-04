@@ -199,6 +199,14 @@ program match_cubes
    ! (T7/T12) and convolve_cubes' own copy of this option -- see
    ! do_block_write's own comment for how it composes with io_overlap.
    integer :: nwriters
+   ! dry_run (default n, T24 docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md):
+   ! same key name as rm_synthesis' own dry_run -- checks the target
+   ! output disk's rotational status and writes a suggested
+   ! match_cubes_dryrun.cfg (io_overlap/nwriters) instead of processing
+   ! any real file, mirroring rm_synthesis' own tile_autotune.cfg
+   ! convention. See run_dry_run_check's own comment for the full
+   ! rationale.
+   logical :: dry_run
    integer :: npts
    real(dp) :: khachiyan_tol
 
@@ -243,6 +251,11 @@ program match_cubes
       stop 1
    endif
    call log_message('info', 'startup', 'match_cubes run started')
+
+   if (dry_run) then
+      call run_dry_run_check(infiles(1), 'match_cubes')
+      stop
+   endif
 
    do_reproject = (trim(stages).eq.'reproject' .or. trim(stages).eq.'both')
    do_convolve = (trim(stages).eq.'convolve' .or. trim(stages).eq.'both')
@@ -663,6 +676,7 @@ contains
       mem_frac_ram = 0.25
       io_overlap = .false.
       nwriters = 1
+      dry_run = .false.
       log_level = 'info'
       timing_enabled = .false.
       log_output_file = ' '
@@ -895,6 +909,8 @@ contains
             status = -1
             return
          endif
+      case ('dry_run')
+         dry_run = flag_from_value_match(val)
       case ('log_level')
          log_level = trim(val)
       case ('timing_enabled')
@@ -971,7 +987,7 @@ contains
       write(*,'(A)') '    [target_bmaj=<arcsec> target_bmin=<arcsec> target_bpa=<deg>]'
       write(*,'(A)') '    [max_common_bmaj=<arcsec>] [mem_frac_ram=<fraction>]'
       write(*,'(A)') '    [outsuffix=<suffix>] [npts=<n>] [khachiyan_tol=<tol>]'
-      write(*,'(A)') '    [manifest=<path>] [io_overlap=y|n] [nwriters=<n>]'
+      write(*,'(A)') '    [manifest=<path>] [io_overlap=y|n] [nwriters=<n>] [dry_run=y|n]'
       write(*,'(A)') '  match_cubes --config <cfgfile>'
       write(*,'(A)') '  match_cubes --help | -h'
       write(*,'(A)') ''
@@ -1036,6 +1052,12 @@ contains
       write(*,'(A)') '  rmclean_cubes'' own nwriters (max(1, min(nwriters, OMP thread count))).'//&
       &' Orthogonal to io_overlap: io_overlap decides WHEN a block''s write runs;'
       write(*,'(A)') '  nwriters decides how many concurrent writers do it once dispatched.'
+      write(*,'(A)') ''
+      write(*,'(A)') 'dry_run (default n): y -- check the target output disk''s own'//&
+      &' rotational status and write a suggested match_cubes_dryrun.cfg'
+      write(*,'(A)') '  (io_overlap/nwriters), instead of processing any real file.'//&
+      &' Advisory only -- does not change any clamp, just suggests a'
+      write(*,'(A)') '  starting value. Touches no data.'
       write(*,'(A)') ''
       write(*,'(A)') 'Optional keys (CLI or config, logging/timing):'
       write(*,'(A)') '  log_level       = error|warn|info|debug (default info)'
@@ -3855,5 +3877,129 @@ contains
       endif
       if (mem_total_kb.le.0_8) mem_total_kb = 4194304_8
    end subroutine get_mem_total_kb
+
+   subroutine run_dry_run_check(target_path, tool_name)
+      !! dry_run=y (T24, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): planning-
+      !! only pass, mirroring rm_synthesis' own dry_run/tile_autotune.cfg
+      !! convention -- touches no real data, just checks the target output
+      !! disk's own rotational status (via /sys/block/<dev>/queue/
+      !! rotational, resolved from target_path's own mount point -- the
+      !! same, direct mechanism this session used to confirm /data1 is a
+      !! genuine spinning disk and /home is NVMe, no benchmarking needed)
+      !! and writes a suggested <tool_name>_dryrun.cfg with recommended
+      !! io_overlap/nwriters settings. Advisory only: this project's own
+      !! nwriters clamp formula was deliberately left tied to
+      !! omp_get_max_threads(), not disk type (see T7/T12's own
+      !! discussion) -- this dry-run pass suggests a starting VALUE within
+      !! that clamp, it does not change the clamp itself.
+      !!
+      !! Shells out (execute_command_line) rather than reimplementing
+      !! mount-point/block-device resolution in Fortran -- df/basename/
+      !! sed are already exactly what this session used interactively to
+      !! confirm /data1 vs /home, so this reuses that same, already-
+      !! verified logic instead of a parallel, untested reimplementation.
+      !! Captures the shell command's own stdout via a plain output
+      !! redirect to a file in the CURRENT working directory (never /tmp
+      !! or any other system directory, matching this project's own
+      !! standing convention for its own scratch files, applied here to
+      !! the tool's own runtime behaviour too since HPC compute nodes
+      !! often restrict or omit /tmp entirely) -- read back, then deleted
+      !! immediately.
+      character(len=*), intent(in) :: target_path, tool_name
+
+      character(len=600) :: shell_cmd
+      character(len=64) :: capture_file
+      character(len=16) :: rot_str
+      integer :: capture_unit, ios_cap, exitstat_cmd, cfg_unit
+      integer :: rot_val
+      logical :: is_rotational, have_answer
+
+      write(capture_file, '(A,I0,A)') '.dryrun_rotational_', getpid_wrap(), '.tmp'
+
+      write(shell_cmd, '(A,A,A,A,A)')&
+      &'dev=$(df --output=source ''', trim(target_path), ''' 2>/dev/null | tail -1); ',&
+      &'base=$(basename "$dev"); ',&
+      &'if echo "$base" | grep -Eq ''^nvme[0-9]+n[0-9]+p[0-9]+$''; then parent="${base%p*}"; '//&
+      &'elif echo "$base" | grep -Eq ''^nvme[0-9]+n[0-9]+$''; then parent="$base"; '//&
+      &'else parent=$(echo "$base" | sed -E ''s/[0-9]+$//''); fi; '//&
+      &'cat "/sys/block/$parent/queue/rotational" 2>/dev/null > '//trim(capture_file)
+
+      call execute_command_line(trim(shell_cmd), wait=.true., exitstat=exitstat_cmd)
+
+      have_answer = .false.
+      rot_val = -1
+      open(newunit=capture_unit, file=trim(capture_file), status='old',&
+      &action='read', iostat=ios_cap)
+      if (ios_cap.eq.0) then
+         read(capture_unit, '(A)', iostat=ios_cap) rot_str
+         close(capture_unit, status='delete')
+         if (ios_cap.eq.0) then
+            read(rot_str, *, iostat=ios_cap) rot_val
+            if (ios_cap.eq.0 .and. (rot_val.eq.0 .or. rot_val.eq.1)) have_answer = .true.
+         endif
+      else
+         close(capture_unit, status='delete', iostat=ios_cap)
+      endif
+
+      is_rotational = (rot_val.eq.1)
+
+      write(*,'(A)') 'dry_run=y: no files will be processed.'
+      write(*,'(A,A)') 'Target path checked: ', trim(target_path)
+      if (.not. have_answer) then
+         write(*,'(A)') 'Could not determine the target disk''s rotational status'//&
+         &' (df/sysfs check failed or path not found) -- no suggestion made.'
+         return
+      endif
+      if (is_rotational) then
+         write(*,'(A)') 'Target disk: spinning (rotational=1).'
+         write(*,'(A)') 'Suggestion: io_overlap=n, nwriters=1 -- on a single spinning'//&
+         &' disk, concurrent reads/writes contend for the same physical head;'
+         write(*,'(A)') '  see docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md T24 for the full'//&
+         &' reasoning (this is advisory, not enforced).'
+      else
+         write(*,'(A)') 'Target disk: non-rotational (SSD/NVMe, rotational=0).'
+         write(*,'(A)') 'Suggestion: io_overlap=y, nwriters=2 -- concurrent I/O is'//&
+         &' generally safe on SSD/NVMe; nwriters starts conservative (this machine''s'
+         write(*,'(A)') '  own spare-core headroom outside OMP_NUM_THREADS), raise it'//&
+         &' if your own machine has more idle cores available.'
+      endif
+
+      open(newunit=cfg_unit, file=trim(tool_name)//'_dryrun.cfg', status='replace',&
+      &action='write', iostat=ios_cap)
+      if (ios_cap.ne.0) then
+         write(*,'(A)') 'WARNING: could not write suggested cfg file.'
+         return
+      endif
+      write(cfg_unit, '(A)') '# Autogenerated by '//trim(tool_name)//' dry_run=y'
+      write(cfg_unit, '(A)') '# Target path checked: '//trim(target_path)
+      if (is_rotational) then
+         write(cfg_unit, '(A)') '# Target disk: spinning (rotational=1)'
+         write(cfg_unit, '(A)') 'io_overlap=n'
+         write(cfg_unit, '(A)') 'nwriters=1'
+      else
+         write(cfg_unit, '(A)') '# Target disk: non-rotational (SSD/NVMe, rotational=0)'
+         write(cfg_unit, '(A)') 'io_overlap=y'
+         write(cfg_unit, '(A)') 'nwriters=2'
+      endif
+      write(cfg_unit, '(A)') '# Copy these KEY=VALUE lines into your own cfg, or pass'
+      write(cfg_unit, '(A)') '# them directly on the command line.'
+      close(cfg_unit)
+      write(*,'(A)') 'Wrote suggested settings to '//trim(tool_name)//'_dryrun.cfg'
+   end subroutine run_dry_run_check
+
+   integer function getpid_wrap() result(pid)
+      !! Wraps the getpid() C library call (via iso_c_binding) purely to
+      !! make the dry_run capture-file name collision-proof if multiple
+      !! dry_run invocations somehow overlap in the same directory --
+      !! not needed for correctness of a single run, just cheap safety.
+      use, intrinsic :: iso_c_binding, only: c_int
+      interface
+         function c_getpid() bind(C, name="getpid") result(r)
+            import :: c_int
+            integer(c_int) :: r
+         end function c_getpid
+      end interface
+      pid = int(c_getpid())
+   end function getpid_wrap
 
 end program match_cubes
