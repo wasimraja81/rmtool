@@ -2,11 +2,15 @@ module gaussft_mod
    !! Convolve a single 2D image plane from one elliptical-Gaussian PSF to
    !! another, via FFT-domain deconvolve-then-reconvolve: multiply
    !! FT(image) by FT(target beam)/FT(source beam), inverse-transform.
-   !! Pure computation only -- no FITS I/O, no NaN/bad-data handling, no
-   !! per-channel BMAJ/BMIN/BPA bookkeeping; those are a caller's job
-   !! (planned: a main program mirroring reproject_cubes' own split
-   !! between user-facing I/O and this kind of narrowly-scoped
-   !! computational module). Multi-band needs nothing extra here --
+   !! Pure computation only -- no FITS I/O, no per-channel BMAJ/BMIN/BPA
+   !! bookkeeping; those are a caller's job (planned: a main program
+   !! mirroring reproject_cubes' own split between user-facing I/O and
+   !! this kind of narrowly-scoped computational module). NaN/bad-data
+   !! handling IS done here (see convolve_to_beam's own comment): real
+   !! ASKAP data is genuinely partially blanked (primary-beam edge
+   !! NaNs), and a single NaN anywhere in a plane would otherwise poison
+   !! the entire FFT-convolved output, since the FFT is a global
+   !! operation over the whole plane. Multi-band needs nothing extra here --
    !! every plane already carries its own independent source PSF against
    !! one shared target PSF, whether it's the only plane being processed
    !! or one of many from several bands; "multi-band" is purely a matter
@@ -60,6 +64,18 @@ module gaussft_mod
    real(dp), parameter :: deg2rad = pi/180.0_dp
    ! sqrt(8*ln2): standard FWHM -> Gaussian-sigma conversion factor.
    real(dp), parameter :: fwhm2sigma = 2.0_dp*sqrt(2.0_dp*log(2.0_dp))
+
+   ! Minimum acceptable valid-data weight fraction for a NaN-containing
+   ! plane's convolved output pixel (see convolve_to_beam's NaN-aware
+   ! path below). A pixel's output is kept only if at least this
+   ! fraction of the KERNEL'S OWN WEIGHT (not a raw NaN/valid pixel
+   ! count -- the kernel is a Gaussian, so a NaN near its centre counts
+   ! far more than one in its tail) came from valid input pixels;
+   ! otherwise the output pixel is re-NaN'd rather than reported as a
+   ! number derived mostly from fabricated (zero-filled) data. At the
+   ! chosen 0.5, this is equivalent to: reject if more of the kernel's
+   ! weight fell on NaN pixels than on valid ones.
+   real(dp), parameter :: conv_nan_reject_frac = 0.5_dp
 
    ! FFTW3 constants (from /usr/include/fftw3.f) -- declared directly
    ! rather than `include`d: fftw3.f is fixed-form Fortran 77 (same
@@ -156,6 +172,8 @@ contains
    subroutine convolve_to_beam(plan_fwd, plan_bwd, image, nx, ny, nx_pad,&
    &ny_pad, dx, dy, bmaj_in, bmin_in, bpa_in, bmaj, bmin, bpa, image_out,&
    &status)
+      use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value,&
+      &ieee_quiet_nan
       !! plan_fwd/plan_bwd: from plan_convolution, already created,
       !! describing an nx_pad-by-ny_pad transform (not checked here --
       !! passing plans for a different size is undefined behaviour, same
@@ -190,6 +208,28 @@ contains
       !! bmaj_in/bmin_in/bpa_in; that policy call belongs to the caller,
       !! not this computation). Thread-safe: see this module's own
       !! header comment.
+      !!
+      !! NaN handling: if image has no NaN pixels, the computation below
+      !! is byte-for-byte identical to the original NaN-agnostic version
+      !! (zero regression risk for the common case). If image DOES
+      !! contain NaN (real ASKAP data routinely does, from primary-beam
+      !! edge blanking), a plain FFT convolution would let a single NaN
+      !! poison the entire plane -- the FFT is a global operation, so
+      !! there is no such thing as a "locally" NaN output pixel.
+      !! Instead: NaN pixels are zero-filled and convolved to give C_D;
+      !! separately, a 0/1 validity mask is convolved through the SAME
+      !! kernel and normalised by g_ratio (the kernel's own DC gain) to
+      !! give C_M, the fraction of each output pixel's kernel weight
+      !! that came from valid input (0..1, exactly 1 with no NaN
+      !! nearby). image_out = C_D/C_M where C_M >= conv_nan_reject_frac,
+      !! and NaN otherwise -- i.e. an output pixel is only reported if
+      !! most of the kernel's weight, not just most of the surrounding
+      !! pixel COUNT, came from real data. Matches the precedent set by
+      !! RACS-tools' own convolve() (verified directly against its
+      !! source), except RACS-tools does not renormalise the
+      !! partially-contaminated case at all -- this implementation is
+      !! more rigorous for the pixels it keeps rather than only
+      !! blanket-rejecting fully-contaminated ones.
       integer(kind=8), intent(in) :: plan_fwd, plan_bwd
       integer, intent(in) :: nx, ny, nx_pad, ny_pad
       real(dp), intent(in) :: image(nx, ny)
@@ -204,11 +244,19 @@ contains
       real(dp) :: cos_bpa, sin_bpa, cos_bpa_in, sin_bpa_in
       real(dp) :: g_amp, dg_amp, g_ratio
       real(dp) :: ur, vr, ur_in, vr_in, g_arg, dg_arg
+      real(dp) :: nanval
       real(dp), allocatable :: u(:), v(:)
-      complex(dp), allocatable :: cimg(:,:), g_final(:,:)
+      real(dp), allocatable :: c_d(:,:), c_m(:,:)
+      logical, allocatable :: nan_mask(:,:)
+      logical :: has_nan
+      complex(dp), allocatable :: cimg(:,:), cmsk(:,:), g_final(:,:)
       integer :: ix, iy
 
       status = 0
+
+      allocate(nan_mask(nx, ny))
+      nan_mask = ieee_is_nan(image)
+      has_nan = any(nan_mask)
 
       dx_rad = dx*deg2rad
       dy_rad = dy*deg2rad
@@ -249,13 +297,14 @@ contains
 
       allocate(cimg(nx_pad, ny_pad))
       cimg = cmplx(0.0_dp, 0.0_dp, dp)
-      cimg(1:nx, 1:ny) = cmplx(image, 0.0_dp, dp)
+      if (has_nan) then
+         cimg(1:nx, 1:ny) = cmplx(merge(0.0_dp, image, nan_mask), 0.0_dp, dp)
+      else
+         cimg(1:nx, 1:ny) = cmplx(image, 0.0_dp, dp)
+      endif
       call dfftw_execute_dft(plan_fwd, cimg, cimg)
 
       cimg = cimg*g_final
-      deallocate(g_final)
-
-      call dfftw_execute_dft(plan_bwd, cimg, cimg)
 
       ! FFTW's transforms are unnormalised (forward then backward scales
       ! the result by nx_pad*ny_pad, same convention as numpy.fft.fft2/
@@ -263,8 +312,45 @@ contains
       ! leaves it to the caller, matching its own documented convention).
       ! Cropped back from the same top-left corner the image was placed
       ! at above.
-      image_out = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
-      deallocate(cimg)
+      if (.not. has_nan) then
+         deallocate(g_final)
+         call dfftw_execute_dft(plan_bwd, cimg, cimg)
+         image_out = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
+         deallocate(cimg)
+      else
+         call dfftw_execute_dft(plan_bwd, cimg, cimg)
+         allocate(c_d(nx, ny))
+         c_d = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
+         deallocate(cimg)
+
+         ! Convolve the 0/1 validity mask through the SAME kernel as the
+         ! data -- the fraction of each output pixel's kernel weight
+         ! that came from valid input. Raw mask convolution maxes out at
+         ! g_ratio (the kernel's own DC gain), not 1, when the mask is
+         ! entirely 1 nearby -- see this subroutine's own header comment
+         ! for why g_ratio isn't unit gain -- so divide it out once here
+         ! to get a clean 0..1 fraction.
+         allocate(cmsk(nx_pad, ny_pad))
+         cmsk = cmplx(0.0_dp, 0.0_dp, dp)
+         cmsk(1:nx, 1:ny) = cmplx(merge(0.0_dp, 1.0_dp, nan_mask), 0.0_dp, dp)
+         call dfftw_execute_dft(plan_fwd, cmsk, cmsk)
+         cmsk = cmsk*g_final
+         deallocate(g_final)
+         call dfftw_execute_dft(plan_bwd, cmsk, cmsk)
+
+         allocate(c_m(nx, ny))
+         c_m = real(cmsk(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp) / g_ratio
+         deallocate(cmsk)
+
+         nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+         where (c_m >= conv_nan_reject_frac)
+            image_out = c_d/c_m
+         elsewhere
+            image_out = nanval
+         endwhere
+         deallocate(c_d, c_m)
+      endif
+      deallocate(nan_mask)
    end subroutine convolve_to_beam
 
    subroutine build_fftfreq(n, d, freq)

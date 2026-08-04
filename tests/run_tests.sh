@@ -3153,6 +3153,136 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "48. convolve_cubes: NaN pixels (T23) are locally masked, not plane-poisoning, and don't corrupt distant source recovery"
+
+if [[ -x bin/convolve_cubes && -x "$BIN_SERIAL" ]]; then
+    mbpp_nan_band1q="$OUT_DIR/mbpp_nan.TEST.Q.FITSCUBE"
+    mbpp_nan_band1u="$OUT_DIR/mbpp_nan.TEST.U.FITSCUBE"
+    mbpp_nan_band2q="$OUT_DIR/mbpp_nan.TEST_BAND2.Q.FITSCUBE"
+    mbpp_nan_band2u="$OUT_DIR/mbpp_nan.TEST_BAND2.U.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$mbpp_nan_band1q"
+    cp "$DATA_DIR/TEST.U.FITSCUBE" "$mbpp_nan_band1u"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$mbpp_nan_band2q"
+    cp "$DATA_DIR/TEST_BAND2.U.FITSCUBE" "$mbpp_nan_band2u"
+
+    # Inject NaN into a 6x6 corner block (x=0..5, y=0..5), every channel,
+    # of band 1's Q and U only -- far from both known sources (src_A at
+    # (12,10), src_B at (22,20)). Before T23's fix, convolve_to_beam ran
+    # the whole plane as one global FFT with no NaN handling, so a
+    # single NaN anywhere turned the ENTIRE output plane to NaN; a
+    # correct fix must recover both sources unaffected while the
+    # injected block itself still comes back mostly NaN (the threshold
+    # rejection actually engaging, not just "no longer 100% NaN by
+    # accident").
+    python3 - "$mbpp_nan_band1q" "$mbpp_nan_band1u" <<'PYEOF'
+import sys
+import numpy as np
+from astropy.io import fits
+for path in sys.argv[1:]:
+    with fits.open(path, mode='update') as hdul:
+        data = hdul[0].data
+        data[..., 0:6, 0:6] = np.nan
+        hdul.flush()
+PYEOF
+
+    mbpp_nan_band1q_conv="${mbpp_nan_band1q%.FITSCUBE}_CONV.FITS"
+    mbpp_nan_band1u_conv="${mbpp_nan_band1u%.FITSCUBE}_CONV.FITS"
+    mbpp_nan_band2q_conv="${mbpp_nan_band2q%.FITSCUBE}_CONV.FITS"
+    mbpp_nan_band2u_conv="${mbpp_nan_band2u%.FITSCUBE}_CONV.FITS"
+    rm -f "$mbpp_nan_band1q_conv" "$mbpp_nan_band1u_conv" \
+          "$mbpp_nan_band2q_conv" "$mbpp_nan_band2u_conv"
+
+    mbpp_nan_convolve_log="$OUT_DIR/mbpp_nan_convolve.log"
+    if bin/convolve_cubes \
+            infiles="$mbpp_nan_band1q,$mbpp_nan_band1u,$mbpp_nan_band2q,$mbpp_nan_band2u" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            mem_frac_ram=0.25 > "$mbpp_nan_convolve_log" 2>&1 && \
+       [[ -s "$mbpp_nan_band1q_conv" && -s "$mbpp_nan_band2q_conv" ]]; then
+        pass "convolve_cubes: ran to completion on NaN-containing input, wrote output"
+    else
+        fail "convolve_cubes: NaN-containing input run failed or wrote no output (see $mbpp_nan_convolve_log)"
+    fi
+
+    if [[ -s "$mbpp_nan_band1q_conv" ]]; then
+        if python3 - "$mbpp_nan_band1q_conv" <<'PYEOF'
+import sys
+import numpy as np
+from astropy.io import fits
+data = fits.getdata(sys.argv[1]).astype(float)
+nan_frac = float(np.mean(np.isnan(data)))
+block = data[..., 1:3, 1:3]   # well inside the injected 6x6 block
+far   = data[..., 15:20, 15:20]  # far outside the block
+ok = True
+if nan_frac >= 0.5:
+    print(f"FAIL: {nan_frac:.3f} of output is NaN -- plane-poisoning bug (T23) has regressed")
+    ok = False
+else:
+    print(f"OK: only {nan_frac:.3f} of output is NaN (localized, not plane-poisoning)")
+if not np.all(np.isnan(block)):
+    print("FAIL: pixels well inside the injected NaN block came back non-NaN (threshold rejection not engaging)")
+    ok = False
+else:
+    print("OK: pixels well inside the injected NaN block correctly remain NaN")
+if np.any(np.isnan(far)):
+    print("FAIL: pixels far from the injected NaN block came back NaN (over-rejection)")
+    ok = False
+else:
+    print("OK: pixels far from the injected NaN block are clean (non-NaN)")
+sys.exit(0 if ok else 1)
+PYEOF
+        then
+            pass "convolve_cubes: NaN handling is localized -- far pixels clean, deep-block pixels correctly rejected"
+        else
+            fail "convolve_cubes: NaN handling localization check failed (see output above)"
+        fi
+    else
+        fail "convolve_cubes: NaN-containing input produced no output to check"
+    fi
+
+    if [[ -s "$mbpp_nan_band1q_conv" && -s "$mbpp_nan_band2q_conv" ]]; then
+        mbpp_nan_cfg="$OUT_DIR/mbpp_nan_rmsynth.cfg"
+        cat > "$mbpp_nan_cfg" <<CFGEOF
+path                = ${OUT_DIR}/
+infileQ             = $(basename "$mbpp_nan_band1q_conv"),$(basename "$mbpp_nan_band2q_conv")
+infileU             = $(basename "$mbpp_nan_band1u_conv"),$(basename "$mbpp_nan_band2u_conv")
+outfile             = ${OUT_DIR}/mbpp_nan_out
+remove_badchan      = n
+global_badchan_file = /dev/null,/dev/null
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 201
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        mbpp_nan_rmsynth_log="$OUT_DIR/mbpp_nan_rmsynth.log"
+        "$BIN_SERIAL" "$mbpp_nan_cfg" > "$mbpp_nan_rmsynth_log" 2>&1
+        if [[ -f "${OUT_DIR}/mbpp_nan_out.AMP.RMCUBE.FITS" ]] && \
+           python3 "$TESTS_DIR/check_rm_peak.py" "${OUT_DIR}/mbpp_nan_out.AMP.RMCUBE.FITS" "$TRUTH" > /dev/null 2>&1; then
+            pass "convolve_cubes NaN fix + rm_synthesis: src_A/src_B still recovered despite NaN injected far away in band 1"
+        else
+            fail "convolve_cubes NaN fix + rm_synthesis: RM peak(s) not recovered (see $mbpp_nan_rmsynth_log)"
+        fi
+    else
+        fail "convolve_cubes: NaN-containing run did not produce usable output; skipping downstream rm_synthesis check"
+    fi
+else
+    skip "convolve_cubes or serial rm_synthesis binary not available; skipping NaN-handling regression test (T23)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

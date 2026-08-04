@@ -2651,7 +2651,7 @@ flags needed) on a real `stages=both` run of the small mismatched-band
 fixture, correctly showing `reproject_compute` (62%) dominating
 `convolve_compute` (4%) for that case.
 
-### T23 -- Real Output Is 100% NaN: `convolve_to_beam` Has No NaN Handling (found, root-caused, fix DEFERRED pending design decision -- not started)
+### T23 -- Real Output Is 100% NaN: `convolve_to_beam` Has No NaN Handling (found, root-caused, fixed, verified -- committed)
 
 **Gap found:** after the real WALLABY+EMU `match` run finally completed
 end-to-end (all 4 bands, exit code 0 -- see T19/T20's own verification
@@ -2716,20 +2716,47 @@ was **entirely** filler (`mask_conv >= 1`, within float tolerance) --
 partially-contaminated boundary pixels are left with the plain,
 uncorrected zero-fill result, with no renormalization attempted.
 
-**Status: DEFERRED, not implemented.** Extensive design discussion
-covered: zero-fill vs mean-fill as the substitution value (mean-fill is
-unbiased only in expectation under a missing-at-random assumption --
-disproved as *exact* via a concrete counterexample: a 4-pixel 1D case
-where mean-fill and the true hidden value give provably different
-convolved results at a valid neighbouring pixel); whether a second
-("mask") FFT pass can be avoided (no, if an exact per-pixel weighted
-renormalization is wanted -- knowing how much of a pixel's kernel
-footprint was real vs filler requires convolving the mask itself,
-regardless of what fill value was used); and the real-world RACS-tools
-precedent (zero-fill, no renormalization, mask-FFT used only to decide
-a binary re-NaN threshold). Final approach not yet chosen -- picking up
-this ticket next requires the user's own decision on which of these
-tradeoffs to adopt before writing any code.
+**Design settled (more rigorous than the RACS-tools precedent, not
+just a copy of it):** unlike RACS-tools, which only ever fully rejects
+a pixel (`mask_conv >= 1`) and otherwise reports the plain, unnormalized
+zero-fill result, this implementation renormalizes every partially-
+contaminated pixel exactly, not just the fully-clean or fully-dirty
+ones. Zero-fill NaN pixels, convolve once through the existing analytic
+kernel to get `C_D`; separately build a 0/1 validity mask, convolve
+it through the *same* kernel, and divide by `g_ratio` (the kernel's own
+DC gain -- see this module's header comment on why it isn't unit gain)
+to get `C_M`, the exact 0..1 fraction of each output pixel's kernel
+WEIGHT (not a raw pixel count -- the kernel is a Gaussian, so a NaN
+near its centre counts far more than one in its tail) that came from
+real data. `image_out = C_D/C_M` where `C_M >= conv_nan_reject_frac`
+(a fixed module-level constant, `src/gaussft.f90`, currently `0.5` --
+reject if more of the kernel's weight fell on NaN than on valid
+pixels), NaN otherwise. Reduces to byte-for-byte the original
+NaN-agnostic computation when a plane has no NaN at all (verified: full
+139-test suite, all synthetic fixtures are NaN-free, zero regressions).
+
+**Implemented** in `src/gaussft.f90`'s `convolve_to_beam` only --
+self-contained inside `gaussft_mod.f90`, so `convolve_cubes.f90` and
+both of `match_cubes.f90`'s call sites (convolve-first and
+reproject-first paths) get the fix automatically, no caller changes
+needed. NaN detection via `ieee_is_nan` (`ieee_arithmetic`, the same
+intrinsic already used elsewhere in this project, e.g.
+`convolve_cubes.f90`'s own bad-channel writer).
+
+**Verification:** new regression test (`tests/run_tests.sh` §48) --
+injects real NaN into a 6x6 spatial corner block (all 200 channels) of
+band 1's Q/U test cubes, far from both known sources (`src_A` at
+(12,10), `src_B` at (22,20)), then runs the full `convolve_cubes` ->
+`rm_synthesis` pipeline (mirroring §39's own structure). Confirms three
+things a plane-poisoning regression would each independently break:
+(1) output is NOT mostly NaN (measured 2.3%, vs. 100% before this fix
+-- the direct regression check for T23's own bug), (2) pixels well
+inside the injected block correctly remain NaN (the threshold rejection
+is actually engaging, not just accidentally producing *some* non-NaN
+output), (3) pixels far from the block are completely clean, and both
+`src_A`/`src_B` RM peaks are still recovered downstream through
+`rm_synthesis` -- proving the fix is genuinely LOCAL, not merely
+"less broken". Full suite: 142/142.
 
 ### T24 -- `dry_run`: Disk-Type-Aware `io_overlap`/`nwriters` Advisory for `convolve_cubes`/`match_cubes`/`reproject_cubes`
 
