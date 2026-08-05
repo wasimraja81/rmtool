@@ -123,7 +123,7 @@ program rmclean_cubes
    use rmclean_io_mod
    use rmclean_cache_mod, only: fnv1a_hash, linear_scan_extreme,&
    &pattern_registry_t, registry_init, registry_lookup_or_insert,&
-   &registry_advance, registry_next_occurrence
+   &registry_lookup, registry_advance, registry_next_occurrence
    implicit none
 
    ! --- Logging & timing (planning-doc ticket) -- see convolve_cubes.f90
@@ -409,6 +409,15 @@ program rmclean_cubes
       ! cache is full. Unused under policy='belady' (see that policy's
       ! own eviction logic instead).
       integer(kind=8) :: hit_count = 0_8
+      ! T14 increment 7: cache_eviction_policy='belady' only -- which
+      ! pattern_registry entry this cache row corresponds to, set once
+      ! at insertion (registry_lookup, never re-looked-up on a hit).
+      ! Lets a cache HIT advance that pattern's own registry timeline
+      ! (registry_advance) without paying for a second hash lookup into
+      ! a SEPARATE hash table on every hit -- only insertions/overflow
+      ! (the rare case once the cache is warm) need a fresh
+      ! registry_lookup. Unused (stays 0) under policy='hitcount'.
+      integer :: registry_id = 0
    end type table_cache_entry_t
    type(table_cache_entry_t), allocatable :: cache_entries(:)
    integer, allocatable :: cache_buckets(:)
@@ -2688,6 +2697,11 @@ contains
       integer, allocatable :: valid_idx_l(:)
       real(sp), allocatable :: l_sq_valid_l(:)
       logical :: do_insert
+      ! T14 increment 7: this pixel's own pattern_registry entry id,
+      ! looked up fresh only when this pixel's pattern is NOT already a
+      ! cache hit (see cache_entries(entry_idx)%registry_id's own
+      ! comment for why hits skip this).
+      integer :: registry_id_l
 
       allocate(valid_idx_l(nchan), l_sq_valid_l(nchan))
 
@@ -2714,6 +2728,15 @@ contains
             enddo
             if (entry_idx.ne.-1) then
                cache_entries(entry_idx)%hit_count = cache_entries(entry_idx)%hit_count + 1_8
+               ! T14 increment 7: this pattern's own registry timeline
+               ! advances regardless of caching -- a cache HIT still
+               ! means this pixel's occurrence of the pattern has now
+               ! been consumed. registry_id was set once, at this
+               ! entry's own original insertion; no fresh lookup needed
+               ! here.
+               if (cache_eviction_policy.eq.'belady') then
+                  call registry_advance(pattern_registry, cache_entries(entry_idx)%registry_id)
+               endif
                cycle ! already cached
             endif
 
@@ -2727,7 +2750,15 @@ contains
                else
                   ! 'belady' -- eviction not implemented yet (T14
                   ! increment 8); same overflow/one-off safety valve as
-                  ! before T14 for now.
+                  ! before T14 for now. Still advance this pattern's own
+                  ! registry timeline: "how far through this pattern's
+                  ! occurrences are we" is a fact about the pattern,
+                  ! not about whether it's currently cached (T14
+                  ! increment 7) -- without this, increment 8's own
+                  ! Belady decision would see a stale, already-passed
+                  ! next-occurrence position for this pattern.
+                  call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:), nchan, registry_id_l)
+                  call registry_advance(pattern_registry, registry_id_l)
                   n_overflow_pixels_total = n_overflow_pixels_total + 1
                   do_insert = .false.
                endif
@@ -2743,6 +2774,11 @@ contains
             allocate(cache_entries(target_slot)%pattern(nchan))
             cache_entries(target_slot)%pattern = mask_tile(ix_l,iy_l,:)
             cache_entries(target_slot)%hit_count = 1_8
+            if (cache_eviction_policy.eq.'belady') then
+               call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:), nchan, registry_id_l)
+               cache_entries(target_slot)%registry_id = registry_id_l
+               call registry_advance(pattern_registry, registry_id_l)
+            endif
 
             ! Bucket slot for target_slot: reuse either a genuinely
             ! empty slot OR a tombstone left by an earlier eviction --

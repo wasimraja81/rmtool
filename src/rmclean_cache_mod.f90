@@ -10,7 +10,7 @@ module rmclean_cache_mod
    private
    public :: fnv1a_hash, linear_scan_extreme
    public :: pattern_registry_t, pattern_registry_entry_t
-   public :: registry_init, registry_lookup_or_insert
+   public :: registry_init, registry_lookup_or_insert, registry_lookup
    public :: registry_advance, registry_next_occurrence
 
    type :: pattern_registry_entry_t
@@ -220,6 +220,46 @@ contains
       reg%entries(entry_id)%n_occurrences = reg%entries(entry_id)%n_occurrences + 1_8
       reg%entries(entry_id)%occurrences(reg%entries(entry_id)%n_occurrences) = scan_pos
    end subroutine registry_lookup_or_insert
+
+   subroutine registry_lookup(reg, pattern, n, entry_id)
+      !! T14: pure READ-ONLY lookup into the registry -- unlike
+      !! registry_lookup_or_insert, never inserts a new entry and never
+      !! appends an occurrence. Used during Pass 1 (the real run) to
+      !! find an ALREADY-registered pattern's own entry_id -- every
+      !! pattern Pass 1 encounters was already recorded by Pass 0's own
+      !! whole-cube pre-scan, so calling registry_lookup_or_insert again
+      !! here would silently (and wrongly) append a duplicate,
+      !! out-of-order occurrence to that pattern's own timeline.
+      !! entry_id=0 means "not found" -- under correct operation this
+      !! should never happen when cache_eviction_policy='belady' (Pass 0
+      !! and Pass 1 visit the same pixels in the same order via the same
+      !! next_tile_extent stepper), so callers should treat a 0 result
+      !! as a genuine scan-order-mismatch bug, not a normal case to
+      !! silently handle.
+      type(pattern_registry_t), intent(in) :: reg
+      integer(kind=1), intent(in) :: pattern(n)
+      integer, intent(in) :: n
+      integer, intent(out) :: entry_id
+      integer(kind=8) :: h, probe
+      integer :: tries, slot
+
+      h = fnv1a_hash(pattern, n)
+      probe = modulo(h, int(reg%n_buckets, 8))
+      entry_id = 0
+      do tries = 1, reg%n_buckets
+         slot = int(probe)
+         if (reg%buckets(slot).eq.0) return
+         if (reg%entries(reg%buckets(slot))%hash.eq.h) then
+            if (size(reg%entries(reg%buckets(slot))%pattern).eq.n) then
+               if (all(reg%entries(reg%buckets(slot))%pattern.eq.pattern)) then
+                  entry_id = reg%buckets(slot)
+                  return
+               endif
+            endif
+         endif
+         probe = modulo(probe+1, int(reg%n_buckets, 8))
+      enddo
+   end subroutine registry_lookup
 
    subroutine registry_advance(reg, entry_id)
       !! T14: moves entry_id's own next_occ_ptr past the CURRENT scan

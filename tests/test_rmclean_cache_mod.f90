@@ -7,7 +7,7 @@ program test_rmclean_cache_mod
    use, intrinsic :: iso_fortran_env, only: int8, int64
    use rmclean_cache_mod, only: fnv1a_hash, linear_scan_extreme,&
    &pattern_registry_t, registry_init, registry_lookup_or_insert,&
-   &registry_advance, registry_next_occurrence
+   &registry_lookup, registry_advance, registry_next_occurrence
    implicit none
 
    logical :: all_pass
@@ -58,6 +58,7 @@ program test_rmclean_cache_mod
    call test_registry_known_repeats(all_pass)
    call test_registry_growth(all_pass)
    call test_registry_advance_and_next_occurrence(all_pass)
+   call test_registry_lookup(all_pass)
 
    if (all_pass) then
       write(*,'(A)') '[PASS] test_rmclean_cache_mod: all checks passed'
@@ -227,5 +228,44 @@ contains
       call check(registry_next_occurrence(reg, id_b).eq.huge(0_8),&
       &'pattern_registry: after B''s 2nd (last) occurrence is consumed, next occurrence is the sentinel', all_pass_io)
    end subroutine test_registry_advance_and_next_occurrence
+
+   subroutine test_registry_lookup(all_pass_io)
+      !! T14 increment 7: registry_lookup is the pure READ-ONLY
+      !! counterpart to registry_lookup_or_insert -- Pass 1 (the real
+      !! run) uses it to find an already-registered pattern's entry_id
+      !! without appending a spurious duplicate occurrence. Must (a)
+      !! find exactly the same entry_id registry_lookup_or_insert
+      !! would, (b) NEVER mutate n_occurrences/occurrences (unlike
+      !! registry_lookup_or_insert), and (c) report entry_id=0 for a
+      !! pattern that was never registered.
+      logical, intent(inout) :: all_pass_io
+      type(pattern_registry_t) :: reg
+      integer(kind=1) :: pat_a(3), pat_b(3), pat_unseen(3)
+      integer :: id_a, id_b, id_tmp, id_unseen
+      integer(kind=8) :: n_occ_a_before
+
+      pat_a = [integer(kind=1) :: 1, 0, 1]
+      pat_b = [integer(kind=1) :: 0, 1, 0]
+      pat_unseen = [integer(kind=1) :: 1, 1, 1]
+
+      call registry_init(reg)
+      call registry_lookup_or_insert(reg, pat_a, 3, 1_8, id_a)
+      call registry_lookup_or_insert(reg, pat_b, 3, 2_8, id_b)
+      call registry_lookup_or_insert(reg, pat_a, 3, 3_8, id_tmp)
+
+      call registry_lookup(reg, pat_a, 3, id_tmp)
+      call check(id_tmp.eq.id_a, 'registry_lookup: finds the same entry_id as registry_lookup_or_insert for a known pattern', all_pass_io)
+      call registry_lookup(reg, pat_b, 3, id_tmp)
+      call check(id_tmp.eq.id_b, 'registry_lookup: finds the correct entry_id for a second known pattern', all_pass_io)
+
+      call registry_lookup(reg, pat_unseen, 3, id_unseen)
+      call check(id_unseen.eq.0, 'registry_lookup: entry_id=0 for a pattern that was never registered', all_pass_io)
+
+      n_occ_a_before = reg%entries(id_a)%n_occurrences
+      call registry_lookup(reg, pat_a, 3, id_tmp)
+      call registry_lookup(reg, pat_a, 3, id_tmp)
+      call check(reg%entries(id_a)%n_occurrences.eq.n_occ_a_before,&
+      &'registry_lookup: repeated calls never mutate n_occurrences (read-only, unlike registry_lookup_or_insert)', all_pass_io)
+   end subroutine test_registry_lookup
 
 end program test_rmclean_cache_mod
