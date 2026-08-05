@@ -3008,7 +3008,7 @@ downstream reader could actually discover and use correctly (right now
 keyword; a genuinely per-pixel beam has no equivalent standard
 convention to fall back on).
 
-### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Offline-Optimal (Belady/OPT) Eviction via a Mask Pre-Scan (documented, IMPLEMENTATION APPROVED by the user -- proceed)
+### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Offline-Optimal (Belady/OPT) Eviction via a Mask Pre-Scan (IN PROGRESS -- Phase A/LFU fallback done, Phase B/Belady NOT started -- T14 itself is NOT done)
 
 **Found, while watching the live WALLABY+EMU `rmclean_cubes` run take much
 longer per block than expected (block 3: 73 min; block 4: still running
@@ -3216,3 +3216,63 @@ the default eviction policy; hit-count-without-decay as the opt-out
 fallback (skips Pass 0). Follow this project's own standing
 microscopic dev-test-dev-test discipline -- do not implement this as
 one large change.
+
+**Progress (2026-08-06). Explicit, repeated per the plan's own
+non-negotiable completion criterion (agreed with the user before
+implementation started): Phase A finishing is a checkpoint, not T14
+finishing. Do not read the below as "T14 done."**
+
+- **Phase A (LFU fallback, stepping stone only -- NOT the deliverable)
+  -- DONE.** `cache_eviction_policy=belady|hitcount` cfg key added
+  (default `belady`, following `lsq_ref_compute_mode`'s exact parsing
+  style). `table_cache_entry_t` gained `hit_count`; once the cache is
+  full under `cache_eviction_policy=hitcount`, the globally
+  least-hit entry is evicted and its slot rebuilt in place for the new
+  pattern. `fnv1a_hash` extracted into a new module
+  (`src/rmclean_cache_mod.f90`) so cache logic can be unit-tested
+  standalone -- a `program`'s own internal procedures can't be `use`d
+  by a separate test program.
+- **A real correctness gap not caught during planning, found and
+  fixed during implementation:** evicting a cache slot leaves its OLD
+  bucket-table entry stale, but open-addressing lookup cannot simply
+  zero that slot out -- doing so breaks reachability for OTHER
+  entries whose own insertion probe happened to pass through it
+  (their lookups would incorrectly stop early and report "not
+  cached"). Implemented proper open-addressing-with-deletion: a new
+  `evict_cache_slot` marks the vacated bucket entry as a tombstone
+  (`-1`, distinct from both empty (`0`) and any valid cache index);
+  every lookup site (`cache_lookup_readonly`, used in the parallel
+  per-pixel CLEAN loop, AND `update_mask_pattern_cache_for_tile`'s own
+  inline lookup) now skips tombstones without ever dereferencing them
+  as an array index, continuing to probe past them exactly like any
+  other non-matching occupied slot; insertion can reuse either an
+  empty slot or a tombstone. Without this fix, the bucket table would
+  eventually exhaust under sustained eviction (every eviction
+  otherwise permanently burns one bucket slot with no way to reclaim
+  it) and either corrupt lookups or hit an infinite probe loop on
+  insertion.
+- **`cache_eviction_policy=belady` still behaves exactly as it did
+  before T14** (falls back to the pre-existing overflow/one-off
+  throwaway path when the cache is full) -- real Belady eviction is
+  increment 8, not started.
+- **Verification so far:** new test
+  (`run_tests.sh`, extending the existing `rmc_varied.MASK.CUBE.FITS`
+  fixture/section 29) forces genuine eviction --
+  `mask_pattern_cache_max=100` against a fixture confirmed (via the
+  tool's own log line) to have 757 true distinct patterns -- and
+  checks two things: output stays bit-identical to caching disabled
+  entirely (eviction is a compute-time optimisation only, never
+  changes results), and zero pixels fall back to the overflow/one-off
+  path (proving eviction genuinely engages rather than just quietly
+  not helping). Full suite 148/148 (146 after increment 2, +2 new
+  checks from the forced-eviction test).
+- **Phase B (Belady/OPT with admission control -- the actual decided
+  default, the entire reason this ticket exists) -- NOT STARTED.**
+  Increments 4-8 remain: the pattern registry (`rmclean_cache_mod.f90`,
+  a global, uncapped-but-safety-valved record of every distinct
+  pattern's own future occurrence positions), the Pass-0 mask
+  pre-scan, connecting the runtime cache to the registry, and the
+  actual Belady eviction decision with admission control. T14 is not
+  done until this phase's own bit-identity AND effectiveness tests
+  (Belady's own admission-decline count `<=` hitcount's, on the same
+  data) are green.
