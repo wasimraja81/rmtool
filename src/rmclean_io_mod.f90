@@ -12,9 +12,48 @@ module rmclean_io_mod
    use fitsio_unit_mod
    implicit none
    private
-   public :: read_mask_tile
+   public :: read_mask_tile, next_tile_extent
 
 contains
+
+   subroutine next_tile_extent(nx_in, ny_in, tile_ra_in, tile_dec_in,&
+   &ix_tile_beg, iy_tile_beg, tx, ty, done)
+      !! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): given the CURRENT
+      !! tile origin (ix_tile_beg, iy_tile_beg), returns that tile's own
+      !! (tx, ty) extent and ADVANCES (ix_tile_beg, iy_tile_beg) in
+      !! place to the NEXT tile's own origin (RA-strips-first). This is
+      !! the exact tile-geometry rule the main program's own
+      !! `do while (iy_tile_beg.le.ny) / do while (ix_tile_beg.le.nx)`
+      !! nesting implements (rmclean_cubes.f90) -- flattened into one
+      !! flat `do while (.not. done)` loop here specifically so it can
+      !! be SHARED, verbatim, by both that real per-tile compute loop
+      !! (Pass 1) and the new pattern pre-scan (Pass 0, T14) -- the two
+      !! passes must never silently diverge on tile geometry, since
+      !! Pass-0's own scan-position bookkeeping is only meaningful if
+      !! Pass 1 visits pixels in EXACTLY the same order.
+      !! done=.true. (tx=ty=0) once iy_tile_beg has already advanced
+      !! past ny_in on entry -- the caller's own signal to stop.
+      integer, intent(in) :: nx_in, ny_in, tile_ra_in, tile_dec_in
+      integer, intent(inout) :: ix_tile_beg, iy_tile_beg
+      integer, intent(out) :: tx, ty
+      logical, intent(out) :: done
+
+      if (iy_tile_beg.gt.ny_in) then
+         done = .true.
+         tx = 0
+         ty = 0
+         return
+      endif
+      done = .false.
+      ty = min(tile_dec_in, ny_in-iy_tile_beg+1)
+      tx = min(tile_ra_in, nx_in-ix_tile_beg+1)
+
+      ix_tile_beg = ix_tile_beg + tx
+      if (ix_tile_beg.gt.nx_in) then
+         ix_tile_beg = 1
+         iy_tile_beg = iy_tile_beg + ty
+      endif
+   end subroutine next_tile_extent
 
    subroutine split_range_rmclean_io(n_total, n_threads, base, rem)
       !! Same convention as rmclean_cubes.f90's own split_range_rmclean

@@ -3267,8 +3267,8 @@ finishing. Do not read the below as "T14 done."**
   not helping). Full suite 148/148 (146 after increment 2, +2 new
   checks from the forced-eviction test).
 - **Phase B (Belady/OPT with admission control -- the actual decided
-  default, the entire reason this ticket exists) -- NOT STARTED.**
-  Increments 4-8 remain: the pattern registry (`rmclean_cache_mod.f90`,
+  default, the entire reason this ticket exists) -- IN PROGRESS.**
+  Increments 4-8: the pattern registry (`rmclean_cache_mod.f90`,
   a global, uncapped-but-safety-valved record of every distinct
   pattern's own future occurrence positions), the Pass-0 mask
   pre-scan, connecting the runtime cache to the registry, and the
@@ -3276,3 +3276,69 @@ finishing. Do not read the below as "T14 done."**
   done until this phase's own bit-identity AND effectiveness tests
   (Belady's own admission-decline count `<=` hitcount's, on the same
   data) are green.
+- **Increments 4+5 (pattern registry data structure) -- DONE.**
+  `pattern_registry_t`/`pattern_registry_entry_t` added to
+  `rmclean_cache_mod.f90` (int64 occurrence positions/counts --
+  cheap-insurance sizing, not a demonstrated necessity at this
+  dataset's ~77.5M-pixel scale; all other counts stay plain
+  `integer`, matching the existing runtime cache's own convention).
+  `registry_lookup_or_insert`, `registry_advance`,
+  `registry_next_occurrence` implemented and unit-tested (27 checks
+  in `tests/test_rmclean_cache_mod.f90`, including forced growth past
+  the initial bucket-table size).
+- **Increment 6 (Pass-0 wiring into the real program) -- DONE.**
+  `next_tile_extent` added to `rmclean_io_mod.f90` -- a single shared
+  stepper for the tile-origin sequence, used by BOTH the real per-tile
+  compute loop and the new `run_pattern_prescan()`, so the two passes
+  can never silently disagree on what "scan position N" means.
+  `run_pattern_prescan()` added to `rmclean_cubes.f90`, called once
+  right after mask dimensions are known, only when
+  `cache_eviction_policy=belady`. 10%-of-image-pixels safety valve
+  implemented and verified against real fixture data (see below).
+  - **Verification:** an independent Python oracle
+    (`np.unique` over packed per-pixel channel-validity bytes) computed
+    ground truth for two fixtures: `rmc_varied.MASK.CUBE.FITS` (1024
+    valid pixels, 757 distinct patterns -- 73.9%, a deliberately
+    high-diversity stress fixture) and `rmc_lsqref.MASK.CUBE.FITS`
+    (1024 valid pixels, 1 distinct pattern -- realistic low-diversity
+    case). Running `cache_eviction_policy=belady` against the first
+    correctly triggers the safety valve (757 > 102 = 10% of 1024) --
+    Pass 0 aborts with the WARNING, falls back to `hitcount`, and the
+    run still completes correctly. Running against the second
+    (`rmc_lsqref`) exercises Pass 0's genuine success path: "Pass 0:
+    done -- 1 distinct pattern(s), 1024 valid pixel(s) scanned" is
+    logged, matching the oracle exactly, at BOTH the default single
+    32x32 tile and a forced 7x5 (35-tile) run -- proving Pass 0's own
+    scan order/counts are invariant to tiling, the single most
+    important correctness property this increment depends on. The two
+    runs' `CLEAN.AMP`/`CLEAN.PHA` outputs (the only outputs a caching
+    policy can affect) are bit-identical.
+  - **A pre-existing, T14-unrelated floating-point artifact found
+    during this verification, not yet fixed -- flagged here as a
+    follow-up rather than chased now:** the same two runs'
+    `RESID`/`RESTORED` outputs are NOT bit-identical (differences
+    ~1e-7 relative for AMP, ~1e-5 for PHA). Confirmed NOT caused by
+    T14: the same discrepancy reproduces with
+    `cache_eviction_policy=hitcount` (no Pass 0, no registry
+    involved). Traced to tile geometry, not randomness: differing
+    pixels are exactly those with `x mod 7 in {4,5,6}` under a 7-wide
+    tiling (0 differing pixels at `x mod 7 in {0,1,2,3}`) -- i.e. the
+    last 3 columns of every 7-wide tile, never the first 4. Working
+    hypothesis (well-evidenced, not confirmed at the disassembly
+    level): `resid_re_dp`/`resid_im_dp`'s per-iteration update
+    (`rmclean.f90:1031-1032`, a full `nrm`-length double-precision
+    array subtraction repeated up to `niter` times) is a loop the
+    compiler auto-vectorizes; a tile width that isn't a multiple of
+    the CPU's double-precision SIMD width (4, for 256-bit AVX) forces
+    a scalar/differently-grouped remainder loop for the leftover
+    columns, which can round differently (e.g. no FMA fusion) than the
+    vectorized main loop for the same formula on the same inputs. This
+    is consistent with `comp_re_dp`/`comp_im_dp` (`rmclean.f90:1026-
+    1027`, single-index scalar updates, no array op to vectorize)
+    staying bit-identical regardless of tile width. **Follow-up
+    (tracked here, under T14, not a separate ticket):** decide whether
+    this tile-width-dependent RESID/RESTORED non-reproducibility is
+    worth fixing (e.g. forcing consistent vectorization regardless of
+    remainder size) -- out of scope for T14's own completion bar,
+    which only requires CLEAN-output bit-identity across
+    tilings/eviction policies (already proven above).

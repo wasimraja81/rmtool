@@ -121,7 +121,9 @@ program rmclean_cubes
    use logging_mod
    use fitsio_unit_mod
    use rmclean_io_mod
-   use rmclean_cache_mod, only: fnv1a_hash, linear_scan_extreme
+   use rmclean_cache_mod, only: fnv1a_hash, linear_scan_extreme,&
+   &pattern_registry_t, registry_init, registry_lookup_or_insert,&
+   &registry_advance, registry_next_occurrence
    implicit none
 
    ! --- Logging & timing (planning-doc ticket) -- see convolve_cubes.f90
@@ -366,6 +368,14 @@ program rmclean_cubes
    ! plain least-frequently-used fallback needing no pre-scan at all --
    ! see either policy's own call site for the full story.
    character(len=16) :: cache_eviction_policy
+   ! T14: the whole-mask-cube pre-scan's own output -- every distinct
+   ! pattern's future occurrence timeline, built once by
+   ! run_pattern_prescan before real compute starts, consulted (never
+   ! rebuilt) by the Belady eviction decision during the real run.
+   ! Allocated/populated only when cache_eviction_policy='belady'; left
+   ! entirely untouched (registry%n_entries stays 0) under 'hitcount',
+   ! which needs no registry at all.
+   type(pattern_registry_t) :: pattern_registry
    real(dp) :: t_stage
    ! Per-thread swim-lane instrumentation (planning-doc ticket) -- see
    ! convolve_cubes.f90's own write_convolved_file for the full
@@ -530,17 +540,30 @@ program rmclean_cubes
    ! decides.
    call plan_rmclean_tile()
 
-   call init_mask_pattern_cache()
-
    ! T4b: same clamp convention as rm_synthesis's own io_read_threads --
    ! never more threads than OMP has, never more than there are RM planes
    ! to split across them (a tile's own nrm, not the outer tile count).
+   ! Moved earlier than T4b's own original spot (still right after
+   ! plan_rmclean_tile, just ahead of nwriters_eff now) since T14's own
+   ! Pass-0 pre-scan needs io_read_threads_eff for its own read_mask_tile
+   ! calls, and runs before nwriters_eff (an OUTPUT-side concern,
+   ! irrelevant to Pass 0) is otherwise needed.
    io_read_threads_eff = max(1, min(io_read_threads, omp_get_max_threads()))
    io_read_threads_eff = min(io_read_threads_eff, nrm)
    if (io_read_threads.gt.io_read_threads_eff) then
       write(*,'(A,I0,A,I0)') 'WARNING: io_read_threads=', io_read_threads,&
       &' clamped to ', io_read_threads_eff
    endif
+
+   ! T14: mask_tile itself moved earlier too (was allocated further
+   ! down, after init_mask_pattern_cache) so Pass 0 and the real Pass-1
+   ! tile loop share ONE allocation instead of doubling peak mask-tile
+   ! memory.
+   allocate(mask_tile(tile_ra,tile_dec,nchan))
+
+   if (cache_eviction_policy.eq.'belady') call run_pattern_prescan()
+
+   call init_mask_pattern_cache()
 
    ! T4c: same clamp convention as io_read_threads_eff above.
    nwriters_eff = max(1, min(nwriters, omp_get_max_threads()))
@@ -551,7 +574,6 @@ program rmclean_cubes
    endif
 
    allocate(re_tile(tile_ra,tile_dec,nrm), im_tile(tile_ra,tile_dec,nrm))
-   allocate(mask_tile(tile_ra,tile_dec,nchan))
    allocate(clean_re_buf(tile_ra,tile_dec,nrm,2), clean_im_buf(tile_ra,tile_dec,nrm,2))
    allocate(resid_re_buf(tile_ra,tile_dec,nrm,2), resid_im_buf(tile_ra,tile_dec,nrm,2))
    allocate(restored_re_buf(tile_ra,tile_dec,nrm,2), restored_im_buf(tile_ra,tile_dec,nrm,2))
@@ -2520,6 +2542,90 @@ contains
       n_distinct_patterns_total = 0
       n_overflow_pixels_total = 0
    end subroutine init_mask_pattern_cache
+
+   subroutine run_pattern_prescan()
+      !! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): Pass 0 -- scans the
+      !! WHOLE mask cube once, before real CLEAN compute starts,
+      !! building pattern_registry's own complete future-occurrence
+      !! timeline for every distinct channel-validity pattern. Called
+      !! only when cache_eviction_policy='belady' (see call site) --
+      !! 'hitcount' needs no registry and skips this entirely, no point
+      !! paying an extra full mask read for a registry that won't be
+      !! used.
+      !!
+      !! Uses next_tile_extent (rmclean_io_mod) for tile geometry --
+      !! the SAME function the real Pass-1 tile loop uses, not a
+      !! hand-duplicated rule -- so the two passes can never silently
+      !! diverge on scan order, the one property Pass 0's own
+      !! scan-position bookkeeping absolutely depends on. mask_tile
+      !! itself is the SAME array the real Pass-1 loop will use
+      !! (already allocated by the caller, before this call).
+      !!
+      !! Safety valve: if the number of distinct patterns found so far
+      !! exceeds 10% of the total image pixel count (nx*ny), a
+      !! lookahead-based cache isn't worth its own memory/IO cost for
+      !! this dataset (too little pattern reuse to exploit) -- abort
+      !! immediately, warn loudly, and fall back to
+      !! cache_eviction_policy='hitcount' for the rest of this run,
+      !! rather than finish a scan whose own output wouldn't be worth
+      !! keeping anyway.
+      integer :: ix_tile_beg, iy_tile_beg, ix_cur, iy_cur, tx, ty
+      logical :: done
+      integer :: ix_l, iy_l, entry_id
+      integer(kind=8) :: scan_pos, safety_threshold
+      integer :: status_prescan
+
+      write(*,'(A)') 'Pass 0: pre-scanning the whole mask cube to'//&
+      &' build the pattern registry (cache_eviction_policy=belady)...'
+
+      call registry_init(pattern_registry)
+      safety_threshold = (int(nx, 8) * int(ny, 8)) / 10_8
+
+      scan_pos = 0_8
+      ix_tile_beg = 1
+      iy_tile_beg = 1
+      do
+         ix_cur = ix_tile_beg
+         iy_cur = iy_tile_beg
+         call next_tile_extent(nx, ny, tile_ra, tile_dec, ix_tile_beg,&
+         &iy_tile_beg, tx, ty, done)
+         if (done) exit
+
+         call read_mask_tile(maskfile, nx, ny, nchan, ix_cur, iy_cur, tx, ty,&
+         &io_read_threads_eff, mask_tile(1:tx,1:ty,:), status_prescan)
+         if (status_prescan.ne.0) then
+            write(*,*) 'ERROR: Pass 0 failed to read mask tile at (',&
+            &ix_cur, ',', iy_cur, ')'
+            stop 1
+         endif
+
+         do iy_l = 1, ty
+            do ix_l = 1, tx
+               if (all(mask_tile(ix_l,iy_l,:).eq.0_1)) cycle
+               scan_pos = scan_pos + 1_8
+               call registry_lookup_or_insert(pattern_registry,&
+               &mask_tile(ix_l,iy_l,:), nchan, scan_pos, entry_id)
+            enddo
+         enddo
+
+         if (int(pattern_registry%n_entries, 8).ge.safety_threshold) then
+            write(*,'(A,I0,A)') 'WARNING: Pass 0 found ',&
+            &pattern_registry%n_entries, ' distinct patterns, already'//&
+            &' past 10% of the total image pixel count -- too little'//&
+            &' pattern reuse for a lookahead-based cache to be worth'//&
+            &' its own memory/IO cost. Aborting Pass 0 and falling'//&
+            &' back to cache_eviction_policy=hitcount for the rest of'//&
+            &' this run.'
+            cache_eviction_policy = 'hitcount'
+            call registry_init(pattern_registry) ! discard what was built, free its memory
+            return
+         endif
+      end do
+
+      write(*,'(A,I0,A,I0,A)') 'Pass 0: done -- ',&
+      &pattern_registry%n_entries, ' distinct pattern(s), ', scan_pos,&
+      &' valid pixel(s) scanned.'
+   end subroutine run_pattern_prescan
 
    subroutine evict_cache_slot(victim_idx)
       !! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): marks victim_idx's

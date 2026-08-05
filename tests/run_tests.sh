@@ -3433,6 +3433,138 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 52. rmclean_io_mod: next_tile_extent standalone unit test (T14,
+#     docs/dev/RMCLEAN_INTEGRATION_PLAN.md) -- the tile-geometry stepper
+#     shared by the real per-tile compute loop and the new pattern
+#     pre-scan (Pass 0). Links cfitsio (rmclean_io_mod's own module
+#     dependency, via fitsio_unit_mod) even though this specific
+#     function never calls a FITS routine.
+# ---------------------------------------------------------------------------
+section "52. rmclean_io_mod: next_tile_extent standalone unit test (T14)"
+
+riom_bin="$OUT_DIR/test_rmclean_io_mod"
+riom_log="$OUT_DIR/test_rmclean_io_mod.log"
+if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+        -O3 -fopenmp -J"$OUT_DIR" \
+        src/fitsio_unit_mod.f90 src/rmclean_io_mod.f90 "$TESTS_DIR/test_rmclean_io_mod.f90" \
+        -o "$riom_bin" -lcfitsio 2>"$OUT_DIR/rmclean_io_mod_build.log"; then
+    if "$riom_bin" > "$riom_log" 2>&1; then
+        while IFS= read -r line; do
+            if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then
+                echo "  $line"
+            fi
+        done < "$riom_log"
+        if grep -q "^\[PASS\] test_rmclean_io_mod" "$riom_log"; then
+            pass "rmclean_io_mod: next_tile_extent checks passed"
+        else
+            fail "rmclean_io_mod: one or more checks failed (see $riom_log)"
+        fi
+    else
+        fail "rmclean_io_mod: program exited non-zero (see $riom_log)"
+    fi
+else
+    fail "rmclean_io_mod: build failed (see $OUT_DIR/rmclean_io_mod_build.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# 53. rmclean_cubes: Pass 0 (pattern pre-scan) correctness (T14 increment
+#     6, docs/dev/RMCLEAN_INTEGRATION_PLAN.md) -- two fixtures, chosen to
+#     exercise Pass 0's two distinct outcomes:
+#       - rmc_varied.MASK.CUBE.FITS (757 distinct patterns / 1024 valid
+#         pixels, 73.9% -- a deliberately high-diversity stress fixture)
+#         must trip the 10%-of-image-pixels safety valve and fall back
+#         to cache_eviction_policy=hitcount, completing successfully.
+#       - rmc_lsqref.MASK.CUBE.FITS (1 distinct pattern / 1024 valid
+#         pixels) must NOT trip the safety valve, and Pass 0's own
+#         logged distinct-pattern/valid-pixel counts must be identical
+#         whether the whole image is one 32x32 tile or split into
+#         sixteen 8x8 tiles -- proving Pass 0 and the real per-tile
+#         compute loop agree on scan order regardless of tiling (the
+#         single most important correctness property this increment
+#         depends on, since Pass 0's own position bookkeeping is only
+#         meaningful if Pass 1 visits pixels in exactly the same order).
+#         Tile size 8x8 (a multiple of 4) is deliberately chosen over,
+#         say, 7x5: a pre-existing, T14-unrelated floating-point
+#         artifact (tile widths not a multiple of the CPU's
+#         double-precision SIMD width cause RESID/RESTORED -- but never
+#         CLEAN -- to differ by ~1e-7 relative between tilings; see
+#         this ticket's own "Progress" notes) would otherwise force this
+#         test to special-case which outputs it compares. Both true
+#         distinct-pattern/valid-pixel counts were independently
+#         confirmed via a Python oracle (np.unique over packed per-pixel
+#         channel-validity bytes) before being hard-coded as the
+#         expected values below.
+# ---------------------------------------------------------------------------
+section "53. rmclean_cubes: Pass 0 (pattern pre-scan) correctness"
+
+if [[ -x bin/rmclean_cubes && -f "$rmc_lsqref_amp" && -f "$cep_pha" && -f "$cep_mask" && -f "$rmc_varied_mask" ]]; then
+    # --- Safety valve: high-diversity fixture must fall back cleanly ---
+    p0sv_out="$OUT_DIR/rmc_p0_safetyvalve"
+    p0sv_log="$OUT_DIR/rmc_p0_safetyvalve.log"
+    rm -f "${p0sv_out}".*.FITS
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$rmc_varied_mask" outfile="$p0sv_out" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            cache_eviction_policy=belady > "$p0sv_log" 2>&1; then
+        if grep -q "WARNING: Pass 0 found 757 distinct patterns" "$p0sv_log" && \
+           grep -q "falling back to cache_eviction_policy=hitcount" "$p0sv_log"; then
+            pass "rmclean_cubes: Pass 0 safety valve trips on a high-diversity mask (757/1024 patterns) and falls back to hitcount"
+        else
+            fail "rmclean_cubes: Pass 0 safety valve did not trip as expected on the high-diversity mask (see $p0sv_log)"
+        fi
+    else
+        fail "rmclean_cubes: cache_eviction_policy=belady run failed on the high-diversity mask (see $p0sv_log)"
+    fi
+    rm -f "${p0sv_out}".*.FITS
+
+    # --- Happy path: low-diversity fixture, Pass 0 completes normally,
+    #     tiling-invariant counts and outputs ---
+    p0hp_full="$OUT_DIR/rmc_p0_happypath_full"
+    p0hp_tiled="$OUT_DIR/rmc_p0_happypath_tiled"
+    p0hp_full_log="$OUT_DIR/rmc_p0_happypath_full.log"
+    p0hp_tiled_log="$OUT_DIR/rmc_p0_happypath_tiled.log"
+    rm -f "${p0hp_full}".*.FITS "${p0hp_tiled}".*.FITS
+    p0_expect="Pass 0: done -- 1 distinct pattern(s), 1024 valid pixel(s) scanned."
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$cep_mask" outfile="$p0hp_full" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            cache_eviction_policy=belady > "$p0hp_full_log" 2>&1 && \
+       bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$cep_mask" outfile="$p0hp_tiled" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            cache_eviction_policy=belady tile_auto=n tile_ra=8 tile_dec=8 \
+            > "$p0hp_tiled_log" 2>&1; then
+        if grep -qF "$p0_expect" "$p0hp_full_log" && grep -qF "$p0_expect" "$p0hp_tiled_log"; then
+            pass "rmclean_cubes: Pass 0 completes (no safety valve) and logs the correct oracle-matched count (1 pattern/1024 pixels) on a low-diversity mask"
+        else
+            fail "rmclean_cubes: Pass 0's logged distinct-pattern/valid-pixel count is wrong or missing (see $p0hp_full_log / $p0hp_tiled_log)"
+        fi
+        if grep -q "^WARNING: Pass 0" "$p0hp_full_log" || grep -q "^WARNING: Pass 0" "$p0hp_tiled_log"; then
+            fail "rmclean_cubes: Pass 0 safety valve fired unexpectedly on the low-diversity mask (see $p0hp_full_log / $p0hp_tiled_log)"
+        else
+            pass "rmclean_cubes: Pass 0 safety valve does not fire on a low-diversity mask"
+        fi
+
+        p0hp_ok=1
+        for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                      RESTORED.AMP RESTORED.PHA; do
+            if ! cmp -s "${p0hp_full}.${suffix}.RMCUBE.FITS" \
+                        "${p0hp_tiled}.${suffix}.RMCUBE.FITS"; then
+                p0hp_ok=0
+                fail "rmclean_cubes: Pass 0 happy-path output differs between 1-tile (32x32) and 16-tile (8x8) runs on $suffix"
+            fi
+        done
+        [[ "$p0hp_ok" -eq 1 ]] && \
+            pass "rmclean_cubes: Pass 0 happy-path output bit-identical across tile sizes (32x32 vs 8x8)"
+    else
+        fail "rmclean_cubes: Pass 0 happy-path run(s) failed on the low-diversity mask (see $p0hp_full_log / $p0hp_tiled_log)"
+    fi
+    rm -f "${p0hp_full}".*.FITS "${p0hp_tiled}".*.FITS
+else
+    skip "rmclean_cubes: Pass 0 correctness checks skipped (bin/rmclean_cubes or section 29/51's own fixtures not available)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"
