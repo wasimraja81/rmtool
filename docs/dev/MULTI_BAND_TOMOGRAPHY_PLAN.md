@@ -3179,3 +3179,26 @@ finite pixels present with a real positive peak). The
 surfaced the `t_status` bug above was independently re-verified by
 direct reproduction outside the test harness after the fix (exit code
 0, all four synthetic multi-band files processed and written).
+
+**TODO -- real-scale re-run of `match_cubes` on the WALLABY+EMU data,
+post-T28 (not started, deferred for disk space):** everything verified
+above is against synthetic fixtures only. The existing real matched
+output under `/data1/tmp/pipeline_multiband_e2e/match_input_symlinks/`
+(`*_MATCHED.FITS`, ~267.8GB across the 4 Q/U files) was produced on
+2026-08-04, BEFORE T28 was implemented -- it reflects the old
+concurrent-multi-thread-per-plane convolve strategy, not the new
+serial-per-plane/threaded-within-plane one. Need to re-run
+`match_cubes` on the same real WALLABY+EMU input under the current
+(T28) code and compare against that existing output: correctness
+(should match the pre-T28 result numerically -- T28 changed
+parallelization strategy, not the convolution math itself) and real
+wall-clock/peak-memory behaviour (the actual point of T28 -- does peak
+RSS on this run now stay flat regardless of `OMP_NUM_THREADS`, as the
+synthetic-fixture testing implies but has never been checked at this
+real 563GB-input scale). Blocked purely on disk space: `/data1` is at
+67% (1.2TB free) but the existing pre-T28 `*_MATCHED.FITS` output would
+need to coexist with a fresh post-T28 run's own output for the
+comparison to mean anything, and `/home`'s own NVMe scratch is already
+at 83% (131GB free, currently held by the in-progress real
+`rmclean_cubes` run's own pre-allocated output cubes). Deferred until
+some of that space is cleared -- not forgotten, not silently dropped.
