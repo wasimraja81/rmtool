@@ -3565,6 +3565,139 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 54. rmclean_cubes: Belady eviction correctness + effectiveness vs
+#     hitcount (T14 increment 8, docs/dev/RMCLEAN_INTEGRATION_PLAN.md) --
+#     the end of Phase B. A deliberately adversarial fixture (not real
+#     data -- built to expose LFU-without-decay's own structural blind
+#     spot, so the comparison actually measures something): the first 50
+#     pixels cycle through 5 "early" patterns (each racking up ~10 hits
+#     before never appearing again); the remaining ~974 pixels cycle
+#     through 15 "late" patterns that keep recurring for the rest of the
+#     run. Under a cache too small to hold all of them, LFU/hitcount
+#     (which only remembers PAST hit counts) evicts the low-hit-count
+#     but soon-to-recur late patterns instead of the high-hit-count but
+#     permanently-dead early ones -- a real, structural blind spot of
+#     any eviction policy that cannot see the future. Belady, via
+#     Pass 0's own registry, correctly identifies the early patterns'
+#     "never again" future and evicts those instead. 19 true distinct
+#     patterns (well under the 10% safety valve for a 1024-pixel image),
+#     confirmed via an independent Python oracle.
+# ---------------------------------------------------------------------------
+section "54. rmclean_cubes: Belady eviction correctness + effectiveness vs hitcount"
+
+if [[ -x bin/rmclean_cubes && -f "$rmc_lsqref_amp" && -f "$cep_pha" ]]; then
+    belady_kpat_mask="$OUT_DIR/rmc_kpat.MASK.CUBE.FITS"
+    python3 - "$cep_mask" "$belady_kpat_mask" <<'PYEOF'
+import sys
+import numpy as np
+from astropy.io import fits
+
+src, dst = sys.argv[1], sys.argv[2]
+with fits.open(src) as hdul:
+    rng = np.random.default_rng(11)
+    data = hdul[0].data
+    nchan, ny, nx = data.shape
+
+    # 5 "early" prototypes + 15 "late" prototypes, each a fixed random
+    # subset of channels flipped to 0 relative to the all-valid base
+    # pattern (rmc_lsqref's own mask is all-valid everywhere).
+    n_early, n_late = 5, 15
+    protos = []
+    for _ in range(n_early + n_late):
+        nflip = rng.integers(1, 5)
+        chans = rng.choice(nchan, size=nflip, replace=False)
+        protos.append(chans)
+
+    base = data[:, 0, 0].copy()
+    for iy in range(ny):
+        for ix in range(nx):
+            i = iy*nx + ix
+            if i < 50:
+                p = i % n_early
+            else:
+                p = n_early + ((i - 50) % n_late)
+            row = base.copy()
+            row[protos[p]] = 0
+            data[:, iy, ix] = row
+    hdul.writeto(dst, overwrite=True)
+PYEOF
+
+    belady_kpat_nocache="$OUT_DIR/rmc_kpat_nocache"
+    belady_kpat_hitcount="$OUT_DIR/rmc_kpat_hitcount"
+    belady_kpat_belady="$OUT_DIR/rmc_kpat_belady"
+    rm -f "${belady_kpat_nocache}".*.FITS "${belady_kpat_hitcount}".*.FITS "${belady_kpat_belady}".*.FITS
+
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$belady_kpat_mask" outfile="$belady_kpat_nocache" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 mask_pattern_cache_max=0 \
+            > "$OUT_DIR/rmc_kpat_nocache.log" 2>&1 && \
+       bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$belady_kpat_mask" outfile="$belady_kpat_hitcount" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            mask_pattern_cache_max=8 cache_eviction_policy=hitcount \
+            > "$OUT_DIR/rmc_kpat_hitcount.log" 2>&1 && \
+       bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$belady_kpat_mask" outfile="$belady_kpat_belady" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            mask_pattern_cache_max=8 cache_eviction_policy=belady \
+            > "$OUT_DIR/rmc_kpat_belady.log" 2>&1; then
+
+        if grep -q "^WARNING: Pass 0" "$OUT_DIR/rmc_kpat_belady.log"; then
+            fail "rmclean_cubes: Belady safety valve fired unexpectedly on the 19-pattern adversarial fixture (see $OUT_DIR/rmc_kpat_belady.log)"
+        else
+            pass "rmclean_cubes: Belady safety valve does not fire on the 19-pattern adversarial fixture"
+        fi
+
+        kpat_ok=1
+        for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                      RESTORED.AMP RESTORED.PHA; do
+            for pol_out in "$belady_kpat_hitcount" "$belady_kpat_belady"; do
+                if ! cmp -s "${belady_kpat_nocache}.${suffix}.RMCUBE.FITS" \
+                            "${pol_out}.${suffix}.RMCUBE.FITS"; then
+                    kpat_ok=0
+                    fail "rmclean_cubes: $(basename "$pol_out") (forced eviction, cache_max=8) differs from cache-disabled on $suffix"
+                fi
+            done
+        done
+        [[ "$kpat_ok" -eq 1 ]] && \
+            pass "rmclean_cubes: both hitcount and belady (forced eviction, cache_max=8 < 19 distinct patterns) bit-identical to cache disabled"
+
+        # Effectiveness regression guard: total redundant-rebuild count
+        # (cache inserts, including evict-and-reinsert, PLUS declined
+        # one-offs) must be no worse under belady than under hitcount --
+        # Belady is supposed to be PROVABLY optimal for a known future
+        # access sequence, not merely "correct."
+        # grep -oP exits 1 (killing the whole script under this file's
+        # own `set -euo pipefail`, line 98) when the "(N pixel(s) past
+        # ...)" line is absent -- an EXPECTED outcome under hitcount
+        # (which never declines, so n_overflow_pixels_total stays 0 and
+        # that line is never printed at all). `|| true` treats no-match
+        # as valid, same idiom used in section 51 for this exact class
+        # of bug.
+        hc_inserts=$(grep -oP 'Mask-pattern cache: \K[0-9]+' "$OUT_DIR/rmc_kpat_hitcount.log" || true)
+        hc_overflow=$(grep -oP '\(\K[0-9]+(?= pixel\(s\) past)' "$OUT_DIR/rmc_kpat_hitcount.log" || true)
+        hc_overflow=${hc_overflow:-0}
+        bl_inserts=$(grep -oP 'Mask-pattern cache: \K[0-9]+' "$OUT_DIR/rmc_kpat_belady.log" || true)
+        bl_overflow=$(grep -oP '\(\K[0-9]+(?= pixel\(s\) past)' "$OUT_DIR/rmc_kpat_belady.log" || true)
+        bl_overflow=${bl_overflow:-0}
+        hc_total=$((hc_inserts + hc_overflow))
+        bl_total=$((bl_inserts + bl_overflow))
+        echo "  hitcount total redundant rebuilds: $hc_total (inserts=$hc_inserts, one-off=$hc_overflow)"
+        echo "  belady   total redundant rebuilds: $bl_total (inserts=$bl_inserts, one-off=$bl_overflow)"
+        if [[ "$bl_total" -le "$hc_total" ]]; then
+            pass "rmclean_cubes: belady's total redundant-rebuild count ($bl_total) is <= hitcount's ($hc_total) on the same adversarial fixture/cache size"
+        else
+            fail "rmclean_cubes: belady's total redundant-rebuild count ($bl_total) is WORSE than hitcount's ($hc_total) -- Belady should never be worse"
+        fi
+    else
+        fail "rmclean_cubes: Belady effectiveness run(s) failed on the adversarial fixture (see $OUT_DIR/rmc_kpat_*.log)"
+    fi
+    rm -f "${belady_kpat_nocache}".*.FITS "${belady_kpat_hitcount}".*.FITS "${belady_kpat_belady}".*.FITS "$belady_kpat_mask"
+else
+    skip "rmclean_cubes: Belady eviction effectiveness check skipped (bin/rmclean_cubes or section 51's own fixtures not available)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

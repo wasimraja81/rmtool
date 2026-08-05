@@ -2682,10 +2682,13 @@ contains
       !! reset here).
       !! T14: once the cache is full, a genuinely new pattern either
       !! evicts an existing entry (cache_eviction_policy='hitcount':
-      !! least-hit-so-far; 'belady': not yet implemented, increment 8 --
-      !! still falls back to the pre-T14 overflow/one-off behaviour for
-      !! now) or, for 'belady' today, is simply not cached (unchanged
-      !! safety valve). Either way, target_slot is where the new
+      !! least-hit-so-far; 'belady': offline-optimal admission-
+      !! controlled eviction, increment 8 -- evicts whichever cached
+      !! pattern's own next occurrence is farthest away, but ONLY if the
+      !! new pattern's own next occurrence is strictly sooner; otherwise
+      !! the cache is left untouched and this pixel's table is built as
+      !! a one-off) or, for 'belady' when admission is declined, is
+      !! simply not cached. Either way, target_slot is where the new
       !! pattern's own table gets built -- a genuinely NEW cache row
       !! (n_cache_entries incremented) or an EVICTED, now-reused one;
       !! the actual insert logic below is identical either way.
@@ -2702,8 +2705,18 @@ contains
       ! cache hit (see cache_entries(entry_idx)%registry_id's own
       ! comment for why hits skip this).
       integer :: registry_id_l
+      ! T14 increment 8: the Belady eviction decision's own working
+      ! state -- new_next_occ is the NEW pattern's own next occurrence
+      ! (after the current pixel is consumed); victim_next_occs(k) is
+      ! cached slot k's own next occurrence, queried fresh every time a
+      ! decision is needed (see this subroutine's own Belady branch for
+      ! why a linear scan, not a maintained priority queue).
+      integer(kind=8) :: new_next_occ
+      integer(kind=8), allocatable :: victim_next_occs(:)
+      integer :: k2
 
       allocate(valid_idx_l(nchan), l_sq_valid_l(nchan))
+      allocate(victim_next_occs(max(1, mask_pattern_cache_max)))
 
       do iy_l = 1, ty_in
          do ix_l = 1, tx_in
@@ -2740,6 +2753,22 @@ contains
                cycle ! already cached
             endif
 
+            ! T14 increment 7/8: this pattern's own registry consult --
+            ! lookup + advance -- happens exactly ONCE per pixel miss,
+            ! here, regardless of which branch below ends up handling
+            ! it (genuinely-new-slot, evicted-and-reused, or declined
+            ! one-off): the registry timeline is a fact about the
+            ! PATTERN, not about how this particular miss gets
+            ! resolved. new_next_occ (the pattern's own NEXT future
+            ! need, after this occurrence) is only meaningful for the
+            ! 'belady' eviction decision below, but computing it is
+            ! cheap and harmless when unused (e.g. cache not yet full).
+            if (cache_eviction_policy.eq.'belady') then
+               call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:), nchan, registry_id_l)
+               call registry_advance(pattern_registry, registry_id_l)
+               new_next_occ = registry_next_occurrence(pattern_registry, registry_id_l)
+            endif
+
             do_insert = .true.
             if (n_cache_entries.ge.mask_pattern_cache_max) then
                if (cache_eviction_policy.eq.'hitcount') then
@@ -2748,19 +2777,37 @@ contains
                   call evict_cache_slot(target_slot)
                   n_distinct_patterns_total = n_distinct_patterns_total + 1
                else
-                  ! 'belady' -- eviction not implemented yet (T14
-                  ! increment 8); same overflow/one-off safety valve as
-                  ! before T14 for now. Still advance this pattern's own
-                  ! registry timeline: "how far through this pattern's
-                  ! occurrences are we" is a fact about the pattern,
-                  ! not about whether it's currently cached (T14
-                  ! increment 7) -- without this, increment 8's own
-                  ! Belady decision would see a stale, already-passed
-                  ! next-occurrence position for this pattern.
-                  call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:), nchan, registry_id_l)
-                  call registry_advance(pattern_registry, registry_id_l)
-                  n_overflow_pixels_total = n_overflow_pixels_total + 1
-                  do_insert = .false.
+                  ! T14 increment 8: 'belady', cache full -- the actual
+                  ! offline-optimal eviction decision, with admission
+                  ! control. Whichever CURRENTLY CACHED pattern has the
+                  ! farthest-away next occurrence is Belady's own
+                  ! textbook eviction candidate -- registry_next_
+                  ! occurrence's huge() sentinel for "never needed
+                  ! again" always wins find_max=.true., exactly
+                  ! matching Belady's own "never again always evicts
+                  ! first" rule.
+                  do k2 = 1, n_cache_entries
+                     victim_next_occs(k2) =&
+                     &registry_next_occurrence(pattern_registry, cache_entries(k2)%registry_id)
+                  enddo
+                  target_slot = linear_scan_extreme(victim_next_occs(1:n_cache_entries),&
+                  &n_cache_entries, .true.)
+
+                  ! Admission control (the refinement over textbook
+                  ! Belady): unlike a CPU cache, a miss here does NOT
+                  ! force residency -- this pixel's table gets built
+                  ! either way. Only evict-and-admit if the NEW
+                  ! pattern's own next need is STRICTLY sooner than the
+                  ! farthest victim's; otherwise leave the cache
+                  ! untouched and build this pixel's table as a one-off
+                  ! throwaway (the pre-T14 overflow behaviour).
+                  if (new_next_occ.lt.victim_next_occs(target_slot)) then
+                     call evict_cache_slot(target_slot)
+                     n_distinct_patterns_total = n_distinct_patterns_total + 1
+                  else
+                     n_overflow_pixels_total = n_overflow_pixels_total + 1
+                     do_insert = .false.
+                  endif
                endif
             else
                n_cache_entries = n_cache_entries + 1
@@ -2775,9 +2822,7 @@ contains
             cache_entries(target_slot)%pattern = mask_tile(ix_l,iy_l,:)
             cache_entries(target_slot)%hit_count = 1_8
             if (cache_eviction_policy.eq.'belady') then
-               call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:), nchan, registry_id_l)
                cache_entries(target_slot)%registry_id = registry_id_l
-               call registry_advance(pattern_registry, registry_id_l)
             endif
 
             ! Bucket slot for target_slot: reuse either a genuinely
@@ -2805,7 +2850,7 @@ contains
          enddo
       enddo
 
-      deallocate(valid_idx_l, l_sq_valid_l)
+      deallocate(valid_idx_l, l_sq_valid_l, victim_next_occs)
    end subroutine update_mask_pattern_cache_for_tile
 
    subroutine clean_one_pixel(ix_l, iy_l, ix0, iy0)
