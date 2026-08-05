@@ -3346,6 +3346,55 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 51. rmclean_cubes: cache_eviction_policy cfg validation (T14 increment
+#     2, docs/dev/RMCLEAN_INTEGRATION_PLAN.md) -- plumbing only at this
+#     point, no eviction-policy behavior yet; just confirms the key is
+#     parsed/validated/defaulted correctly.
+# ---------------------------------------------------------------------------
+section "51. rmclean_cubes: cache_eviction_policy cfg validation"
+
+if [[ -x bin/rmclean_cubes ]]; then
+    cep_bad_log="$OUT_DIR/rmclean_cache_eviction_policy_bad.log"
+    # A nonzero exit is the EXPECTED outcome here -- must not be a bare
+    # statement under this script's own `set -e` (line 98), or the
+    # expected failure kills the whole test run. Test the command's
+    # own status directly via `if`, same idiom used everywhere else in
+    # this file, rather than capturing $? from a standalone statement.
+    if bin/rmclean_cubes cache_eviction_policy=bogus > "$cep_bad_log" 2>&1; then
+        fail "rmclean_cubes: cache_eviction_policy=bogus was not rejected (exited 0, see $cep_bad_log)"
+    else
+        if grep -q "ERROR: cache_eviction_policy must be one of belady|hitcount" "$cep_bad_log"; then
+            pass "rmclean_cubes: cache_eviction_policy=bogus rejected with the expected error"
+        else
+            fail "rmclean_cubes: cache_eviction_policy=bogus rejected, but not with the expected error (see $cep_bad_log)"
+        fi
+    fi
+
+    cep_pha="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS"
+    cep_mask="$OUT_DIR/rmc_lsqref.MASK.CUBE.FITS"
+    if [[ -f "$rmc_lsqref_amp" && -f "$cep_pha" && -f "$cep_mask" ]]; then
+        cep_default_out="$OUT_DIR/rmc_cep_default"
+        cep_default_log="$OUT_DIR/rmclean_cache_eviction_policy_default.log"
+        rm -f "${cep_default_out}".*.FITS
+        if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+                maskfile="$cep_mask" outfile="$cep_default_out" \
+                abs_flux_floor=0.01 niter=5 > "$cep_default_log" 2>&1; then
+            if grep -q "^cache_eviction_policy=belady" "$cep_default_log"; then
+                pass "rmclean_cubes: cache_eviction_policy defaults to belady"
+            else
+                fail "rmclean_cubes: cache_eviction_policy default not logged as belady (see $cep_default_log)"
+            fi
+        else
+            fail "rmclean_cubes: default-policy run failed to complete (see $cep_default_log)"
+        fi
+    else
+        skip "rmclean_cubes: cache_eviction_policy default check skipped (section 29's own fixtures not available)"
+    fi
+else
+    skip "bin/rmclean_cubes not built; skipping cache_eviction_policy cfg validation"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

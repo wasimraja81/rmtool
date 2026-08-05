@@ -359,6 +359,13 @@ program rmclean_cubes
    real(dp) :: peak_residual_sum
    real(sp) :: peak_residual_max, peak_residual_min
    integer :: mask_pattern_cache_max
+   ! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): which policy decides
+   ! what to evict once mask_pattern_cache_max is reached. 'belady'
+   ! (default) is the offline-optimal policy, informed by a one-time
+   ! whole-mask-cube pre-scan (run_pattern_prescan); 'hitcount' is a
+   ! plain least-frequently-used fallback needing no pre-scan at all --
+   ! see either policy's own call site for the full story.
+   character(len=16) :: cache_eviction_policy
    real(dp) :: t_stage
    ! Per-thread swim-lane instrumentation (planning-doc ticket) -- see
    ! convolve_cubes.f90's own write_convolved_file for the full
@@ -404,6 +411,7 @@ program rmclean_cubes
       stop 1
    endif
    call log_message('info', 'startup', 'rmclean_cubes run started')
+   write(*,'(A)') 'cache_eviction_policy='//trim(cache_eviction_policy)
 
    call read_chanfreq(maskfile, l_sq, band_id, nchan, status)
    if (status.ne.0) stop 1
@@ -804,6 +812,7 @@ contains
       have_lsq_ref_compute_value = .false.
       lsq_ref_compute_value = 0.0_sp
       mask_pattern_cache_max = 4096
+      cache_eviction_policy = 'belady'
       tile_ra = 0
       tile_dec = 0
       tile_auto = .true.
@@ -1044,6 +1053,16 @@ contains
             status = -1
             return
          endif
+      case ('cache_eviction_policy')
+         select case (trim(val))
+         case ('belady', 'hitcount')
+            cache_eviction_policy = trim(val)
+         case default
+            write(*,*) 'ERROR: cache_eviction_policy must be one of'//&
+            &' belady|hitcount'
+            status = -1
+            return
+         end select
       case ('mem_frac_ram')
          read(val, *, iostat=ios) mem_frac_ram
          if (ios.ne.0 .or. mem_frac_ram.le.0.0_sp .or. mem_frac_ram.gt.0.95_sp) then
@@ -1144,7 +1163,8 @@ contains
       &'|mid|fixed] [lsq_ref_report_value=<v>]'
       write(*,'(A)') '    [lsq_ref_compute_mode=native|zero|centroid|min'//&
       &'|max|mid|fixed] [lsq_ref_compute_value=<v>]'
-      write(*,'(A)') '    [mask_pattern_cache_max=<n>] [mem_frac_ram=<f>]'//&
+      write(*,'(A)') '    [mask_pattern_cache_max=<n>]'//&
+      &' [cache_eviction_policy=belady|hitcount] [mem_frac_ram=<f>]'//&
       &' [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]'//&
       &' [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]'
       write(*,'(A)') '   or: rmclean_cubes --config <cfgfile>'
@@ -1221,6 +1241,16 @@ contains
       &' many DISTINCT patterns, additional patterns fall back to a'//&
       &' one-off table per pixel (safety valve, not a correctness'//&
       &' issue -- just loses the reuse benefit).'
+      write(*,'(A)') 'cache_eviction_policy (default belady): which'//&
+      &' pattern to evict once mask_pattern_cache_max is reached rather'//&
+      &' than simply refusing new entries. belady: offline-optimal,'//&
+      &' informed by a one-time whole-mask-cube pre-scan (evicts'//&
+      &' whichever cached pattern is not needed again for the longest'//&
+      &' time, or ever) -- no tuning parameter, provably the best'//&
+      &' possible for a given cache size. hitcount: a plain'//&
+      &' least-frequently-used fallback needing no pre-scan at all --'//&
+      &' cheaper to start, but not competitive with belady; intended'//&
+      &' as an opt-out, not the recommended choice.'
       write(*,'(A)') 'mem_frac_ram (default 0.25): fraction of total'//&
       &' system RAM budgeted for one tile''s own read+compute+write'//&
       &' working set (2 input + 6 output RM-depth arrays per pixel) --'//&
