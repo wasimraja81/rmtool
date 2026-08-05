@@ -3007,3 +3007,142 @@ downstream reader could actually discover and use correctly (right now
 `fwhm_rm`'s single value could in principle be written to a header
 keyword; a genuinely per-pixel beam has no equivalent standard
 convention to fall back on).
+
+### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Generational-Eviction Design Proposed (documented, NOT started -- user has explicitly asked to implement, waiting on their go-ahead before touching code)
+
+**Found, while watching the live WALLABY+EMU `rmclean_cubes` run take much
+longer per block than expected (block 3: 73 min; block 4: still running
+after 4+ hours):** the mask-pattern cache (T10b, `mask_pattern_cache_max`,
+default 4096) has no eviction policy at all -- it is strictly first-come,
+never-evicted, and it is GLOBAL across the whole run (one cache, shared
+by all 32 blocks in Dec-scan order), not reset per block. Verified
+directly against the real mask cube (0=bad/1=good per pixel per channel,
+432 total channels = 144 WALLABY + 288 EMU) with a faithful Python
+replay of the actual Fortran scan order (block-by-block, row-major
+within each block, matching `update_mask_pattern_cache_for_tile`'s own
+`do iy_l=1,ty_in / do ix_l=1,tx_in` nesting) and the real fill/overflow
+logic:
+
+| Block | pixels getting cache benefit | pixels paying a full redundant rebuild | cache state after |
+|---|---|---|---|
+| 1 | 2,378,814 (98.0%) | 0 | 211/4096 |
+| 2 | 2,370,196 (97.7%) | 0 | 292/4096 |
+| 3 | 1,969,913 (83.1%) | 399,233 (16.9%) | **4096/4096, mid-block** |
+| 4 | 625,363 (25.8%) | **1,749,801 (72.2%)** | already full on entry |
+
+Block 4 alone loses nearly three-quarters of its pixels to fully
+redundant, from-scratch RMSF-table rebuilds. This is a direct,
+measured consequence of the no-eviction design: the cache filled to
+capacity partway through block 3 and has not changed since -- block 4
+arrives with an almost entirely new local set of channel-validity
+patterns (its own transition-zone geography) and has zero room for any
+of them, even though whatever is still occupying those 4096 slots from
+blocks 1-3 has essentially no chance of recurring that far north.
+
+**Why rebuilding a table is expensive (confirmed in code, not
+assumed):** `build_rmsf_offset_table` (`src/rmclean.f90:404-447`)
+computes, for each of `n_fine` fine-grid points (4,601 for this run's
+own RM-axis span/spacing/`table_oversample`), a `sum(cos(...))` AND
+`sum(sin(...))` over every valid channel:
+```fortran
+do m = 1, table%n_fine
+   table%re_fine(m) = sum(cos(phase_k*(l_sq - lsq_ref_dp))) / nchan
+   table%im_fine(m) = sum(sin(phase_k*(l_sq - lsq_ref_dp))) / nchan
+end do
+```
+For a high-coverage pixel (nchan~424) that is ~3.9 million trig
+evaluations for ONE table. This loop has its own `!$omp parallel do`
+over `m`, but since `build_rmsf_offset_table` is called from inside
+`clean_one_pixel`, which already runs inside the OUTER per-pixel
+`!$omp parallel do`, that inner parallel region gets no benefit under
+OpenMP's default (nesting off) -- it just runs serially on whichever
+single thread already owns that pixel, pure added cost with no extra
+parallelism. Critically, there is ALSO no within-tile deduplication:
+`clean_one_pixel` calls this unconditionally whenever
+`cache_lookup_readonly` returns a miss, independently per pixel, even
+if a neighboring pixel in the SAME tile just built the byte-for-byte
+identical table a moment ago for the same (uncached) pattern -- an
+uncached pattern shared by 50,000 pixels costs 50,000 full rebuilds,
+not one build reused 50,000 times.
+
+**Two candidate fixes considered and one ruled out, with direct
+verification, not assumption:**
+
+1. **Exclude a rectangular RA/Dec guard region (user's own initial
+   idea, on the theory that the ~19,000 distinct patterns come from
+   convolution-kernel edge smearing near a sharp WALLABY/EMU coverage
+   boundary) -- assessed and NOT recommended.** Checked directly: the
+   fraction of pixels in an intermediate ("neither pure-WALLABY-only
+   nor full-combined-coverage") state stays above 50% for ~620
+   consecutive Dec rows and doesn't fall below ~10% until ~1,700 rows
+   in. The common target beam for this run is only ~10 pixels FWHM
+   (BMAJ=20.04" / CDELT2=2"/pixel), so a convolution-kernel edge-erosion
+   effect should only reach a few tens of pixels past a true data
+   boundary -- 60-170x narrower than the observed transition width.
+   This looks like the genuine, gradual overlap between WALLABY's and
+   EMU's own independent survey footprints (different pointings/mosaic
+   geometries), not an edge artifact. A rectangular guard wide enough to
+   matter would discard on the order of 1,000+ Dec rows (~15% of the
+   whole image) of real, scientifically meaningful multi-band overlap
+   data -- exactly the deeper/wider-coverage data combining these two
+   surveys is meant to produce. It is also an imprecise tool for a
+   boundary that has no reason to be RA/Dec-axis-aligned. Separately:
+   the genuinely-junk case (`nchan=0`, no data at all, ~2.2-2.4% of
+   pixels throughout) is already handled for free --
+   `clean_one_pixel` returns immediately for those
+   (`if (nvalid_p.lt.1) ... return`), no RMSF table involved at all --
+   so this proposal would not even be solving that part.
+
+2. **Generational (tile-recency) eviction -- assessed and
+   RECOMMENDED, this is what T14 is scoped to.** Directly targets the
+   confirmed mechanism (stale, never-evicted entries permanently
+   occupying slots that a spatially-drifted, currently-relevant pattern
+   set could use instead):
+   - Add one extra field to `table_cache_entry_t`
+     (`src/rmclean_cubes.f90:383-387`): a small integer,
+     "last-touched tile index."
+   - Update it ONLY from the already-serial per-tile pre-scan
+     (`update_mask_pattern_cache_for_tile`), which already performs a
+     lookup for every pixel in the tile (hit or miss) -- stamp
+     "last-touched = this tile's own index" on whichever entry each
+     pixel's pattern resolves to, whether that's a fresh insertion or
+     an existing hit. This requires NO change to the parallel per-pixel
+     lookup path (`cache_lookup_readonly`) at all -- it stays exactly
+     as lock-free as it is today (its own comment is explicit that
+     lock-freedom depends on nothing ever being written during the
+     parallel region).
+   - When the cache is full and a genuinely new pattern is
+     encountered: scan for an entry whose last-touched tile index is
+     more than some threshold behind the current tile; if found, evict
+     it (free the slot) and insert the new pattern there instead of
+     unconditionally discarding it (today's behaviour).
+   - If an evicted pattern's own pixels recur even later: no worse
+     than today -- cache miss, either re-inserted (if room) or falls
+     back to the existing one-off throwaway path.
+   - Does not change any numerical output -- a table is the same table
+     whether it comes from a cache hit or a fresh build; this is a
+     compute-time optimisation only, not a correctness change.
+   - Does not help genuinely, globally unique patterns (occurring
+     exactly once in the whole cube) -- no caching policy can.
+
+**Open questions, explicitly not yet resolved (need real tuning, not
+guessing, before implementation):**
+- The eviction-staleness threshold (how many tiles "unused" before an
+  entry is eligible for eviction) is a real tuning parameter -- too
+  aggressive risks evicting something that would have been reused
+  within the next tile or two; too conservative barely improves on the
+  current 0% eviction rate. Should be chosen by testing against this
+  same real run's own data (or a similarly-diverse synthetic fixture),
+  not picked arbitrarily.
+- Whether eviction should also consider HIT COUNT (evict the
+  least-frequently-hit stale entry first, if multiple are eligible) or
+  simple recency alone is sufficient -- not yet decided.
+- Bookkeeping cost is expected to be negligible (one extra integer
+  compare/update per pixel during the already-existing serial
+  pre-scan, versus the ~72KiB/~3.9M-trig-evaluation cost of an actual
+  table rebuild it's trying to avoid) but should be confirmed with a
+  real before/after timing comparison, not assumed.
+
+**Status: documented only, not implemented.** The user has explicitly
+said they are happy to implement this but wants to give the go-ahead
+first -- do not start T14's own implementation without that signal.
