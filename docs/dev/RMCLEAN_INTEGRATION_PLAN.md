@@ -3008,7 +3008,7 @@ downstream reader could actually discover and use correctly (right now
 keyword; a genuinely per-pixel beam has no equivalent standard
 convention to fall back on).
 
-### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Offline-Optimal (Belady/OPT) Eviction via a Mask Pre-Scan (IN PROGRESS -- Phase A/LFU fallback done, Phase B/Belady NOT started -- T14 itself is NOT done)
+### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Offline-Optimal (Belady/OPT) Eviction via a Mask Pre-Scan (DONE -- Phase A/LFU fallback and Phase B/Belady both implemented, tested, Belady is the default)
 
 **Found, while watching the live WALLABY+EMU `rmclean_cubes` run take much
 longer per block than expected (block 3: 73 min; block 4: still running
@@ -3342,3 +3342,93 @@ finishing. Do not read the below as "T14 done."**
     remainder size) -- out of scope for T14's own completion bar,
     which only requires CLEAN-output bit-identity across
     tilings/eviction policies (already proven above).
+- **Increment 7 (connect the runtime cache to the registry) -- DONE.**
+  `table_cache_entry_t` gained `registry_id`, set once at insertion.
+  Every pixel visit under `cache_eviction_policy=belady` now advances
+  that pattern's own registry timeline (`registry_advance`) -- on a
+  cache hit via the entry's own stored `registry_id` (no second hash
+  lookup); on an insert or a not-yet-decided overflow via a fresh
+  lookup, since no cache slot exists yet to remember it in. Added
+  `registry_lookup` to `rmclean_cache_mod.f90` -- a pure read-only
+  counterpart to `registry_lookup_or_insert`, needed because calling
+  the insert-and-append version again during Pass 1 would silently
+  append a duplicate, out-of-order occurrence to a pattern's own
+  timeline (every pattern Pass 1 sees was already recorded by Pass 0).
+  This increment changed no observable output by design (nothing yet
+  read the registry state it was updating) -- verified: full suite
+  153/153, unchanged.
+- **Increment 8 (the actual Belady eviction decision, admission
+  control -- END OF PHASE B) -- DONE.** When the cache is full and a
+  genuinely new pattern appears: consume its current occurrence
+  (`registry_advance`) to get its own next future need
+  (`registry_next_occurrence`); find whichever currently cached
+  pattern has the farthest-away next occurrence
+  (`linear_scan_extreme`, `find_max=.true.` -- the `huge()` "never
+  again" sentinel always wins, matching Belady's own rule); evict-and-
+  admit only if the new pattern's own next need is strictly sooner
+  than that farthest victim's, otherwise leave the cache untouched and
+  build this pixel's table as a one-off throwaway. The registry
+  consult (lookup + advance) was restructured to happen exactly once
+  per pixel miss, before the eviction-vs-decline branch -- an earlier
+  draft advanced once in the eviction branch and again in the shared
+  insert code, which would have double-consumed the registry timeline
+  per pixel; caught by re-reading the diff before running any test,
+  not by a failing test.
+  - **Verification:** a deliberately adversarial synthetic fixture
+    (not real data -- built specifically to expose LFU-without-decay's
+    own structural blind spot, so the effectiveness comparison
+    actually measures something): 5 "early" patterns cycle through the
+    first 50 pixels, racking up hit counts, then never recur; 15
+    "late" patterns cycle repeatedly through the remaining ~974
+    pixels. Hitcount, which only remembers PAST hits, keeps the dead
+    early patterns resident (high hit_count) and repeatedly evicts the
+    soon-to-recur late ones (low hit_count, freshly inserted) --
+    hitcount has no way to know the early patterns will never return.
+    Belady, via the registry's actual future knowledge, does the
+    opposite. Measured result, `mask_pattern_cache_max=8` against 19
+    true distinct patterns (well under the 10% safety valve for this
+    1024-pixel fixture, confirmed via an independent Python oracle):
+    **402 total redundant rebuilds under belady vs 851 under hitcount
+    -- under half the wasted work** -- while both remain bit-identical
+    to caching disabled entirely, proving eviction (like caching
+    itself) never changes the numerical result, only how much
+    redundant work it takes to get there.
+  - **A `set -e` trap hit in the new test, fixed before landing:**
+    `grep -oP` exits 1 on no match, which is the EXPECTED case for
+    hitcount's own "(N pixel(s) past...)" log line (hitcount never
+    declines admission, so that line is never printed at all) --
+    silently killed the whole test script under `run_tests.sh`'s own
+    `set -euo pipefail` (line 98), the same class of bug already fixed
+    once in section 51. Fixed the same way: `|| true` treats no-match
+    as a valid outcome.
+  - Full suite: 156/156 (153 + 3 new checks), zero regressions.
+
+**T14 is DONE as of increment 8.** Both phases are implemented and
+tested: Phase A (LFU/`hitcount`, the opt-out fallback) and Phase B
+(Belady/OPT with admission control, the default). Every bit-identity
+test across every increment confirms eviction -- under either policy
+-- never changes CLEAN output, only how much redundant recompute it
+takes to get there; the increment 8 effectiveness test additionally
+confirms Belady is not merely correct but genuinely, substantially
+better than the simpler fallback on data built to expose the
+fallback's own blind spot.
+
+**Not done, deliberately out of scope for "T14 done":**
+- **Increment 9** (de-duplicate pattern bytes between the runtime
+  cache entry and the registry entry) -- optional, flagged in the
+  original plan as worth a separate yes/no, never required for
+  correctness.
+- **The pre-existing tile-width RESID/RESTORED floating-point
+  artifact** documented under increment 6's own progress notes above
+  -- confirmed unrelated to T14, its own follow-up decision still
+  open.
+- **Real-scale validation against the WALLABY+EMU data itself** --
+  everything above is verified on small, fast, synthetic fixtures per
+  this project's own stated verification order; re-running the real
+  full-scale pipeline with `cache_eviction_policy=belady` (the new
+  default) is the natural next step but was not part of this ticket's
+  own completion bar.
+- **Choosing a real value for `mask_pattern_cache_max` itself** --
+  flagged from the start (see "Things to confirm" above) as a
+  separate question Belady doesn't answer; still needs a measurement
+  against the full 32-block mask.
