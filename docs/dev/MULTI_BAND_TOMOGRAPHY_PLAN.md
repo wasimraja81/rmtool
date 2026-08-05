@@ -3202,3 +3202,52 @@ comparison to mean anything, and `/home`'s own NVMe scratch is already
 at 83% (131GB free, currently held by the in-progress real
 `rmclean_cubes` run's own pre-allocated output cubes). Deferred until
 some of that space is cleared -- not forgotten, not silently dropped.
+
+### T29 -- Multi-Band Merge Implicitly Assumes Bands Are Already Flux-Cross-Calibrated; No Stokes-I Use in the Multi-Band Path (documented, not started)
+
+**Raised by the user, verified against the actual code rather than
+taken on trust** ("check and verify, do not believe me since I am a
+human with finite memory"): does anything in the multi-band toolchain
+use Stokes-I, and does anything cross-calibrate Q/U flux scale between
+bands before `rm_synthesis` merges their channels into one run?
+
+**Verified: no, on both counts.**
+- `reproject_cubes`/`convolve_cubes`/`match_cubes` -- the entire
+  multi-band preprocessing toolchain -- never reference Stokes-I at
+  all (grepped `src/{reproject,convolve,match}_cubes.f90`: zero hits
+  for `infileI`/any Stokes-I concept). They operate on Q/U only.
+- `rm_synthesis` DOES have an existing Stokes-I option
+  (`infileI`/`path_I` cfg keys, `rm_synthesis_mod.f90`), but it is used
+  for exactly ONE purpose: `remove_qu_bias`, a linear leakage-bias
+  correction (`resiQ`/`slopeQ`/`resiU`/`slopeU`, i.e. `Q_corrected = Q
+  - (resiQ + slopeQ*I)` and the U equivalent -- values supplied
+  directly in the cfg, not derived from I automatically) for
+  instrumental Q/U-vs-I leakage, NOT a flux-scale renormalization.
+- That one existing use is explicitly BLOCKED for multi-band runs:
+  `rm_synthesis.f90`'s own T2-scope-narrowing block (`if
+  (n_bands_t2.gt.1)`) hard-stops with `'ERROR: multi-band Q/U bias
+  correction is not yet implemented.'` the instant `remove_qu_bias=y`
+  is combined with `nbands>1`.
+- Net effect: for any actual multi-band run today, Stokes-I is never
+  read, never touched, anywhere in the pipeline. `rm_synthesis`
+  combines each band's Q/U channels directly, with an entirely
+  IMPLICIT assumption that every band's own flux scale is already
+  mutually consistent (correctly absolute-calibrated relative to each
+  other) before they're combined -- nothing in the code checks,
+  verifies, warns about, or corrects for a cross-band flux-scale
+  mismatch.
+
+**Future direction (user's own idea, explicitly NOT planned or scoped
+yet -- documented here so it isn't lost, not committed to):**
+per-pixel Stokes-I (a smoothed version of each band's own I cube, per
+pixel) could in principle be used to cross-calibrate Q/U flux scale
+BETWEEN bands before merging -- i.e., use each band's own I as a
+per-pixel flux-scale reference, rather than trusting the bands were
+already calibrated onto a common scale. This itself carries its own
+further assumption, worth stating precisely rather than glossing over:
+it only works if each band's own Stokes-I is ITSELF absolute-flux-
+calibrated (correct in an absolute sense, not just internally
+consistent within that band) -- if a band's own I calibration is off,
+using it as a Q/U flux-scale reference would just propagate that same
+error into the "corrected" Q/U. Not started; no design work done
+beyond capturing the idea and its own precondition here.
