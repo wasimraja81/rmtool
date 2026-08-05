@@ -2945,7 +2945,7 @@ contains
       ! header setup instead of kept open for the whole block loop.
       integer(kind=8) :: datastart, headstart_dum, dataend_dum
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes, block_planes64
-      integer(kind=8) :: transient_bytes_per_thread, mem_safe_bytes_io
+      integer(kind=8) :: transient_bytes_per_plane, mem_safe_bytes_io
       integer :: block_planes, chan_start, chan_len, local_iplane, nthreads
       integer :: omp_threads_cap
       integer :: cur_slot
@@ -3213,40 +3213,32 @@ contains
       ! gaussft_mod's own type declarations, so this drifts stale if
       ! those kinds change again (as it did once already across T27,
       ! caught and re-derived here) -- re-derive by hand, don't assume.
-      ! Solve for the largest safe thread count (down from the full
-      ! omp_get_max_threads() requested, never below 1) whose reserved
-      ! transient cost still leaves a positive I/O budget -- refined
-      ! (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md, T26 follow-up) from the
-      ! original all-or-nothing check (either the full requested thread
-      ! count fit, or block_planes floored straight to 1/serial even
-      ! when, say, 3 of 6 threads would genuinely have fit). A plain
-      ! decrementing search rather than a closed-form division: thread
-      ! counts are always small (a handful to a few dozen at most), so
-      ! there is no performance reason to prefer a division's rounding
-      ! subtleties over an easy-to-verify loop.
-      transient_bytes_per_thread = 16_8*int(conv_nx,8)*int(conv_ny,8) +&
+      !
+      ! T28 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): reserved ONCE now,
+      ! not omp_get_max_threads() copies of it. The per-plane loop below no longer
+      ! runs convolve_to_beam concurrently across planes -- it's called
+      ! serially, once per plane, with each call internally
+      ! multi-threaded via plan_convolution's own nthreads argument
+      ! (sfftw_plan_with_nthreads) instead. So this is a per-PLANE cost,
+      ! not a per-THREAD one -- T26's own decrementing search (find the
+      ! largest safe thread count) no longer applies to THIS
+      ! reservation; renamed accordingly (transient_bytes_per_plane, not
+      ! _per_thread). omp_threads_cap below is a plain performance
+      ! choice now (how many threads help each plane's own convolve,
+      ! and separately, how many planes' worth of reproject work runs
+      ! concurrently -- reproject KEPT its original parallel-across-
+      ! planes strategy, see the per-plane loop below), not a
+      ! memory-safety cap.
+      transient_bytes_per_plane = 16_8*int(conv_nx,8)*int(conv_ny,8) +&
       &16_8*int(nx_pad,8)*int(ny_pad,8)
       omp_threads_cap = omp_get_max_threads()
-      do while (omp_threads_cap.gt.1 .and.&
-      &int(omp_threads_cap,8)*transient_bytes_per_thread.ge.mem_safe_bytes)
-         omp_threads_cap = omp_threads_cap - 1
-      enddo
-      if (omp_threads_cap.lt.omp_get_max_threads()) then
-         write(*,'(A,I0,A,I0,A,F0.2,A)') 'WARNING: mem_frac_ram budget only'//&
-         &' supports ', omp_threads_cap, ' of the ', omp_get_max_threads(),&
-         &' requested OMP thread(s) for convolution (',&
-         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
-         &' GB/thread) -- reducing to avoid overcommitting RAM. Raise'//&
-         &' mem_frac_ram, reduce OMP_NUM_THREADS yourself, or add RAM to use more.'
-      endif
-      mem_safe_bytes_io = mem_safe_bytes -&
-      &int(omp_threads_cap,8)*transient_bytes_per_thread
+      mem_safe_bytes_io = mem_safe_bytes - transient_bytes_per_plane
       if (mem_safe_bytes_io.le.0_8) then
          write(*,'(A,F0.2,A)') 'WARNING: convolve working memory alone (',&
-         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
-         &' GB) exceeds the mem_frac_ram budget even at 1 thread -- block'//&
-         &' shrunk to 1 plane, but even that may not fit; raise mem_frac_ram'//&
-         &' or add more RAM.'
+         &real(transient_bytes_per_plane,8)/(1024.0d0**3),&
+         &' GB/plane) exceeds the mem_frac_ram budget -- block shrunk to'//&
+         &' 1 plane, but even that may not fit; raise mem_frac_ram or add'//&
+         &' more RAM.'
          mem_safe_bytes_io = bytes_per_plane
       endif
       block_planes64 = max(1_8, mem_safe_bytes_io / bytes_per_plane)
@@ -3258,12 +3250,6 @@ contains
 
       write(*,'(A,A,A,I0,A,I0,A)') 'Writing ', trim(outfile), ': ', nfreq,&
       &' plane(s), in blocks of up to ', block_planes, ' plane(s)'
-      if (block_planes.lt.omp_threads_cap) then
-         write(*,'(A,I0,A,I0,A)') 'WARNING: mem_frac_ram limits blocks to ',&
-         &block_planes, ' plane(s), below the ', omp_threads_cap,&
-         &' memory-safe thread(s) -- parallelism is further reduced; raise',&
-         &' mem_frac_ram for full speedup if memory allows.'
-      endif
 
       allocate(block_in(nx_in, ny_in, block_planes))
       allocate(block_out(nx_out, ny_out, block_planes, 0:1))
@@ -3273,8 +3259,10 @@ contains
       ! corruption, not a clean error -- caught the hard way via a
       ! munmap_chunk() crash before this fix). conv_nx/conv_ny (and the
       ! resulting nx_pad/ny_pad) were already determined above, ahead of
-      ! the memory budget that needs them.
-      call plan_convolution(conv_nx, conv_ny, plan_fwd, plan_bwd, nx_pad, ny_pad)
+      ! the memory budget that needs them. omp_threads_cap (T28): this
+      ! plan now executes each transform using this many threads
+      ! INTERNALLY -- see plan_convolution's own comment.
+      call plan_convolution(conv_nx, conv_ny, plan_fwd, plan_bwd, nx_pad, ny_pad, omp_threads_cap)
       if (nx_pad.ne.conv_nx .or. ny_pad.ne.conv_ny) then
          write(*,'(A,I0,A,I0,A,I0,A,I0,A)') 'Convolution FFT padded from ',&
          &conv_nx, 'x', conv_ny, ' to ', nx_pad, 'x', ny_pad,&
@@ -3285,10 +3273,12 @@ contains
       write_pending = .false.
       write_failed = .false.
       status_par = 0
-      ! omp_threads_cap (not omp_get_max_threads()) -- the memory-safe
-      ! cap solved for above; using the raw thread count here would
-      ! silently reopen the exact overcommit this whole calculation
-      ! exists to prevent.
+      ! nthreads here is for the REPROJECT pass specifically (still
+      ! parallel-across-planes, T28 kept its original strategy -- see
+      ! the per-plane loop below) -- capped at block_planes since more
+      ! threads than planes-in-flight would just sit idle under the
+      ! dynamic schedule, not a memory-safety concern (omp_threads_cap
+      ! itself no longer is one, see above).
       nthreads = max(1, min(omp_threads_cap, block_planes))
       nwriters_eff = max(1, min(nwriters_l, omp_get_max_threads()))
       chan_start = 1
@@ -3304,39 +3294,200 @@ contains
          if (status_par.ne.0) exit
 
          call timer_start(t_stage)
-         !$omp parallel num_threads(nthreads) default(none)&
-         !$omp& shared(chan_len, nx_in, ny_in, nx_out, ny_out, nx_pad, ny_pad, cur_slot, block_in,&
-         !$omp& block_out, isbad, chan_start, plan_fwd, plan_bwd, dx_deg,&
-         !$omp& dy_deg, ref_dx_deg, ref_dy_deg, bmaj_in, bmin_in,&
-         !$omp& bpa_in_pixel, tgt_bmaj, tgt_bmin, tgt_bpa_pixel_native,&
-         !$omp& tgt_bpa_pixel_out, status_par, do_reproject_l, convolve_first_l,&
-         !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock)&
-         !$omp& private(local_iplane, ich, k, nanval, plane_native,&
-         !$omp& plane_out_arr, plane_native_sp, plane_out_sp, t_status,&
-         !$omp& t_wcs_ref, t_skymap_ref, t_skyframe_ref, t_naxes_ref,&
-         !$omp& t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
-         !$omp& t_naxes_in2, t_pixaxes_in, t_map_in2ref, lbnd_in, ubnd_in,&
-         !$omp& lbnd_o, ubnd_o, badval_sp, params_dummy, nbad,&
-         !$omp& tid_local, t_thread_start, t_thread_elapsed, thread_msg,&
-         !$omp& t_conv_local, t_resamp_local)
+         ! T28 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): convolve and
+         ! reproject are now TWO SEPARATE passes over this block's own
+         ! planes, not one combined per-plane loop -- convolve always
+         ! runs SERIAL-over-planes/THREADED-within-each-plane (via
+         ! plan_convolution's own nthreads), reproject always runs
+         ! PARALLEL-over-planes exactly as before (T20's own AST
+         ! setup fix, unchanged). Which one is pass 1 vs pass 2 follows
+         ! convolve_first_l, same as the original single-pass ordering.
+         ! Cross-checked before implementing (see T28's own ticket):
+         ! this preserves reproject's existing cross-plane parallelism
+         ! (real risk found -- a naive single serial pass for BOTH
+         ! steps would have made reproject-heavy files slower, since
+         ! ast_resampler has no in-call threading of its own to give
+         ! it the same treatment convolve_to_beam gets).
+         if (.not. do_reproject_l) then
+            ! stages=convolve alone: one serial/in-plane-threaded pass,
+            ! straight into block_out -- no reproject step exists.
+            do local_iplane = 1, chan_len
+               if (status_par.ne.0) exit
+               ich = chan_start + local_iplane - 1
+               if (isbad(ich)) then
+                  nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+                  block_out(:,:,local_iplane,cur_slot) = real(nanval)
+                  cycle
+               endif
+               if (.not. allocated(plane_native)) allocate(plane_native(nx_in,ny_in))
+               plane_native = real(block_in(:,:,local_iplane), dp)
+               t_thread_start = omp_get_wtime()
+               call timer_start(t_conv_local)
+               call convolve_to_beam(plan_fwd, plan_bwd, plane_native, nx_in, ny_in, nx_pad, ny_pad,&
+               &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
+               &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
+               &tgt_bpa_pixel_native, plane_native, k)
+               call timer_stop('convolve_compute', t_conv_local)
+               t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+               write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)')&
+               &'thread_timing stage=convolve event=done tid=0 block=',&
+               &iblock,' plane=',ich,' nthreads=',omp_threads_cap,&
+               &' dur_ms=',t_thread_elapsed
+               call log_message('debug','tile_thread',trim(thread_msg))
+               block_out(:,:,local_iplane,cur_slot) = real(plane_native)
+               if (k.ne.0) status_par = -1
+            enddo
 
-         tid_local = omp_get_thread_num()
-         t_thread_start = omp_get_wtime()
-         write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=convolve event=start tid=',&
-         &tid_local,' block=',iblock,' unit_count=',chan_len
-         call log_message('debug','tile_thread',trim(thread_msg))
+         else if (convolve_first_l) then
+            ! order=convolve_reproject (default): PASS 1 = convolve,
+            ! serial/in-plane-threaded, overwriting block_in IN PLACE
+            ! (native grid in, native grid convolved result out -- same
+            ! shape, so the existing buffer is reused, no new
+            ! allocation). Bad channels are left untouched here (still
+            ! whatever read_freq_block put there) -- pass 2 below
+            ! NaN-fills block_out for them directly and never reads
+            ! this plane's own block_in content, so it does not matter
+            ! that it was never convolved.
+            do local_iplane = 1, chan_len
+               if (status_par.ne.0) exit
+               ich = chan_start + local_iplane - 1
+               if (isbad(ich)) cycle
+               if (.not. allocated(plane_native)) allocate(plane_native(nx_in,ny_in))
+               plane_native = real(block_in(:,:,local_iplane), dp)
+               t_thread_start = omp_get_wtime()
+               call timer_start(t_conv_local)
+               call convolve_to_beam(plan_fwd, plan_bwd, plane_native, nx_in, ny_in, nx_pad, ny_pad,&
+               &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
+               &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
+               &tgt_bpa_pixel_native, plane_native, k)
+               call timer_stop('convolve_compute', t_conv_local)
+               t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+               write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)')&
+               &'thread_timing stage=convolve event=done tid=0 block=',&
+               &iblock,' plane=',ich,' nthreads=',omp_threads_cap,&
+               &' dur_ms=',t_thread_elapsed
+               call log_message('debug','tile_thread',trim(thread_msg))
+               block_in(:,:,local_iplane) = real(plane_native)
+               if (k.ne.0) status_par = -1
+            enddo
 
-         t_status = 0
-         if (do_reproject_l) then
-            ! Own private AST Mapping per thread -- required, see
-            ! process_one_file_general's own comment on why (this Fortran
-            ! AST binding has no lock/unlock for cross-thread sharing).
-            ! T20 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the creation
-            ! step itself (not the resulting per-thread objects) is what
-            ! deadlocks under genuine concurrency -- see process_one_
-            ! file_general's own T20 comment for the full account.
-            ! Critical section serializes just this setup; the actual
-            ! per-plane resampling below stays fully parallel.
+            ! PASS 2 = reproject, parallel-across-planes, EXACTLY the
+            ! original strategy (T20's own AST-setup critical section
+            ! unchanged) -- reads the now-convolved block_in.
+            if (status_par.eq.0) then
+               !$omp parallel num_threads(nthreads) default(none)&
+               !$omp& shared(chan_len, nx_in, ny_in, nx_out, ny_out, cur_slot,&
+               !$omp& block_in, block_out, isbad, chan_start, status_par,&
+               !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock)&
+               !$omp& private(local_iplane, ich, nanval, plane_native_sp,&
+               !$omp& plane_out_sp, t_status, t_wcs_ref, t_skymap_ref,&
+               !$omp& t_skyframe_ref, t_naxes_ref, t_pixaxes_ref, t_wcs_in,&
+               !$omp& t_skymap_in, t_skyframe_in, t_naxes_in2, t_pixaxes_in,&
+               !$omp& t_map_in2ref, lbnd_in, ubnd_in, lbnd_o, ubnd_o,&
+               !$omp& badval_sp, params_dummy, nbad, tid_local,&
+               !$omp& t_thread_start, t_thread_elapsed, thread_msg,&
+               !$omp& t_resamp_local)
+
+               tid_local = omp_get_thread_num()
+               t_thread_start = omp_get_wtime()
+               write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=reproject event=start tid=',&
+               &tid_local,' block=',iblock,' unit_count=',chan_len
+               call log_message('debug','tile_thread',trim(thread_msg))
+
+               ! Own private AST Mapping per thread -- required, see
+               ! process_one_file_general's own comment on why (this
+               ! Fortran AST binding has no lock/unlock for cross-thread
+               ! sharing). T20: the creation step itself (not the
+               ! resulting per-thread objects) is what deadlocks under
+               ! genuine concurrency.
+               t_status = 0
+               !$omp critical (ast_setup)
+               call ast_begin(t_status)
+               call load_wcs(reffile_l, t_wcs_ref, t_naxes_ref, t_status)
+               call extract_sky_mapping(t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
+               &t_pixaxes_ref, t_status)
+               call load_wcs(infile, t_wcs_in, t_naxes_in2, t_status)
+               call extract_sky_mapping(t_wcs_in, t_skymap_in, t_skyframe_in,&
+               &t_pixaxes_in, t_status)
+               call compose_pix2pix(t_skymap_in, t_skyframe_in, t_skymap_ref,&
+               &t_skyframe_ref, t_map_in2ref, t_status)
+               !$omp end critical (ast_setup)
+               if (t_status.ne.0) then
+                  !$omp atomic write
+                  status_par = -1
+               endif
+
+               !$omp do schedule(dynamic)
+               do local_iplane = 1, chan_len
+                  ich = chan_start + local_iplane - 1
+                  if (t_status.ne.0 .or. status_par.ne.0) cycle
+                  if (isbad(ich)) then
+                     nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+                     block_out(:,:,local_iplane,cur_slot) = real(nanval)
+                     cycle
+                  endif
+                  lbnd_in(1) = 1
+                  lbnd_in(2) = 1
+                  ubnd_in(1) = nx_in
+                  ubnd_in(2) = ny_in
+                  lbnd_o(1) = nint(lbnd_out_d(1))
+                  lbnd_o(2) = nint(lbnd_out_d(2))
+                  ubnd_o(1) = nint(ubnd_out_d(1))
+                  ubnd_o(2) = nint(ubnd_out_d(2))
+                  params_dummy(1) = 0.0d0
+                  if (.not. allocated(plane_native_sp)) allocate(plane_native_sp(nx_in,ny_in))
+                  if (.not. allocated(plane_out_sp)) allocate(plane_out_sp(nx_out,ny_out))
+                  ! block_in already holds the CONVOLVED result (pass 1,
+                  ! above) -- same real(4) kind as plane_native_sp, no
+                  ! cast needed, unlike pass 1's own real(dp) conversion.
+                  plane_native_sp = block_in(:,:,local_iplane)
+                  badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
+                  call timer_start(t_resamp_local)
+                  nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
+                  &plane_native_sp, plane_native_sp,&
+                  &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
+                  &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
+                  &plane_out_sp, plane_out_sp, t_status)
+                  call timer_stop('reproject_compute', t_resamp_local)
+                  if (t_status.ne.0) then
+                     !$omp atomic write
+                     status_par = -1
+                     cycle
+                  endif
+                  block_out(:,:,local_iplane,cur_slot) = plane_out_sp
+               enddo
+               !$omp end do
+               t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+               tid_local = omp_get_thread_num()
+               write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=reproject event=done tid=',&
+               &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
+               call log_message('debug','tile_thread',trim(thread_msg))
+               call ast_end(t_status)
+               !$omp end parallel
+            endif
+
+         else
+            ! order=reproject_convolve: PASS 1 = reproject,
+            ! parallel-across-planes, EXACTLY the original strategy,
+            ! writing into block_out (not yet convolved).
+            !$omp parallel num_threads(nthreads) default(none)&
+            !$omp& shared(chan_len, nx_in, ny_in, nx_out, ny_out, cur_slot,&
+            !$omp& block_in, block_out, isbad, chan_start, status_par,&
+            !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock)&
+            !$omp& private(local_iplane, ich, nanval, t_status,&
+            !$omp& t_wcs_ref, t_skymap_ref, t_skyframe_ref, t_naxes_ref,&
+            !$omp& t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
+            !$omp& t_naxes_in2, t_pixaxes_in, t_map_in2ref, lbnd_in, ubnd_in,&
+            !$omp& lbnd_o, ubnd_o, badval_sp, params_dummy, nbad, tid_local,&
+            !$omp& t_thread_start, t_thread_elapsed, thread_msg, t_resamp_local)
+
+            tid_local = omp_get_thread_num()
+            t_thread_start = omp_get_wtime()
+            write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=reproject event=start tid=',&
+            &tid_local,' block=',iblock,' unit_count=',chan_len
+            call log_message('debug','tile_thread',trim(thread_msg))
+
+            t_status = 0
             !$omp critical (ast_setup)
             call ast_begin(t_status)
             call load_wcs(reffile_l, t_wcs_ref, t_naxes_ref, t_status)
@@ -3352,92 +3503,25 @@ contains
                !$omp atomic write
                status_par = -1
             endif
-         endif
 
-         !$omp do schedule(dynamic)
-         do local_iplane = 1, chan_len
-            ich = chan_start + local_iplane - 1
-            if (t_status.ne.0 .or. status_par.ne.0) cycle
-            if (isbad(ich)) then
-               nanval = ieee_value(1.0_dp, ieee_quiet_nan)
-               block_out(:,:,local_iplane,cur_slot) = real(nanval)
-               cycle
-            endif
-
-            if (.not. do_reproject_l) then
-               ! stages=convolve alone: no resampling, output grid ==
-               ! native grid, identical to today's standalone
-               ! convolve_cubes.
-               if (.not. allocated(plane_native)) allocate(plane_native(nx_in,ny_in))
-               plane_native = real(block_in(:,:,local_iplane), dp)
-               call timer_start(t_conv_local)
-               call convolve_to_beam(plan_fwd, plan_bwd, plane_native, nx_in, ny_in, nx_pad, ny_pad,&
-               &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
-               &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
-               &tgt_bpa_pixel_native, plane_native, k)
-               call timer_stop('convolve_compute', t_conv_local)
-               block_out(:,:,local_iplane,cur_slot) = real(plane_native)
-               if (k.ne.0) then
-                  !$omp atomic write
-                  status_par = -1
-               endif
-               cycle
-            endif
-
-            lbnd_in(1) = 1
-            lbnd_in(2) = 1
-            ubnd_in(1) = nx_in
-            ubnd_in(2) = ny_in
-            lbnd_o(1) = nint(lbnd_out_d(1))
-            lbnd_o(2) = nint(lbnd_out_d(2))
-            ubnd_o(1) = nint(ubnd_out_d(1))
-            ubnd_o(2) = nint(ubnd_out_d(2))
-            params_dummy(1) = 0.0d0
-
-            if (convolve_first_l) then
-               ! order=convolve_reproject (default): convolve on the
-               ! native grid using this file's OWN dx/dy, then resample
-               ! the (now low-pass-filtered) native-grid plane onto the
-               ! output grid.
-               if (.not. allocated(plane_native)) allocate(plane_native(nx_in,ny_in))
-               if (.not. allocated(plane_native_sp)) allocate(plane_native_sp(nx_in,ny_in))
-               if (.not. allocated(plane_out_sp)) allocate(plane_out_sp(nx_out,ny_out))
-               plane_native = real(block_in(:,:,local_iplane), dp)
-               call timer_start(t_conv_local)
-               call convolve_to_beam(plan_fwd, plan_bwd, plane_native, nx_in, ny_in, nx_pad, ny_pad,&
-               &dx_deg, dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
-               &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
-               &tgt_bpa_pixel_native, plane_native, k)
-               call timer_stop('convolve_compute', t_conv_local)
-               if (k.ne.0) then
-                  !$omp atomic write
-                  status_par = -1
+            !$omp do schedule(dynamic)
+            do local_iplane = 1, chan_len
+               ich = chan_start + local_iplane - 1
+               if (t_status.ne.0 .or. status_par.ne.0) cycle
+               if (isbad(ich)) then
+                  nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+                  block_out(:,:,local_iplane,cur_slot) = real(nanval)
                   cycle
                endif
-               ! ast_resampler needs genuine REAL*4 storage, not a real(dp)
-               ! array or a throwaway real(plane_native) conversion
-               ! expression (which is a temporary, not a reference it can
-               ! read/write through) -- convert into the dedicated
-               ! single-precision scratch arrays declared above.
-               plane_native_sp = real(plane_native)
-               badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
-               call timer_start(t_resamp_local)
-               nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
-               &plane_native_sp, plane_native_sp,&
-               &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
-               &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
-               &plane_out_sp, plane_out_sp, t_status)
-               call timer_stop('reproject_compute', t_resamp_local)
-               if (t_status.ne.0) then
-                  !$omp atomic write
-                  status_par = -1
-                  cycle
-               endif
-               block_out(:,:,local_iplane,cur_slot) = plane_out_sp
-            else
-               ! order=reproject_convolve: resample first onto the output
-               ! grid, then convolve there using the OUTPUT grid's own
-               ! (reference) dx/dy.
+               lbnd_in(1) = 1
+               lbnd_in(2) = 1
+               ubnd_in(1) = nx_in
+               ubnd_in(2) = ny_in
+               lbnd_o(1) = nint(lbnd_out_d(1))
+               lbnd_o(2) = nint(lbnd_out_d(2))
+               ubnd_o(1) = nint(ubnd_out_d(1))
+               ubnd_o(2) = nint(ubnd_out_d(2))
+               params_dummy(1) = 0.0d0
                badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
                call timer_start(t_resamp_local)
                nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
@@ -3449,33 +3533,45 @@ contains
                if (t_status.ne.0) then
                   !$omp atomic write
                   status_par = -1
-                  cycle
                endif
-               if (.not. allocated(plane_out_arr)) allocate(plane_out_arr(nx_out,ny_out))
-               plane_out_arr = real(block_out(:,:,local_iplane,cur_slot), dp)
-               call timer_start(t_conv_local)
-               call convolve_to_beam(plan_fwd, plan_bwd, plane_out_arr, nx_out, ny_out, nx_pad, ny_pad,&
-               &ref_dx_deg, ref_dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
-               &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
-               &tgt_bpa_pixel_out, plane_out_arr, k)
-               call timer_stop('convolve_compute', t_conv_local)
-               if (k.ne.0) then
-                  !$omp atomic write
-                  status_par = -1
-                  cycle
-               endif
-               block_out(:,:,local_iplane,cur_slot) = real(plane_out_arr)
-            endif
-         enddo
-         !$omp end do
-         t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
-         tid_local = omp_get_thread_num()
-         write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=convolve event=done tid=',&
-         &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
-         call log_message('debug','tile_thread',trim(thread_msg))
+            enddo
+            !$omp end do
+            t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+            tid_local = omp_get_thread_num()
+            write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=reproject event=done tid=',&
+            &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
+            call log_message('debug','tile_thread',trim(thread_msg))
+            call ast_end(t_status)
+            !$omp end parallel
 
-         if (do_reproject_l) call ast_end(t_status)
-         !$omp end parallel
+            ! PASS 2 = convolve, serial/in-plane-threaded, reading FROM
+            ! and overwriting block_out IN PLACE (reprojected-not-yet-
+            ! convolved in, convolved final result out -- same shape).
+            if (status_par.eq.0) then
+               do local_iplane = 1, chan_len
+                  if (status_par.ne.0) exit
+                  ich = chan_start + local_iplane - 1
+                  if (isbad(ich)) cycle
+                  if (.not. allocated(plane_out_arr)) allocate(plane_out_arr(nx_out,ny_out))
+                  plane_out_arr = real(block_out(:,:,local_iplane,cur_slot), dp)
+                  t_thread_start = omp_get_wtime()
+                  call timer_start(t_conv_local)
+                  call convolve_to_beam(plan_fwd, plan_bwd, plane_out_arr, nx_out, ny_out, nx_pad, ny_pad,&
+                  &ref_dx_deg, ref_dy_deg, bmaj_in(ich)/3600.0_dp, bmin_in(ich)/3600.0_dp,&
+                  &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
+                  &tgt_bpa_pixel_out, plane_out_arr, k)
+                  call timer_stop('convolve_compute', t_conv_local)
+                  t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+                  write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)')&
+                  &'thread_timing stage=convolve event=done tid=0 block=',&
+                  &iblock,' plane=',ich,' nthreads=',omp_threads_cap,&
+                  &' dur_ms=',t_thread_elapsed
+                  call log_message('debug','tile_thread',trim(thread_msg))
+                  block_out(:,:,local_iplane,cur_slot) = real(plane_out_arr)
+                  if (k.ne.0) status_par = -1
+               enddo
+            endif
+         endif
          call timer_stop('block_convolve', t_stage)
          if (status_par.ne.0) exit
 

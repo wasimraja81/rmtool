@@ -101,10 +101,13 @@ contains
       image_padded_manual = 0.0_dp
       image_padded_manual(1:n, 1:n) = image_native
 
+      ! nthreads=1 -- this test's own use of convolve_to_beam is
+      ! serial/single-call, not exercising T28's in-plane threading
+      ! specifically (see test_gaussft_threading.f90 for that).
       call plan_convolution(n, n, plan_fwd_native, plan_bwd_native,&
-      &nx_pad_native, ny_pad_native)
+      &nx_pad_native, ny_pad_native, 1)
       call plan_convolution(n_pad_expected, n_pad_expected, plan_fwd_manual,&
-      &plan_bwd_manual, nx_pad_manual, ny_pad_manual)
+      &plan_bwd_manual, nx_pad_manual, ny_pad_manual, 1)
 
       call check_eq_int('plan_convolution(43,43) auto-pads to 45x45',&
       &nx_pad_native, n_pad_expected, ok)

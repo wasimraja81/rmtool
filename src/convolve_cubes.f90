@@ -1431,8 +1431,8 @@ contains
       ! its own use, below.
       integer(kind=8) :: datastart, headstart_dum, dataend_dum
       integer(kind=8) :: mem_total_kb, bytes_per_plane, mem_safe_bytes, block_planes64
-      integer(kind=8) :: transient_bytes_per_thread, mem_safe_bytes_io
-      integer :: block_planes, chan_start, chan_len, local_iplane, nthreads
+      integer(kind=8) :: transient_bytes_per_plane, mem_safe_bytes_io
+      integer :: block_planes, chan_start, chan_len, local_iplane
       integer :: omp_threads_cap
       integer :: cur_slot
       logical :: write_dispatched_ok
@@ -1442,13 +1442,15 @@ contains
       integer :: status_par, ich, k
       real(dp) :: dx_deg, dy_deg
       real(dp) :: nanval
-      ! Per-thread swim-lane instrumentation (planning-doc ticket): one
-      ! 'thread_timing stage=convolve event=start|done' pair per thread
-      ! per block, same convention as rm_synthesis.f90/rm_synthesis_mod.
-      ! f90's own thread_timing lines (see scripts/plot_tile_async_
-      ! swimlane.py) -- gated behind log_level=debug like every other
-      ! debug-level log_message call, no separate flag needed.
-      integer :: iblock, tid_local
+      ! Per-plane timing instrumentation (T28, docs/dev/MULTI_BAND_
+      ! TOMOGRAPHY_PLAN.md): one 'thread_timing stage=convolve
+      ! event=done' line per plane -- finer-grained than the old
+      ! per-thread-per-block lines it replaces, since the per-plane loop
+      ! is serial now (see below) and each plane's own convolve_to_beam
+      ! call is internally multi-threaded, not this loop running
+      ! multiple iterations concurrently. Still gated behind
+      ! log_level=debug like every other debug-level log_message call.
+      integer :: iblock
       real(dp) :: t_thread_start, t_thread_elapsed
       character(len=160) :: thread_msg
       ! ALLOCATABLE, not automatic/stack -- one instance per OpenMP thread
@@ -1563,57 +1565,45 @@ contains
       bytes_per_plane = int(4,8) * int(nx,8) * int(ny,8) * 3_8
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) * 1024.0d0, 8)
 
-      ! T26 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): same gap fixed in
-      ! match_cubes.f90 -- bytes_per_plane above only budgets the block
-      ! I/O buffer, not convolve_to_beam's own NaN-aware-path transient
-      ! working set (a native-size NaN mask, two padded-size complex FFT
-      ! buffers alive at once, two native-size real buffers, on top of
-      ! this caller's own native-size plane_in, real(dp), held for the
-      ! whole call), entirely un-budgeted by the block buffer above.
-      ! 16*(nx*ny) + 16*(nx_pad*ny_pad) bytes, PER THREAD actively
-      ! convolving a plane (thread-private locals, not shared). The two
-      ! 16s are NOT the same "16" -- each is its own sum (see
-      ! match_cubes.f90's own identical comment for the full per-array
-      ! breakdown: native term = nan_mask(4) + c_d-or-c_m(4, now sp) +
-      ! this caller's own plane_in(8, real(dp), deliberately not
-      ! converted) = 16; padded term = g_final(8, sp) + cimg-or-cmsk(8,
-      ! sp) = 16 -- the padded term genuinely halved, the native term
-      ! only partly halved, held back by plane_in's own real(dp)). NOT
-      ! computed from gaussft_mod's own type declarations, so it needs
-      ! re-deriving by hand if those kinds ever change again. Solve for
-      ! the largest safe thread count (down
-      ! from the full omp_get_max_threads() requested, never below 1) --
-      ! refined (T26 follow-up) from an earlier all-or-nothing version
-      ! that either fit the full requested thread count or floored
-      ! straight to 1 plane/serial, even when some smaller thread count
-      ! in between would genuinely have fit. Plain decrementing search,
-      ! not a closed-form division -- thread counts are always small, so
-      ! there's no performance reason to prefer a division's rounding
-      ! subtleties over an easy-to-verify loop. See match_cubes.f90's own
-      ! identical logic for the full derivation.
-      transient_bytes_per_thread = 16_8*int(nx,8)*int(ny,8) +&
+      ! T26 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): bytes_per_plane
+      ! above only budgets the block I/O buffer, not convolve_to_beam's
+      ! own NaN-aware-path transient working set (a native-size NaN
+      ! mask, two padded-size complex FFT buffers alive at once, two
+      ! native-size real buffers, on top of this caller's own
+      ! native-size plane_in, real(dp), held for the whole call),
+      ! entirely un-budgeted by the block buffer above.
+      ! 16*(nx*ny) + 16*(nx_pad*ny_pad) bytes. The two 16s are NOT the
+      ! same "16" -- each is its own sum (see match_cubes.f90's own
+      ! identical comment for the full per-array breakdown: native term
+      ! = nan_mask(4) + c_d-or-c_m(4, sp) + this caller's own
+      ! plane_in(8, real(dp), deliberately not converted) = 16; padded
+      ! term = g_final(8, sp) + cimg-or-cmsk(8, sp) = 16). NOT computed
+      ! from gaussft_mod's own type declarations, so it needs
+      ! re-deriving by hand if those kinds ever change again.
+      !
+      ! T28 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): reserved ONCE now,
+      ! not omp_get_max_threads() copies of it -- convolve_to_beam is called
+      ! serially, once per plane (see the per-plane loop below), with
+      ! each call internally multi-threaded via plan_convolution's own
+      ! nthreads (sfftw_plan_with_nthreads) rather than N callers each
+      ! running their own independent copy of this working set
+      ! concurrently. So this is a per-PLANE cost now, not a per-THREAD
+      ! one -- T26's own decrementing search (find the largest safe
+      ! thread count) no longer applies to THIS reservation; the
+      ! variable is named accordingly (transient_bytes_per_plane, not
+      ! _per_thread). omp_threads_cap here is a plain performance
+      ! choice (how many threads help each plane's own compute), not a
+      ! memory-safety cap.
+      transient_bytes_per_plane = 16_8*int(nx,8)*int(ny,8) +&
       &16_8*int(nx_pad,8)*int(ny_pad,8)
       omp_threads_cap = omp_get_max_threads()
-      do while (omp_threads_cap.gt.1 .and.&
-      &int(omp_threads_cap,8)*transient_bytes_per_thread.ge.mem_safe_bytes)
-         omp_threads_cap = omp_threads_cap - 1
-      enddo
-      if (omp_threads_cap.lt.omp_get_max_threads()) then
-         write(*,'(A,I0,A,I0,A,F0.2,A)') 'WARNING: mem_frac_ram budget only'//&
-         &' supports ', omp_threads_cap, ' of the ', omp_get_max_threads(),&
-         &' requested OMP thread(s) for convolution (',&
-         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
-         &' GB/thread) -- reducing to avoid overcommitting RAM. Raise'//&
-         &' mem_frac_ram, reduce OMP_NUM_THREADS yourself, or add RAM to use more.'
-      endif
-      mem_safe_bytes_io = mem_safe_bytes -&
-      &int(omp_threads_cap,8)*transient_bytes_per_thread
+      mem_safe_bytes_io = mem_safe_bytes - transient_bytes_per_plane
       if (mem_safe_bytes_io.le.0_8) then
          write(*,'(A,F0.2,A)') 'WARNING: convolve working memory alone (',&
-         &real(transient_bytes_per_thread,8)/(1024.0d0**3),&
-         &' GB) exceeds the mem_frac_ram budget even at 1 thread -- block'//&
-         &' shrunk to 1 plane, but even that may not fit; raise mem_frac_ram'//&
-         &' or add more RAM.'
+         &real(transient_bytes_per_plane,8)/(1024.0d0**3),&
+         &' GB/plane) exceeds the mem_frac_ram budget -- block shrunk to'//&
+         &' 1 plane, but even that may not fit; raise mem_frac_ram or add'//&
+         &' more RAM.'
          mem_safe_bytes_io = bytes_per_plane
       endif
       block_planes64 = max(1_8, mem_safe_bytes_io / bytes_per_plane)
@@ -1625,17 +1615,17 @@ contains
 
       write(*,'(A,A,A,I0,A,I0,A)') 'Writing ', trim(outfile), ': ', nfreq,&
       &' plane(s), in blocks of up to ', block_planes, ' plane(s)'
-      if (block_planes.lt.omp_threads_cap) then
-         write(*,'(A,I0,A,I0,A)') 'WARNING: mem_frac_ram limits blocks to ',&
-         &block_planes, ' plane(s), below the ', omp_threads_cap,&
-         &' memory-safe thread(s) -- parallelism is further reduced; raise',&
-         &' mem_frac_ram for full speedup if memory allows.'
-      endif
 
       allocate(block_in(nx, ny, block_planes))
       allocate(block_out(nx, ny, block_planes, 0:1))
 
-      call plan_convolution(nx, ny, plan_fwd, plan_bwd, nx_pad, ny_pad)
+      ! T28 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): nthreads here means
+      ! the plan itself now executes each transform using this many
+      ! threads INTERNALLY -- see plan_convolution's own comment. The
+      ! caller's per-plane loop below is SERIAL (no longer an !$omp
+      ! parallel do across planes), so this genuinely is the compute
+      ! parallelism now, not a duplicate of it.
+      call plan_convolution(nx, ny, plan_fwd, plan_bwd, nx_pad, ny_pad, omp_threads_cap)
       if (nx_pad.ne.nx .or. ny_pad.ne.ny) then
          write(*,'(A,I0,A,I0,A,I0,A,I0,A)') 'Convolution FFT padded from ',&
          &nx, 'x', ny, ' to ', nx_pad, 'x', ny_pad,&
@@ -1660,11 +1650,6 @@ contains
       write_pending = .false.
       write_failed = .false.
       status_par = 0
-      ! omp_threads_cap (not omp_get_max_threads()) -- the memory-safe
-      ! cap solved for above; using the raw thread count here would
-      ! silently reopen the exact overcommit this whole calculation
-      ! exists to prevent.
-      nthreads = max(1, min(omp_threads_cap, block_planes))
       ! nwriters_eff: same clamp formula as rm_synthesis/rmclean_cubes'
       ! own nwriters (T7/T12) -- never changed at rename time, kept
       ! identical here (see do_block_write's own comment for why writer
@@ -1684,26 +1669,24 @@ contains
          if (status_par.ne.0) exit
 
          call timer_start(t_stage)
-         !$omp parallel num_threads(nthreads)&
-         !$omp& default(none) shared(chan_len, nx, ny, nx_pad, ny_pad,&
-         !$omp& block_in, block_out, cur_slot,&
-         !$omp& isbad, chan_start, plan_fwd, plan_bwd, dx_deg, dy_deg,&
-         !$omp& bmaj_in, bmin_in, bpa_in_pixel, tgt_bmaj, tgt_bmin,&
-         !$omp& tgt_bpa_pixel, status_par, iblock)&
-         !$omp& private(local_iplane, ich, k, nanval, plane_in, plane_out,&
-         !$omp& tid_local, t_thread_start, t_thread_elapsed, thread_msg)
-         tid_local = omp_get_thread_num()
-         t_thread_start = omp_get_wtime()
-         write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=convolve event=start tid=',&
-         &tid_local,' block=',iblock,' unit_count=',chan_len
-         call log_message('debug','tile_thread',trim(thread_msg))
-         !$omp do schedule(dynamic)
+         ! T28 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): SERIAL over
+         ! planes now (no !$omp parallel do here) -- each convolve_to_beam
+         ! call is internally multi-threaded instead (plan_convolution's
+         ! own nthreads, above), so the compute parallelism moved INSIDE
+         ! this loop's own single call per iteration rather than being
+         ! this loop running N iterations concurrently. See T28's own
+         ! ticket for why (T26's per-thread memory multiplication).
+         ! Per-plane (not per-thread-per-block) debug timing now, since
+         ! there is no longer a "per-thread" axis to this loop at all --
+         ! finer-grained than the old per-block-per-thread lines, not
+         ! coarser.
          do local_iplane = 1, chan_len
             ich = chan_start + local_iplane - 1
             if (isbad(ich)) then
                nanval = ieee_value(1.0_dp, ieee_quiet_nan)
                block_out(:,:,local_iplane,cur_slot) = real(nanval)
             else
+               t_thread_start = omp_get_wtime()
                if (.not. allocated(plane_in)) allocate(plane_in(nx,ny))
                if (.not. allocated(plane_out)) allocate(plane_out(nx,ny))
                plane_in = real(block_in(:,:,local_iplane), dp)
@@ -1713,19 +1696,16 @@ contains
                &bpa_in_pixel(ich), tgt_bmaj/3600.0_dp, tgt_bmin/3600.0_dp,&
                &tgt_bpa_pixel, plane_out, k)
                block_out(:,:,local_iplane,cur_slot) = real(plane_out)
-               if (k.ne.0) then
-                  !$omp atomic write
-                  status_par = -1
-               endif
+               if (k.ne.0) status_par = -1
+               t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+               write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)')&
+               &'thread_timing stage=convolve event=done tid=0 block=',&
+               &iblock,' plane=',ich,' nthreads=',omp_threads_cap,&
+               &' dur_ms=',t_thread_elapsed
+               call log_message('debug','tile_thread',trim(thread_msg))
             endif
+            if (status_par.ne.0) exit
          enddo
-         !$omp end do
-         t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
-         tid_local = omp_get_thread_num()
-         write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=convolve event=done tid=',&
-         &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
-         call log_message('debug','tile_thread',trim(thread_msg))
-         !$omp end parallel
          call timer_stop('block_convolve', t_stage)
          if (status_par.ne.0) exit
 

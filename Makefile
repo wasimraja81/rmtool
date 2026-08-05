@@ -240,8 +240,15 @@ $(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDI
 # points, which live in libfftw3f, not libfftw3. Harmless to also link
 # into rmclean_cubes (the other consumer of FFTW_LIBS, via rmclean_mod's
 # own double-precision-only FFTW calls) -- an unused library on the link
-# line costs nothing at runtime.
-FFTW_LIBS := -lfftw3 -lfftw3f
+# line costs nothing at runtime. -lfftw3f_omp (T28, docs/dev/
+# MULTI_BAND_TOMOGRAPHY_PLAN.md): the OpenMP-backed threaded-FFT
+# library (sfftw_init_threads/sfftw_plan_with_nthreads), chosen over
+# the separate pthreads-backed -lfftw3f_threads for consistency with
+# the rest of this project's own -fopenmp threading model -- both
+# expose the identical legacy Fortran entry points (confirmed via nm
+# -D on both .so files), so this is purely a "stay consistent with
+# what's already used everywhere else" choice, not a functional one.
+FFTW_LIBS := -lfftw3 -lfftw3f -lfftw3f_omp
 CONVOLVE_BINDIR ?= bin
 CONVOLVE_BUILDDIR := build/convolve_cubes
 CONVOLVE_EXECUTABLE := $(CONVOLVE_BINDIR)/convolve_cubes

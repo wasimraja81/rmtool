@@ -3062,3 +3062,120 @@ deliberately not implemented alongside T27, since it would duplicate
 `convolve_to_beam`'s own per-pixel loop under a runtime/compile-time
 switch rather than being a drop-in replacement. Left as a distinct,
 separately-scoped future ticket.
+
+### T28 -- Convolve Parallelization Redesign: Serial-Over-Planes, Threaded-Within-Plane (implemented, verified -- committed)
+
+**Motivation:** raised directly by the user while reviewing T26/T27's
+own numbers. The pre-T28 model parallelized `convolve_to_beam` by
+running N OpenMP threads *concurrently*, each independently processing
+its own whole plane -- so peak transient memory scales linearly with
+thread count (T26's own `omp_threads_cap` exists purely to cap that
+multiplication). The user's question: why parallelize *across* planes
+at all, when the actual bottlenecks for this workload are I/O and RAM,
+not FFT compute? A plane's own 2D FFT can instead be parallelized
+*internally* (FFTW natively supports multi-threaded execution of a
+single transform), while planes themselves are processed one at a
+time -- trading "N threads x 1 plane's memory each" for "1 thread's
+worth of memory, N-way-threaded". This does not need linear FFT
+speedup to be worthwhile, since FFT is one step of the whole pipeline,
+not the dominant cost. It also directly serves the original
+Raspberry-Pi-5 portability motivation behind T26/T27: a design whose
+peak memory no longer multiplies by core count is a genuine, real
+claim about running this tool on an 8GB single-board machine, not just
+an aspiration.
+
+**Design:** `plan_convolution` (`gaussft.f90`) takes a new `nthreads`
+argument and calls FFTW's `sfftw_init_threads`/
+`sfftw_plan_with_nthreads(nthreads)` before planning, so the resulting
+plan itself executes multi-threaded on every subsequent
+`sfftw_execute_dft` call -- linked against `libfftw3f_omp`
+(OpenMP-backed), chosen over the pthreads-backed `libfftw3f_threads`
+alternative purely for consistency with the rest of the codebase's
+`-fopenmp` model; both expose identical `sfftw_*` legacy Fortran
+symbols (confirmed via `nm -D` before committing to the choice).
+`convolve_to_beam`'s own internals (kernel build, NaN masking, array
+-syntax elementwise ops) are now parallelized in-place with
+`!$omp parallel do collapse(2)`/`!$omp workshare` rather than relying
+on the caller to run multiple concurrent instances. In
+`match_cubes.f90`/`convolve_cubes.f90`, the per-plane loop that used to
+be `!$omp parallel ... !$omp do schedule(dynamic)` (N planes at once,
+each single-threaded) is now a plain serial `do` loop, one
+`convolve_to_beam` call at a time, each internally using
+`omp_threads_cap` threads. `transient_bytes_per_thread` (T26/T27) is
+renamed `transient_bytes_per_plane` and reserved ONCE regardless of
+thread count, since only one plane's transient memory is ever alive at
+a time now; `omp_threads_cap` reverts from T26's memory-safety search
+to a plain performance choice (`omp_get_max_threads()`), since more
+threads no longer costs more memory.
+
+**Cross-check performed before implementing (per explicit instruction
+to document, then cross-check, then implement):** two issues found,
+both resolved before writing code, not discovered mid-implementation:
+
+1. FFTW's `sfftw_plan_with_nthreads` and the old
+   concurrent-multiple-threads-each-calling-`sfftw_execute_dft` pattern
+   are mutually exclusive -- combining them (a plan already configured
+   for N-way internal threading, itself invoked from N concurrent
+   OpenMP threads) would oversubscribe by a factor of N. Resolution:
+   full replacement of the old parallel-over-planes loop, not a
+   layering of the two strategies.
+2. A naive single-serial-pass redesign covering BOTH convolve and
+   reproject together would have been a real regression for
+   reproject-heavy files: `ast_resampler` (via `reproject_cubes`'s own
+   `reproject_compute` stage) has no internal threading of its own, so
+   reproject's existing parallel-over-planes strategy is the ONLY
+   source of its parallelism -- serializing it alongside convolve would
+   have silently made reproject-heavy runs slower, trading a real
+   existing speedup for one that doesn't apply to that stage.
+   Resolution: kept as two independent passes over each block's
+   planes, not one combined loop -- convolve always
+   serial-over-planes/threaded-within-plane (T28's new strategy,
+   regardless of whether it runs first or second), reproject always
+   parallel-over-planes exactly as before (T20's critical-section
+   AST setup, unchanged). Which pass runs first still follows the
+   existing `convolve_first_l`/`order=` config, matching the
+   pre-T28 ordering semantics exactly -- only the internal
+   parallelization strategy of each stage changed, not the pipeline's
+   observable behaviour.
+
+**Implementation notes:**
+- `Makefile`'s `FFTW_LIBS` gained `-lfftw3f_omp`; `tests/run_tests.sh`'s
+  standalone `gaussft_padding`/`gaussft_threading` build commands
+  needed the same library added separately (missed once, caught by a
+  link failure, fixed).
+- T22's per-file stage timers (`convolve_compute`/`reproject_compute`)
+  had to be re-added at all 5 call sites after being dropped during the
+  rewrite -- a self-caught regression, not something the two-pass
+  split intentionally changed.
+- A genuine bug was found (not by the user -- via a failing
+  integration test, `match_cubes stages=both order=convolve_reproject`)
+  and fixed during implementation: the original single combined
+  per-plane loop initialized `t_status = 0` once before AST's
+  "inherited status" convention was first used
+  (`call ast_begin(t_status)`; AST no-ops every call once its status
+  argument is non-zero, so a garbage initial value silently no-ops the
+  entire WCS/mapping setup without raising any visible error). Splitting
+  the combined loop into three separate `!$omp parallel` regions (T28's
+  two-pass structure) dropped this initialization from the two branches
+  that do reprojection, leaving `t_status` as uninitialized
+  thread-private stack garbage on entry -- confirmed directly via a
+  temporary debug print, which showed real AST error code `32` (and,
+  on one thread, uninitialized garbage `-311422384`) at the critical
+  section, despite both passes' own debug logs showing every plane
+  "done". Fixed by restoring `t_status = 0` immediately before each
+  branch's own `!$omp critical (ast_setup)` block.
+
+**Verification:** full suite, 143/143 (142 pre-existing + one new:
+`tests/test_gaussft_threading.f90`, wired in as section 49). The new
+test checks, against a 401x401 synthetic plane exercising the
+NaN-handling (`has_nan=.true.`) path: (1) `nthreads=4` output matches
+`nthreads=1` (max|diff|=0, i.e. bit-identical, not merely within
+tolerance); (2) `nthreads=4` run twice against the same FFTW plan is
+bit-identical (confirms the threaded decomposition is genuinely
+deterministic run-to-run, not just claimed so by FFTW's own
+documentation); (3) output is not degenerate (NaN block stays NaN,
+finite pixels present with a real positive peak). The
+`match_cubes stages=both order=convolve_reproject` scenario that
+surfaced the `t_status` bug above was independently re-verified by
+direct reproduction outside the test harness after the fix (exit code
+0, all four synthetic multi-band files processed and written).

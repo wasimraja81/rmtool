@@ -2271,7 +2271,7 @@ gfp_log="$OUT_DIR/test_gaussft_padding.log"
 if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
         -O3 -fopenmp -J"$OUT_DIR" \
         src/gaussft.f90 "$TESTS_DIR/test_gaussft_padding.f90" \
-        -o "$gfp_bin" -lfftw3 -lfftw3f 2>"$OUT_DIR/gaussft_padding_build.log"; then
+        -o "$gfp_bin" -lfftw3 -lfftw3f -lfftw3f_omp 2>"$OUT_DIR/gaussft_padding_build.log"; then
     if "$gfp_bin" > "$gfp_log" 2>&1; then
         while IFS= read -r line; do
             if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then
@@ -3280,6 +3280,37 @@ CFGEOF
     fi
 else
     skip "convolve_cubes or serial rm_synthesis binary not available; skipping NaN-handling regression test (T23)"
+fi
+
+# ---------------------------------------------------------------------------
+# 49. gaussft_mod: in-plane FFT threading (T28) matches single-threaded
+#     output, is run-to-run deterministic, and is not degenerate --
+#     see docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md's own T28 entry.
+# ---------------------------------------------------------------------------
+section "49. gaussft_mod: in-plane FFT threading (T28) matches nthreads=1, deterministic"
+
+gft_bin="$OUT_DIR/test_gaussft_threading"
+gft_log="$OUT_DIR/test_gaussft_threading.log"
+if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+        -O3 -fopenmp -J"$OUT_DIR" \
+        src/gaussft.f90 "$TESTS_DIR/test_gaussft_threading.f90" \
+        -o "$gft_bin" -lfftw3 -lfftw3f -lfftw3f_omp 2>"$OUT_DIR/gaussft_threading_build.log"; then
+    if OMP_NUM_THREADS=4 "$gft_bin" > "$gft_log" 2>&1; then
+        while IFS= read -r line; do
+            if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then
+                echo "  $line"
+            fi
+        done < "$gft_log"
+        if grep -q "^\[PASS\] test_gaussft_threading" "$gft_log"; then
+            pass "gaussft_mod in-plane threading: all checks passed"
+        else
+            fail "gaussft_mod in-plane threading: one or more checks failed (see $gft_log)"
+        fi
+    else
+        fail "gaussft_mod in-plane threading: program exited non-zero (see $gft_log)"
+    fi
+else
+    fail "gaussft_mod in-plane threading: build failed (see $OUT_DIR/gaussft_threading_build.log)"
 fi
 
 # ---------------------------------------------------------------------------

@@ -42,18 +42,40 @@ module gaussft_mod
    !!
    !! Split into plan/execute/destroy (rather than one self-contained
    !! call that plans its own FFTs, as the first version of this module
-   !! did) so a caller can parallelise across planes with OpenMP: FFTW's
-   !! planner functions are not thread-safe and must never run inside a
-   !! parallel region, but a single plan, once created, is safe to
-   !! EXECUTE concurrently from multiple threads via the "new-array
-   !! execute" form (sfftw_execute_dft with explicit in/out arguments,
-   !! as convolve_to_beam uses below) as long as each concurrent call
+   !! did): FFTW's planner functions are not thread-safe and must never
+   !! run inside a parallel region, so plan_convolution/
+   !! destroy_convolution_plan must always be called serially --
+   !! unchanged since this module's very first version.
+   !!
+   !! Parallelisation strategy (T28, docs/dev/MULTI_BAND_TOMOGRAPHY_
+   !! PLAN.md) -- CURRENT: convolve_to_beam is called SERIALLY, once per
+   !! plane, by its caller; the plan itself (see plan_convolution's own
+   !! nthreads argument) executes each transform using multiple threads
+   !! INTERNALLY (sfftw_plan_with_nthreads), and every other elementwise
+   !! step in convolve_to_beam is parallelised with its own !$omp
+   !! construct. Chosen over the alternative (many caller threads each
+   !! independently calling convolve_to_beam on their own plane) because
+   !! the alternative's per-thread memory cost multiplies by thread
+   !! count (T26 found this the hard way, on real ASKAP-scale data) --
+   !! this module's own working arrays are large enough, at real
+   !! resolution, that this dominates over near-linear-vs-sub-linear
+   !! scaling differences between the two strategies.
+   !!
+   !! HISTORICAL (pre-T28, still technically supported, just no longer
+   !! how this module's own callers use it): a single plan created with
+   !! nthreads=1 is safe to EXECUTE CONCURRENTLY from multiple caller
+   !! threads via the "new-array execute" form (sfftw_execute_dft with
+   !! explicit in/out arguments) as long as each concurrent call
    !! supplies its own distinct arrays -- true here, since image/
    !! image_out/the internal work arrays are all local to each call.
-   !! Verified directly (see this module's own test suite): 16 OpenMP
-   !! threads calling convolve_to_beam concurrently against the SAME
-   !! shared plan, each on its own image/beam pair, matches a serial
-   !! run of the same 16 calls exactly.
+   !! Verified directly (see this module's own test suite, at the time):
+   !! 16 OpenMP threads calling convolve_to_beam concurrently against
+   !! the SAME shared plan, each on its own image/beam pair, matched a
+   !! serial run of the same 16 calls exactly. Do NOT combine the two
+   !! strategies -- a plan created with nthreads>1, executed
+   !! concurrently by nthreads>1 caller threads, oversubscribes threads
+   !! by a factor of nthreads (each concurrent execute call would try to
+   !! internally fan out to nthreads threads of its own).
    use, intrinsic :: iso_fortran_env, only: dp => real64, sp => real32
    implicit none
    private
@@ -106,7 +128,7 @@ module gaussft_mod
 
 contains
 
-   subroutine plan_convolution(nx, ny, plan_fwd, plan_bwd, nx_pad, ny_pad)
+   subroutine plan_convolution(nx, ny, plan_fwd, plan_bwd, nx_pad, ny_pad, nthreads)
       !! Create the FFTW plans for an nx-by-ny transform, once, to be
       !! reused by every subsequent convolve_to_beam call for planes of
       !! this same size (the common case -- every plane of a cube, and
@@ -124,14 +146,47 @@ contains
       !! pass nx_pad/ny_pad back into every convolve_to_beam call for
       !! this plan (an image smaller than the plan's own transform size
       !! is zero-padded internally, and the result cropped back).
-      integer, intent(in) :: nx, ny
+      !!
+      !! nthreads (T28, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the
+      !! resulting plan EXECUTES using this many threads INTERNALLY for
+      !! every subsequent sfftw_execute_dft call against it
+      !! (sfftw_plan_with_nthreads, applies to plans created immediately
+      !! after the call, per FFTW's own documented global/thread-local
+      !! planning-time state). This is a DIFFERENT parallelisation
+      !! strategy than this module's original one (see the module
+      !! header comment, now historical): originally, ONE single-
+      !! threaded plan was executed CONCURRENTLY by many caller threads,
+      !! each on their own plane. Now, ONE thread calls
+      !! convolve_to_beam serially, once per plane, and the plan itself
+      !! fans out across nthreads threads for each transform. These are
+      !! MUTUALLY EXCLUSIVE strategies -- a caller must not do both at
+      !! once (nthreads>1 concurrent callers each executing an
+      !! nthreads>1-internally-threaded plan would oversubscribe
+      !! threads^2-fold). Pass nthreads=1 for the old concurrent-callers
+      !! usage pattern (behaves identically to before T28).
+      integer, intent(in) :: nx, ny, nthreads
       integer(kind=8), intent(out) :: plan_fwd, plan_bwd
       integer, intent(out) :: nx_pad, ny_pad
 
       complex(sp), allocatable :: scratch(:,:)
+      integer :: threads_ok
 
       nx_pad = next_fast_fft_size(nx)
       ny_pad = next_fast_fft_size(ny)
+
+      ! sfftw_init_threads is safe to call more than once (FFTW's own
+      ! documented behaviour -- subsequent calls are a no-op) so no
+      ! separate "call once globally" bookkeeping is needed here; this
+      ! is already called once per file (plan_convolution's own
+      ! existing per-file granularity), not per plane.
+      call sfftw_init_threads(threads_ok)
+      if (threads_ok.eq.0) then
+         write(*,'(A)') 'WARNING: sfftw_init_threads failed -- falling'//&
+         &' back to single-threaded FFT execution (nthreads=1).'
+         call sfftw_plan_with_nthreads(1)
+      else
+         call sfftw_plan_with_nthreads(max(1, nthreads))
+      endif
 
       ! FFTW_ESTIMATE plans don't depend on the array CONTENTS, or even
       ! specifically on the memory used here, only the shape -- every
@@ -278,8 +333,19 @@ contains
 
       status = 0
 
+      ! T28 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): convolve_to_beam
+      ! is now called SERIALLY, once per plane, by its caller (the
+      ! caller's own outer per-plane loop is no longer itself an
+      ! !$omp parallel do -- see T28) -- so every elementwise step below
+      ! is parallelised internally with its own !$omp construct, or it
+      ! would run single-threaded and give up the throughput the old
+      ! per-plane-per-thread design got for free. The FFT itself is
+      ! parallelised separately, via plan_convolution's own
+      ! sfftw_plan_with_nthreads (see there).
       allocate(nan_mask(nx, ny))
+      !$omp workshare
       nan_mask = ieee_is_nan(image)
+      !$omp end workshare
       has_nan = any(nan_mask)
 
       dx_rad = dx*deg2rad
@@ -304,6 +370,11 @@ contains
       call build_fftfreq(ny_pad, dy_rad, v)
 
       allocate(g_final(nx_pad, ny_pad))
+      ! T28: private(ur,vr,g_arg,ur_in,vr_in,dg_arg) -- each thread's own
+      ! per-(ix,iy) scratch, not shared state; u/v/cos_bpa/etc. stay
+      ! shared (read-only within this loop).
+      !$omp parallel do collapse(2) default(shared)&
+      !$omp& private(ix,iy,ur,vr,g_arg,ur_in,vr_in,dg_arg)
       do iy = 1, ny_pad
          do ix = 1, nx_pad
             ur = u(ix)*cos_bpa - v(iy)*sin_bpa
@@ -322,18 +393,27 @@ contains
             g_final(ix,iy) = cmplx(g_ratio * exp(cmplx(g_arg - dg_arg, 0.0_dp, dp)), kind=sp)
          enddo
       enddo
+      !$omp end parallel do
       deallocate(u, v)
 
       allocate(cimg(nx_pad, ny_pad))
+      !$omp workshare
       cimg = cmplx(0.0_sp, 0.0_sp, sp)
+      !$omp end workshare
       if (has_nan) then
+         !$omp workshare
          cimg(1:nx, 1:ny) = cmplx(merge(0.0_dp, image, nan_mask), 0.0_dp, sp)
+         !$omp end workshare
       else
+         !$omp workshare
          cimg(1:nx, 1:ny) = cmplx(image, 0.0_dp, sp)
+         !$omp end workshare
       endif
       call sfftw_execute_dft(plan_fwd, cimg, cimg)
 
+      !$omp workshare
       cimg = cimg*g_final
+      !$omp end workshare
 
       ! FFTW's transforms are unnormalised (forward then backward scales
       ! the result by nx_pad*ny_pad, same convention as numpy.fft.fft2/
@@ -348,12 +428,16 @@ contains
       if (.not. has_nan) then
          deallocate(g_final)
          call sfftw_execute_dft(plan_bwd, cimg, cimg)
+         !$omp workshare
          image_out = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
+         !$omp end workshare
          deallocate(cimg)
       else
          call sfftw_execute_dft(plan_bwd, cimg, cimg)
          allocate(c_d(nx, ny))
+         !$omp workshare
          c_d = real(cimg(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp)
+         !$omp end workshare
          deallocate(cimg)
 
          ! Convolve the 0/1 validity mask through the SAME kernel as the
@@ -364,23 +448,31 @@ contains
          ! for why g_ratio isn't unit gain -- so divide it out once here
          ! to get a clean 0..1 fraction.
          allocate(cmsk(nx_pad, ny_pad))
+         !$omp workshare
          cmsk = cmplx(0.0_sp, 0.0_sp, sp)
          cmsk(1:nx, 1:ny) = cmplx(merge(0.0_dp, 1.0_dp, nan_mask), 0.0_dp, sp)
+         !$omp end workshare
          call sfftw_execute_dft(plan_fwd, cmsk, cmsk)
+         !$omp workshare
          cmsk = cmsk*g_final
+         !$omp end workshare
          deallocate(g_final)
          call sfftw_execute_dft(plan_bwd, cmsk, cmsk)
 
          allocate(c_m(nx, ny))
+         !$omp workshare
          c_m = real(cmsk(1:nx, 1:ny), dp) / real(nx_pad*ny_pad, dp) / g_ratio
+         !$omp end workshare
          deallocate(cmsk)
 
          nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+         !$omp workshare
          where (c_m >= conv_nan_reject_frac)
             image_out = c_d/c_m
          elsewhere
             image_out = nanval
          endwhere
+         !$omp end workshare
          deallocate(c_d, c_m)
       endif
       deallocate(nan_mask)
