@@ -2976,10 +2976,15 @@ only a subset -- the normal case for `match_cubes`' own
 particular WALLABY+EMU run) should expect the RESTORED cubes
 specifically (not CLEAN, not RESID) to show artificially sharp/
 over-resolved peaks in any region with less-than-full band coverage,
-most visible where coverage drops to a single band. Concrete example on
-file: `scratch/rmclean_diag/overlays.png` (pixels `iy=455,ix=3061` and
-`iy=445,ix=8227`, both WALLABY-only) versus the 3 mixed-coverage
-pixels in the same figure, which don't show the mismatch as starkly.
+most visible where coverage drops to a single band. Concrete example
+(checked directly against the real run's own output; the diagnostic
+plot itself was a throwaway scratch file, not kept, but is trivially
+reproducible from `ampfile`/`RESTORED`/mask-cube pixel spectra at the
+same coordinates): two genuinely WALLABY-only pixels (`iy=455,ix=3061`
+and `iy=445,ix=8227`, confirmed `emu=0/288` in the mask cube) each
+showed a sharp central spike sitting on correctly-broad residual
+wings; three mixed-coverage pixels checked alongside them didn't show
+the mismatch as starkly.
 
 **Direction being considered (not committed, needs more design
 thought before implementing):** a per-line-of-sight restoring beam --
