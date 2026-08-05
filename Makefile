@@ -349,11 +349,14 @@ $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(R
 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o: $(SRCDIR)/rmclean_io_mod.f90 $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(RMCLEAN_CUBES_BUILDDIR) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
 
-$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o: $(SRCDIR)/rmclean_cubes.f90 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o: $(SRCDIR)/rmclean_cache_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o: $(SRCDIR)/rmclean_cubes.f90 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(RMCLEAN_CUBES_BUILDDIR) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
 
-$(RMCLEAN_CUBES_EXECUTABLE): $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS) -lpthread
+$(RMCLEAN_CUBES_EXECUTABLE): $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS) -lpthread
 	@echo "✓ Executable created: $@"
 
 install: $(EXECUTABLE)

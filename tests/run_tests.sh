@@ -3314,6 +3314,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 50. rmclean_cache_mod: standalone unit tests (T14, docs/dev/
+#     RMCLEAN_INTEGRATION_PLAN.md) -- FITS-free/FFTW-free pure-logic
+#     checks for the mask-pattern cache eviction support module, grown
+#     incrementally as T14's own increments land.
+# ---------------------------------------------------------------------------
+section "50. rmclean_cache_mod: standalone unit tests (T14)"
+
+rcm_bin="$OUT_DIR/test_rmclean_cache_mod"
+rcm_log="$OUT_DIR/test_rmclean_cache_mod.log"
+if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+        -O3 -fopenmp -J"$OUT_DIR" \
+        src/rmclean_cache_mod.f90 "$TESTS_DIR/test_rmclean_cache_mod.f90" \
+        -o "$rcm_bin" 2>"$OUT_DIR/rmclean_cache_mod_build.log"; then
+    if "$rcm_bin" > "$rcm_log" 2>&1; then
+        while IFS= read -r line; do
+            if [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* ]]; then
+                echo "  $line"
+            fi
+        done < "$rcm_log"
+        if grep -q "^\[PASS\] test_rmclean_cache_mod" "$rcm_log"; then
+            pass "rmclean_cache_mod: all checks passed"
+        else
+            fail "rmclean_cache_mod: one or more checks failed (see $rcm_log)"
+        fi
+    else
+        fail "rmclean_cache_mod: program exited non-zero (see $rcm_log)"
+    fi
+else
+    fail "rmclean_cache_mod: build failed (see $OUT_DIR/rmclean_cache_mod_build.log)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

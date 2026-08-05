@@ -121,6 +121,7 @@ program rmclean_cubes
    use logging_mod
    use fitsio_unit_mod
    use rmclean_io_mod
+   use rmclean_cache_mod, only: fnv1a_hash
    implicit none
 
    ! --- Logging & timing (planning-doc ticket) -- see convolve_cubes.f90
@@ -2416,26 +2417,6 @@ contains
          is_naxis_keyword = .true.
       endif
    end function is_naxis_keyword
-
-   function fnv1a_hash(bytes, n) result(h)
-      !! Standard 64-bit FNV-1a over a byte pattern (here: one pixel's
-      !! own valid-channel mask row, mask_tile(ix_l,iy_l,:)) -- used as the
-      !! bucket key for table_cache_entry_t below. Collisions are
-      !! possible (any hash is), so every lookup below ALSO does a full
-      !! byte-for-byte pattern compare on a hash match -- never trusts
-      !! the hash alone.
-      integer(kind=1), intent(in) :: bytes(n)
-      integer, intent(in) :: n
-      integer(kind=8) :: h
-      integer(kind=8), parameter :: fnv_offset = -3750763034362895579_8
-      integer(kind=8), parameter :: fnv_prime = 1099511628211_8
-      integer :: i
-      h = fnv_offset
-      do i = 1, n
-         h = ieor(h, int(bytes(i), 8))
-         h = h * fnv_prime
-      end do
-   end function fnv1a_hash
 
    subroutine cache_lookup_readonly(pattern, entry_idx)
       !! Open-addressing (linear probing) lookup into cache_buckets/
