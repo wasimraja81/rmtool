@@ -2935,3 +2935,70 @@ ancillary tools (`scripts/make_all.sh`), zero errors. Full suite:
 132/132, including the `rmclean_cubes: nwriters=1,2,4` bit-identical
 sections and the combined small-tile+`io_read_threads`+`nwriters`+
 `io_overlap` stress case -- both confirmed passing under the new name.
+
+### T13 -- Restoring beam is one global (finest/combined-band) FWHM, not per-line-of-sight (found on real multi-band data, documented -- not fixed, direction under consideration)
+
+**Found:** while eyeballing real dirty-vs-CLEAN overlays from the live
+WALLABY+EMU run (southern-Dec pixels, the only region CLEANed so far),
+two genuinely WALLABY-only pixels (`mask.CUBE` confirms `emu=0/288` for
+both) showed a visibly wrong RESTORED shape: a sharp, narrow central
+spike sitting on top of correctly-broad residual wings, rather than a
+single coherently-resolved peak. Traced directly in
+`src/rmclean_cubes.f90`:
+
+- **CLEAN itself is correct, per pixel.** The RMSF table actually used
+  for deconvolution (`build_rmsf_offset_table`, called from both the
+  mask-pattern-cache path and the one-off/throwaway path) is built from
+  `l_sq_valid_p` -- THAT pixel's own valid-channel subset (via
+  `mask_tile`), not the whole cube's channel list. Component positions/
+  amplitudes and the RESID cube genuinely reflect each pixel's own true
+  native resolution.
+- **The restoring beam does not.** `fwhm_rm` is computed exactly ONCE,
+  before the per-pixel loop even starts (`compute_rmsf_fwhm_multiband(
+  l_sq, nchan, ...)`, the FULL cube-wide channel list, `nchan=432` for
+  this run) and that same single scalar (42.005 rad/m^2 here -- matches
+  the rm_synthesis diagnostic's own `combined: delta_RM`) is passed to
+  `restore_clean` for EVERY pixel regardless of what that pixel's own
+  `mask_tile(ix_l,iy_l,:)` says. A WALLABY-only pixel's own true
+  resolution is ~308.7 rad/m^2 (band 1's own `delta_RM`, ~7.3x
+  coarser) -- restoring it with the combined-band beam reconvolves its
+  correctly-placed CLEAN components far too tightly, producing a peak
+  that looks sharper/better-resolved than that pixel's actual data
+  supports.
+
+**Decision (explicit, user's own call): this is not being fixed right
+now.** Recorded here as a known, documented behaviour with a real
+visible consequence, not silently left as an undiscovered gap. Users
+combining bands with genuinely different per-pixel channel coverage
+(any footprint where some sky positions see every band and others see
+only a subset -- the normal case for `match_cubes`' own
+`footprint_mode=union`/partial-overlap outputs, not just this
+particular WALLABY+EMU run) should expect the RESTORED cubes
+specifically (not CLEAN, not RESID) to show artificially sharp/
+over-resolved peaks in any region with less-than-full band coverage,
+most visible where coverage drops to a single band. Concrete example on
+file: `scratch/rmclean_diag/overlays.png` (pixels `iy=455,ix=3061` and
+`iy=445,ix=8227`, both WALLABY-only) versus the 3 mixed-coverage
+pixels in the same figure, which don't show the mismatch as starkly.
+
+**Direction being considered (not committed, needs more design
+thought before implementing):** a per-line-of-sight restoring beam --
+compute `fwhm_rm` from each pixel's own `l_sq_valid_p` (the exact same
+input already used to build that pixel's own RMSF table), the same
+way `compute_rmsf_fwhm_multiband` is currently called once globally
+from `l_sq`/`nchan`. Open questions before this becomes a real plan,
+not yet answered: whether to cache the per-pattern FWHM alongside the
+existing per-pattern RMSF table entry (same mask-pattern-cache
+mechanism already keys on the identical valid-channel pattern, so this
+looks like a natural extension rather than new machinery) or recompute
+it per pixel; whether a per-pixel-varying restoring beam across one
+output cube is itself the right convention to present to users (most
+radio-imaging tools assume one common restoring beam per image/cube --
+CASAMBM-style per-plane beam tables exist for the FREQUENCY axis in
+this package already, but nothing analogous exists for a
+per-*spatial-pixel* beam within a single plane); and how to record
+that varying beam in the output FITS header/metadata in a way a
+downstream reader could actually discover and use correctly (right now
+`fwhm_rm`'s single value could in principle be written to a header
+keyword; a genuinely per-pixel beam has no equivalent standard
+convention to fall back on).
