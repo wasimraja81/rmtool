@@ -58,6 +58,13 @@ resolution:
   real multi-hundred-GB cube sizes.
 - Beam metadata (`BMAJ`/`BMIN`/`BPA`) is carried faithfully through the
   whole chain, not silently dropped at any stage.
+- The resolution-matching step (convolution) processes one image plane
+  at a time, using several CPU cores to speed up that single plane
+  rather than handing whole planes to separate cores in parallel — so
+  peak memory use no longer grows with how many cores a run is given.
+  That's what makes a real multi-hundred-GB survey run practical on
+  ordinary hardware, and keeps the same code path usable on much
+  smaller machines too, down to something like a Raspberry Pi.
 
 ### RM-CLEAN deconvolution
 
@@ -89,19 +96,22 @@ plainly rather than blended into one blanket claim:
   iteration budget dropped from 99.05% to 0.00%, and a follow-up
   memory-management redesign was confirmed byte-for-byte identical to
   that fix on a full repeat run.
-- **Multi-band preprocessing is proven correct end-to-end, but only
-  against synthetic test data so far.** A dedicated test fixture with
-  deliberately mismatched sky grid and resolution is run through
-  `reproject_cubes`/`convolve_cubes`/`match_cubes`, and the known
-  injected sources are confirmed recovered at the correct RM afterward
-  — this exercises the real toolchain against a real mismatch, not a
-  no-op. What it has **not** yet done is process genuinely large real
-  multi-band data end-to-end. That run is planned as a near-term
-  follow-up (real ASKAP multi-band survey cubes, several hundred GB
-  total), deferred so far purely because of the disk space a real
-  output run needs — tracked as a known next step, not silently
-  skipped.
-- Full automated regression suite: 127/127, covering both feature
+- **Multi-band preprocessing is proven correct end-to-end against
+  synthetic test data, and has now also completed a genuine real-scale
+  run.** A dedicated test fixture with deliberately mismatched sky grid
+  and resolution is run through `reproject_cubes`/`convolve_cubes`/
+  `match_cubes`, and the known injected sources are confirmed recovered
+  at the correct RM afterward — this exercises the real toolchain
+  against a real mismatch, not a no-op. Beyond that, the full chain has
+  now also been run on genuine ASKAP survey data: two real bands
+  (a 144-channel WALLABY cube and a 288-channel EMU cube, ~563GB of
+  Stokes Q/U input between them) with different sky footprints and
+  different resolutions, matched onto one common grid/beam by
+  `match_cubes`, then merged by `rm_synthesis` into a single RM
+  synthesis run across all channels — completed successfully end to
+  end. RM-CLEAN against this same real multi-band output is the
+  immediate next step (see What's next).
+- Full automated regression suite: 143/143, covering both feature
   areas plus every tool's own parameter handling, I/O parallelism
   consistency, and GPU/CPU numerical agreement.
 
@@ -119,9 +129,9 @@ plainly rather than blended into one blanket claim:
 
 ## What's next
 
-- Real-scale validation of the multi-band preprocessing toolchain
-  against genuine, large ASKAP multi-band survey data (see Validation
-  above) — the immediate next priority.
+- Running RM-CLEAN against the real multi-band RM synthesis output
+  described above (see Validation) — closing out validation of the
+  full pipeline, not just its individual stages, at real scale.
 - Further CLEAN stopping-criteria work: detecting a peak residual that
   diverges or stalls without real progress, a case none of today's
   three stopping criteria catches on its own.
