@@ -3008,7 +3008,7 @@ downstream reader could actually discover and use correctly (right now
 keyword; a genuinely per-pixel beam has no equivalent standard
 convention to fall back on).
 
-### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Generational-Eviction Design Proposed (documented, NOT started -- user has explicitly asked to implement, waiting on their go-ahead before touching code)
+### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Offline-Optimal (Belady/OPT) Eviction via a Mask Pre-Scan (documented, IMPLEMENTATION APPROVED by the user -- proceed)
 
 **Found, while watching the live WALLABY+EMU `rmclean_cubes` run take much
 longer per block than expected (block 3: 73 min; block 4: still running
@@ -3093,56 +3093,126 @@ verification, not assumption:**
    (`if (nvalid_p.lt.1) ... return`), no RMSF table involved at all --
    so this proposal would not even be solving that part.
 
-2. **Generational (tile-recency) eviction -- assessed and
-   RECOMMENDED, this is what T14 is scoped to.** Directly targets the
-   confirmed mechanism (stale, never-evicted entries permanently
-   occupying slots that a spatially-drifted, currently-relevant pattern
-   set could use instead):
-   - Add one extra field to `table_cache_entry_t`
-     (`src/rmclean_cubes.f90:383-387`): a small integer,
-     "last-touched tile index."
-   - Update it ONLY from the already-serial per-tile pre-scan
-     (`update_mask_pattern_cache_for_tile`), which already performs a
-     lookup for every pixel in the tile (hit or miss) -- stamp
-     "last-touched = this tile's own index" on whichever entry each
-     pixel's pattern resolves to, whether that's a fresh insertion or
-     an existing hit. This requires NO change to the parallel per-pixel
-     lookup path (`cache_lookup_readonly`) at all -- it stays exactly
-     as lock-free as it is today (its own comment is explicit that
-     lock-freedom depends on nothing ever being written during the
-     parallel region).
-   - When the cache is full and a genuinely new pattern is
-     encountered: scan for an entry whose last-touched tile index is
-     more than some threshold behind the current tile; if found, evict
-     it (free the slot) and insert the new pattern there instead of
-     unconditionally discarding it (today's behaviour).
-   - If an evicted pattern's own pixels recur even later: no worse
-     than today -- cache miss, either re-inserted (if room) or falls
-     back to the existing one-off throwaway path.
-   - Does not change any numerical output -- a table is the same table
-     whether it comes from a cache hit or a fresh build; this is a
-     compute-time optimisation only, not a correctness change.
-   - Does not help genuinely, globally unique patterns (occurring
-     exactly once in the whole cube) -- no caching policy can.
+2. **Eviction, evolved through three iterations before landing on the
+   final design -- recorded here because the reasoning matters, not
+   just the endpoint:**
 
-**Open questions, explicitly not yet resolved (need real tuning, not
-guessing, before implementation):**
-- The eviction-staleness threshold (how many tiles "unused" before an
-  entry is eligible for eviction) is a real tuning parameter -- too
-  aggressive risks evicting something that would have been reused
-  within the next tile or two; too conservative barely improves on the
-  current 0% eviction rate. Should be chosen by testing against this
-  same real run's own data (or a similarly-diverse synthetic fixture),
-  not picked arbitrarily.
-- Whether eviction should also consider HIT COUNT (evict the
-  least-frequently-hit stale entry first, if multiple are eligible) or
-  simple recency alone is sufficient -- not yet decided.
-- Bookkeeping cost is expected to be negligible (one extra integer
-  compare/update per pixel during the already-existing serial
-  pre-scan, versus the ~72KiB/~3.9M-trig-evaluation cost of an actual
-  table rebuild it's trying to avoid) but should be confirmed with a
-  real before/after timing comparison, not assumed.
+   **(a) Generational (tile-recency) eviction, first proposed --
+   found insufficient.** Track a "last-touched tile index" per cache
+   entry, updated during the already-serial per-tile pre-scan; evict
+   whichever entry is stalest when the cache is full. Problem, caught
+   by the user directly: this only distinguishes BETWEEN tiles, so
+   within a single tile's own scan nothing ever looks stale relative
+   to anything else touched in that same tile -- and the measured
+   numbers show the bulk of the damage (1.75M of block 4's own 2.4M
+   pixels) happens WITHIN a single block whose own local diversity
+   (19,119 distinct patterns) already exceeds the 4096-slot cache on
+   its own, before any cross-block staleness even enters into it.
+   Tile-boundary-only eviction cannot fix a within-block deficit.
 
-**Status: documented only, not implemented.** The user has explicitly
-said they are happy to implement this but wants to give the go-ahead
-first -- do not start T14's own implementation without that signal.
+   **(b) Finer-grained hit-count eviction (LFU-style), proposed next
+   by the user -- fixes (a)'s granularity problem, but introduces a
+   new one.** Track a per-entry hit count (incremented during the same
+   serial per-tile pre-scan, no change to the parallel lookup path
+   needed), evict the least-hit entry when full. This is a genuine
+   improvement over (a): a global counter naturally handles within-tile
+   and cross-tile staleness identically, no special-casing needed.
+   But naive, undecayed hit counts have a classic, well-known failure
+   mode: a pattern dominant early (block 1-2's own WALLABY-only
+   pattern, plausibly hit millions of times) accumulates a count so
+   large it becomes functionally permanent, blocking out later,
+   currently-relevant patterns that haven't had time to accumulate
+   comparable counts yet -- silently reproducing the SAME "stuck
+   forever" failure this ticket exists to fix, just delayed. The
+   proposed fix (periodic decay, e.g. halve all counts every K tiles)
+   works, but introduces two real tuning parameters (decay fraction,
+   decay cadence) that would need deriving from data -- doable (a
+   grid-search backtest against the real mask cube's own access
+   sequence, weighted by each pattern's own rebuild cost, checking the
+   result isn't a fragile fit to this one dataset), but genuinely
+   requires tuning.
+
+   **(c) Offline-optimal (Belady/OPT) eviction via a mask pre-scan --
+   final design, no tuning required.** The key realization (user's
+   own): `maskfile` is a REQUIRED input to `rmclean_cubes` -- every
+   real invocation has the complete mask cube available before compute
+   starts. That means the entire future sequence of per-pixel pattern
+   accesses is fully known in advance, not merely estimated from past
+   behaviour -- this is exactly the classical OFFLINE caching setting,
+   for which Belady's algorithm (evict whichever cached entry's own
+   NEXT use is farthest in the future, or never recurs at all) is
+   PROVABLY optimal for a given cache size. No decay fraction, no
+   cadence, nothing to guess or backtest.
+   - **Pass 0 (new, runs once before the tile loop starts):** scan the
+     whole mask cube in the same final scan order the main run will
+     use (block-by-block, row-major within each tile -- identical
+     nesting to `update_mask_pattern_cache_for_tile`'s own
+     `do iy_l=1,ty_in / do ix_l=1,tx_in`). Hash each pixel's pattern
+     (same `fnv1a_hash` already in use) and build, per distinct
+     pattern, a sorted list of every future scan-position it occurs
+     at.
+   - **Pass 1 (the actual CLEAN run, mostly unchanged):** each cached
+     entry carries a pointer into its own pattern's occurrence list,
+     advancing naturally as the real scan encounters it -- O(1) "when
+     do I next need this" lookup, no per-eviction search required.
+   - **Admission control, a genuine refinement over textbook Belady,
+     not just an application of it:** textbook Belady assumes the
+     accessed item MUST be brought into the cache (true for CPU/VM
+     demand-paging, where the data must be resident to be read at
+     all) -- not true here. The current pixel's own table gets built
+     regardless of caching (a miss always costs a rebuild for THAT
+     occurrence); the only question caching answers is whether to KEEP
+     it afterward for possible reuse. So: only admit a newly-built
+     table into the cache (evicting the current farthest-next-use
+     entry) if the new pattern's own next occurrence is CLOSER than
+     that farthest-next-use entry's own -- otherwise, admitting would
+     evict something more valuable for a worse trade, so just discard
+     the freshly-built table after this one use (identical to today's
+     throwaway path for that specific occurrence, but without
+     disturbing the cache). Fully decidable from the same Pass-0
+     foreknowledge, no extra cost.
+   - **Why a DYNAMIC (time-varying) policy, not a simpler STATIC
+     "pick the best C patterns once" selection:** worth stating
+     explicitly since a static top-C-by-total-occurrence-count
+     selection is the natural simpler alternative and is provably
+     WORSE here. Patterns drift with declination -- a pattern dominant
+     in blocks 1-2 and a completely different one dominant in block 10
+     could each be worth caching in their own local window, but a
+     static selection could only ever keep one or the other for the
+     WHOLE run, not switch between them. Dynamic replacement captures
+     both; a static selection cannot.
+   - **Fallback (opt-out, for when a user doesn't want to pay the
+     Pass-0 I/O cost -- e.g. a quick/low-stakes run):** plain
+     hit-count-without-decay, (b) above minus the decay refinement.
+     Selecting the fallback skips Pass 0 entirely -- no point paying
+     that extra full read of the mask cube if its own output won't be
+     used. Belady/OPT is the DEFAULT; this is the explicit opt-out.
+   - Neither policy changes any numerical output -- a table is the
+     same table whether it's a cache hit or a fresh build; this is a
+     compute-time optimisation only. Neither helps genuinely,
+     globally-unique patterns (occurring exactly once in the whole
+     cube) -- no caching policy can.
+
+**Costs, to be measured, not assumed, before calling this done:**
+- Pass 0 reads the full mask cube a second time before compute starts
+  (~33.5GiB for this real run) -- a real, one-time I/O cost, expected
+  to be far smaller than what it eliminates (block 4 alone burned
+  hours on ~1.75M redundant rebuilds, each ~3.9M trig evaluations) but
+  should be timed directly, not assumed.
+- Per-pattern occurrence-list memory is expected to be small relative
+  to the RMSF-table cache itself (patterns number in the tens of
+  thousands, not millions) -- confirm with a real measurement once
+  implemented, not assumed.
+- `mask_pattern_cache_max` itself still needs a real value chosen (the
+  "moderate, not multi-GB" sizing discussion, ~72.3KiB/entry) --
+  Belady/OPT removes the need to tune eviction PARAMETERS, but does
+  not remove the need to pick a cache SIZE; that should still be
+  measured against the full 32-block mask (not just blocks 1-4) before
+  picking a number.
+
+**Status: implementation approved by the user (2026-08-05) --
+proceed.** Sequencing: Pass-0 pre-scan + Belady/OPT-with-admission as
+the default eviction policy; hit-count-without-decay as the opt-out
+fallback (skips Pass 0). Follow this project's own standing
+microscopic dev-test-dev-test discipline -- do not implement this as
+one large change.
