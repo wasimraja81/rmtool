@@ -2043,6 +2043,44 @@ PYEOF
         else
             fail "rmclean_cubes: mask-pattern cache comparison run(s) failed"
         fi
+
+        # T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): the comparison
+        # above never actually exercises eviction -- mask_pattern_
+        # cache_max=4096 comfortably fits rmc_varied's own true distinct-
+        # pattern count (757, confirmed via this same fixture's own
+        # "Mask-pattern cache: N distinct pattern(s) cached" log line).
+        # Force real eviction by setting the cache far below that count
+        # and confirm cache_eviction_policy=hitcount still gives
+        # bit-identical output vs caching disabled entirely -- eviction
+        # (like caching itself) must never change the numerical result,
+        # only how much redundant work it takes to get there.
+        rmc_cache_evict="$OUT_DIR/rmc_cache_evict"
+        rmc_cache_evict_log="$OUT_DIR/rmc_cache_evict.log"
+        if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
+                phafile="$OUT_DIR/rmc_lsqref.PHA.RMCUBE.FITS" \
+                maskfile="$rmc_varied_mask" outfile="$rmc_cache_evict" \
+                abs_flux_floor=0.01 niter=200 gain=0.1 \
+                mask_pattern_cache_max=100 cache_eviction_policy=hitcount \
+                > "$rmc_cache_evict_log" 2>&1; then
+            evict_ok=1
+            for suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA \
+                          RESTORED.AMP RESTORED.PHA; do
+                if ! cmp -s "${rmc_cache_evict}.${suffix}.RMCUBE.FITS" \
+                            "${rmc_cache_zero}.${suffix}.RMCUBE.FITS"; then
+                    evict_ok=0
+                    fail "rmclean_cubes: hitcount eviction (cache_max=100) vs no-cache differ on $suffix"
+                fi
+            done
+            [[ "$evict_ok" -eq 1 ]] && \
+                pass "rmclean_cubes: cache_eviction_policy=hitcount (forced eviction, cache_max=100 < 757 distinct patterns) bit-identical to cache disabled"
+            if grep -q "pixel(s) past" "$rmc_cache_evict_log"; then
+                fail "rmclean_cubes: hitcount eviction still fell back to the overflow/one-off path (see $rmc_cache_evict_log) -- eviction isn't actually engaging"
+            else
+                pass "rmclean_cubes: cache_eviction_policy=hitcount served every pattern via eviction, zero overflow fallbacks"
+            fi
+        else
+            fail "rmclean_cubes: cache_eviction_policy=hitcount forced-eviction run failed (see $rmc_cache_evict_log)"
+        fi
     else
         fail "rm_synthesis (lsq_ref_mode=mid, for rmclean_cubes test): run failed (see $rmc_lsqref_log)"
     fi

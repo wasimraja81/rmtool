@@ -121,7 +121,7 @@ program rmclean_cubes
    use logging_mod
    use fitsio_unit_mod
    use rmclean_io_mod
-   use rmclean_cache_mod, only: fnv1a_hash
+   use rmclean_cache_mod, only: fnv1a_hash, linear_scan_extreme
    implicit none
 
    ! --- Logging & timing (planning-doc ticket) -- see convolve_cubes.f90
@@ -392,6 +392,13 @@ program rmclean_cubes
       integer(kind=8) :: hash = 0_8
       integer(kind=1), allocatable :: pattern(:)
       type(rmsf_table_t) :: table
+      ! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): cache_eviction_
+      ! policy='hitcount' only -- counts lookups that hit this entry
+      ! (starts at 1 on insertion, since that first use IS a hit).
+      ! Least-frequently-used entry is the eviction candidate once the
+      ! cache is full. Unused under policy='belady' (see that policy's
+      ! own eviction logic instead).
+      integer(kind=8) :: hit_count = 0_8
    end type table_cache_entry_t
    type(table_cache_entry_t), allocatable :: cache_entries(:)
    integer, allocatable :: cache_buckets(:)
@@ -2462,6 +2469,16 @@ contains
       !! pattern was first seen --
       !! either way, the caller's own correct response is to build a
       !! one-off throwaway table (see clean_one_pixel).
+      !! T14: cache_buckets(slot)==-1 is a TOMBSTONE (a bucket slot
+      !! whose own cache_entries row has since been evicted and
+      !! overwritten by a DIFFERENT pattern, cache_eviction_policy=
+      !! 'hitcount'/'belady') -- standard open-addressing-with-deletion:
+      !! a tombstone must NOT stop the probe (the pattern being looked
+      !! up may still exist further along the same probe sequence,
+      !! exactly as if this were any other non-matching occupied slot),
+      !! and must never be dereferenced as a cache_entries index (-1 is
+      !! not a valid one). Only a genuinely empty slot (0) proves "not
+      !! cached, stop looking."
       integer(kind=1), intent(in) :: pattern(:)
       integer, intent(out) :: entry_idx
       integer(kind=8) :: h, probe
@@ -2473,11 +2490,13 @@ contains
       do tries = 1, n_cache_buckets
          slot = int(probe)
          if (cache_buckets(slot).eq.0) return
-         if (cache_entries(cache_buckets(slot))%hash.eq.h) then
-            if (size(cache_entries(cache_buckets(slot))%pattern).eq.size(pattern)) then
-               if (all(cache_entries(cache_buckets(slot))%pattern.eq.pattern)) then
-                  entry_idx = cache_buckets(slot)
-                  return
+         if (cache_buckets(slot).ne.-1) then
+            if (cache_entries(cache_buckets(slot))%hash.eq.h) then
+               if (size(cache_entries(cache_buckets(slot))%pattern).eq.size(pattern)) then
+                  if (all(cache_entries(cache_buckets(slot))%pattern.eq.pattern)) then
+                     entry_idx = cache_buckets(slot)
+                     return
+                  endif
                endif
             endif
          endif
@@ -2502,6 +2521,37 @@ contains
       n_overflow_pixels_total = 0
    end subroutine init_mask_pattern_cache
 
+   subroutine evict_cache_slot(victim_idx)
+      !! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): marks victim_idx's
+      !! OWN bucket entry as a TOMBSTONE (cache_buckets value -1) --
+      !! standard open-addressing-with-deletion. Relocates that bucket
+      !! slot by re-running victim_idx's own original insertion probe
+      !! (starting from its own stored hash) and stopping at the first
+      !! slot whose value literally equals victim_idx -- correct and
+      !! sufficient because that exact (slot -> victim_idx) association
+      !! was established once, at victim_idx's own original insertion,
+      !! and open-addressing linear probing is deterministic given a
+      !! fixed hash and an unchanged occupancy history; later tombstones
+      !! elsewhere don't affect this, since lookups already treat
+      !! tombstones as "keep probing," not "stop." Does NOT touch
+      !! cache_entries(victim_idx) itself -- the caller overwrites its
+      !! hash/pattern/table/hit_count immediately after this returns.
+      integer, intent(in) :: victim_idx
+      integer(kind=8) :: h, probe
+      integer :: tries, slot
+      h = cache_entries(victim_idx)%hash
+      probe = modulo(h, int(n_cache_buckets, 8))
+      do tries = 1, n_cache_buckets
+         slot = int(probe)
+         if (cache_buckets(slot).eq.victim_idx) then
+            cache_buckets(slot) = -1
+            return
+         endif
+         if (cache_buckets(slot).eq.0) exit ! shouldn't happen if invariants hold; defensive only
+         probe = modulo(probe+1, int(n_cache_buckets, 8))
+      enddo
+   end subroutine evict_cache_slot
+
    subroutine update_mask_pattern_cache_for_tile(tx_in, ty_in)
       !! T10b: serial pre-scan of ONE tile's own mask_tile(1:tx_in,
       !! 1:ty_in,:) subrange, called once per tile, right after that
@@ -2515,13 +2565,23 @@ contains
       !! reusable by any LATER tile (cache_entries/cache_buckets persist
       !! across calls, initialised once by init_mask_pattern_cache, not
       !! reset here).
+      !! T14: once the cache is full, a genuinely new pattern either
+      !! evicts an existing entry (cache_eviction_policy='hitcount':
+      !! least-hit-so-far; 'belady': not yet implemented, increment 8 --
+      !! still falls back to the pre-T14 overflow/one-off behaviour for
+      !! now) or, for 'belady' today, is simply not cached (unchanged
+      !! safety valve). Either way, target_slot is where the new
+      !! pattern's own table gets built -- a genuinely NEW cache row
+      !! (n_cache_entries incremented) or an EVICTED, now-reused one;
+      !! the actual insert logic below is identical either way.
       integer, intent(in) :: tx_in, ty_in
-      integer :: ix_l, iy_l, entry_idx
+      integer :: ix_l, iy_l, entry_idx, target_slot
       integer(kind=8) :: h, probe
       integer :: tries, slot
       integer :: nvalid_l
       integer, allocatable :: valid_idx_l(:)
       real(sp), allocatable :: l_sq_valid_l(:)
+      logical :: do_insert
 
       allocate(valid_idx_l(nchan), l_sq_valid_l(nchan))
 
@@ -2535,28 +2595,59 @@ contains
             do tries = 1, n_cache_buckets
                slot = int(probe)
                if (cache_buckets(slot).eq.0) exit
-               if (cache_entries(cache_buckets(slot))%hash.eq.h) then
-                  if (all(cache_entries(cache_buckets(slot))%pattern.eq.&
-                  &mask_tile(ix_l,iy_l,:))) then
-                     entry_idx = cache_buckets(slot)
-                     exit
+               if (cache_buckets(slot).ne.-1) then
+                  if (cache_entries(cache_buckets(slot))%hash.eq.h) then
+                     if (all(cache_entries(cache_buckets(slot))%pattern.eq.&
+                     &mask_tile(ix_l,iy_l,:))) then
+                        entry_idx = cache_buckets(slot)
+                        exit
+                     endif
                   endif
                endif
                probe = modulo(probe+1, int(n_cache_buckets, 8))
             enddo
-            if (entry_idx.ne.-1) cycle ! already cached (0 means bucket array full, handled below)
-
-            if (n_cache_entries.ge.mask_pattern_cache_max) then
-               n_overflow_pixels_total = n_overflow_pixels_total + 1
-               cycle ! safety valve: clean_one_pixel builds a throwaway table
+            if (entry_idx.ne.-1) then
+               cache_entries(entry_idx)%hit_count = cache_entries(entry_idx)%hit_count + 1_8
+               cycle ! already cached
             endif
 
-            n_cache_entries = n_cache_entries + 1
-            n_distinct_patterns_total = n_distinct_patterns_total + 1
-            cache_buckets(slot) = n_cache_entries
-            cache_entries(n_cache_entries)%hash = h
-            allocate(cache_entries(n_cache_entries)%pattern(nchan))
-            cache_entries(n_cache_entries)%pattern = mask_tile(ix_l,iy_l,:)
+            do_insert = .true.
+            if (n_cache_entries.ge.mask_pattern_cache_max) then
+               if (cache_eviction_policy.eq.'hitcount') then
+                  target_slot = linear_scan_extreme(&
+                  &cache_entries(1:n_cache_entries)%hit_count, n_cache_entries, .false.)
+                  call evict_cache_slot(target_slot)
+                  n_distinct_patterns_total = n_distinct_patterns_total + 1
+               else
+                  ! 'belady' -- eviction not implemented yet (T14
+                  ! increment 8); same overflow/one-off safety valve as
+                  ! before T14 for now.
+                  n_overflow_pixels_total = n_overflow_pixels_total + 1
+                  do_insert = .false.
+               endif
+            else
+               n_cache_entries = n_cache_entries + 1
+               target_slot = n_cache_entries
+               n_distinct_patterns_total = n_distinct_patterns_total + 1
+            endif
+            if (.not. do_insert) cycle
+
+            cache_entries(target_slot)%hash = h
+            if (allocated(cache_entries(target_slot)%pattern)) deallocate(cache_entries(target_slot)%pattern)
+            allocate(cache_entries(target_slot)%pattern(nchan))
+            cache_entries(target_slot)%pattern = mask_tile(ix_l,iy_l,:)
+            cache_entries(target_slot)%hit_count = 1_8
+
+            ! Bucket slot for target_slot: reuse either a genuinely
+            ! empty slot OR a tombstone left by an earlier eviction --
+            ! either is valid, per evict_cache_slot's own comment.
+            probe = modulo(h, int(n_cache_buckets, 8))
+            do tries = 1, n_cache_buckets
+               slot = int(probe)
+               if (cache_buckets(slot).eq.0 .or. cache_buckets(slot).eq.-1) exit
+               probe = modulo(probe+1, int(n_cache_buckets, 8))
+            enddo
+            cache_buckets(slot) = target_slot
 
             nvalid_l = 0
             do k = 1, nchan
@@ -2568,7 +2659,7 @@ contains
             l_sq_valid_l(1:nvalid_l) = l_sq(valid_idx_l(1:nvalid_l))
             call build_rmsf_offset_table(l_sq_valid_l(1:nvalid_l), nvalid_l,&
             &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
-            &table_oversample, cache_entries(n_cache_entries)%table)
+            &table_oversample, cache_entries(target_slot)%table)
          enddo
       enddo
 

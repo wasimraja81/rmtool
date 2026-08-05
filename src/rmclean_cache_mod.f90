@@ -8,9 +8,36 @@ module rmclean_cache_mod
    !! can). Pure Fortran -- no CFITSIO/OMP/config dependency.
    implicit none
    private
-   public :: fnv1a_hash
+   public :: fnv1a_hash, linear_scan_extreme
 
 contains
+
+   function linear_scan_extreme(values, n, find_max) result(idx)
+      !! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): 1-based index of
+      !! the smallest (find_max=.false.) or largest (find_max=.true.)
+      !! value in values(1:n); ties resolved to the LOWEST index
+      !! (deterministic, not an arbitrary tie-break). Shared by both
+      !! eviction policies: cache_eviction_policy='hitcount' scans
+      !! hit_count (find_max=.false., evict the least-used); 'belady'
+      !! scans each cached pattern's own next-occurrence position
+      !! (find_max=.true., evict whichever is needed furthest in the
+      !! future, or never again -- see rmclean_cubes.f90's own Belady
+      !! eviction call site for why a plain linear scan, not a
+      !! priority queue, is the deliberate choice here).
+      integer(kind=8), intent(in) :: values(n)
+      integer, intent(in) :: n
+      logical, intent(in) :: find_max
+      integer :: idx
+      integer :: i
+      idx = 1
+      do i = 2, n
+         if (find_max) then
+            if (values(i).gt.values(idx)) idx = i
+         else
+            if (values(i).lt.values(idx)) idx = i
+         endif
+      end do
+   end function linear_scan_extreme
 
    function fnv1a_hash(bytes, n) result(h)
       !! Standard 64-bit FNV-1a over a byte pattern (here: one pixel's
