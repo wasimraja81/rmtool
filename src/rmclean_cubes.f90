@@ -2867,6 +2867,17 @@ contains
       real(dp) :: bytes_per_table
       logical :: have_bytes_per_table
 
+      ! T15 follow-up: <outfile>.advisory.csv, one row per block, so a
+      ! standalone tool (scripts/plot_rmclean_advisory.py) can plot the
+      ! predicted table-GENERATION time per block without re-parsing
+      ! this program's own stdout text. Kept as a plain CSV rather than
+      ! auto-invoking a plotting script from here -- this binary has no
+      ! Python/matplotlib dependency anywhere else, and shelling out for
+      ! a diagnostic plot is a separate, explicitly deferred decision
+      ! (docs/dev/RMCLEAN_INTEGRATION_PLAN.md T15).
+      integer :: csv_unit, ios_csv
+      character(len=600) :: csv_path
+
       if (pattern_registry%n_entries.lt.1) return
       n_entries_tot = pattern_registry%n_entries
 
@@ -3167,6 +3178,19 @@ contains
       tot_hits = 0_8; tot_admitted = 0_8; tot_evicted = 0_8; tot_declined = 0_8
       tot_declined_singleton = 0_8; tot_declined_recurs = 0_8
       predicted_total_min = 0.0_dp
+
+      csv_path = trim(outfile)//'.advisory.csv'
+      open(newunit=csv_unit, file=trim(csv_path), status='replace',&
+      &action='write', iostat=ios_csv)
+      if (ios_csv.ne.0) then
+         write(*,'(A)') 'WARNING: could not open '//trim(csv_path)//&
+         &' for the T15 advisory CSV -- continuing without it.'
+      else
+         write(csv_unit,'(A)') 'block,hits,admitted,evicted_to_admit,'//&
+         &'declined_oneoff,declined_singleton,declined_recurs,'//&
+         &'ms_per_channel,predicted_build_min'
+      endif
+
       do b = 1, n_blocks
          tot_hits = tot_hits + int(block_hits(b), 8)
          tot_admitted = tot_admitted + int(block_admitted(b), 8)
@@ -3185,7 +3209,20 @@ contains
          &') measured=', block_ms_per_channel(b),&
          &' ms/channel -> predicted build time ~', predicted_block_min,&
          &' min.'
+         if (ios_csv.eq.0) then
+            write(csv_unit,'(I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,F0.4,A,F0.4)')&
+            &b, ',', block_hits(b), ',', block_admitted(b), ',',&
+            &block_evicted(b), ',', block_declined(b), ',',&
+            &block_declined_singleton(b), ',', block_declined_recurs(b),&
+            &',', block_ms_per_channel(b), ',', predicted_block_min
+         endif
       enddo
+      if (ios_csv.eq.0) then
+         close(csv_unit)
+         write(*,'(A)') 'Wrote '//trim(csv_path)//&
+         &' (per-block predicted table-generation time -- see'//&
+         &' scripts/plot_rmclean_advisory.py to plot it).'
+      endif
       write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A)') '  TOTAL (actual'//&
       &' mask_pattern_cache_max=', mask_pattern_cache_max, '): hits=', tot_hits,&
       &' admitted=', tot_admitted, ' (evicted-to-admit=', tot_evicted,&
@@ -3285,6 +3322,13 @@ contains
       integer, allocatable :: valid_idx_l(:)
       real(sp), allocatable :: l_sq_valid_l(:)
       logical :: do_insert
+      ! Debug-only, per-table-build timing (real production cost, not
+      ! T15's own artificial self-timing sample) -- log_message('debug',
+      ! ...) is a no-op below the configured log_level (single integer
+      ! compare before the critical section, see logging_mod.f90), so
+      ! this costs nothing when log_level != debug.
+      real(dp) :: t_table_build_start_l, t_table_build_ms_l
+      character(len=160) :: table_build_msg_l
       ! T14 increment 7: this pixel's own pattern_registry entry id,
       ! looked up fresh only when this pixel's pattern is NOT already a
       ! cache hit (see cache_entries(entry_idx)%registry_id's own
@@ -3443,9 +3487,15 @@ contains
                endif
             enddo
             l_sq_valid_l(1:nvalid_l) = l_sq(valid_idx_l(1:nvalid_l))
+            t_table_build_start_l = omp_get_wtime()
             call build_rmsf_offset_table(l_sq_valid_l(1:nvalid_l), nvalid_l,&
             &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
             &table_oversample, cache_entries(target_slot)%table)
+            t_table_build_ms_l = (omp_get_wtime()-t_table_build_start_l)*1000.0_dp
+            write(table_build_msg_l,'(A,I0,A,I0,A,F0.3)')&
+            &'table_build stage=cache_populate block=', tile_seq,&
+            &' nvalid=', nvalid_l, ' dur_ms=', t_table_build_ms_l
+            call log_message('debug','table_build',trim(table_build_msg_l))
          enddo
       enddo
 
@@ -3491,6 +3541,16 @@ contains
       real(sp) :: restored_re_p(nrm), restored_im_p(nrm)
       type(rmsf_table_t) :: throwaway_table
       logical :: used_throwaway
+      ! Debug-only per-table-build timing for the one-off/throwaway
+      ! path -- see update_mask_pattern_cache_for_tile's own comment on
+      ! why this is free when log_level != debug. This call site runs
+      ! NESTED inside the outer per-pixel !$omp parallel do, so
+      ! build_rmsf_offset_table's own internal parallel do is a no-op
+      ! here (nesting disabled) -- this measures that genuinely
+      ! single-threaded-in-practice cost, distinct from cache_populate's
+      ! own (not nested, really multi-threaded) cost above.
+      real(dp) :: t_table_build_start_p, t_table_build_ms_p
+      character(len=160) :: table_build_msg_p
 
       ix_g = ix0 + ix_l - 1
       iy_g = iy0 + iy_l - 1
@@ -3560,9 +3620,16 @@ contains
       call cache_lookup_readonly(mask_tile(ix_l,iy_l,:), entry_idx_p)
       used_throwaway = (entry_idx_p.eq.0)
       if (used_throwaway) then
+         t_table_build_start_p = omp_get_wtime()
          call build_rmsf_offset_table(l_sq_valid_p(1:nvalid_p), nvalid_p,&
          &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
          &table_oversample, throwaway_table)
+         t_table_build_ms_p = (omp_get_wtime()-t_table_build_start_p)*1000.0_dp
+         write(table_build_msg_p,'(A,I0,A,I0,A,I0,A,F0.3)')&
+         &'table_build stage=oneoff block=', tile_seq, ' tid=',&
+         &omp_get_thread_num(), ' nvalid=', nvalid_p,&
+         &' dur_ms=', t_table_build_ms_p
+         call log_message('debug','table_build',trim(table_build_msg_p))
       endif
 
       dirty_re_p = re_tile(ix_l,iy_l,:)

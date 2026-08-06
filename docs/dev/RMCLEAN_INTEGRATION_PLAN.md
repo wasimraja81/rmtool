@@ -3557,6 +3557,35 @@ EMU run:
   not have recovered any of that specific cost on this dataset (though
   this doesn't yet account for whether *evicted* -- not just declined
   -- patterns ever recur, a separate, unmeasured question).
+- **`<outfile>.advisory.csv`**: `report_build_time_advisory` now also
+  writes one CSV row per block (hits/admitted/evicted/declined counts,
+  measured ms/channel, predicted build minutes) alongside its stdout
+  text, so a standalone tool doesn't need to re-parse that text.
+  `scripts/plot_rmclean_advisory.py` (new, follows the existing
+  `scripts/plot_tile_async_swimlane.py` convention: Fortran writes
+  structured/parseable output, a separate committed Python script
+  plots it) reads this CSV and, optionally, a `log_level=debug` run
+  log (`thread_timing stage=clean` events) to overlay the predicted
+  table-generation curve against actual measured per-block total wall
+  time. Deliberately NOT auto-invoked from Fortran -- this binary has
+  no Python/matplotlib dependency anywhere else, and plotting stays a
+  separate, explicit step (confirmed with the user rather than
+  assumed). Real-run validation: on the live WALLABY+EMU run, the
+  overlay revealed CLEAN itself (not table generation) dominates the
+  edge-block (3-5, predicted 30-32) slowdown -- e.g. block 4's own
+  inferred CLEAN component is ~84 min against a predicted table-gen
+  cost of ~22 min -- strengthening the case for T17 below, which skips
+  CLEAN entirely for those pixels, not just their table build.
+- Also added debug-level (`log_level=debug`) per-table-build timing
+  (`table_build stage=cache_populate|oneoff`) at both REAL production
+  call sites (the serial, non-nested cache-population pass and the
+  nested one-off/throwaway fallback inside the per-pixel parallel
+  loop) -- real ground-truth per-call cost at production scale, distinct
+  from this ticket's own artificial self-timing sample, and distinct
+  between the two regimes (cache-population genuinely benefits from
+  `build_rmsf_offset_table`'s own internal parallel do since it isn't
+  nested; the one-off path is nested, so that internal parallelism is a
+  no-op there, same as production always sees).
 
 ### T17 -- `min_valid_chan_frac`: skip CLEANing pixels below a configurable channel-coverage threshold
 
