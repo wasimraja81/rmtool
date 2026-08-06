@@ -211,7 +211,7 @@ program rmclean_cubes
    ! at least one valid channel is CLEANed, today's original
    ! behaviour), matching abs_flux_floor's own "0.0 = inert" precedent
    ! elsewhere in this file.
-   real(sp) :: min_valid_frac
+   real(sp) :: min_valid_chan_frac
 
    ! --- T4b: io_read_threads (planning/RMCLEAN_INTEGRATION_PLAN.md T4) ---
    ! Same scheme/key name/clamping convention as rm_synthesis's own
@@ -897,7 +897,7 @@ contains
       tile_dec = 0
       tile_auto = .true.
       mem_frac_ram = 0.25_sp
-      min_valid_frac = 0.0_sp
+      min_valid_chan_frac = 0.0_sp
       io_read_threads = 1
       nwriters = 1
       io_overlap = .false.
@@ -1151,10 +1151,10 @@ contains
             status = -1
             return
          endif
-      case ('min_valid_frac')
-         read(val, *, iostat=ios) min_valid_frac
-         if (ios.ne.0 .or. min_valid_frac.lt.0.0_sp .or. min_valid_frac.gt.1.0_sp) then
-            write(*,*) 'ERROR: min_valid_frac must be >= 0 and <= 1'
+      case ('min_valid_chan_frac')
+         read(val, *, iostat=ios) min_valid_chan_frac
+         if (ios.ne.0 .or. min_valid_chan_frac.lt.0.0_sp .or. min_valid_chan_frac.gt.1.0_sp) then
+            write(*,*) 'ERROR: min_valid_chan_frac must be >= 0 and <= 1'
             status = -1
             return
          endif
@@ -1253,7 +1253,7 @@ contains
       &'|max|mid|fixed] [lsq_ref_compute_value=<v>]'
       write(*,'(A)') '    [mask_pattern_cache_max=<n>]'//&
       &' [cache_eviction_policy=belady|hitcount] [mem_frac_ram=<f>]'//&
-      &' [min_valid_frac=<f>]'//&
+      &' [min_valid_chan_frac=<f>]'//&
       &' [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]'//&
       &' [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]'
       write(*,'(A)') '   or: rmclean_cubes --config <cfgfile>'
@@ -1345,7 +1345,7 @@ contains
       &' working set (2 input + 6 output RM-depth arrays per pixel) --'//&
       &' same scheme/key name as rm_synthesis''s own mem_frac_ram'//&
       &' (planning ticket T4).'
-      write(*,'(A)') 'min_valid_frac (default 0.0, i.e. off): pixels'//&
+      write(*,'(A)') 'min_valid_chan_frac (default 0.0, i.e. off): pixels'//&
       &' whose own valid-channel fraction (summed across ALL bands,'//&
       &' out of the full channel count) falls below this are never'//&
       &' CLEANed -- output NaN across every RM-bin instead. 0.0 means'//&
@@ -2708,9 +2708,9 @@ contains
                ! bookkeeping would silently diverge from Pass 1's own
                ! actual visit order (the one property T14's own Belady
                ! eviction decisions absolutely depend on).
-               if (min_valid_frac.gt.0.0_sp .and.&
+               if (min_valid_chan_frac.gt.0.0_sp .and.&
                &real(count(mask_tile(ix_l,iy_l,:).ne.0_1), sp).lt.&
-               &min_valid_frac*real(nchan, sp)) cycle
+               &min_valid_chan_frac*real(nchan, sp)) cycle
                scan_pos = scan_pos + 1_8
                call registry_lookup_or_insert(pattern_registry,&
                &mask_tile(ix_l,iy_l,:), nchan, scan_pos, entry_id)
@@ -2989,9 +2989,9 @@ contains
                ! looking it up here would hit the "not found" case
                ! below for a reason that has nothing to do with a real
                ! bug.
-               if (min_valid_frac.gt.0.0_sp .and.&
+               if (min_valid_chan_frac.gt.0.0_sp .and.&
                &real(count(mask_tile(ix_l,iy_l,:).ne.0_1), sp).lt.&
-               &min_valid_frac*real(nchan, sp)) cycle
+               &min_valid_chan_frac*real(nchan, sp)) cycle
                call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:),&
                &nchan, entry_id)
                if (entry_id.lt.1) cycle ! defensive: should never happen
@@ -3311,9 +3311,9 @@ contains
             ! will be skipped entirely in clean_one_pixel too (which
             ! applies the exact same threshold independently), so
             ! building/caching a table for it here would be pure waste.
-            if (min_valid_frac.gt.0.0_sp .and.&
+            if (min_valid_chan_frac.gt.0.0_sp .and.&
             &real(count(mask_tile(ix_l,iy_l,:).ne.0_1), sp).lt.&
-            &min_valid_frac*real(nchan, sp)) cycle
+            &min_valid_chan_frac*real(nchan, sp)) cycle
 
             h = fnv1a_hash(mask_tile(ix_l,iy_l,:), nchan)
             probe = modulo(h, int(n_cache_buckets, 8))
@@ -3521,8 +3521,8 @@ contains
          return
       endif
 
-      if (min_valid_frac.gt.0.0_sp .and.&
-      &real(nvalid_p, sp).lt.min_valid_frac*real(nchan, sp)) then
+      if (min_valid_chan_frac.gt.0.0_sp .and.&
+      &real(nvalid_p, sp).lt.min_valid_chan_frac*real(nchan, sp)) then
          ! T17 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): below the
          ! configured coverage threshold -- UNLIKE the nvalid_p<1 case
          ! above, the dirty spectrum here is real, non-NaN data (this

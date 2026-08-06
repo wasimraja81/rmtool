@@ -3549,7 +3549,7 @@ EMU run:
   this doesn't yet account for whether *evicted* -- not just declined
   -- patterns ever recur, a separate, unmeasured question).
 
-### T17 -- `min_valid_frac`: skip CLEANing pixels below a configurable channel-coverage threshold
+### T17 -- `min_valid_chan_frac`: skip CLEANing pixels below a configurable channel-coverage threshold
 
 **Motivation:** live diagnosis of the real WALLABY+EMU run's own
 diversity (T15's advisory plus an ad hoc heatmap analysis, both this
@@ -3570,10 +3570,10 @@ fwhm_multiband`). User's proposal: stop paying full CLEAN cost for
 pixels whose own science value is already compromised by sparse
 coverage.
 
-**Design:** `min_valid_frac` (real, default `0.0` = off, same
+**Design:** `min_valid_chan_frac` (real, default `0.0` = off, same
 `_frac`-fraction-value naming convention as `mem_frac_ram`, same
 "0.0 = inert" precedent as `abs_flux_floor`). A pixel whose own valid-
-channel count (summed across ALL bands) falls below `min_valid_frac x
+channel count (summed across ALL bands) falls below `min_valid_chan_frac x
 nchan` is:
 - never registered in Pass 0's pattern registry (`run_pattern_
   prescan`) -- keeps Pass-0/Pass-1 scan-position bookkeeping in sync,
@@ -3593,7 +3593,7 @@ nchan` is:
   it through would silently present un-CLEANed dirty data as if it
   were a real CLEAN/RESID/RESTORED result.
 
-The SAME threshold check (`count(mask_tile.ne.0) < min_valid_frac x
+The SAME threshold check (`count(mask_tile.ne.0) < min_valid_chan_frac x
 nchan`) is applied independently, identically, at all four call sites
 above -- not derived from a shared helper, to avoid adding a new
 cross-cutting abstraction for a one-line comparison already computed
@@ -3602,7 +3602,7 @@ site.
 
 **Verified:** on a synthetic fixture with known per-pixel flag counts
 (20 prototype patterns, 1-4 of 200 channels flipped each, exact counts
-known from the generating script), `min_valid_frac=0.99` (skip any
+known from the generating script), `min_valid_chan_frac=0.99` (skip any
 pixel with >2 flagged channels) kept exactly the 10 prototypes with
 <=2 flags -- cross-checked by hand from the pixel-to-prototype
 assignment (2 "early" + 8 "late" prototypes survive, ~10 + ~65 pixels
@@ -3629,7 +3629,7 @@ not redundant with this ticket's own coverage-fraction skip.
 kept-pixel count matching the known per-prototype flag counts, and
 kept pixels bit-identical to the no-threshold baseline across all 6
 outputs). Not yet run against the real WALLABY+EMU data -- that real-
-data validation (picking a real `min_valid_frac` value informed by the
+data validation (picking a real `min_valid_chan_frac` value informed by the
 flagged-fraction map) is a separate, follow-up step.
 
 ### T18 -- subimage/subcube reading for `rmclean_cubes` (NOT STARTED -- flagged as a TODO, not scoped)

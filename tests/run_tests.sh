@@ -3718,16 +3718,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 55. rmclean_cubes: min_valid_frac coverage-threshold pixel skip (T17,
+# 55. rmclean_cubes: min_valid_chan_frac coverage-threshold pixel skip (T17,
 #     docs/dev/RMCLEAN_INTEGRATION_PLAN.md). Reuses the same 20-
 #     prototype adversarial fixture generator as section 54, but this
 #     time the check that matters is each prototype's own KNOWN
 #     nflip count (1-4 of nchan flagged, fixed by the seeded RNG) --
-#     min_valid_frac=0.99 (nchan=200 -> skip any pixel with >2 flagged)
+#     min_valid_chan_frac=0.99 (nchan=200 -> skip any pixel with >2 flagged)
 #     should keep exactly the prototypes with nflip<=2 and skip the
 #     rest, with NaN written to every RM-bin of every skipped pixel.
 # ---------------------------------------------------------------------------
-section "55. rmclean_cubes: min_valid_frac coverage-threshold pixel skip"
+section "55. rmclean_cubes: min_valid_chan_frac coverage-threshold pixel skip"
 
 if [[ -x bin/rmclean_cubes && -f "$rmc_lsqref_amp" && -f "$cep_pha" ]]; then
     t17_mask="$OUT_DIR/rmc_t17_kpat.MASK.CUBE.FITS"
@@ -3763,7 +3763,7 @@ with fits.open(src) as hdul:
             data[:, iy, ix] = row
     hdul.writeto(dst, overwrite=True)
 
-    # Expected KEPT pixel count at min_valid_frac=0.99 (nchan=200,
+    # Expected KEPT pixel count at min_valid_chan_frac=0.99 (nchan=200,
     # threshold keeps nflip<=2): replay the exact same i->prototype
     # assignment used above.
     kept_protos = set(p for p, nf in enumerate(nflips) if nf <= 2)
@@ -3782,7 +3782,7 @@ PYEOF
     if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
             maskfile="$t17_mask" outfile="$t17_thresh" \
             abs_flux_floor=0.01 niter=200 gain=0.1 \
-            cache_eviction_policy=belady min_valid_frac=0.99 \
+            cache_eviction_policy=belady min_valid_chan_frac=0.99 \
             > "$OUT_DIR/rmc_t17_thresh.log" 2>&1 && \
        bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
             maskfile="$t17_mask" outfile="$t17_baseline" \
@@ -3791,11 +3791,11 @@ PYEOF
             > "$OUT_DIR/rmc_t17_baseline.log" 2>&1; then
 
         t17_reported_kept=$(grep -oP 'CLEANed \K[0-9]+(?= pixels)' "$OUT_DIR/rmc_t17_thresh.log" || true)
-        echo "  min_valid_frac=0.99: expected kept=$t17_expected_kept, reported kept=$t17_reported_kept"
+        echo "  min_valid_chan_frac=0.99: expected kept=$t17_expected_kept, reported kept=$t17_reported_kept"
         if [[ "$t17_reported_kept" == "$t17_expected_kept" ]]; then
-            pass "rmclean_cubes: min_valid_frac=0.99 keeps exactly the expected pixel count ($t17_expected_kept), matching the known per-prototype flag counts"
+            pass "rmclean_cubes: min_valid_chan_frac=0.99 keeps exactly the expected pixel count ($t17_expected_kept), matching the known per-prototype flag counts"
         else
-            fail "rmclean_cubes: min_valid_frac=0.99 kept $t17_reported_kept pixels, expected $t17_expected_kept (see $OUT_DIR/rmc_t17_thresh.log)"
+            fail "rmclean_cubes: min_valid_chan_frac=0.99 kept $t17_reported_kept pixels, expected $t17_expected_kept (see $OUT_DIR/rmc_t17_thresh.log)"
         fi
 
         if python3 - "$t17_thresh" "$t17_baseline" "$t17_expected_kept" <<'PYEOF'
@@ -3827,16 +3827,16 @@ if ok:
 sys.exit(0 if ok else 1)
 PYEOF
         then
-            pass "rmclean_cubes: min_valid_frac NaN placement matches expected skip count, and kept pixels are bit-identical to the no-threshold baseline (all 6 outputs)"
+            pass "rmclean_cubes: min_valid_chan_frac NaN placement matches expected skip count, and kept pixels are bit-identical to the no-threshold baseline (all 6 outputs)"
         else
-            fail "rmclean_cubes: min_valid_frac output verification failed (see above)"
+            fail "rmclean_cubes: min_valid_chan_frac output verification failed (see above)"
         fi
     else
-        fail "rmclean_cubes: min_valid_frac test run(s) failed (see $OUT_DIR/rmc_t17_*.log)"
+        fail "rmclean_cubes: min_valid_chan_frac test run(s) failed (see $OUT_DIR/rmc_t17_*.log)"
     fi
     rm -f "${t17_thresh}".*.FITS "${t17_baseline}".*.FITS "$t17_mask"
 else
-    skip "rmclean_cubes: min_valid_frac check skipped (bin/rmclean_cubes or section 51's own fixtures not available)"
+    skip "rmclean_cubes: min_valid_chan_frac check skipped (bin/rmclean_cubes or section 51's own fixtures not available)"
 fi
 
 # ---------------------------------------------------------------------------
