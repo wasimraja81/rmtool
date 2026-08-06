@@ -492,7 +492,12 @@ a per-block, per-total estimate of table-*generation* time only (never
 CLEAN time, which depends on the sky and can't be predicted from the
 mask alone), derived from a full Belady-cache simulation plus a small
 per-block timing sample — not just a naive "first occurrence" count.
-Informational only; it does not affect the run.
+Informational only; it does not affect the run. It also writes
+`<outfile>.advisory.csv` (one row per block) — fine-grained enough to
+drive `scripts/plot_rmclean_advisory.py`'s predicted-vs-actual plot,
+useful for checking a run's real progress against what Pass 0 expected
+(`--csv` is auto-detected from a `log_level=debug` run log via
+`--actual-log` alone, no need to locate the CSV by hand).
 
 **Memory/tiling (identical scheme/defaults to `rm_synthesis`, now covering the mask cube too — see `docs/user/PARALLELISM.md`):**
 
