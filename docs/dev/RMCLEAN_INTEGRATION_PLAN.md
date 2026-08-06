@@ -3010,6 +3010,15 @@ convention to fall back on).
 
 ### T14 -- Mask-Pattern Cache Has No Eviction: Real Compute Waste on the WALLABY+EMU Run, Offline-Optimal (Belady/OPT) Eviction via a Mask Pre-Scan (DONE -- Phase A/LFU fallback and Phase B/Belady both implemented, tested, Belady is the default)
 
+**Attribution:** "Belady" here is L. A. Belady's offline-optimal
+page-replacement algorithm (also called OPT or MIN) -- L. A. Belady,
+"A Study of Replacement Algorithms for a Virtual-Storage Computer,"
+*IBM Systems Journal*, vol. 5, no. 2, pp. 78-101, 1966. Everything in
+this ticket beyond the base algorithm itself (the admission-control
+refinement, the whole-mask-cube Pass-0 pre-scan that supplies the
+lookahead, the cache-size sweep in T15) is this project's own
+extension on top of it, not part of the original paper.
+
 **Found, while watching the live WALLABY+EMU `rmclean_cubes` run take much
 longer per block than expected (block 3: 73 min; block 4: still running
 after 4+ hours):** the mask-pattern cache (T10b, `mask_pattern_cache_max`,

@@ -411,7 +411,8 @@ bin/rmclean_cubes ampfile=<f> phafile=<f> maskfile=<f> outfile=<base>
     [trace_ix=<n>] [trace_iy=<n>] [log_every=<n>]
     [lsq_ref_report_mode=intrinsic|centroid|min|max|mid|fixed] [lsq_ref_report_value=<v>]
     [lsq_ref_compute_mode=native|zero|centroid|min|max|fixed] [lsq_ref_compute_value=<v>]
-    [mask_pattern_cache_max=<n>] [mem_frac_ram=<f>] [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]
+    [mask_pattern_cache_max=<n>] [cache_eviction_policy=belady|hitcount] [min_valid_chan_frac=<f>]
+    [mem_frac_ram=<f>] [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]
     [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]
     [log_level=<level>] [timing_enabled=y|n] [log_output_file=<path>]
 bin/rmclean_cubes --config <cfgfile>
@@ -472,9 +473,26 @@ printed saying so.
 
 **Mask-pattern cache:**
 
+`belady` is L. A. Belady's offline-optimal page-replacement algorithm
+(also called OPT/MIN) — L. A. Belady, "A Study of Replacement
+Algorithms for a Virtual-Storage Computer," *IBM Systems Journal*,
+vol. 5, no. 2, pp. 78–101, 1966. The admission-control refinement and
+the whole-mask-cube pre-scan that supplies its lookahead are this
+project's own addition on top of that algorithm.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `mask_pattern_cache_max` | `4096` | Pixels sharing the same valid-channel mask pattern share one RMSF table, built once during an incremental per-tile pre-scan; past this many distinct patterns, additional patterns fall back to a one-off table per pixel (a performance safety valve, not a correctness issue). |
+| `cache_eviction_policy` | `belady` | `belady\|hitcount` — which cached pattern to evict once `mask_pattern_cache_max` is reached, rather than simply refusing new entries. `belady`: offline-optimal, informed by a one-time whole-mask-cube pre-scan (Pass 0) that evicts whichever cached pattern isn't needed again for the longest time (or ever) — no tuning parameter, provably the best possible for a given cache size. `hitcount`: a plain least-frequently-used fallback needing no pre-scan — cheaper to start, but not competitive with `belady`; an opt-out, not the recommended choice. Pass 0 has its own safety valve: if distinct patterns exceed 10% of total image pixels (too little reuse for a lookahead cache to be worth its cost), it aborts with a warning and falls back to `hitcount` for that run. |
+| `min_valid_chan_frac` | `0.0` (off) | Pixels whose own valid-channel fraction (summed across ALL bands, out of the full channel count) falls below this are never CLEANed — output NaN across every RM-bin instead. `0.0` means every pixel with at least 1 valid channel is CLEANed (original behaviour); e.g. `0.7` skips any pixel with less than 70% of channels valid. Sparse-coverage pixels have a coarser/noisier RMSF regardless of compute spent on them, so skipping them saves real time — the skipped pixels are also never registered in Pass 0's pattern registry or the runtime cache. |
+
+When `cache_eviction_policy=belady`, Pass 0 finishes by printing a
+**build-time advisory** (to both stdout and `log_output_file` if set):
+a per-block, per-total estimate of table-*generation* time only (never
+CLEAN time, which depends on the sky and can't be predicted from the
+mask alone), derived from a full Belady-cache simulation plus a small
+per-block timing sample — not just a naive "first occurrence" count.
+Informational only; it does not affect the run.
 
 **Memory/tiling (identical scheme/defaults to `rm_synthesis`, now covering the mask cube too — see `docs/user/PARALLELISM.md`):**
 
