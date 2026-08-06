@@ -400,6 +400,15 @@ program rmclean_cubes
    ! table_cache_entry_t's own comment.
    type :: table_cache_entry_t
       integer(kind=8) :: hash = 0_8
+      ! T14 increment 9: allocated (holds this slot's own pattern
+      ! bytes) under cache_eviction_policy='hitcount' only -- the only
+      ! policy under which no registry exists to hold them instead.
+      ! Under 'belady', this stays UNALLOCATED: the same bytes already
+      ! live in pattern_registry%entries(registry_id)%pattern (Pass 0
+      ! put them there before Pass 1 ever runs), so storing a second
+      ! copy here would be pure duplication -- registry_id below
+      ! reaches them instead, via cached_pattern_matches, the one place
+      ! either lookup site compares a cached entry's own pattern.
       integer(kind=1), allocatable :: pattern(:)
       type(rmsf_table_t) :: table
       ! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): cache_eviction_
@@ -762,6 +771,24 @@ program rmclean_cubes
       write(*,'(A,I0,A)') '  (', n_overflow_pixels_total, ' pixel(s) past'//&
       &' mask_pattern_cache_max fall back to a one-off table each)'
    endif
+   ! T14 increment 9: direct, printed evidence for the actual point of
+   ! this increment -- how many resident cache slots still carry their
+   ! own local pattern-bytes copy. Expected 0 under belady (every
+   ! slot's own pattern lives in the registry instead) and equal to
+   ! n_cache_entries under hitcount (no registry exists to delegate to,
+   ! so every slot must keep its own copy) -- printed rather than
+   ! silently assumed, so a real regression here doesn't hide invisibly
+   ! behind otherwise-passing correctness tests.
+   block
+      integer :: n_pattern_allocated, kk
+      n_pattern_allocated = 0
+      do kk = 1, n_cache_entries
+         if (allocated(cache_entries(kk)%pattern)) n_pattern_allocated = n_pattern_allocated + 1
+      enddo
+      write(*,'(A,I0,A,I0,A)') '  (pattern bytes locally stored for ',&
+      &n_pattern_allocated, ' of ', n_cache_entries, ' resident cache'//&
+      &' slot(s) -- 0 expected under cache_eviction_policy=belady)'
+   end block
    write(*,'(A,I0,A)') 'CLEANed ', n_pixels_done, ' pixels.'
    if (n_stopped_niter+n_stopped_abs_flux+n_stopped_auto_nsigma .gt. 0_8) then
       block
@@ -2486,6 +2513,36 @@ contains
       endif
    end function is_naxis_keyword
 
+   function cached_pattern_matches(cidx, pattern) result(matches)
+      !! T14 increment 9: whether cache slot cidx's own pattern equals
+      !! pattern -- the single place both cache-lookup sites
+      !! (cache_lookup_readonly and update_mask_pattern_cache_for_tile's
+      !! own inline lookup) go to compare a cached entry's pattern,
+      !! since WHERE that pattern's bytes actually live depends on
+      !! cache_eviction_policy (see table_cache_entry_t's own pattern(:)
+      !! comment): 'hitcount' reads cache_entries(cidx)%pattern
+      !! directly (the only place those bytes are stored); 'belady'
+      !! reads pattern_registry%entries(cache_entries(cidx)%registry_id)
+      !! %pattern instead -- the SAME bytes already live there (Pass 0
+      !! put them there), so the cache slot never duplicates them.
+      !! PURE READ access (cache_eviction_policy is fixed for the whole
+      !! run by the time this is ever called, and pattern_registry is
+      !! never mutated during the parallel CLEAN loop), safe to call
+      !! concurrently, same as cache_lookup_readonly itself.
+      integer, intent(in) :: cidx
+      integer(kind=1), intent(in) :: pattern(:)
+      logical :: matches
+      integer :: rid
+      if (cache_eviction_policy.eq.'belady') then
+         rid = cache_entries(cidx)%registry_id
+         matches = size(pattern_registry%entries(rid)%pattern).eq.size(pattern)
+         if (matches) matches = all(pattern_registry%entries(rid)%pattern.eq.pattern)
+      else
+         matches = size(cache_entries(cidx)%pattern).eq.size(pattern)
+         if (matches) matches = all(cache_entries(cidx)%pattern.eq.pattern)
+      endif
+   end function cached_pattern_matches
+
    subroutine cache_lookup_readonly(pattern, entry_idx)
       !! Open-addressing (linear probing) lookup into cache_buckets/
       !! cache_entries -- PURE READ access, safe to call concurrently
@@ -2523,11 +2580,9 @@ contains
          if (cache_buckets(slot).eq.0) return
          if (cache_buckets(slot).ne.-1) then
             if (cache_entries(cache_buckets(slot))%hash.eq.h) then
-               if (size(cache_entries(cache_buckets(slot))%pattern).eq.size(pattern)) then
-                  if (all(cache_entries(cache_buckets(slot))%pattern.eq.pattern)) then
-                     entry_idx = cache_buckets(slot)
-                     return
-                  endif
+               if (cached_pattern_matches(cache_buckets(slot), pattern)) then
+                  entry_idx = cache_buckets(slot)
+                  return
                endif
             endif
          endif
@@ -2730,8 +2785,7 @@ contains
                if (cache_buckets(slot).eq.0) exit
                if (cache_buckets(slot).ne.-1) then
                   if (cache_entries(cache_buckets(slot))%hash.eq.h) then
-                     if (all(cache_entries(cache_buckets(slot))%pattern.eq.&
-                     &mask_tile(ix_l,iy_l,:))) then
+                     if (cached_pattern_matches(cache_buckets(slot), mask_tile(ix_l,iy_l,:))) then
                         entry_idx = cache_buckets(slot)
                         exit
                      endif
@@ -2817,13 +2871,20 @@ contains
             if (.not. do_insert) cycle
 
             cache_entries(target_slot)%hash = h
-            if (allocated(cache_entries(target_slot)%pattern)) deallocate(cache_entries(target_slot)%pattern)
-            allocate(cache_entries(target_slot)%pattern(nchan))
-            cache_entries(target_slot)%pattern = mask_tile(ix_l,iy_l,:)
-            cache_entries(target_slot)%hit_count = 1_8
             if (cache_eviction_policy.eq.'belady') then
+               ! T14 increment 9: no local pattern-bytes copy under
+               ! belady -- this slot's own pattern lives in the
+               ! registry instead (Pass 0 already put it there),
+               ! reachable via registry_id; cached_pattern_matches
+               ! reads from there. See table_cache_entry_t's own
+               ! pattern(:) comment for the full story.
                cache_entries(target_slot)%registry_id = registry_id_l
+            else
+               if (allocated(cache_entries(target_slot)%pattern)) deallocate(cache_entries(target_slot)%pattern)
+               allocate(cache_entries(target_slot)%pattern(nchan))
+               cache_entries(target_slot)%pattern = mask_tile(ix_l,iy_l,:)
             endif
+            cache_entries(target_slot)%hit_count = 1_8
 
             ! Bucket slot for target_slot: reuse either a genuinely
             ! empty slot OR a tombstone left by an earlier eviction --

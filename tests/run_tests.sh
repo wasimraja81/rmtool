@@ -3689,6 +3689,26 @@ PYEOF
         else
             fail "rmclean_cubes: belady's total redundant-rebuild count ($bl_total) is WORSE than hitcount's ($hc_total) -- Belady should never be worse"
         fi
+
+        # T14 increment 9: direct evidence that belady's own resident
+        # cache slots carry NO local pattern-bytes copy (delegated to
+        # the registry instead), while hitcount's own slots -- which
+        # have no registry to delegate to -- still carry one each. Both
+        # numbers are printed by rmclean_cubes itself, not inferred.
+        bl_pattern_line=$(grep -oP 'pattern bytes locally stored for \K[0-9]+ of [0-9]+' "$OUT_DIR/rmc_kpat_belady.log" || true)
+        hc_pattern_line=$(grep -oP 'pattern bytes locally stored for \K[0-9]+ of [0-9]+' "$OUT_DIR/rmc_kpat_hitcount.log" || true)
+        echo "  belady   pattern bytes locally stored: $bl_pattern_line"
+        echo "  hitcount pattern bytes locally stored: $hc_pattern_line"
+        if [[ "$bl_pattern_line" =~ ^0\ of\ ([0-9]+)$ ]] && [[ "${BASH_REMATCH[1]}" -gt 0 ]]; then
+            pass "rmclean_cubes: belady's own resident cache slots (${BASH_REMATCH[1]}) carry zero local pattern-bytes copies (T14 increment 9)"
+        else
+            fail "rmclean_cubes: belady's own resident cache slots still carry local pattern-bytes copies (see $OUT_DIR/rmc_kpat_belady.log) -- increment 9 de-duplication not engaging"
+        fi
+        if [[ "$hc_pattern_line" =~ ^([0-9]+)\ of\ ([0-9]+)$ ]] && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] && [[ "${BASH_REMATCH[1]}" -gt 0 ]]; then
+            pass "rmclean_cubes: hitcount's own resident cache slots (${BASH_REMATCH[2]}) each still carry their own local pattern-bytes copy (no registry to delegate to)"
+        else
+            fail "rmclean_cubes: hitcount's own resident cache slots don't match their own expected pattern-bytes count (see $OUT_DIR/rmc_kpat_hitcount.log)"
+        fi
     else
         fail "rmclean_cubes: Belady effectiveness run(s) failed on the adversarial fixture (see $OUT_DIR/rmc_kpat_*.log)"
     fi
