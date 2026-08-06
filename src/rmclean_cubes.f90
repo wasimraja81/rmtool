@@ -117,7 +117,8 @@ program rmclean_cubes
    use, intrinsic :: iso_c_binding, only: c_int, c_long, c_ptr, c_funptr,&
    &c_null_ptr, c_funloc, c_loc, c_f_pointer
    use rmclean_mod
-   use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
+   use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime,&
+   &omp_set_num_threads
    use logging_mod
    use fitsio_unit_mod
    use rmclean_io_mod
@@ -197,6 +198,20 @@ program rmclean_cubes
    integer :: tile_ra, tile_dec
    logical :: tile_auto
    real(sp) :: mem_frac_ram
+
+   ! --- T17 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): coverage-fraction
+   ! pixel skip -- pixels whose own valid-channel fraction (summed
+   ! across ALL bands) falls below this threshold are never CLEANed at
+   ! all (output NaN across every RM-bin), never registered in Pass
+   ! 0's own pattern registry, and never inserted into the runtime
+   ! mask-pattern cache -- a sparse-coverage pixel's own RMSF is
+   ! already coarser/noisier than a well-covered one regardless of how
+   ! much compute is spent on it. Same "_frac" fraction-value naming
+   ! convention as mem_frac_ram; default 0.0 (off -- every pixel with
+   ! at least one valid channel is CLEANed, today's original
+   ! behaviour), matching abs_flux_floor's own "0.0 = inert" precedent
+   ! elsewhere in this file.
+   real(sp) :: min_valid_frac
 
    ! --- T4b: io_read_threads (planning/RMCLEAN_INTEGRATION_PLAN.md T4) ---
    ! Same scheme/key name/clamping convention as rm_synthesis's own
@@ -882,6 +897,7 @@ contains
       tile_dec = 0
       tile_auto = .true.
       mem_frac_ram = 0.25_sp
+      min_valid_frac = 0.0_sp
       io_read_threads = 1
       nwriters = 1
       io_overlap = .false.
@@ -1135,6 +1151,13 @@ contains
             status = -1
             return
          endif
+      case ('min_valid_frac')
+         read(val, *, iostat=ios) min_valid_frac
+         if (ios.ne.0 .or. min_valid_frac.lt.0.0_sp .or. min_valid_frac.gt.1.0_sp) then
+            write(*,*) 'ERROR: min_valid_frac must be >= 0 and <= 1'
+            status = -1
+            return
+         endif
       case ('tile_ra')
          read(val, *, iostat=ios) tile_ra
          if (ios.ne.0 .or. tile_ra.lt.0) then
@@ -1230,6 +1253,7 @@ contains
       &'|max|mid|fixed] [lsq_ref_compute_value=<v>]'
       write(*,'(A)') '    [mask_pattern_cache_max=<n>]'//&
       &' [cache_eviction_policy=belady|hitcount] [mem_frac_ram=<f>]'//&
+      &' [min_valid_frac=<f>]'//&
       &' [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]'//&
       &' [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]'
       write(*,'(A)') '   or: rmclean_cubes --config <cfgfile>'
@@ -1321,6 +1345,17 @@ contains
       &' working set (2 input + 6 output RM-depth arrays per pixel) --'//&
       &' same scheme/key name as rm_synthesis''s own mem_frac_ram'//&
       &' (planning ticket T4).'
+      write(*,'(A)') 'min_valid_frac (default 0.0, i.e. off): pixels'//&
+      &' whose own valid-channel fraction (summed across ALL bands,'//&
+      &' out of the full channel count) falls below this are never'//&
+      &' CLEANed -- output NaN across every RM-bin instead. 0.0 means'//&
+      &' every pixel with at least 1 valid channel is CLEANed (today''s'//&
+      &' original behaviour); e.g. 0.7 skips any pixel with less than'//&
+      &' 70% of channels valid. Sparse-coverage pixels have a'//&
+      &' coarser/noisier RMSF regardless of compute spent on them --'//&
+      &' this also shrinks Pass 0''s own pattern registry and the'//&
+      &' runtime cache, since skipped pixels are never registered or'//&
+      &' cached at all (docs/dev/RMCLEAN_INTEGRATION_PLAN.md T17).'
       write(*,'(A)') 'tile_ra/tile_dec (default 0/0, i.e. auto): manual'//&
       &' tile size override (pixels); ignored unless tile_auto=n. Auto'//&
       &' policy (tile_auto=y, the default) packs full-RA Dec strips --'//&
@@ -2666,6 +2701,16 @@ contains
          do iy_l = 1, ty
             do ix_l = 1, tx
                if (all(mask_tile(ix_l,iy_l,:).eq.0_1)) cycle
+               ! T17: same threshold, same skip, as
+               ! update_mask_pattern_cache_for_tile/clean_one_pixel --
+               ! a pixel Pass 1 will never CLEAN must never be
+               ! registered here either, or Pass 0's own scan-position
+               ! bookkeeping would silently diverge from Pass 1's own
+               ! actual visit order (the one property T14's own Belady
+               ! eviction decisions absolutely depend on).
+               if (min_valid_frac.gt.0.0_sp .and.&
+               &real(count(mask_tile(ix_l,iy_l,:).ne.0_1), sp).lt.&
+               &min_valid_frac*real(nchan, sp)) cycle
                scan_pos = scan_pos + 1_8
                call registry_lookup_or_insert(pattern_registry,&
                &mask_tile(ix_l,iy_l,:), nchan, scan_pos, entry_id)
@@ -2689,7 +2734,492 @@ contains
       write(*,'(A,I0,A,I0,A)') 'Pass 0: done -- ',&
       &pattern_registry%n_entries, ' distinct pattern(s), ', scan_pos,&
       &' valid pixel(s) scanned.'
+
+      call report_build_time_advisory()
    end subroutine run_pattern_prescan
+
+   subroutine report_build_time_advisory()
+      !! T15 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): predicts, per
+      !! block and in total, how much wall-clock time Pass 1 will spend
+      !! GENERATING new RMSF tables (build_rmsf_offset_table) -- never
+      !! CLEAN-iteration time, which depends on each pixel's own real
+      !! SNR/stopping behaviour, not on caching, and would answer a
+      !! different question than the one this advisory exists to
+      !! answer (how much of the old no-eviction disaster T14 fixes is
+      !! actually recoverable). Printed to stdout only -- already
+      !! captured in the run's own provenance log by the caller's
+      !! existing `> logfile 2>&1` redirection, same convention every
+      !! other Pass 0/startup message in this program already relies
+      !! on; no separate logging mechanism needed.
+      !!
+      !! A single, cheap, read-only second scan of the mask cube
+      !! (registry_lookup, not insert -- the registry is already
+      !! complete) does three things together:
+      !!
+      !! (1) A full BELADY SIMULATION at the ACTUAL configured
+      !! mask_pattern_cache_max: replays the EXACT same admission-
+      !! control eviction logic update_mask_pattern_cache_for_tile's
+      !! own 'belady' branch uses in real Pass 1, against a throwaway
+      !! simulated cache (integer bookkeeping only, no RMSF tables
+      !! built). This is NOT optional detail -- an earlier version of
+      !! this advisory counted only each pattern's first-ever
+      !! occurrence in the whole cube (i.e. assumed an INFINITELY large
+      !! cache) and undercounted block 3's own real table-generation
+      !! time by ~7x purely because the real 4096-slot cache is far
+      !! smaller than that block's own local diversity, forcing genuine
+      !! repeated rebuilds that simpler model couldn't see.
+      !!
+      !! (2) A CACHE-SIZE SWEEP: the SAME simulation, run in parallel
+      !! (same single scan, same shared per-pattern occurrence data) at
+      !! several LARGER candidate cache sizes (doubling from the actual
+      !! configured size up to n_entries -- a cache that size can hold
+      !! every distinct pattern simultaneously, the best any cache size
+      !! could ever do), reusing each block's own already-measured
+      !! ms/channel rate (a property of that block's own DATA, not of
+      !! cache policy) rather than re-timing per candidate. Answers a
+      !! real, asked-for question directly from data already collected:
+      !! how much memory would it take to meaningfully cut this
+      !! predicted build time -- without ever building a second,
+      !! separately-managed cache (mathematically pointless: Belady is
+      !! already optimal for whatever total capacity it's given, so two
+      !! independently-managed pools of the same combined size can
+      !! never beat one unified cache of that size -- see this ticket's
+      !! own progress notes for the full reasoning).
+      !!
+      !! (3) A TRUE-SINGLETON vs RECURS-BUT-DECLINED split for the
+      !! actual cache size's own declined-oneoff pixels: a decline
+      !! means "not worth evicting anything for right now," which
+      !! covers two different situations -- the pattern's own next
+      !! occurrence is huge() (never again, genuinely unique data no
+      !! cache size could ever help) versus a real, finite future
+      !! position (it WILL recur, just not soon enough to beat whatever
+      !! else is cached at that moment -- exactly the case a bigger
+      !! cache, not a smarter policy, could capture). If declines are
+      !! mostly the latter, the cache-size sweep above is the
+      !! actionable lever; if mostly the former, no cache size will
+      !! help much.
+      !!
+      !! All three reuse the SAME per-pattern next-occurrence walk
+      !! (sim_next_occ_ptr, SEPARATE from pattern_registry's own
+      !! entries(:)%next_occ_ptr, which must stay at its untouched,
+      !! post-Pass-0 state for Pass 1's own real use) -- every
+      !! occurrence of a pattern advances this pointer exactly once,
+      !! regardless of which candidate cache size is being evaluated,
+      !! so it is computed once per pixel and shared across all
+      !! candidates rather than duplicated.
+      !!
+      !! Cost: a second full mask-cube read (I/O, comparable to Pass
+      !! 0's own first read) plus, per miss, a linear scan bounded by
+      !! each candidate's own cache size (exactly the same per-miss
+      !! cost real Pass 1 itself pays for its own real eviction
+      !! decisions, just repeated for a handful of candidates) -- no
+      !! RMSF tables are built except the actual cache size's own
+      !! per-block timing samples, so this stays far cheaper than
+      !! actual Pass 1 compute.
+      integer, parameter :: n_sample_per_block = 5
+      integer, parameter :: max_candidates = 8
+      integer, allocatable :: pattern_nvalid(:)
+      integer(kind=8), allocatable :: sim_next_occ_ptr(:)
+      integer :: n_entries_tot
+
+      integer :: n_candidates
+      integer :: candidate_cache_max(max_candidates)
+      integer, allocatable :: sim_pattern_slot_c(:,:), sim_slot_pattern_c(:,:)
+      integer :: sim_n_resident_c(max_candidates)
+      integer(kind=8), allocatable :: victim_next_occs_sim(:)
+      integer(kind=8) :: cand_hits(max_candidates), cand_admitted(max_candidates),&
+      &cand_evicted(max_candidates), cand_declined(max_candidates)
+      integer(kind=8) :: cand_declined_singleton, cand_declined_recurs
+      real(dp) :: cand_predicted_total_min(max_candidates)
+      integer(kind=8) :: cand_block_miss_nvalid_sum(max_candidates)
+
+      integer :: ix_tile_beg, iy_tile_beg, ix_cur, iy_cur, tx, ty
+      logical :: done
+      integer :: ix_l, iy_l, entry_id, target_slot
+      integer :: status_prescan
+      integer(kind=8) :: new_next_occ
+      integer :: n_blocks, block_cap
+      integer, allocatable :: block_hits(:), block_admitted(:),&
+      &block_evicted(:), block_declined(:), block_declined_singleton(:),&
+      &block_declined_recurs(:)
+      integer(kind=8), allocatable :: block_miss_nvalid_sum(:)
+      real(dp), allocatable :: block_ms_per_channel(:)
+      integer, allocatable :: tmp_i(:)
+      integer(kind=8), allocatable :: tmp_i8(:)
+      real(dp), allocatable :: tmp_r8(:)
+      integer(kind=8) :: tot_hits, tot_admitted, tot_evicted, tot_declined,&
+      &tot_declined_singleton, tot_declined_recurs
+      real(dp) :: predicted_block_min, predicted_total_min
+      integer :: b, k, k2, kc
+
+      integer :: block_sample_ids(n_sample_per_block)
+      integer :: block_sample_filled, block_sample_seen
+      real(sp) :: rnd
+      integer :: rnd_slot
+      integer, allocatable :: valid_idx_s(:)
+      real(sp), allocatable :: l_sq_valid_s(:)
+      type(rmsf_table_t) :: table_s
+      integer(kind=8) :: c0, c1, crate
+      real(dp) :: sample_total_ms
+      integer(kind=8) :: sample_total_channels
+      integer :: nvalid_s
+      integer :: saved_max_threads
+      real(dp) :: bytes_per_table
+      logical :: have_bytes_per_table
+
+      if (pattern_registry%n_entries.lt.1) return
+      n_entries_tot = pattern_registry%n_entries
+
+      ! Candidate cache sizes: the actual configured size, then
+      ! doubling, capped at n_entries_tot (a cache that big can hold
+      ! every distinct pattern at once -- the best ANY size could do,
+      ! a natural ceiling data point). max_candidates=8 is generous
+      ! headroom; real datasets need far fewer doublings to reach the
+      ! ceiling (e.g. ~4096 -> ~62000 takes 5 steps).
+      n_candidates = 0
+      k = mask_pattern_cache_max
+      do while (n_candidates.lt.max_candidates)
+         n_candidates = n_candidates + 1
+         candidate_cache_max(n_candidates) = min(k, n_entries_tot)
+         if (k.ge.n_entries_tot) exit
+         k = k * 2
+      enddo
+
+      ! build_rmsf_offset_table has its own internal !$omp parallel do
+      ! (src/rmclean.f90:439). In REAL production use it's called from
+      ! clean_one_pixel, itself already inside the outer per-pixel
+      ! !$omp parallel do -- OMP nesting is off by default, so that
+      ! inner parallel region is a no-op there, and the call runs
+      ! serially on whichever single thread already owns that pixel.
+      ! This whole simulation is called from run_pattern_prescan, which
+      ! is NOT nested inside any other parallel region -- without
+      ! forcing single-threaded execution for the timing samples below,
+      ! the inner parallel do would get REAL multi-thread speedup
+      ! production never sees, making every measurement artificially
+      ! fast (confirmed directly: an earlier version measured 0.062
+      ! ms/channel with 16 threads available, versus 0.222 ms/channel
+      ! from a genuinely single-threaded standalone microbenchmark of
+      ! the same call -- a ~3.6x discrepancy, not a rounding
+      ! difference). Set once for this whole subroutine, restored once
+      ! at the end.
+      saved_max_threads = omp_get_max_threads()
+      call omp_set_num_threads(1)
+
+      allocate(pattern_nvalid(n_entries_tot))
+      do k = 1, n_entries_tot
+         pattern_nvalid(k) = count(pattern_registry%entries(k)%pattern.ne.0_1)
+      enddo
+      allocate(sim_next_occ_ptr(n_entries_tot))
+      sim_next_occ_ptr = 1_8
+      allocate(sim_pattern_slot_c(n_entries_tot, n_candidates))
+      sim_pattern_slot_c = 0
+      allocate(sim_slot_pattern_c(n_entries_tot, n_candidates)) ! upper bound: largest candidate
+      sim_slot_pattern_c = 0
+      sim_n_resident_c(1:n_candidates) = 0
+      allocate(victim_next_occs_sim(n_entries_tot)) ! upper bound: largest candidate
+      allocate(valid_idx_s(nchan), l_sq_valid_s(nchan))
+      cand_hits = 0_8; cand_admitted = 0_8; cand_evicted = 0_8; cand_declined = 0_8
+      cand_predicted_total_min = 0.0_dp
+      cand_declined_singleton = 0_8
+      cand_declined_recurs = 0_8
+      have_bytes_per_table = .false.
+      bytes_per_table = 0.0_dp
+
+      block_cap = 64
+      allocate(block_hits(block_cap), block_admitted(block_cap),&
+      &block_evicted(block_cap), block_declined(block_cap),&
+      &block_declined_singleton(block_cap), block_declined_recurs(block_cap),&
+      &block_miss_nvalid_sum(block_cap), block_ms_per_channel(block_cap))
+      n_blocks = 0
+
+      ix_tile_beg = 1
+      iy_tile_beg = 1
+      do
+         ix_cur = ix_tile_beg
+         iy_cur = iy_tile_beg
+         call next_tile_extent(nx, ny, tile_ra, tile_dec, ix_tile_beg,&
+         &iy_tile_beg, tx, ty, done)
+         if (done) exit
+
+         call read_mask_tile(maskfile, nx, ny, nchan, ix_cur, iy_cur, tx, ty,&
+         &io_read_threads_eff, mask_tile(1:tx,1:ty,:), status_prescan)
+         if (status_prescan.ne.0) then
+            write(*,*) 'WARNING: T15 Belady simulation failed to'//&
+            &' re-read a mask tile -- skipping the build-time advisory.'
+            call omp_set_num_threads(saved_max_threads)
+            return
+         endif
+
+         n_blocks = n_blocks + 1
+         if (n_blocks.gt.block_cap) then
+            block_cap = block_cap * 2
+            allocate(tmp_i(block_cap)); tmp_i(1:n_blocks-1)=block_hits
+            call move_alloc(tmp_i, block_hits)
+            allocate(tmp_i(block_cap)); tmp_i(1:n_blocks-1)=block_admitted
+            call move_alloc(tmp_i, block_admitted)
+            allocate(tmp_i(block_cap)); tmp_i(1:n_blocks-1)=block_evicted
+            call move_alloc(tmp_i, block_evicted)
+            allocate(tmp_i(block_cap)); tmp_i(1:n_blocks-1)=block_declined
+            call move_alloc(tmp_i, block_declined)
+            allocate(tmp_i(block_cap)); tmp_i(1:n_blocks-1)=block_declined_singleton
+            call move_alloc(tmp_i, block_declined_singleton)
+            allocate(tmp_i(block_cap)); tmp_i(1:n_blocks-1)=block_declined_recurs
+            call move_alloc(tmp_i, block_declined_recurs)
+            allocate(tmp_i8(block_cap)); tmp_i8(1:n_blocks-1)=block_miss_nvalid_sum
+            call move_alloc(tmp_i8, block_miss_nvalid_sum)
+            allocate(tmp_r8(block_cap)); tmp_r8(1:n_blocks-1)=block_ms_per_channel
+            call move_alloc(tmp_r8, block_ms_per_channel)
+         endif
+         block_hits(n_blocks) = 0
+         block_admitted(n_blocks) = 0
+         block_evicted(n_blocks) = 0
+         block_declined(n_blocks) = 0
+         block_declined_singleton(n_blocks) = 0
+         block_declined_recurs(n_blocks) = 0
+         block_miss_nvalid_sum(n_blocks) = 0_8
+         block_sample_filled = 0
+         block_sample_seen = 0
+         cand_block_miss_nvalid_sum(1:n_candidates) = 0_8
+
+         do iy_l = 1, ty
+            do ix_l = 1, tx
+               if (all(mask_tile(ix_l,iy_l,:).eq.0_1)) cycle
+               ! T17: same threshold as run_pattern_prescan/Pass 1 --
+               ! a below-threshold pixel was never registered, so
+               ! looking it up here would hit the "not found" case
+               ! below for a reason that has nothing to do with a real
+               ! bug.
+               if (min_valid_frac.gt.0.0_sp .and.&
+               &real(count(mask_tile(ix_l,iy_l,:).ne.0_1), sp).lt.&
+               &min_valid_frac*real(nchan, sp)) cycle
+               call registry_lookup(pattern_registry, mask_tile(ix_l,iy_l,:),&
+               &nchan, entry_id)
+               if (entry_id.lt.1) cycle ! defensive: should never happen
+
+               ! Shared across all candidates: this pattern's own
+               ! occurrence timeline doesn't depend on cache size, only
+               ! on how many times it's been encountered so far.
+               if (sim_next_occ_ptr(entry_id).le.&
+               &pattern_registry%entries(entry_id)%n_occurrences) then
+                  sim_next_occ_ptr(entry_id) = sim_next_occ_ptr(entry_id) + 1_8
+               endif
+               if (sim_next_occ_ptr(entry_id).gt.&
+               &pattern_registry%entries(entry_id)%n_occurrences) then
+                  new_next_occ = huge(new_next_occ)
+               else
+                  new_next_occ = pattern_registry%entries(entry_id)%&
+                  &occurrences(sim_next_occ_ptr(entry_id))
+               endif
+
+               ! Reservoir-sample this pixel's own pattern for the
+               ! per-block timing test below, regardless of hit/miss at
+               ! the actual cache size -- standard reservoir sampling
+               ! (Algorithm R): the k-th candidate seen is kept with
+               ! probability n_sample_per_block/k, replacing a
+               ! uniformly random existing slot if so.
+               block_sample_seen = block_sample_seen + 1
+               if (block_sample_filled.lt.n_sample_per_block) then
+                  block_sample_filled = block_sample_filled + 1
+                  block_sample_ids(block_sample_filled) = entry_id
+               else
+                  call random_number(rnd)
+                  rnd_slot = 1 + int(rnd*real(block_sample_seen, sp))
+                  if (rnd_slot.le.n_sample_per_block) then
+                     block_sample_ids(rnd_slot) = entry_id
+                  endif
+               endif
+
+               do kc = 1, n_candidates
+                  if (sim_pattern_slot_c(entry_id,kc).gt.0) then
+                     ! HIT for this candidate
+                     cand_hits(kc) = cand_hits(kc) + 1_8
+                     if (kc.eq.1) block_hits(n_blocks) = block_hits(n_blocks) + 1
+                     cycle
+                  endif
+
+                  ! MISS for this candidate
+                  cand_block_miss_nvalid_sum(kc) = cand_block_miss_nvalid_sum(kc)&
+                  &+ int(pattern_nvalid(entry_id), 8)
+                  if (kc.eq.1) block_miss_nvalid_sum(n_blocks) =&
+                  &block_miss_nvalid_sum(n_blocks) + int(pattern_nvalid(entry_id), 8)
+
+                  if (sim_n_resident_c(kc).lt.candidate_cache_max(kc)) then
+                     sim_n_resident_c(kc) = sim_n_resident_c(kc) + 1
+                     target_slot = sim_n_resident_c(kc)
+                     sim_slot_pattern_c(target_slot,kc) = entry_id
+                     sim_pattern_slot_c(entry_id,kc) = target_slot
+                     cand_admitted(kc) = cand_admitted(kc) + 1_8
+                     if (kc.eq.1) block_admitted(n_blocks) = block_admitted(n_blocks) + 1
+                  else
+                     do k2 = 1, sim_n_resident_c(kc)
+                        if (sim_next_occ_ptr(sim_slot_pattern_c(k2,kc)).gt.&
+                        &pattern_registry%entries(sim_slot_pattern_c(k2,kc))%&
+                        &n_occurrences) then
+                           victim_next_occs_sim(k2) = huge(new_next_occ)
+                        else
+                           victim_next_occs_sim(k2) = pattern_registry%&
+                           &entries(sim_slot_pattern_c(k2,kc))%occurrences(&
+                           &sim_next_occ_ptr(sim_slot_pattern_c(k2,kc)))
+                        endif
+                     enddo
+                     target_slot = linear_scan_extreme(&
+                     &victim_next_occs_sim(1:sim_n_resident_c(kc)),&
+                     &sim_n_resident_c(kc), .true.)
+                     if (new_next_occ.lt.victim_next_occs_sim(target_slot)) then
+                        sim_pattern_slot_c(sim_slot_pattern_c(target_slot,kc),kc) = 0
+                        sim_slot_pattern_c(target_slot,kc) = entry_id
+                        sim_pattern_slot_c(entry_id,kc) = target_slot
+                        cand_admitted(kc) = cand_admitted(kc) + 1_8
+                        cand_evicted(kc) = cand_evicted(kc) + 1_8
+                        if (kc.eq.1) then
+                           block_admitted(n_blocks) = block_admitted(n_blocks) + 1
+                           block_evicted(n_blocks) = block_evicted(n_blocks) + 1
+                        endif
+                     else
+                        cand_declined(kc) = cand_declined(kc) + 1_8
+                        if (kc.eq.1) then
+                           block_declined(n_blocks) = block_declined(n_blocks) + 1
+                           ! T15: true singleton (never needed again --
+                           ! no cache size could ever help) vs recurs
+                           ! later but declined anyway (a real,
+                           ! cache-size-recoverable tradeoff).
+                           if (new_next_occ.eq.huge(new_next_occ)) then
+                              block_declined_singleton(n_blocks) =&
+                              &block_declined_singleton(n_blocks) + 1
+                              cand_declined_singleton = cand_declined_singleton + 1_8
+                           else
+                              block_declined_recurs(n_blocks) =&
+                              &block_declined_recurs(n_blocks) + 1
+                              cand_declined_recurs = cand_declined_recurs + 1_8
+                           endif
+                        endif
+                     endif
+                  endif
+               enddo
+            enddo
+         enddo
+
+         ! Per-block self-timing: time build_rmsf_offset_table on this
+         ! block's own reservoir-sampled patterns -- 0 if this block
+         ! had no misses at all at the actual cache size (all hits;
+         ! e.g. a block whose own pixels are all patterns already
+         ! resident from earlier blocks). Reused for EVERY candidate's
+         ! own predicted time below (build cost is a property of the
+         ! DATA's own channel coverage, not of cache policy).
+         if (block_sample_filled.lt.1) then
+            block_ms_per_channel(n_blocks) = 0.0_dp
+         else
+            call system_clock(count_rate=crate)
+            sample_total_ms = 0.0_dp
+            sample_total_channels = 0_8
+            do k = 1, block_sample_filled
+               nvalid_s = 0
+               do k2 = 1, nchan
+                  if (pattern_registry%entries(block_sample_ids(k))%&
+                  &pattern(k2).ne.0_1) then
+                     nvalid_s = nvalid_s + 1
+                     valid_idx_s(nvalid_s) = k2
+                  endif
+               enddo
+               if (nvalid_s.lt.1) cycle
+               l_sq_valid_s(1:nvalid_s) = l_sq(valid_idx_s(1:nvalid_s))
+
+               call system_clock(c0)
+               call build_rmsf_offset_table(l_sq_valid_s(1:nvalid_s), nvalid_s,&
+               &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
+               &table_oversample, table_s)
+               call system_clock(c1)
+
+               sample_total_ms = sample_total_ms +&
+               &real(c1-c0, dp)/real(crate, dp)*1000.0_dp
+               sample_total_channels = sample_total_channels + int(nvalid_s, 8)
+               if (.not.have_bytes_per_table) then
+                  bytes_per_table = 2.0_dp*real(table_s%n_fine, dp)*8.0_dp
+                  have_bytes_per_table = .true.
+               endif
+            enddo
+            if (sample_total_channels.lt.1_8) then
+               block_ms_per_channel(n_blocks) = 0.0_dp
+            else
+               block_ms_per_channel(n_blocks) =&
+               &sample_total_ms/real(sample_total_channels, dp)
+            endif
+         endif
+
+         do kc = 1, n_candidates
+            cand_predicted_total_min(kc) = cand_predicted_total_min(kc) +&
+            &real(cand_block_miss_nvalid_sum(kc), dp)*block_ms_per_channel(n_blocks)&
+            &/1000.0_dp/60.0_dp
+         enddo
+      end do
+      deallocate(pattern_nvalid, sim_next_occ_ptr, sim_pattern_slot_c,&
+      &sim_slot_pattern_c, victim_next_occs_sim, valid_idx_s, l_sq_valid_s)
+      call omp_set_num_threads(saved_max_threads)
+
+      write(*,'(A)') 'Pass 0 build-time advisory (table-GENERATION'//&
+      &' only, not CLEAN -- see docs/dev/RMCLEAN_INTEGRATION_PLAN.md'//&
+      &' T15). Hit/miss counts below are from a full Belady SIMULATION'//&
+      &' (real admission-control eviction logic replayed against a'//&
+      &' throwaway simulated cache, per-block build-cost sampled from'//&
+      &' that block''s own real patterns), not the infinite-cache-'//&
+      &'assumption first-occurrence count an earlier version of this'//&
+      &' advisory used -- keep this log for retrospective analysis.'
+      tot_hits = 0_8; tot_admitted = 0_8; tot_evicted = 0_8; tot_declined = 0_8
+      tot_declined_singleton = 0_8; tot_declined_recurs = 0_8
+      predicted_total_min = 0.0_dp
+      do b = 1, n_blocks
+         tot_hits = tot_hits + int(block_hits(b), 8)
+         tot_admitted = tot_admitted + int(block_admitted(b), 8)
+         tot_evicted = tot_evicted + int(block_evicted(b), 8)
+         tot_declined = tot_declined + int(block_declined(b), 8)
+         tot_declined_singleton = tot_declined_singleton + int(block_declined_singleton(b), 8)
+         tot_declined_recurs = tot_declined_recurs + int(block_declined_recurs(b), 8)
+         predicted_block_min = real(block_miss_nvalid_sum(b), dp)*&
+         &block_ms_per_channel(b)/1000.0_dp/60.0_dp
+         predicted_total_min = predicted_total_min + predicted_block_min
+         write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,F0.4,A,F0.2,A)') '  block ',&
+         &b, ': hits=', block_hits(b), ' admitted=', block_admitted(b),&
+         &' (evicted-to-admit=', block_evicted(b), ') declined-oneoff=',&
+         &block_declined(b), ' (true-singleton=', block_declined_singleton(b),&
+         &' recurs-but-declined=', block_declined_recurs(b),&
+         &') measured=', block_ms_per_channel(b),&
+         &' ms/channel -> predicted build time ~', predicted_block_min,&
+         &' min.'
+      enddo
+      write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A)') '  TOTAL (actual'//&
+      &' mask_pattern_cache_max=', mask_pattern_cache_max, '): hits=', tot_hits,&
+      &' admitted=', tot_admitted, ' (evicted-to-admit=', tot_evicted,&
+      &') declined-oneoff=', tot_declined, ' (true-singleton=',&
+      &tot_declined_singleton
+      write(*,'(A,I0,A)') '    recurs-but-declined=', tot_declined_recurs,&
+      &' -- these are the ones a BIGGER cache could actually recover,'//&
+      &' not the true singletons, which no cache size can help.'
+      write(*,'(A,F0.2,A)') '  predicted TOTAL build time (actual cache'//&
+      &' size): ~', predicted_total_min, ' min (table generation only'//&
+      &' -- actual wall time also includes CLEAN itself, which this'//&
+      &' advisory deliberately does not estimate).'
+
+      write(*,'(A)') '  Cache-size sweep (same simulation, larger'//&
+      &' candidate cache sizes, reusing each block''s own already-'//&
+      &' measured ms/channel rate -- NOT a case for a second, separately'//&
+      &' -managed cache: Belady is already optimal for whatever total'//&
+      &' capacity it is given, so two independent pools of the same'//&
+      &' combined size can never beat one unified cache that size; this'//&
+      &' sweep is for sizing the ONE existing cache, mask_pattern_'//&
+      &'cache_max):'
+      do kc = 1, n_candidates
+         write(*,'(A,I0,A,I0,A,I0,A,F0.2,A)') '    cache_max=',&
+         &candidate_cache_max(kc), ': admitted=', cand_admitted(kc),&
+         &' declined-oneoff=', cand_declined(kc),&
+         &' -> predicted build time ~', cand_predicted_total_min(kc),&
+         &' min'
+         if (have_bytes_per_table) then
+            write(*,'(A,F0.2,A)') '      (approx RMSF-table memory at'//&
+            &' this size: ~', real(candidate_cache_max(kc),dp)*&
+            &bytes_per_table/1024.0_dp/1024.0_dp, ' MiB)'
+         endif
+      enddo
+   end subroutine report_build_time_advisory
 
    subroutine evict_cache_slot(victim_idx)
       !! T14 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): marks victim_idx's
@@ -2776,6 +3306,14 @@ contains
       do iy_l = 1, ty_in
          do ix_l = 1, tx_in
             if (all(mask_tile(ix_l,iy_l,:).eq.0_1)) cycle
+            ! T17: below the configured coverage threshold -- never
+            ! cached, never counted as a distinct pattern; this pixel
+            ! will be skipped entirely in clean_one_pixel too (which
+            ! applies the exact same threshold independently), so
+            ! building/caching a table for it here would be pure waste.
+            if (min_valid_frac.gt.0.0_sp .and.&
+            &real(count(mask_tile(ix_l,iy_l,:).ne.0_1), sp).lt.&
+            &min_valid_frac*real(nchan, sp)) cycle
 
             h = fnv1a_hash(mask_tile(ix_l,iy_l,:), nchan)
             probe = modulo(h, int(n_cache_buckets, 8))
@@ -2979,6 +3517,33 @@ contains
          resid_im_tile(ix_l,iy_l,:) = im_tile(ix_l,iy_l,:)
          restored_re_tile(ix_l,iy_l,:) = re_tile(ix_l,iy_l,:)
          restored_im_tile(ix_l,iy_l,:) = im_tile(ix_l,iy_l,:)
+         deallocate(valid_idx_p, l_sq_valid_p)
+         return
+      endif
+
+      if (min_valid_frac.gt.0.0_sp .and.&
+      &real(nvalid_p, sp).lt.min_valid_frac*real(nchan, sp)) then
+         ! T17 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): below the
+         ! configured coverage threshold -- UNLIKE the nvalid_p<1 case
+         ! above, the dirty spectrum here is real, non-NaN data (this
+         ! pixel does have SOME valid channels); passing it through
+         ! would silently present un-CLEANed dirty data as if it were a
+         ! real CLEAN/RESID/RESTORED result. Write explicit NaN
+         ! instead, same runtime-0.0/0.0 IEEE NaN convention
+         ! rm_synthesis_mod.f90 itself already uses (zero_val_p, a
+         ! genuine runtime variable -- a literal 0.0_sp/0.0_sp would be
+         ! rejected at compile time).
+         block
+            real(sp) :: zero_val_p, nan_val_p
+            zero_val_p = 0.0_sp
+            nan_val_p = zero_val_p/zero_val_p
+            clean_re_tile(ix_l,iy_l,:) = nan_val_p
+            clean_im_tile(ix_l,iy_l,:) = nan_val_p
+            resid_re_tile(ix_l,iy_l,:) = nan_val_p
+            resid_im_tile(ix_l,iy_l,:) = nan_val_p
+            restored_re_tile(ix_l,iy_l,:) = nan_val_p
+            restored_im_tile(ix_l,iy_l,:) = nan_val_p
+         end block
          deallocate(valid_idx_p, l_sq_valid_p)
          return
       endif

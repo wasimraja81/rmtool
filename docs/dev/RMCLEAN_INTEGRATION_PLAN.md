@@ -3445,3 +3445,201 @@ change.
   flagged from the start (see "Things to confirm" above) as a
   separate question Belady doesn't answer; still needs a measurement
   against the full 32-block mask.
+
+### T15 -- Pass 0 build-time advisory: predict RMSF-table-generation cost per block before Pass 1 starts
+
+**Motivation:** while validating T14 against the real WALLABY+EMU run,
+estimating how much of a block's own wall time was avoidable
+(redundant RMSF-table rebuilds under the old no-eviction cache) vs
+unavoidable (CLEAN itself) required ad hoc, after-the-fact analysis --
+an isolated microbenchmark of `build_rmsf_offset_table`, an
+independent Python replay of the mask cube for per-block distinct-
+pattern counts, and hand-combining the two. All of that information is
+already available for free inside Pass 0's own registry by the time it
+finishes scanning -- this ticket turns it into a real, live feature:
+an advisory printed right after Pass 0 completes (before Pass 1's own
+expensive compute starts), telling the user how much table-generation
+time to expect, per block and in total, so they know what they're
+getting into before committing to a multi-hour run.
+
+**Explicitly out of scope (user's own instruction, not a corner cut):
+this predicts table-GENERATION (cache-building) cost only -- the
+sin/cos work in `build_rmsf_offset_table` -- never CLEAN-iteration
+cost.** CLEAN's own per-pixel iteration count depends on that pixel's
+real SNR (via `auto_nsigma`/`abs_flux_floor`), not on caching at all,
+and mixing it into this advisory would answer a different question
+than the one being asked here (how much of the OLD no-eviction
+disaster is actually recoverable by Belady).
+
+**Design:**
+- `run_pattern_prescan()` already walks the whole mask cube block by
+  block (`next_tile_extent`) to build the registry. Track, per block,
+  how many of that block's own pattern-registry insertions were
+  GENUINELY NEW (first ever seen in the whole-cube scan so far, not a
+  repeat) -- detected cheaply by comparing `pattern_registry%n_entries`
+  before/after each `registry_lookup_or_insert` call, no new registry
+  API needed. Also accumulate that block's own sum of valid-channel
+  counts for those new patterns, to get a per-block average.
+- Once the whole scan completes successfully (not on the safety-valve
+  abort path -- a partial/discarded registry has nothing meaningful to
+  advise on), run a small SELF-TIMING sample: `build_rmsf_offset_table`
+  called on ~30 real patterns already found by THIS run's own registry
+  (evenly spaced across the distinct-pattern list, not just the first
+  few), using this run's own real `l_sq`/`lsq_ref_compute`/RM-axis
+  parameters, timed via `system_clock`. This measures the actual
+  per-channel build cost on THIS hardware, THIS run -- not a value
+  carried over from a different machine or dataset.
+- Multiply: for each block, `predicted_build_time ~= (new patterns in
+  that block) x (that block's own average channel count) x (measured
+  ms/channel)`. Print a per-block table plus a whole-run total, to
+  stdout -- already captured in the run's own provenance log by the
+  caller's existing `> logfile 2>&1` redirection (same convention
+  every other Pass 0/startup message in this program already relies
+  on), no separate logging mechanism needed.
+
+**Status: DONE.** Shipped beyond the original design above after two
+real corrections found during validation against the actual WALLABY+
+EMU run:
+- **OMP-nesting bug** (found and fixed): the self-timing sample runs
+  from `run_pattern_prescan`, NOT nested inside the outer per-pixel
+  parallel region the way production `build_rmsf_offset_table` calls
+  always are -- without forcing single-threaded execution
+  (`omp_set_num_threads(1)`, restored after), the call's own internal
+  `!$omp parallel do` got real multi-thread speedup production never
+  sees, undercounting the true cost by ~3.6x (0.062 vs 0.222
+  ms/channel measured for the same call).
+- **First-occurrence-only counting was a real, ~7x underestimate**
+  (found by comparing the advisory's own prediction against the live
+  run's real block 3 timing): assuming an infinite cache (count each
+  pattern's first-ever occurrence only) ignores that the real
+  4096-slot cache is far smaller than some blocks' own local
+  diversity, forcing genuine repeated rebuilds. Replaced with a full
+  BELADY SIMULATION -- the exact admission-control eviction logic
+  `update_mask_pattern_cache_for_tile`'s own 'belady' branch uses,
+  replayed against a throwaway simulated cache (integer bookkeeping
+  only) during the same second scan -- verified to exactly match real
+  production cache statistics on two controlled fixtures (1
+  admitted/1023 hits; 13 admitted/5 evicted/389 declined, both
+  matching the real run's own "Mask-pattern cache: N distinct
+  pattern(s) cached" summary exactly).
+- **Per-block self-timing** (not one pooled global sample): coverage
+  genuinely differs block to block (mean 177 vs 239 valid
+  channels/pixel measured directly on two real blocks), so a single
+  global rate would be biased toward whichever blocks contribute the
+  most distinct patterns to the registry.
+- **Cache-size sweep**: the same simulation re-run in parallel (same
+  scan, shared per-pattern occurrence data) at several larger
+  candidate cache sizes, up to `n_entries` (a cache that size can hold
+  every distinct pattern at once -- the best any size could do).
+  Answers "how much memory to meaningfully cut this cost" directly
+  from data already collected, without ever building a second,
+  separately-managed cache (mathematically pointless: Belady is
+  already optimal for whatever total capacity it is given, so two
+  independent pools of the same combined size can never beat one
+  unified cache that size).
+- **True-singleton vs recurs-but-declined split**: a decline means
+  "not worth evicting anything for right now," which covers two
+  different cases -- the pattern's own next occurrence is `huge()`
+  (never again, no cache size could ever help) vs a real finite future
+  position (recurs later, just not soon enough to beat whatever's
+  cached -- exactly what a bigger cache could capture). On the real
+  run: **100% of the 26,167 declined-oneoff pixels were true
+  singletons, 0% recurs-but-declined** -- meaning a bigger cache would
+  not have recovered any of that specific cost on this dataset (though
+  this doesn't yet account for whether *evicted* -- not just declined
+  -- patterns ever recur, a separate, unmeasured question).
+
+### T17 -- `min_valid_frac`: skip CLEANing pixels below a configurable channel-coverage threshold
+
+**Motivation:** live diagnosis of the real WALLABY+EMU run's own
+diversity (T15's advisory plus an ad hoc heatmap analysis, both this
+session) found the dominant driver of the pathologically expensive
+blocks (3-5, 30-32) is footprint-boundary geography, not per-beam
+flagging: WALLABY (`square_6x6` footprint) and EMU (`closepack36`
+footprint) have different shapes and different Dec extents, and
+`match_cubes`' own `mode=intersection` approximates their true,
+irregular overlap with a rectangular bounding box -- so a real,
+substantial band of pixels near every image edge sees only ONE
+survey's own channels (33-67% coverage) or none at all, and these are
+exactly the pixels driving the worst cache-diversity cost (T15: block
+31 alone declined 15,397 admissions, ALL genuine one-time patterns).
+Those same pixels also have an inherently coarser/noisier RMSF
+regardless of compute spent on them (fewer channels -> larger
+lambda-squared-span deficit -> worse RM resolution, `compute_rmsf_
+fwhm_multiband`). User's proposal: stop paying full CLEAN cost for
+pixels whose own science value is already compromised by sparse
+coverage.
+
+**Design:** `min_valid_frac` (real, default `0.0` = off, same
+`_frac`-fraction-value naming convention as `mem_frac_ram`, same
+"0.0 = inert" precedent as `abs_flux_floor`). A pixel whose own valid-
+channel count (summed across ALL bands) falls below `min_valid_frac x
+nchan` is:
+- never registered in Pass 0's pattern registry (`run_pattern_
+  prescan`) -- keeps Pass-0/Pass-1 scan-position bookkeeping in sync,
+  the one property T14's own Belady eviction decisions depend on;
+- never looked up in T15's own Belady-simulation second scan (same
+  reason);
+- never inserted into or looked up in the runtime mask-pattern cache
+  (`update_mask_pattern_cache_for_tile`) -- no table built, no cache
+  slot spent on a pattern that will never be CLEANed;
+- never CLEANed in `clean_one_pixel` -- output is explicit NaN across
+  every RM-bin for all 6 output cubes, using this project's own
+  existing runtime-`0.0/0.0` IEEE NaN convention (`rm_synthesis_mod.
+  f90`'s `zero_val`), NOT a pass-through of the dirty spectrum: unlike
+  the pre-existing `nvalid<1` case (where the dirty spectrum is
+  already all-NaN, rm_synthesis's own convention), a below-threshold-
+  but-nonzero-coverage pixel has REAL, non-NaN dirty data -- passing
+  it through would silently present un-CLEANed dirty data as if it
+  were a real CLEAN/RESID/RESTORED result.
+
+The SAME threshold check (`count(mask_tile.ne.0) < min_valid_frac x
+nchan`) is applied independently, identically, at all four call sites
+above -- not derived from a shared helper, to avoid adding a new
+cross-cutting abstraction for a one-line comparison already computed
+differently (a boolean `all(...)` vs an integer `count(...)`) at each
+site.
+
+**Verified:** on a synthetic fixture with known per-pixel flag counts
+(20 prototype patterns, 1-4 of 200 channels flipped each, exact counts
+known from the generating script), `min_valid_frac=0.99` (skip any
+pixel with >2 flagged channels) kept exactly the 10 prototypes with
+<=2 flags -- cross-checked by hand from the pixel-to-prototype
+assignment (2 "early" + 8 "late" prototypes survive, ~10 + ~65 pixels
+each) against the program's own reported count: predicted 539 pixels,
+program reported exactly 539. Output FITS confirmed NaN at every
+skipped pixel (485 = 1024-539 pixels fully NaN across all RM bins) and
+real values at every kept pixel. Full suite: pending (this increment
+not yet given its own permanent automated test in `run_tests.sh`).
+
+**Explicitly NOT this ticket -- noted as a TODO for T18, not
+implemented:** this only skips *compute* (CLEAN, table-build) for
+low-value pixels -- `rmclean_cubes` still *reads* the full-width AMP/
+PHA/MASK data for every tile regardless, including guaranteed-100%-
+empty edge strips (confirmed directly: `rm_synthesis.f90` already has
+a full subimage mechanism, `subim_ra_blc/trc/inc`, `subim_dec_blc/
+trc/inc`, `subim_chan_blc/trc/inc` -- `rmclean_cubes.f90` has zero
+matches for any equivalent key, so it was never carried over). A real
+subimage/subcube feature would additionally skip the I/O and memory
+footprint for regions known in advance to be entirely outside
+coverage -- a genuinely separate saving (I/O+memory, not compute),
+not redundant with this ticket's own coverage-fraction skip.
+
+**Status: DONE.** Full suite: 160/160 (158 + 2 new checks -- exact
+kept-pixel count matching the known per-prototype flag counts, and
+kept pixels bit-identical to the no-threshold baseline across all 6
+outputs). Not yet run against the real WALLABY+EMU data -- that real-
+data validation (picking a real `min_valid_frac` value informed by the
+flagged-fraction map) is a separate, follow-up step.
+
+### T18 -- subimage/subcube reading for `rmclean_cubes` (NOT STARTED -- flagged as a TODO, not scoped)
+
+Carry `rm_synthesis.f90`'s own subimage mechanism (`subim_ra_blc/trc/
+inc`, `subim_dec_blc/trc/inc`, `subim_chan_blc/trc/inc`) over to
+`rmclean_cubes.f90`, which currently has no equivalent at all -- it
+always reads the full RA/Dec/channel extent of the input cubes. See
+T17's own "explicitly NOT this ticket" note for why this is a real,
+separate saving (I/O + memory footprint for regions known in advance
+to be entirely outside coverage) from T17's own coverage-fraction
+compute skip, not a duplicate of it. Not scoped or designed yet --
+this entry exists only so the gap isn't silently forgotten.

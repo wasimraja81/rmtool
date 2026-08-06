@@ -3718,6 +3718,128 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 55. rmclean_cubes: min_valid_frac coverage-threshold pixel skip (T17,
+#     docs/dev/RMCLEAN_INTEGRATION_PLAN.md). Reuses the same 20-
+#     prototype adversarial fixture generator as section 54, but this
+#     time the check that matters is each prototype's own KNOWN
+#     nflip count (1-4 of nchan flagged, fixed by the seeded RNG) --
+#     min_valid_frac=0.99 (nchan=200 -> skip any pixel with >2 flagged)
+#     should keep exactly the prototypes with nflip<=2 and skip the
+#     rest, with NaN written to every RM-bin of every skipped pixel.
+# ---------------------------------------------------------------------------
+section "55. rmclean_cubes: min_valid_frac coverage-threshold pixel skip"
+
+if [[ -x bin/rmclean_cubes && -f "$rmc_lsqref_amp" && -f "$cep_pha" ]]; then
+    t17_mask="$OUT_DIR/rmc_t17_kpat.MASK.CUBE.FITS"
+    t17_proto_log="$OUT_DIR/rmc_t17_protos.log"
+    python3 - "$cep_mask" "$t17_mask" > "$t17_proto_log" <<'PYEOF'
+import sys
+import numpy as np
+from astropy.io import fits
+
+src, dst = sys.argv[1], sys.argv[2]
+with fits.open(src) as hdul:
+    rng = np.random.default_rng(11)
+    data = hdul[0].data
+    nchan, ny, nx = data.shape
+    n_early, n_late = 5, 15
+    protos = []
+    nflips = []
+    for _ in range(n_early + n_late):
+        nflip = rng.integers(1, 5)
+        chans = rng.choice(nchan, size=nflip, replace=False)
+        protos.append(chans)
+        nflips.append(int(nflip))
+    base = data[:, 0, 0].copy()
+    for iy in range(ny):
+        for ix in range(nx):
+            i = iy*nx + ix
+            if i < 50:
+                p = i % n_early
+            else:
+                p = n_early + ((i - 50) % n_late)
+            row = base.copy()
+            row[protos[p]] = 0
+            data[:, iy, ix] = row
+    hdul.writeto(dst, overwrite=True)
+
+    # Expected KEPT pixel count at min_valid_frac=0.99 (nchan=200,
+    # threshold keeps nflip<=2): replay the exact same i->prototype
+    # assignment used above.
+    kept_protos = set(p for p, nf in enumerate(nflips) if nf <= 2)
+    n_kept = 0
+    for i in range(nx*ny):
+        p = (i % n_early) if i < 50 else (n_early + ((i - 50) % n_late))
+        if p in kept_protos:
+            n_kept += 1
+    print(n_kept)
+PYEOF
+    t17_expected_kept=$(tail -1 "$t17_proto_log")
+
+    t17_thresh="$OUT_DIR/rmc_t17_thresh"
+    t17_baseline="$OUT_DIR/rmc_t17_baseline"
+    rm -f "${t17_thresh}".*.FITS "${t17_baseline}".*.FITS
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$t17_mask" outfile="$t17_thresh" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            cache_eviction_policy=belady min_valid_frac=0.99 \
+            > "$OUT_DIR/rmc_t17_thresh.log" 2>&1 && \
+       bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$t17_mask" outfile="$t17_baseline" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            cache_eviction_policy=belady \
+            > "$OUT_DIR/rmc_t17_baseline.log" 2>&1; then
+
+        t17_reported_kept=$(grep -oP 'CLEANed \K[0-9]+(?= pixels)' "$OUT_DIR/rmc_t17_thresh.log" || true)
+        echo "  min_valid_frac=0.99: expected kept=$t17_expected_kept, reported kept=$t17_reported_kept"
+        if [[ "$t17_reported_kept" == "$t17_expected_kept" ]]; then
+            pass "rmclean_cubes: min_valid_frac=0.99 keeps exactly the expected pixel count ($t17_expected_kept), matching the known per-prototype flag counts"
+        else
+            fail "rmclean_cubes: min_valid_frac=0.99 kept $t17_reported_kept pixels, expected $t17_expected_kept (see $OUT_DIR/rmc_t17_thresh.log)"
+        fi
+
+        if python3 - "$t17_thresh" "$t17_baseline" "$t17_expected_kept" <<'PYEOF'
+import sys
+import numpy as np
+from astropy.io import fits
+
+thresh_base, baseline_base, n_expected_kept = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ok = True
+for suffix in ['CLEAN.AMP','CLEAN.PHA','RESID.AMP','RESID.PHA','RESTORED.AMP','RESTORED.PHA']:
+    thresh = fits.getdata(f'{thresh_base}.{suffix}.RMCUBE.FITS')
+    base = fits.getdata(f'{baseline_base}.{suffix}.RMCUBE.FITS')
+    nan_pixels = np.isnan(thresh).all(axis=0)
+    n_nan = int(nan_pixels.sum())
+    n_total = thresh.shape[1]*thresh.shape[2]
+    if n_nan != n_total - n_expected_kept:
+        print(f'{suffix}: FAIL wrong NaN pixel count: {n_nan} (expected {n_total - n_expected_kept})')
+        ok = False
+        continue
+    # Kept pixels (not NaN under threshold) must be BIT-IDENTICAL to the
+    # no-threshold baseline -- the threshold must never change a KEPT
+    # pixel's own CLEAN result, only decide whether it runs at all.
+    kept_mask = ~nan_pixels
+    if not np.array_equal(thresh[:, kept_mask], base[:, kept_mask]):
+        print(f'{suffix}: FAIL kept pixels differ from no-threshold baseline')
+        ok = False
+if ok:
+    print('ALL_OK')
+sys.exit(0 if ok else 1)
+PYEOF
+        then
+            pass "rmclean_cubes: min_valid_frac NaN placement matches expected skip count, and kept pixels are bit-identical to the no-threshold baseline (all 6 outputs)"
+        else
+            fail "rmclean_cubes: min_valid_frac output verification failed (see above)"
+        fi
+    else
+        fail "rmclean_cubes: min_valid_frac test run(s) failed (see $OUT_DIR/rmc_t17_*.log)"
+    fi
+    rm -f "${t17_thresh}".*.FITS "${t17_baseline}".*.FITS "$t17_mask"
+else
+    skip "rmclean_cubes: min_valid_frac check skipped (bin/rmclean_cubes or section 51's own fixtures not available)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"
