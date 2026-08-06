@@ -3413,11 +3413,24 @@ confirms Belady is not merely correct but genuinely, substantially
 better than the simpler fallback on data built to expose the
 fallback's own blind spot.
 
+**Increment 9 (de-duplicate pattern bytes between the runtime cache
+entry and the registry entry) -- DONE, at the user's explicit request
+after T14's own completion, to minimize memory footprint.** Under
+`cache_eviction_policy='belady'`, `table_cache_entry_t%pattern` is now
+never allocated -- every cache slot reads its pattern bytes through
+its own `registry_id` into `pattern_registry` instead (the same bytes
+Pass 0 already stored there), via a new single shared comparison
+function `cached_pattern_matches`. Under `'hitcount'` (no registry
+exists to delegate to), behaviour is unchanged -- each slot still
+keeps its own copy. Verified directly: a new printed diagnostic
+("pattern bytes locally stored for N of M resident cache slot(s)")
+confirmed 0 of 8 under belady vs 8 of 8 under hitcount on the same
+increment 8 adversarial fixture, not just inferred from unchanged
+correctness. Full suite: 158/158 (156 + 2 new checks), zero
+regressions -- pure internal storage-location plumbing, no output
+change.
+
 **Not done, deliberately out of scope for "T14 done":**
-- **Increment 9** (de-duplicate pattern bytes between the runtime
-  cache entry and the registry entry) -- optional, flagged in the
-  original plan as worth a separate yes/no, never required for
-  correctness.
 - **The pre-existing tile-width RESID/RESTORED floating-point
   artifact** documented under increment 6's own progress notes above
   -- confirmed unrelated to T14, its own follow-up decision still
