@@ -17,12 +17,19 @@ as "Block N of 32 processed."; this script computes it directly from
 the start/done timestamps rather than trusting that summary line's own
 formatting.
 
+--csv is optional if --actual-log is given: the same run's log already
+contains the line report_build_time_advisory prints right after
+writing the CSV ('Wrote <path>.advisory.csv (...)'), so it can be
+found there automatically -- this only works for a log produced by the
+CURRENT binary; a log from before this CSV-writing feature existed has
+no such line, and --csv must be given explicitly.
+
 Example:
   scripts/plot_rmclean_advisory.py \\
       --csv out_cleaned.advisory.csv \\
       --out scratch/rmclean_advisory.png
   scripts/plot_rmclean_advisory.py \\
-      --csv out_cleaned.advisory.csv --actual-log rmclean.run.log \\
+      --actual-log rmclean.run.log \\
       --out scratch/rmclean_advisory_vs_actual.png
 """
 
@@ -40,6 +47,29 @@ THREAD_TIMING_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}).*"
     r"stage=clean\s+event=(?P<event>start|done)\s+.*block=(?P<block>\d+)"
 )
+
+WROTE_CSV_RE = re.compile(r"^Wrote (?P<path>.+\.advisory\.csv) \(")
+
+
+def find_advisory_csv_in_log(log_path: Path) -> Optional[Path]:
+    """Find the CSV path from this SAME run's own 'Wrote ...' line."""
+    with log_path.open() as f:
+        for line in f:
+            m = WROTE_CSV_RE.match(line)
+            if not m:
+                continue
+            candidate = Path(m.group("path"))
+            if candidate.is_file():
+                return candidate
+            # outfile= in the run's own cfg may have been relative to
+            # wherever rmclean_cubes was launched from, not this
+            # script's own cwd -- try relative to the log file itself,
+            # a common layout (both under the same provenance dir).
+            candidate = log_path.parent / candidate.name
+            if candidate.is_file():
+                return candidate
+            return None
+    return None
 
 
 def read_advisory_csv(path: Path) -> Tuple[List[int], List[float]]:
@@ -78,14 +108,20 @@ def main() -> int:
         "overlaid against a run's own measured total block time."
     )
     parser.add_argument(
-        "--csv", required=True, help="<outfile>.advisory.csv from a rmclean_cubes run"
+        "--csv",
+        default=None,
+        help="<outfile>.advisory.csv from a rmclean_cubes run. Optional if "
+        "--actual-log is given AND that log's own run already printed "
+        "'Wrote ...advisory.csv' (i.e. it wasn't cache_eviction_policy=hitcount, "
+        "which skips Pass 0 entirely) -- auto-detected from the log in that case.",
     )
     parser.add_argument("--out", required=True, help="Output PNG path")
     parser.add_argument(
         "--actual-log",
         default=None,
         help="Optional: a rmclean_cubes run log (log_level=debug) to overlay "
-        "measured per-block TOTAL wall time against",
+        "measured per-block TOTAL wall time against. Also used to auto-detect "
+        "--csv when --csv is omitted.",
     )
     args = parser.parse_args()
 
@@ -94,7 +130,32 @@ def main() -> int:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    csv_path = Path(args.csv)
+    if args.csv:
+        csv_path = Path(args.csv)
+    else:
+        if not args.actual_log:
+            print(
+                "ERROR: --csv is required unless --actual-log is given "
+                "(the CSV path is then auto-detected from that log).",
+                file=sys.stderr,
+            )
+            return 1
+        log_path = Path(args.actual_log)
+        if not log_path.is_file():
+            print(f"ERROR: no such file: {log_path}", file=sys.stderr)
+            return 1
+        found = find_advisory_csv_in_log(log_path)
+        if not found:
+            print(
+                f"ERROR: no 'Wrote ...advisory.csv' line found in {log_path} "
+                "(older run, predates this feature, or cache_eviction_policy="
+                "hitcount) -- pass --csv explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        csv_path = found
+        print(f"auto-detected --csv {csv_path} from {log_path}")
+
     if not csv_path.is_file():
         print(f"ERROR: no such file: {csv_path}", file=sys.stderr)
         return 1
