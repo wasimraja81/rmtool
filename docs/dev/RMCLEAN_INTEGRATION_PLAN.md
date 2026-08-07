@@ -2506,7 +2506,7 @@ real full Jennifer cube with the curated cfg:**
    cache overhead `mem_frac_ram` was never designed to budget for at
    all. Full regression suite: 121/121 pass after both fixes.
 
-### T10 -- mask-cube read overflow (found via a real full-cube run diverging from small-subimage tests) + RAM-aware mask handling (T10a done, T10b not started)
+### T10 -- mask-cube read overflow (found via a real full-cube run diverging from small-subimage tests) + RAM-aware mask handling (T10a AND T10b both done -- heading corrected 2026-08-07, was stale: said "T10b not started" while the body below already said "T10b is done"; T11 below was blocked on this and is now unblocked, just still not started)
 
 **Background:** after T9 landed, the user ran a full 4501x4501
 Jennifer CLEAN with the curated cfg (`jennifer_e2e_v4_cleaned`, isolated
@@ -3681,3 +3681,168 @@ separate saving (I/O + memory footprint for regions known in advance
 to be entirely outside coverage) from T17's own coverage-fraction
 compute skip, not a duplicate of it. Not scoped or designed yet --
 this entry exists only so the gap isn't silently forgotten.
+
+### T19 -- Final sanity-check batch: per-pixel CLEAN diagnostics, BUNIT correctness, restoring-beam header, consolidated pending-ticket roadmap (NOT STARTED)
+
+**Purpose of this ticket:** the user's own request -- rather than
+scattering several real, separately-motivated findings from one
+session (diagnosing the real WALLABY+EMU run's own edge-block
+slowdown) across several new ticket numbers, consolidate them into one
+final ticket, while keeping every OLDER still-pending ticket's own
+number for reference rather than renumbering anything already written.
+Old ticket numbers below are cross-referenced, not superseded.
+
+**Motivation, in one line:** investigating why blocks 3-5/30-32 of the
+real run take far longer than table-generation time alone predicts
+(T15's own advisory) surfaced that `rmclean_cubes` has NO per-pixel or
+per-block visibility into CLEAN's own behaviour (iteration count, stop
+reason, residual quality, Faraday complexity) -- only a single
+whole-run summary, printed once at the end. Diagnosing the user's own
+mosaic-edge-noise hypothesis (WALLABY `square_6x6` vs EMU
+`closepack36` footprints truncate asymmetrically at each image edge --
+west/north edges keep the higher-S/N inner EMU footprint, the south
+edge is EMU's own noisier footprint boundary) needs this data to be
+real, not inferred indirectly from block wall-time alone.
+
+**Part A -- Per-block CLEAN stopping-reason/iteration tallies.**
+Extend the existing GLOBAL-ONLY tally (`n_stopped_niter`/
+`n_stopped_abs_flux`/`n_stopped_auto_nsigma`, `n_iter_used_sum/min/max`,
+printed once at program end, `src/rmclean_cubes.f90:360-367`,
+`823-830`) to ALSO break down per block, printed alongside each
+block's own "Block N of 32 processed." line -- same convention as
+T15's own per-block advisory table.
+
+**Part B -- Five new per-pixel diagnostic maps**, all written once at
+run end (new capability -- `rmclean_cubes.f90` currently has no 2D
+map-writing code at all, only the 6 tiled 3D RM cubes), matching
+`rm_synthesis`'s own `NVALID.MAP.FITS`/`PEAK.MAP.FITS` naming/dtype
+conventions:
+
+| File | dtype | Source | Fill (not-CLEANed / undefined) |
+|---|---|---|---|
+| `NITER.MAP.FITS` | int16 (matches `NVALID.MAP.FITS`'s own precedent -- niter's default 500 already exceeds 8-bit's 0-255 range) | `n_iter_used_p` (already computed) | 0 |
+| `STOP_REASON.MAP.FITS` | int8, coded `0`=not cleaned, `1`=niter, `2`=abs_flux, `3`=auto_nsigma | `stop_reason_p` (already computed) | 0 |
+| `RESID_PEAK.MAP.FITS` | float32 | `pixel_peak_resid_p` (already computed, `rmclean_cubes.f90:3701`) | NaN |
+| `RESID_RMS.MAP.FITS` | float32 | new: `rms_about_mean` (already exists, `rmclean.f90:101`, same routine CLEAN's own loop uses internally) called on the final residual | NaN |
+| `N_COMPONENTS.MAP.FITS` | int16 | new: count of nonzero CLEAN bins | 0 |
+| `COMP_RM_SPREAD.MAP.FITS` | float32 | new: intensity-weighted RM dispersion, see formula below | NaN |
+
+**`COMP_RM_SPREAD` formula** (the actual Faraday-complexity metric --
+raw `N_COMPONENTS` alone conflates genuine multi-screen structure with
+CLEAN simply needing several small hits near one true peak):
+```
+phi_bar = sum(A_i * phi_i) / sum(A_i)                    (intensity-weighted mean RM)
+sigma_phi = sqrt(sum(A_i * (phi_i - phi_bar)^2) / sum(A_i))   (intensity-weighted RM spread)
+```
+summed over nonzero CLEAN bins, weighted by amplitude (not
+amplitude-squared, matching how a spectral-line-width moment is
+conventionally intensity-weighted). Reported in raw rad/m^2 (NOT
+pre-normalized by `fwhm_rm`) -- keeps the map an independent physical
+quantity; converting to "spread in resolution elements" is then a
+one-line post-processing division, and avoids baking in `fwhm_rm`'s
+own known limitation (T13 below: one global value, not per-pixel).
+`N_COMPONENTS==0` or `==1` -> NaN (0/0 undefined; a single component
+has zero spread by construction, but is reported NaN here rather than
+0.0 to distinguish "trivially zero spread" from "no structure to
+measure" -- open question, worth confirming during implementation).
+Verified during design discussion (not yet implemented): rescaling
+component amplitude by any UNIFORM-across-the-spectrum factor (e.g.
+converting Jy/beam to Jy via a fixed RMSF-width divisor) cancels
+exactly in this ratio -- `sigma_phi` is insensitive to which amplitude
+convention is used for the weights, only φ's own units matter.
+
+**Open decision, not yet confirmed:** a `TOTAL_POL_FLUX`-style map
+(`sum(CLEAN.AMP_i)`, no `dphi` weighting -- see Part C below for why
+no weighting is correct for a discrete/additive component list) was
+discussed as a natural complement but not explicitly confirmed in
+scope. Decide before implementing Part B.
+
+**Part C -- `BUNIT` correctness (found via a deep units discussion,
+verified against RM-Tools' own documented convention and source code,
+not merely asserted):**
+- `rm_synthesis.f90:2953/2958` passes the input Q cube's own `BUNIT`
+  ("Jy/beam") straight through, verbatim, to `AMP.RMCUBE.FITS`'s own
+  header. This is a real, verified LABEL gap, not a numerical one:
+  this project's own normalization (`rm_synthesis_mod.f90`, dividing
+  by `wsum`, e.g. lines 1043-1046) already matches RM-Tools'
+  `K = 1.0/np.sum(weightArr)` exactly (confirmed directly against
+  `RMutils/util_RM.py` on GitHub) -- the Faraday dispersion function is
+  a genuine Faraday-depth DENSITY (dimensionally required by the
+  continuous RM-synthesis Fourier relation `P(lambda^2) = integral
+  F(phi) exp(2i*phi*lambda^2) dphi` -- `F(phi)` must carry units of
+  [P]/[phi] for the integral to be dimensionally consistent), and
+  RM-Tools' own documentation states this explicitly: "the FDF has
+  units of the spectra unit per RMSF." Fix: `AMP.RMCUBE.FITS`'s
+  `BUNIT` should read `"Jy/beam/RMSF"` (or whatever exact string
+  matches this project's own header-string conventions elsewhere), NOT
+  a value/computation change -- the numbers already computed and
+  written to every existing file (including the real, currently-live
+  WALLABY+EMU run's own output) are correct as-is.
+- `rmclean_cubes.f90`'s `open_output_cube` copies its header verbatim
+  from `ampfile` for all 6 outputs. Once the fix above lands,
+  `RESID.AMP`/`RESTORED.AMP` correctly INHERIT `"Jy/beam/RMSF"`
+  automatically (both are RMSF-convolution-smeared quantities, same
+  reasoning as the dirty spectrum: naively summing either across phi
+  without an RMSF-width-aware correction double-counts flux correlated
+  across neighbouring bins, exactly like summing raw Jy/beam image
+  pixels without a pixel-area/beam-area correction over-counts an
+  extended source's true total flux).
+  `CLEAN.AMP`/`CLEAN.PHA` need an EXPLICIT override back to plain
+  `"Jy/beam"` after the verbatim copy -- CLEAN components are discrete
+  and additive by construction (each iteration records one delta-like
+  spike, not a sampled continuous density), so `sum(CLEAN.AMP)` is
+  ALREADY the correct total flux with no RMSF-width correction, exactly
+  analogous to 2D imaging's own CLEAN component convention (summed
+  directly, no beam-area correction, unlike the smeared dirty/restored
+  MAPS which do need one). Verified via a worked Faraday-thin
+  point-source thought experiment (100% polarized, 1 Jy/beam, phi=100
+  rad/m^2, RMSF FWHM=42 rad/m^2) during design discussion: applying the
+  `(dphi_bin/RMSF_width)` correction to a discrete single-component case
+  gives the WRONG answer (`dphi_bin/42`, not 1 Jy/beam) unless the bin
+  width coincidentally equals the RMSF FWHM exactly -- confirming the
+  correction belongs on the smeared maps only, never on the component
+  list.
+- `PHA` cubes (`BUNIT='rad'` already) are unaffected either way --
+  phase has no flux-density interpretation.
+
+**Part D -- restoring beam width recorded in `RESTORED`'s own FITS
+header.** New request, directly related to Part C (makes the
+`"Jy/beam/RMSF"` label actionable -- a user needs the actual RMSF/
+restoring-beam width to do the phi-integration correction) and to T13
+below (the restoring beam is currently one GLOBAL value,
+`fwhm_rm`, computed once for the whole run -- recording it explicitly
+in the header at least makes this limitation visible per-file, even
+though it doesn't fix T13's own underlying per-line-of-sight gap). Not
+yet designed: exact keyword name/convention (something in the spirit
+of `BMAJ`/`BMIN` for a real synthesized beam, adapted for a 1D
+Faraday-depth FWHM rather than a 2D elliptical beam).
+
+**Part E -- consolidated pending-ticket roadmap** (older ticket
+numbers kept for reference, not renumbered; status re-verified against
+each ticket's own BODY text this session, not just its heading, after
+finding T10's own heading was stale -- see T10's own corrected heading
+above):
+- **T5** (GPU/CPU hybrid acceleration for RM-CLEAN): exploratory
+  design capture only, not started. See T5's own text in full before
+  any future work on it -- in particular the RM-space-faceting idea
+  the user was genuinely excited about.
+- **T6** (`validation.f90`, flexible cube-slice statistics tool):
+  planning capture only, not started.
+- **T11** (CLEAN divergence / noise-wasting-compute stopping
+  criteria): not started. Was blocked on T10b; T10b is done (see T10's
+  corrected heading), so T11 is now unblocked but still not begun.
+- **T13** (restoring beam is one global FWHM, not per-line-of-sight):
+  documented, not fixed, direction under consideration. Directly
+  related to Part D above.
+- **T18** (subimage/subcube reading for `rmclean_cubes`): not started,
+  not scoped.
+
+**Status: NOT STARTED.** Design captured here per the user's own
+explicit request to consolidate before implementing, rather than
+spreading today's several related findings across several new ticket
+numbers. Implementation should proceed in the project's own standard
+small-increment, tested-at-each-step style (matching T14/T15/T17),
+starting with Part C (BUNIT, lowest risk -- header-only, no new
+compute or output files) and Part D (also header-only), before Parts A
+and B (real new compute + new output files, need real test fixtures
+with known expected niter/stop-reason/residual/component values).
