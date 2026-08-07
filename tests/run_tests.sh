@@ -1862,6 +1862,35 @@ print(fits.getheader('${rmc_out}.${t19_suffix}.RMCUBE.FITS').get('BUNIT'))
             if [ "$t19_bunit_ok" = "1" ]; then
                 pass "rmclean_cubes: all 6 outputs' BUNIT correct (CLEAN=Jy/beam, RESID/RESTORED=Jy/beam/RMSF, PHA=rad) (T19)"
             fi
+
+            # T19 Part D: RMSFFWHM recorded on RESTORED only (the only
+            # output the restoring beam is actually convolved into),
+            # matching the "Restoring beam FWHM = ..." value this same
+            # run printed to its own log.
+            t19_fwhm_printed=$(grep -oP 'Restoring beam FWHM = \K[0-9.]+' "$rmc_log")
+            t19_fwhm_restored_amp=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('${rmc_out}.RESTORED.AMP.RMCUBE.FITS').get('RMSFFWHM'))
+")
+            t19_fwhm_restored_pha=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('${rmc_out}.RESTORED.PHA.RMCUBE.FITS').get('RMSFFWHM'))
+")
+            t19_fwhm_clean_amp=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('${rmc_out}.CLEAN.AMP.RMCUBE.FITS').get('RMSFFWHM'))
+")
+            if python3 -c "
+import sys
+printed = float('$t19_fwhm_printed')
+restored = float('$t19_fwhm_restored_amp')
+sys.exit(0 if abs(printed - restored) < 1e-3 else 1)
+" && [ "$t19_fwhm_restored_pha" = "$t19_fwhm_restored_amp" ] \
+              && [ "$t19_fwhm_clean_amp" = "None" ]; then
+                pass "rmclean_cubes: RMSFFWHM=$t19_fwhm_restored_amp on RESTORED only, matches printed value ($t19_fwhm_printed) (T19)"
+            else
+                fail "rmclean_cubes: RMSFFWHM check failed (printed=$t19_fwhm_printed restored.amp=$t19_fwhm_restored_amp restored.pha=$t19_fwhm_restored_pha clean.amp=$t19_fwhm_clean_amp)"
+            fi
         else
             fail "rmclean_cubes: run failed (see $rmc_log)"
         fi

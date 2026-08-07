@@ -670,11 +670,29 @@ program rmclean_cubes
    call open_output_cube(ampfile, trim(outfile)//'.RESID.PHA.RMCUBE.FITS',&
    &nx, ny, nrm, idx_resid_pha, status, bunit_override='rad')
    if (status.ne.0) stop 1
+   ! T19 Part D (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): RESTORED's own
+   ! RMSFFWHM header keyword (restoring beam FWHM, rad/m^2) -- passed as
+   ! an open_output_cube ARGUMENT, written INSIDE that subroutine (same
+   ! spot as bunit_override), not as separate code after the call
+   ! returns: for nwriters_eff>1, open_output_cube CLOSES out_unit(idx)
+   ! before returning (its own FTGHAD-then-close step), so writing to it
+   ! afterward from here operates on an already-closed CFITSIO unit --
+   ! undefined behaviour, confirmed directly (a real SIGSEGV on
+   ! nwriters=2, caught by run_tests.sh before this reached main).
+   ! CLEAN/RESID take no rmsffwhm_override (only RESTORED actually has
+   ! this beam convolved into it -- CLEAN components are pre-restoration,
+   ! RESID is the raw residual). One GLOBAL value for the whole cube, not
+   ! per-line-of-sight -- see T13's own still-open finding; recording it
+   ! here at least makes that limitation visible per-file, it does not
+   ! fix it. Makes the 'Jy/beam/RMSF' BUNIT label (Part C) actionable: a
+   ! user needs this width for the phi-integration correction.
    call open_output_cube(ampfile, trim(outfile)//'.RESTORED.AMP.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_restored_amp, status)
+   &nx, ny, nrm, idx_restored_amp, status,&
+   &rmsffwhm_override=dble(fwhm_rm))
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESTORED.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_restored_pha, status, bunit_override='rad')
+   &nx, ny, nrm, idx_restored_pha, status, bunit_override='rad',&
+   &rmsffwhm_override=dble(fwhm_rm))
    if (status.ne.0) stop 1
 
    ! T4a/T4d: sequential tiles, each a strict read (single-threaded or T4b
@@ -2156,7 +2174,7 @@ contains
    end subroutine read_amp_pha_chunk
 
    subroutine open_output_cube(template_file, outname, nx_in, ny_in, nrm_in,&
-   &idx, status, bunit_override)
+   &idx, status, bunit_override, rmsffwhm_override)
       !! T4a/T4c: creates outname and writes its header ONLY (no pixel
       !! data -- that now comes tile-by-tile via write_output_tile below,
       !! since the whole cube is never resident in memory at once).
@@ -2172,6 +2190,15 @@ contains
       !! flux), not a smeared Faraday-depth density, so they keep the
       !! same units the input Q/U cube itself had, before rm_synthesis's
       !! own T19 fix appended '/RMSF' to the dirty AMP cube's BUNIT.
+      !!
+      !! T19 Part D: rmsffwhm_override, if present, writes a NEW
+      !! 'RMSFFWHM' keyword (restoring beam FWHM, rad/m^2) -- used ONLY
+      !! for RESTORED.AMP/RESTORED.PHA, the only outputs this beam is
+      !! actually convolved into. MUST be applied here, inside this
+      !! subroutine, not by the caller after it returns -- see this
+      !! keyword's own call-site comment for why (a real SIGSEGV,
+      !! writing to an already-closed CFITSIO unit under nwriters>1,
+      !! confirmed and fixed during T19 Part D's own verification).
       !!
       !! T4c: if nwriters_eff==1, leaves out_unit(idx) OPEN -- the
       !! caller keeps it open across the whole tile loop and closes it
@@ -2194,6 +2221,7 @@ contains
       integer, intent(in) :: idx
       integer, intent(out) :: status
       character(len=*), intent(in), optional :: bunit_override
+      real(dp), intent(in), optional :: rmsffwhm_override
       integer :: src_unit, fitsstat, blocksize
       integer :: naxes_out(3)
       logical :: simple, extend
@@ -2259,6 +2287,15 @@ contains
          call ftukys(out_unit(idx), 'bunit', trim(bunit_override),&
          &'Pixel data units (discrete CLEAN components -- see'//&
          &' docs/dev/RMCLEAN_INTEGRATION_PLAN.md T19)', fitsstat)
+      endif
+      if (present(rmsffwhm_override)) then
+         ! New keyword (never present in the verbatim copy from
+         ! ampfile), so plain FTPKYD -- no existing card to fight with,
+         ! unlike bunit_override's own FTUKYS requirement above.
+         fitsstat = 0
+         call ftpkyd(out_unit(idx), 'RMSFFWHM', rmsffwhm_override, 13,&
+         &'Restoring beam FWHM, rad/m^2 (ONE global value -- T13)',&
+         &fitsstat)
       endif
       out_is_open(idx) = .true.
       if (nwriters_eff.gt.1) then
