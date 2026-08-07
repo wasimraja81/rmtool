@@ -199,6 +199,15 @@ program rmclean_cubes
    logical :: tile_auto
    real(sp) :: mem_frac_ram
 
+   ! T19 Part B (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): one combined
+   ! toggle for all 6 new per-pixel CLEAN diagnostic maps (NITER/
+   ! STOP_REASON/RESID_PEAK/RESID_RMS/N_COMPONENTS/COMP_RM_SPREAD) --
+   ! same "one flag for a cohesive group" convention as rm_synthesis's
+   ! own cubestat (PEAK/RM_PEAK/ANG_PEAK/SNR maps), not one flag per
+   ! map, since all 6 are computed together at negligible incremental
+   ! cost once CLEAN has already run for that pixel.
+   logical :: write_clean_diagnostics
+
    ! --- T17 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): coverage-fraction
    ! pixel skip -- pixels whose own valid-channel fraction (summed
    ! across ALL bands) falls below this threshold are never CLEANed at
@@ -255,6 +264,22 @@ program rmclean_cubes
    ! budget); a small machine naturally gets smaller tiles instead of
    ! failing outright.
    integer(kind=1), allocatable :: mask_tile(:,:,:)
+
+   ! T19 Part B (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): 6 per-pixel CLEAN
+   ! diagnostic maps -- WHOLE-IMAGE (nx,ny), not tiled like everything
+   ! else in this file, since each is 2D and small enough (~17 bytes/
+   ! pixel total) to hold entirely in memory rather than adding tiled-
+   ! I/O machinery for them. Allocated only if write_clean_diagnostics
+   ! (else left unallocated -- every write site below is itself guarded
+   ! by the same flag). dtype/fill-value convention matches T19's own
+   ! design table: int16 for NITER/N_COMPONENTS (bounded counts, same
+   ! precedent as rm_synthesis's own NVALID.MAP.FITS), int8 for
+   ! STOP_REASON (a small code), float32 (NaN fill) for the two
+   ! continuous quantities.
+   integer(kind=2), allocatable :: niter_map(:,:), n_components_map(:,:)
+   integer(kind=1), allocatable :: stop_reason_map(:,:)
+   real(sp), allocatable :: resid_peak_map(:,:), resid_rms_map(:,:)
+   real(sp), allocatable :: comp_rm_spread_map(:,:)
 
    ! T4a: per-tile input buffers, allocated ONCE at the planned
    ! (tile_ra,tile_dec,nrm) max size and reused across every tile -- a
@@ -640,6 +665,30 @@ program rmclean_cubes
    ! memory.
    allocate(mask_tile(tile_ra,tile_dec,nchan))
 
+   ! T19 Part B: whole-image diagnostic maps, allocated+fill-initialized
+   ! ONCE here (not per-tile) -- clean_one_pixel below only ever WRITES
+   ! a pixel's own real value when it actually reaches a normal
+   ! completion; every early-return path (nvalid_p<1, min_valid_chan_frac
+   ! skip) leaves that pixel at whatever's written here, so the fill
+   ! values below ARE this feature's own "not cleaned" convention, not
+   ! just a cosmetic default.
+   if (write_clean_diagnostics) then
+      block
+         real(sp) :: zero_val_diag, nan_val_diag
+         allocate(niter_map(nx,ny), stop_reason_map(nx,ny),&
+         &resid_peak_map(nx,ny), resid_rms_map(nx,ny),&
+         &n_components_map(nx,ny), comp_rm_spread_map(nx,ny))
+         zero_val_diag = 0.0_sp
+         nan_val_diag = zero_val_diag/zero_val_diag
+         niter_map = 0_2
+         stop_reason_map = 0_1
+         n_components_map = 0_2
+         resid_peak_map = nan_val_diag
+         resid_rms_map = nan_val_diag
+         comp_rm_spread_map = nan_val_diag
+      end block
+   endif
+
    if (cache_eviction_policy.eq.'belady') call run_pattern_prescan()
 
    call init_mask_pattern_cache()
@@ -955,6 +1004,12 @@ program rmclean_cubes
       call close_output_cube(k)
    enddo
 
+   if (write_clean_diagnostics) then
+      call write_diagnostic_maps()
+      deallocate(niter_map, stop_reason_map, resid_peak_map,&
+      &resid_rms_map, n_components_map, comp_rm_spread_map)
+   endif
+
    write(*,'(A)') 'OK: rmclean_cubes complete.'
    call timer_report_summary()
    call log_message('info', 'finalize', 'rmclean_cubes run completed')
@@ -1001,6 +1056,7 @@ contains
       tile_dec = 0
       tile_auto = .true.
       mem_frac_ram = 0.25_sp
+      write_clean_diagnostics = .true.
       min_valid_chan_frac = 0.0_sp
       io_read_threads = 1
       nwriters = 1
@@ -1278,6 +1334,8 @@ contains
          endif
       case ('tile_auto')
          tile_auto = flag_from_value_rmclean(val)
+      case ('write_clean_diagnostics')
+         write_clean_diagnostics = flag_from_value_rmclean(val)
       case ('io_read_threads')
          read(val, *, iostat=ios) io_read_threads
          if (ios.ne.0 .or. io_read_threads.lt.1) then
@@ -1357,7 +1415,7 @@ contains
       &'|max|mid|fixed] [lsq_ref_compute_value=<v>]'
       write(*,'(A)') '    [mask_pattern_cache_max=<n>]'//&
       &' [cache_eviction_policy=belady|hitcount] [mem_frac_ram=<f>]'//&
-      &' [min_valid_chan_frac=<f>]'//&
+      &' [min_valid_chan_frac=<f>] [write_clean_diagnostics=y|n]'//&
       &' [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]'//&
       &' [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]'
       write(*,'(A)') '   or: rmclean_cubes --config <cfgfile>'
@@ -1460,6 +1518,15 @@ contains
       &' this also shrinks Pass 0''s own pattern registry and the'//&
       &' runtime cache, since skipped pixels are never registered or'//&
       &' cached at all (docs/dev/RMCLEAN_INTEGRATION_PLAN.md T17).'
+      write(*,'(A)') 'write_clean_diagnostics (default y): write 6'//&
+      &' additional per-pixel 2D diagnostic maps at run end --'//&
+      &' NITER/STOP_REASON/RESID_PEAK/RESID_RMS/N_COMPONENTS/'//&
+      &' COMP_RM_SPREAD.MAP.FITS (docs/dev/RMCLEAN_INTEGRATION_PLAN.md'//&
+      &' T19). Negligible extra compute (all 6 computed from values'//&
+      &' CLEAN already produces); the main cost is memory, a small'//&
+      &' FIXED amount for the whole image regardless of tile size'//&
+      &' (~17 bytes/pixel), already accounted for in the'//&
+      &' mem_frac_ram tile-size budget.'
       write(*,'(A)') 'tile_ra/tile_dec (default 0/0, i.e. auto): manual'//&
       &' tile size override (pixels); ignored unless tile_auto=n. Auto'//&
       &' policy (tile_auto=y, the default) packs full-RA Dec strips --'//&
@@ -1770,6 +1837,7 @@ contains
       !! Dec row exceeding the budget) falls back to subdividing RA.
       integer(kind=8) :: mem_total_kb, bytes_per_tile_pixel, mem_safe_bytes
       integer(kind=8) :: tile_pixels_max, image_pixels_total, tile_bytes_est
+      integer(kind=8) :: diag_maps_bytes_total
 
       ! 2 input arrays (single-buffered) + 6 output arrays (each
       ! double-buffered, unconditionally -- see this subroutine's own
@@ -1784,6 +1852,16 @@ contains
       call get_mem_total_kb(mem_total_kb)
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) *&
       &1024.0d0, 8)
+      ! T19 Part B: the 6 diagnostic maps are a FIXED, whole-image
+      ! allocation (not per-tile, see their own declaration comment) --
+      ! subtracted ONCE here, not folded into bytes_per_tile_pixel
+      ! (which governs the per-tile-PIXEL budget the tiling loop below
+      ! actually divides by). 17 = 2(NITER)+1(STOP_REASON)+4(RESID_PEAK)
+      ! +4(RESID_RMS)+2(N_COMPONENTS)+4(COMP_RM_SPREAD) bytes/pixel.
+      if (write_clean_diagnostics) then
+         diag_maps_bytes_total = int(nx,8) * int(ny,8) * 17_8
+         mem_safe_bytes = mem_safe_bytes - diag_maps_bytes_total
+      endif
       if (mem_safe_bytes.le.bytes_per_tile_pixel) mem_safe_bytes = bytes_per_tile_pixel
       tile_pixels_max = mem_safe_bytes / bytes_per_tile_pixel
       if (tile_pixels_max.lt.1_8) tile_pixels_max = 1_8
@@ -2684,6 +2762,201 @@ contains
          call FTPREC(dst_unit, card, fitsstat)
       enddo
    end subroutine copy_generic_header_rmclean
+
+   subroutine copy_generic_header_2d_rmclean(src_unit, dst_unit, status)
+      !! T19 Part B: SAME idea as copy_generic_header_rmclean above, for
+      !! the 6 new 2D diagnostic maps -- but src_unit (ampfile) is a 3D
+      !! cube, so this ALSO drops the 5 axis-3 WCS keywords this
+      !! project's own cubes always carry (CRVAL3/CRPIX3/CDELT3/CTYPE3/
+      !! CUNIT3, confirmed against rm_synthesis.f90's own header-writing
+      !! code -- no PC/CD rotation-matrix elements are ever used for
+      !! axis 3 here, RM cubes are always axis-aligned) -- copying those
+      !! through verbatim onto a 2-axis file would leave stale, WRONG
+      !! WCS metadata a viewer could misinterpret. RA/Dec (axes 1+2)
+      !! WCS copies through exactly like the 3D case.
+      integer, intent(in) :: src_unit, dst_unit
+      integer, intent(inout) :: status
+      integer :: nkeys, nmore, i, fitsstat
+      character(len=80) :: card
+      character(len=8) :: key
+
+      if (status.ne.0) return
+      fitsstat = 0
+      call FTGHSP(src_unit, nkeys, nmore, fitsstat)
+      do i = 1, nkeys
+         fitsstat = 0
+         call FTGREC(src_unit, i, card, fitsstat)
+         if (fitsstat.ne.0) cycle
+         key = adjustl(card(1:8))
+         select case (trim(key))
+         case ('SIMPLE', 'BITPIX', 'NAXIS', 'EXTEND', 'PCOUNT', 'GCOUNT', 'END')
+            cycle
+         case ('CRVAL3', 'CRPIX3', 'CDELT3', 'CTYPE3', 'CUNIT3')
+            cycle
+         end select
+         if (is_naxis_keyword(key)) cycle
+         fitsstat = 0
+         call FTPREC(dst_unit, card, fitsstat)
+      enddo
+   end subroutine copy_generic_header_2d_rmclean
+
+   subroutine write_diagnostic_maps()
+      !! T19 Part B (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): writes the 6
+      !! whole-image diagnostic maps, once, at run end -- small enough
+      !! (~17 bytes/pixel total) to write in a single FTPSSx call each,
+      !! no tiling/chunking needed unlike the 6 real (3D) outputs.
+      integer :: src_unit, dst_unit, fitsstat, blocksize, status_diag
+      integer :: naxes_2d(2), fpixel(2), lpixel(2)
+      logical :: simple_diag, extend_diag
+
+      naxes_2d = (/ nx, ny /)
+      fpixel = (/ 1, 1 /)
+      lpixel = (/ nx, ny /)
+      simple_diag = .true.
+      extend_diag = .false.
+
+      call write_one_diag_map_i2(ampfile, trim(outfile)//'.NITER.MAP.FITS',&
+      &naxes_2d, fpixel, lpixel, niter_map, 'COUNT',&
+      &'CLEAN iterations used (n_iter_used)')
+      call write_one_diag_map_i2(ampfile,&
+      &trim(outfile)//'.N_COMPONENTS.MAP.FITS', naxes_2d, fpixel, lpixel,&
+      &n_components_map, 'COUNT', 'Count of nonzero CLEAN bins')
+      call write_one_diag_map_r4(ampfile,&
+      &trim(outfile)//'.RESID_PEAK.MAP.FITS', naxes_2d, fpixel, lpixel,&
+      &resid_peak_map, clean_bunit, 'Peak |residual| amplitude after CLEAN')
+      call write_one_diag_map_r4(ampfile,&
+      &trim(outfile)//'.RESID_RMS.MAP.FITS', naxes_2d, fpixel, lpixel,&
+      &resid_rms_map, clean_bunit, 'RMS of |residual| amplitude after CLEAN')
+      call write_one_diag_map_r4(ampfile,&
+      &trim(outfile)//'.COMP_RM_SPREAD.MAP.FITS', naxes_2d, fpixel, lpixel,&
+      &comp_rm_spread_map, 'rad/m**2',&
+      &'Intensity-weighted RM spread of CLEAN components (T19)')
+
+      ! STOP_REASON.MAP.FITS: int8, with its own code mapping written
+      ! into the header as HISTORY cards (user's own explicit request --
+      ! must be self-describing, not just documented in --help/the
+      ! ticket doc).
+      status_diag = 0
+      call safe_ftopen(src_unit, trim(ampfile), 0, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot open FITS file: ', trim(ampfile)
+         call free_fits_unit(src_unit)
+         return
+      endif
+      call safe_ftinit(dst_unit,&
+      &trim(outfile)//'.STOP_REASON.MAP.FITS', blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot create: '//trim(outfile)//&
+         &'.STOP_REASON.MAP.FITS'
+         call safe_ftclos(src_unit, fitsstat)
+         call free_fits_unit(dst_unit)
+         return
+      endif
+      call FTPHPR(dst_unit, simple_diag, 8, 2, naxes_2d, 0, 1, extend_diag,&
+      &fitsstat)
+      call copy_generic_header_2d_rmclean(src_unit, dst_unit, status_diag)
+      call safe_ftclos(src_unit, fitsstat)
+      call ftukys(dst_unit, 'bunit', 'CODE',&
+      &'Coded value -- see HISTORY below', fitsstat)
+      call ftphis(dst_unit,&
+      &'STOP_REASON code: 0=not cleaned (nvalid<1 or below', fitsstat)
+      call ftphis(dst_unit,&
+      &'min_valid_chan_frac), 1=hit niter cap, 2=stopped at', fitsstat)
+      call ftphis(dst_unit,&
+      &'abs_flux_floor, 3=stopped at auto_nsigma (T19).', fitsstat)
+      fitsstat = 0
+      call FTPSSB(dst_unit, 1, 2, naxes_2d, fpixel, lpixel, stop_reason_map,&
+      &fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to write STOP_REASON.MAP.FITS'
+      endif
+      call safe_ftclos(dst_unit, fitsstat)
+
+      write(*,'(A)') 'Wrote 6 CLEAN diagnostic maps ('''//&
+      &trim(outfile)//'.{NITER,STOP_REASON,RESID_PEAK,RESID_RMS,'//&
+      &'N_COMPONENTS,COMP_RM_SPREAD}.MAP.FITS'').'
+   end subroutine write_diagnostic_maps
+
+   subroutine write_one_diag_map_i2(template_file, outname, naxes_2d,&
+   &fpixel, lpixel, data, bunit_str, comment_str)
+      !! T19 Part B: int16 diagnostic map (NITER, N_COMPONENTS).
+      character(len=*), intent(in) :: template_file, outname, bunit_str,&
+      &comment_str
+      integer, intent(in) :: naxes_2d(2), fpixel(2), lpixel(2)
+      integer(kind=2), intent(in) :: data(:,:)
+      integer :: src_unit, dst_unit, fitsstat, blocksize, status_diag
+      logical :: simple_diag, extend_diag
+
+      simple_diag = .true.
+      extend_diag = .false.
+      status_diag = 0
+      call safe_ftopen(src_unit, trim(template_file), 0, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot open FITS file: ', trim(template_file)
+         call free_fits_unit(src_unit)
+         return
+      endif
+      call safe_ftinit(dst_unit, trim(outname), blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot create: ', trim(outname)
+         call safe_ftclos(src_unit, fitsstat)
+         call free_fits_unit(dst_unit)
+         return
+      endif
+      call FTPHPR(dst_unit, simple_diag, 16, 2, naxes_2d, 0, 1,&
+      &extend_diag, fitsstat)
+      call copy_generic_header_2d_rmclean(src_unit, dst_unit, status_diag)
+      call safe_ftclos(src_unit, fitsstat)
+      call ftukys(dst_unit, 'bunit', trim(bunit_str), trim(comment_str),&
+      &fitsstat)
+      fitsstat = 0
+      call FTPSSI(dst_unit, 1, 2, naxes_2d, fpixel, lpixel, data, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to write ', trim(outname)
+      endif
+      call safe_ftclos(dst_unit, fitsstat)
+   end subroutine write_one_diag_map_i2
+
+   subroutine write_one_diag_map_r4(template_file, outname, naxes_2d,&
+   &fpixel, lpixel, data, bunit_str, comment_str)
+      !! T19 Part B: float32 diagnostic map (RESID_PEAK/RESID_RMS/
+      !! COMP_RM_SPREAD).
+      character(len=*), intent(in) :: template_file, outname, bunit_str,&
+      &comment_str
+      integer, intent(in) :: naxes_2d(2), fpixel(2), lpixel(2)
+      real(sp), intent(in) :: data(:,:)
+      integer :: src_unit, dst_unit, fitsstat, blocksize, status_diag
+      logical :: simple_diag, extend_diag
+
+      simple_diag = .true.
+      extend_diag = .false.
+      status_diag = 0
+      call safe_ftopen(src_unit, trim(template_file), 0, blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot open FITS file: ', trim(template_file)
+         call free_fits_unit(src_unit)
+         return
+      endif
+      call safe_ftinit(dst_unit, trim(outname), blocksize, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: cannot create: ', trim(outname)
+         call safe_ftclos(src_unit, fitsstat)
+         call free_fits_unit(dst_unit)
+         return
+      endif
+      call FTPHPR(dst_unit, simple_diag, -32, 2, naxes_2d, 0, 1,&
+      &extend_diag, fitsstat)
+      call copy_generic_header_2d_rmclean(src_unit, dst_unit, status_diag)
+      call safe_ftclos(src_unit, fitsstat)
+      call ftukys(dst_unit, 'bunit', trim(bunit_str), trim(comment_str),&
+      &fitsstat)
+      fitsstat = 0
+      call FTPSSE(dst_unit, 1, 2, naxes_2d, fpixel, lpixel, data, fitsstat)
+      if (fitsstat.ne.0) then
+         write(*,*) 'ERROR: failed to write ', trim(outname)
+      endif
+      call safe_ftclos(dst_unit, fitsstat)
+   end subroutine write_one_diag_map_r4
 
    logical function is_naxis_keyword(key)
       character(len=8), intent(in) :: key
@@ -3953,6 +4226,92 @@ contains
          call derotate_to_lsq_ref(rm_samp, nrm, lsq_ref_compute,&
          &lsq_ref_report, restored_re_p, restored_im_p, restored_re_p,&
          &restored_im_p)
+      endif
+
+      ! T19 Part B (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): the 6
+      ! per-pixel diagnostic maps -- placed here (after any lsq_ref_report
+      ! derotation above, using the SAME final comp_re_p/comp_im_p/
+      ! resid_re_p/resid_im_p about to be written to the real outputs
+      ! below) purely for consistency; amplitude-based quantities are
+      ! unaffected by derotation (a pure phase rotation), so placement
+      ! relative to that block doesn't change any value here.
+      if (write_clean_diagnostics) then
+         niter_map(ix_g,iy_g) = int(n_iter_used_p, 2)
+         select case (trim(stop_reason_p))
+         case ('niter')
+            stop_reason_map(ix_g,iy_g) = 1_1
+         case ('abs_flux')
+            stop_reason_map(ix_g,iy_g) = 2_1
+         case ('auto_nsigma')
+            stop_reason_map(ix_g,iy_g) = 3_1
+         case default
+            ! Matches the global/per-block tally's own case-default
+            ! convention above (n_stopped_niter): should never happen
+            ! per clean_complex's own documented 3-value contract, but
+            ! if it ever did, treating it as 'niter' is more honest than
+            ! silently leaving this pixel looking like "not cleaned".
+            stop_reason_map(ix_g,iy_g) = 1_1
+         end select
+         resid_peak_map(ix_g,iy_g) = pixel_peak_resid_p
+         block
+            ! rmclean_mod's own rms_about_mean (rmclean.f90:101) is
+            ! deliberately kept private -- a documented, intentional
+            ! local copy of rm_synthesis_mod's compute_rms, matching
+            ! that module's own no-cross-module-use precedent. Same
+            ! reasoning applies here: a genuine 2-line utility, not
+            ! worth exposing across the module boundary for.
+            real(sp) :: resid_amp_diag(nrm), resid_mean_diag
+            resid_amp_diag = sqrt(resid_re_p**2 + resid_im_p**2)
+            resid_mean_diag = sum(resid_amp_diag)/real(nrm, sp)
+            resid_rms_map(ix_g,iy_g) =&
+            &sqrt(sum((resid_amp_diag-resid_mean_diag)**2)/real(nrm, sp))
+         end block
+         block
+            ! Faraday-complexity metric (raw N_COMPONENTS alone
+            ! conflates genuine multi-screen structure with CLEAN simply
+            ! needing several small hits near one true peak): an
+            ! intensity-weighted RM dispersion, weighted by amplitude
+            ! (not amplitude^2, matching a spectral-line-width moment's
+            ! own convention), using comp_rm_refined_p (each bin's true
+            ! flux-weighted sub-pixel location -- see this subroutine's
+            ! own comment above on why that differs from rm_samp(j))
+            ! rather than the coarse grid location. Reported in raw
+            ! rad/m^2, NOT pre-normalized by fwhm_rm -- see this map's
+            ! own design note in T19 for why. 0 or 1 components -> left
+            ! at the pre-initialized NaN fill (0/0 undefined; a single
+            ! component has zero spread by construction, but NaN here
+            ! distinguishes "trivially zero" from "no structure to
+            ! measure").
+            real(sp) :: comp_amp_diag(nrm)
+            integer :: n_comp_diag, j_diag
+            real(dp) :: sum_a_diag, sum_a_phi_diag, sum_a_phi2_diag, phi_bar_diag
+            comp_amp_diag = sqrt(comp_re_p**2 + comp_im_p**2)
+            n_comp_diag = count(comp_amp_diag.gt.0.0_sp)
+            n_components_map(ix_g,iy_g) = int(n_comp_diag, 2)
+            if (n_comp_diag.ge.2) then
+               sum_a_diag = 0.0_dp
+               sum_a_phi_diag = 0.0_dp
+               do j_diag = 1, nrm
+                  if (comp_amp_diag(j_diag).gt.0.0_sp) then
+                     sum_a_diag = sum_a_diag + real(comp_amp_diag(j_diag), dp)
+                     sum_a_phi_diag = sum_a_phi_diag +&
+                     &real(comp_amp_diag(j_diag), dp) *&
+                     &real(comp_rm_refined_p(j_diag), dp)
+                  endif
+               enddo
+               phi_bar_diag = sum_a_phi_diag / sum_a_diag
+               sum_a_phi2_diag = 0.0_dp
+               do j_diag = 1, nrm
+                  if (comp_amp_diag(j_diag).gt.0.0_sp) then
+                     sum_a_phi2_diag = sum_a_phi2_diag +&
+                     &real(comp_amp_diag(j_diag), dp) *&
+                     &(real(comp_rm_refined_p(j_diag), dp) - phi_bar_diag)**2
+                  endif
+               enddo
+               comp_rm_spread_map(ix_g,iy_g) =&
+               &real(sqrt(sum_a_phi2_diag/sum_a_diag), sp)
+            endif
+         end block
       endif
 
       clean_re_tile(ix_l,iy_l,:) = comp_re_p

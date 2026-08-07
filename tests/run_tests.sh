@@ -1891,6 +1891,17 @@ sys.exit(0 if abs(printed - restored) < 1e-3 else 1)
             else
                 fail "rmclean_cubes: RMSFFWHM check failed (printed=$t19_fwhm_printed restored.amp=$t19_fwhm_restored_amp restored.pha=$t19_fwhm_restored_pha clean.amp=$t19_fwhm_clean_amp)"
             fi
+
+            # T19 Part B: cross-validate all 6 new diagnostic maps
+            # against the REAL RESID.AMP/CLEAN.AMP cubes from this same
+            # run (check_diagnostic_maps.py's own module docstring for
+            # why -- not just self-consistency, independent recomputation).
+            t19_mean_niter=$(grep -oP 'n_iter_used: mean=\K[0-9.]+' "$rmc_log" | tail -1)
+            if python3 "$TESTS_DIR/check_diagnostic_maps.py" "$rmc_out" "$t19_mean_niter"; then
+                pass "rmclean_cubes: 6 CLEAN diagnostic maps cross-validated against RESID.AMP/CLEAN.AMP (T19)"
+            else
+                fail "rmclean_cubes: CLEAN diagnostic maps failed cross-validation (see above)"
+            fi
         else
             fail "rmclean_cubes: run failed (see $rmc_log)"
         fi
