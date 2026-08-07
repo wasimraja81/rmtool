@@ -1799,6 +1799,21 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
             fail "rm_synthesis lsq_ref_mode=mid: LSQREF header missing or zero (got '$lsqref_val')"
         fi
 
+        # T19 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): the dirty AMP cube's
+        # own BUNIT must be the input Q/U cube's own BUNIT ("Jy/beam" for
+        # this fixture, see tests/make_test_cubes.py) with '/RMSF'
+        # appended -- the Faraday dispersion function is a genuine
+        # Faraday-depth density, not a plain passthrough.
+        rmc_amp_bunit=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('$rmc_lsqref_amp').get('BUNIT'))
+")
+        if [ "$rmc_amp_bunit" = "Jy/beam/RMSF" ]; then
+            pass "rm_synthesis: AMP.RMCUBE.FITS BUNIT is 'Jy/beam/RMSF' (T19)"
+        else
+            fail "rm_synthesis: AMP.RMCUBE.FITS BUNIT expected 'Jy/beam/RMSF', got '$rmc_amp_bunit'"
+        fi
+
         rmc_out="$OUT_DIR/rmc_cleaned"
         rmc_log="$OUT_DIR/rmclean_cubes_run.log"
         if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" \
@@ -1817,6 +1832,35 @@ sys.exit(0 if v is not None and abs(v) > 1e-6 else 1)
                 pass "rmclean_cubes: RESTORED.AMP recovers both known point sources' RM"
             else
                 fail "rmclean_cubes: RESTORED.AMP peak RM check failed"
+            fi
+
+            # T19: CLEAN is discrete/additive -- keeps the PRE-'/RMSF'
+            # units (plain 'Jy/beam' here); RESID/RESTORED are smeared
+            # Faraday-depth densities, same as dirty -- inherit
+            # '/RMSF'. Every .PHA. output is 'rad' regardless (phase has
+            # no flux-density interpretation) -- this also regression-
+            # tests the pre-existing bug found while wiring this up
+            # (every .PHA. output previously inherited the AMP
+            # template's own amplitude BUNIT instead of 'rad').
+            t19_bunit_ok=1
+            for pair in \
+                "CLEAN.AMP:Jy/beam" "CLEAN.PHA:rad" \
+                "RESID.AMP:Jy/beam/RMSF" "RESID.PHA:rad" \
+                "RESTORED.AMP:Jy/beam/RMSF" "RESTORED.PHA:rad"
+            do
+                t19_suffix="${pair%%:*}"
+                t19_expected="${pair##*:}"
+                t19_got=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('${rmc_out}.${t19_suffix}.RMCUBE.FITS').get('BUNIT'))
+")
+                if [ "$t19_got" != "$t19_expected" ]; then
+                    fail "rmclean_cubes: ${t19_suffix}.RMCUBE.FITS BUNIT expected '$t19_expected', got '$t19_got'"
+                    t19_bunit_ok=0
+                fi
+            done
+            if [ "$t19_bunit_ok" = "1" ]; then
+                pass "rmclean_cubes: all 6 outputs' BUNIT correct (CLEAN=Jy/beam, RESID/RESTORED=Jy/beam/RMSF, PHA=rad) (T19)"
             fi
         else
             fail "rmclean_cubes: run failed (see $rmc_log)"

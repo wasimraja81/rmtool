@@ -233,6 +233,12 @@ program rmclean_cubes
    real(sp) :: drm_required, fwhm_rm, fwhm_data
    logical :: have_lsqref_keyword
    real(sp), allocatable :: rm_samp(:)
+   ! T19 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): pre-'/RMSF'-suffix
+   ! BUNIT string, read once from ampfile and used to override CLEAN.AMP/
+   ! CLEAN.PHA's own BUNIT (see open_output_cube's bunit_override and
+   ! read_bunit_keyword's own doc comment for the full reasoning).
+   character(len=64) :: clean_bunit
+   logical :: have_bunit_keyword
 
    ! T10b: mask_tile is now tiled exactly like re_tile/im_tile below
    ! (replacing the old whole-cube-resident mask_cube + its own separate
@@ -485,6 +491,32 @@ program rmclean_cubes
       lsq_ref_native = 0.0_sp
    endif
 
+   ! T19: CLEAN.AMP/CLEAN.PHA's own BUNIT override. read_bunit_keyword
+   ! already exists (added for abs_flux_floor's own unit resolution,
+   ! see its own doc comment) -- reused here rather than duplicated.
+   ! rm_synthesis's own T19 fix appends '/RMSF' to ampfile's BUNIT (e.g.
+   ! 'Jy/beam' becomes 'Jy/beam/RMSF'); strip a trailing '/RMSF' back
+   ! off here, since CLEAN components are discrete/additive (sum
+   ! directly for total flux), not a Faraday-depth density, and should
+   ! keep the ORIGINAL units, not inherit the dirty cube's own suffix.
+   ! Falls back to 'UNKNOWN' (same fallback rm_synthesis.f90 itself uses
+   ! when its own input Q cube has no BUNIT) rather than failing the run
+   ! over a cosmetic header field.
+   block
+      character(len=*), parameter :: rmsf_suffix = '/RMSF'
+      integer :: suffix_pos
+      call read_bunit_keyword(ampfile, clean_bunit, have_bunit_keyword)
+      if (.not. have_bunit_keyword) then
+         clean_bunit = 'UNKNOWN'
+      else
+         suffix_pos = index(trim(clean_bunit), rmsf_suffix, back=.true.)
+         if (suffix_pos.gt.0 .and.&
+         &suffix_pos+len(rmsf_suffix)-1.eq.len_trim(clean_bunit)) then
+            clean_bunit = clean_bunit(1:suffix_pos-1)
+         endif
+      endif
+   end block
+
    ! The DATA's own RM resolution -- needed by Gate 0 just below and as
    ! the default restoring-beam width further down.
    call compute_rmsf_fwhm_multiband(l_sq, nchan, band_offset, band_nz,&
@@ -614,23 +646,35 @@ program rmclean_cubes
    ! Each out_unit(idx) is assigned its own genuinely distinct CFITSIO
    ! unit inside open_output_cube itself, via fitsio_unit_mod's
    ! safe_ftinit (FTGIOU+FTINIT) -- no caller-chosen numbering needed.
+   ! T19: every template_file here is ampfile (same WCS on every axis,
+   ! per this subroutine's own doc comment) -- BUNIT is the one header
+   ! field that must NOT just come along verbatim for every output, so
+   ! each call below overrides it explicitly rather than relying on
+   ! silent inheritance: CLEAN.AMP keeps the pre-'/RMSF' units (discrete
+   ! components, not a density -- clean_bunit, see read_bunit_keyword);
+   ! every .PHA. output is 'rad' (phase, matching rm_synthesis.f90's own
+   ! PHA.RMCUBE.FITS convention -- previously these silently inherited
+   ! ampfile's own amplitude BUNIT instead, a real pre-existing bug found
+   ! while wiring this up, not introduced by it); RESID.AMP/RESTORED.AMP
+   ! take NO override, correctly inheriting ampfile's own '/RMSF'-suffixed
+   ! BUNIT (both are RMSF-convolution-smeared densities, same as dirty).
    call open_output_cube(ampfile, trim(outfile)//'.CLEAN.AMP.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_clean_amp, status)
+   &nx, ny, nrm, idx_clean_amp, status, bunit_override=trim(clean_bunit))
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.CLEAN.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_clean_pha, status)
+   &nx, ny, nrm, idx_clean_pha, status, bunit_override='rad')
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESID.AMP.RMCUBE.FITS',&
    &nx, ny, nrm, idx_resid_amp, status)
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESID.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_resid_pha, status)
+   &nx, ny, nrm, idx_resid_pha, status, bunit_override='rad')
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESTORED.AMP.RMCUBE.FITS',&
    &nx, ny, nrm, idx_restored_amp, status)
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESTORED.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_restored_pha, status)
+   &nx, ny, nrm, idx_restored_pha, status, bunit_override='rad')
    if (status.ne.0) stop 1
 
    ! T4a/T4d: sequential tiles, each a strict read (single-threaded or T4b
@@ -2112,13 +2156,22 @@ contains
    end subroutine read_amp_pha_chunk
 
    subroutine open_output_cube(template_file, outname, nx_in, ny_in, nrm_in,&
-   &idx, status)
+   &idx, status, bunit_override)
       !! T4a/T4c: creates outname and writes its header ONLY (no pixel
       !! data -- that now comes tile-by-tile via write_output_tile below,
       !! since the whole cube is never resident in memory at once).
       !! Header copied verbatim from template_file (always ampfile: same
       !! WCS on every axis, since this program never resamples anything --
       !! Gate 0 validates the existing RM grid rather than changing it).
+      !!
+      !! T19 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): bunit_override, if
+      !! present, overwrites the BUNIT card the verbatim header copy just
+      !! wrote -- used ONLY for CLEAN.AMP/CLEAN.PHA, which (unlike
+      !! RESID/RESTORED) do NOT inherit ampfile's own '.../RMSF' suffix:
+      !! CLEAN components are discrete/additive (sum directly for total
+      !! flux), not a smeared Faraday-depth density, so they keep the
+      !! same units the input Q/U cube itself had, before rm_synthesis's
+      !! own T19 fix appended '/RMSF' to the dirty AMP cube's BUNIT.
       !!
       !! T4c: if nwriters_eff==1, leaves out_unit(idx) OPEN -- the
       !! caller keeps it open across the whole tile loop and closes it
@@ -2140,6 +2193,7 @@ contains
       integer, intent(in) :: nx_in, ny_in, nrm_in
       integer, intent(in) :: idx
       integer, intent(out) :: status
+      character(len=*), intent(in), optional :: bunit_override
       integer :: src_unit, fitsstat, blocksize
       integer :: naxes_out(3)
       logical :: simple, extend
@@ -2190,6 +2244,22 @@ contains
          return
       endif
       call safe_ftclos(src_unit, fitsstat)
+      if (present(bunit_override)) then
+         ! FTPKYS does NOT update an existing keyword in place if that
+         ! keyword arrived via copy_generic_header_rmclean's own raw
+         ! FTPREC card copy just above -- confirmed directly (a real,
+         ! non-obvious CFITSIO behavior, not assumed): it silently
+         ! APPENDS a second 'BUNIT' card instead, leaving the ORIGINAL
+         ! (wrong, inherited-from-ampfile) one as the first occurrence,
+         ! which is what every reader (FTGKYS, astropy, ds9) returns.
+         ! FTUKYS is CFITSIO's own dedicated update routine -- searches
+         ! for and updates an existing keyword (inserting only if truly
+         ! absent), which is what "override" actually requires here.
+         fitsstat = 0
+         call ftukys(out_unit(idx), 'bunit', trim(bunit_override),&
+         &'Pixel data units (discrete CLEAN components -- see'//&
+         &' docs/dev/RMCLEAN_INTEGRATION_PLAN.md T19)', fitsstat)
+      endif
       out_is_open(idx) = .true.
       if (nwriters_eff.gt.1) then
          fitsstat = 0

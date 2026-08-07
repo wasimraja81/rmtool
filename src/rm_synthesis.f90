@@ -2949,14 +2949,31 @@ if(status.eq.0)then
 endif
 
  ! --- BUNIT: passthrough for cube 1 (amp/re); set for cube 2 ---
+ ! T19 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): the Faraday dispersion
+ ! function F(phi) is a genuine Faraday-depth DENSITY, not a plain
+ ! passthrough of the input Q cube's own per-channel BUNIT -- dimensionally
+ ! required by the continuous RM-synthesis relation P(lambda^2) = integral
+ ! F(phi) exp(2i*phi*lambda^2) dphi (F(phi) must carry units of
+ ! [P]/[phi] for this to be dimensionally consistent), and confirmed
+ ! against RM-Tools' own documented convention ("the FDF has units of
+ ! the spectra unit per RMSF", github.com/CIRADA-Tools/RM-Tools) and its
+ ! own source (RMutils/util_RM.py's K=1/sum(weights) -- the SAME
+ ! normalization this project's own wsum division already uses, so this
+ ! is a LABEL fix only, no value/computation change). Appends '/RMSF' to
+ ! whatever the input's own BUNIT is (not hardcoded 'Jy/beam/RMSF' --
+ ! the input need not be Jy/beam specifically). Applies to the dirty
+ ! AMP cube AND PEAK.MAP (a peak reading FROM that same density, same
+ ! units) -- NOT to PHA (phase has no flux-density interpretation), and
+ ! NOT to RM_PEAK/ANG_PEAK/SNR (a location, an angle, and a dimensionless
+ ! ratio respectively, none of them a flux density).
 status = 0
 call ftgkys(21,'bunit',ctype,comment,status)
 if(status.ne.0)then
    ctype = 'UNKNOWN'
    status = 0
 endif
-call ftpkys(41,'bunit',ctype(1:nchar(ctype)),&
-&'Pixel data units',status)
+call ftpkys(41,'bunit',ctype(1:nchar(ctype))//'/RMSF',&
+&'Pixel data units (Faraday-depth density -- see T19)',status)
 call ftpkys(42,'bunit','rad',&
 &'Pixel data units (angle)',status)
 if(out_mask_open)then
@@ -2968,8 +2985,8 @@ if(out_nvalid_open)then
    &'Number of valid channels',status)
 endif
 if(out_peak_open)then
-   call ftpkys(46,'bunit',ctype(1:nchar(ctype)),&
-   &'Peak RM power units',status)
+   call ftpkys(46,'bunit',ctype(1:nchar(ctype))//'/RMSF',&
+   &'Peak RM power units (Faraday-depth density -- see T19)',status)
 endif
 if(out_rmpeak_open)then
    call ftpkys(47,'bunit','rad/m**2',&
