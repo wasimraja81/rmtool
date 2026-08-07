@@ -265,21 +265,26 @@ program rmclean_cubes
    ! failing outright.
    integer(kind=1), allocatable :: mask_tile(:,:,:)
 
-   ! T19 Part B (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): 6 per-pixel CLEAN
+   ! T19 Part B (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): 7 per-pixel CLEAN
    ! diagnostic maps -- WHOLE-IMAGE (nx,ny), not tiled like everything
-   ! else in this file, since each is 2D and small enough (~17 bytes/
+   ! else in this file, since each is 2D and small enough (~21 bytes/
    ! pixel total) to hold entirely in memory rather than adding tiled-
    ! I/O machinery for them. Allocated only if write_clean_diagnostics
    ! (else left unallocated -- every write site below is itself guarded
    ! by the same flag). dtype/fill-value convention matches T19's own
    ! design table: int16 for NITER/N_COMPONENTS (bounded counts, same
    ! precedent as rm_synthesis's own NVALID.MAP.FITS), int8 for
-   ! STOP_REASON (a small code), float32 (NaN fill) for the two
-   ! continuous quantities.
+   ! STOP_REASON (a small code), float32 (NaN "not cleaned" fill) for
+   ! the continuous quantities. TOTAL_POL_FLUX still uses the SAME NaN
+   ! initial fill (not-cleaned pixels stay NaN, same as every other
+   ! float map here) -- but unlike COMP_RM_SPREAD, a CLEANED pixel with
+   ! zero components gets an explicit, genuine 0.0 (an empty sum is a
+   ! well-defined "no flux extracted" answer, not a 0/0 like
+   ! COMP_RM_SPREAD's undefined spread -- see that map's own comment).
    integer(kind=2), allocatable :: niter_map(:,:), n_components_map(:,:)
    integer(kind=1), allocatable :: stop_reason_map(:,:)
    real(sp), allocatable :: resid_peak_map(:,:), resid_rms_map(:,:)
-   real(sp), allocatable :: comp_rm_spread_map(:,:)
+   real(sp), allocatable :: comp_rm_spread_map(:,:), total_pol_flux_map(:,:)
 
    ! T4a: per-tile input buffers, allocated ONCE at the planned
    ! (tile_ra,tile_dec,nrm) max size and reused across every tile -- a
@@ -677,7 +682,8 @@ program rmclean_cubes
          real(sp) :: zero_val_diag, nan_val_diag
          allocate(niter_map(nx,ny), stop_reason_map(nx,ny),&
          &resid_peak_map(nx,ny), resid_rms_map(nx,ny),&
-         &n_components_map(nx,ny), comp_rm_spread_map(nx,ny))
+         &n_components_map(nx,ny), comp_rm_spread_map(nx,ny),&
+         &total_pol_flux_map(nx,ny))
          zero_val_diag = 0.0_sp
          nan_val_diag = zero_val_diag/zero_val_diag
          niter_map = 0_2
@@ -686,6 +692,7 @@ program rmclean_cubes
          resid_peak_map = nan_val_diag
          resid_rms_map = nan_val_diag
          comp_rm_spread_map = nan_val_diag
+         total_pol_flux_map = nan_val_diag
       end block
    endif
 
@@ -1007,7 +1014,8 @@ program rmclean_cubes
    if (write_clean_diagnostics) then
       call write_diagnostic_maps()
       deallocate(niter_map, stop_reason_map, resid_peak_map,&
-      &resid_rms_map, n_components_map, comp_rm_spread_map)
+      &resid_rms_map, n_components_map, comp_rm_spread_map,&
+      &total_pol_flux_map)
    endif
 
    write(*,'(A)') 'OK: rmclean_cubes complete.'
@@ -1518,15 +1526,15 @@ contains
       &' this also shrinks Pass 0''s own pattern registry and the'//&
       &' runtime cache, since skipped pixels are never registered or'//&
       &' cached at all (docs/dev/RMCLEAN_INTEGRATION_PLAN.md T17).'
-      write(*,'(A)') 'write_clean_diagnostics (default y): write 6'//&
+      write(*,'(A)') 'write_clean_diagnostics (default y): write 7'//&
       &' additional per-pixel 2D diagnostic maps at run end --'//&
       &' NITER/STOP_REASON/RESID_PEAK/RESID_RMS/N_COMPONENTS/'//&
-      &' COMP_RM_SPREAD.MAP.FITS (docs/dev/RMCLEAN_INTEGRATION_PLAN.md'//&
-      &' T19). Negligible extra compute (all 6 computed from values'//&
-      &' CLEAN already produces); the main cost is memory, a small'//&
-      &' FIXED amount for the whole image regardless of tile size'//&
-      &' (~17 bytes/pixel), already accounted for in the'//&
-      &' mem_frac_ram tile-size budget.'
+      &' COMP_RM_SPREAD/TOTAL_POL_FLUX.MAP.FITS (docs/dev/'//&
+      &' RMCLEAN_INTEGRATION_PLAN.md T19). Negligible extra compute'//&
+      &' (all 7 computed from values CLEAN already produces); the main'//&
+      &' cost is memory, a small FIXED amount for the whole image'//&
+      &' regardless of tile size (~21 bytes/pixel), already accounted'//&
+      &' for in the mem_frac_ram tile-size budget.'
       write(*,'(A)') 'tile_ra/tile_dec (default 0/0, i.e. auto): manual'//&
       &' tile size override (pixels); ignored unless tile_auto=n. Auto'//&
       &' policy (tile_auto=y, the default) packs full-RA Dec strips --'//&
@@ -1852,14 +1860,15 @@ contains
       call get_mem_total_kb(mem_total_kb)
       mem_safe_bytes = int(real(mem_frac_ram,8) * real(mem_total_kb,8) *&
       &1024.0d0, 8)
-      ! T19 Part B: the 6 diagnostic maps are a FIXED, whole-image
+      ! T19 Part B: the 7 diagnostic maps are a FIXED, whole-image
       ! allocation (not per-tile, see their own declaration comment) --
       ! subtracted ONCE here, not folded into bytes_per_tile_pixel
       ! (which governs the per-tile-PIXEL budget the tiling loop below
-      ! actually divides by). 17 = 2(NITER)+1(STOP_REASON)+4(RESID_PEAK)
-      ! +4(RESID_RMS)+2(N_COMPONENTS)+4(COMP_RM_SPREAD) bytes/pixel.
+      ! actually divides by). 21 = 2(NITER)+1(STOP_REASON)+4(RESID_PEAK)
+      ! +4(RESID_RMS)+2(N_COMPONENTS)+4(COMP_RM_SPREAD)+4(TOTAL_POL_FLUX)
+      ! bytes/pixel.
       if (write_clean_diagnostics) then
-         diag_maps_bytes_total = int(nx,8) * int(ny,8) * 17_8
+         diag_maps_bytes_total = int(nx,8) * int(ny,8) * 21_8
          mem_safe_bytes = mem_safe_bytes - diag_maps_bytes_total
       endif
       if (mem_safe_bytes.le.bytes_per_tile_pixel) mem_safe_bytes = bytes_per_tile_pixel
@@ -2831,6 +2840,10 @@ contains
       &trim(outfile)//'.COMP_RM_SPREAD.MAP.FITS', naxes_2d, fpixel, lpixel,&
       &comp_rm_spread_map, 'rad/m**2',&
       &'Intensity-weighted RM spread of CLEAN components (T19)')
+      call write_one_diag_map_r4(ampfile,&
+      &trim(outfile)//'.TOTAL_POL_FLUX.MAP.FITS', naxes_2d, fpixel, lpixel,&
+      &total_pol_flux_map, clean_bunit,&
+      &'Total polarized flux: sum(CLEAN.AMP), no dphi weight (T19)')
 
       ! STOP_REASON.MAP.FITS: int8, with its own code mapping written
       ! into the header as HISTORY cards (user's own explicit request --
@@ -2872,9 +2885,9 @@ contains
       endif
       call safe_ftclos(dst_unit, fitsstat)
 
-      write(*,'(A)') 'Wrote 6 CLEAN diagnostic maps ('''//&
+      write(*,'(A)') 'Wrote 7 CLEAN diagnostic maps ('''//&
       &trim(outfile)//'.{NITER,STOP_REASON,RESID_PEAK,RESID_RMS,'//&
-      &'N_COMPONENTS,COMP_RM_SPREAD}.MAP.FITS'').'
+      &'N_COMPONENTS,COMP_RM_SPREAD,TOTAL_POL_FLUX}.MAP.FITS'').'
    end subroutine write_diagnostic_maps
 
    subroutine write_one_diag_map_i2(template_file, outname, naxes_2d,&
@@ -4288,6 +4301,16 @@ contains
             comp_amp_diag = sqrt(comp_re_p**2 + comp_im_p**2)
             n_comp_diag = count(comp_amp_diag.gt.0.0_sp)
             n_components_map(ix_g,iy_g) = int(n_comp_diag, 2)
+            ! TOTAL_POL_FLUX (added as a follow-up to Part B): CLEAN
+            ! components are discrete/additive, so the correct total
+            ! polarized flux is a plain, UNweighted sum -- no dphi factor
+            ! (see T19 Part C's own Faraday-thin-source thought
+            ! experiment for why weighting by dphi would be WRONG for a
+            ! discrete component list, unlike the smeared dirty/restored
+            ! spectra). Written unconditionally here (not inside the
+            ! n_comp_diag>=2 branch below) -- sum() over an all-zero
+            ! array is a genuine, correct 0.0, not an undefined case.
+            total_pol_flux_map(ix_g,iy_g) = real(sum(comp_amp_diag), sp)
             if (n_comp_diag.ge.2) then
                sum_a_diag = 0.0_dp
                sum_a_phi_diag = 0.0_dp

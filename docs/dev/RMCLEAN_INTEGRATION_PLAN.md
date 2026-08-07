@@ -3751,12 +3751,19 @@ converting Jy/beam to Jy via a fixed RMSF-width divisor) cancels
 exactly in this ratio -- `sigma_phi` is insensitive to which amplitude
 convention is used for the weights, only φ's own units matter.
 
-**Open decision, not yet confirmed:** a `TOTAL_POL_FLUX`-style map
-(`sum(CLEAN.AMP_i)`, no `dphi` weighting -- see Part C below for why
-no weighting is correct for a discrete/additive component list) was
-discussed as a natural complement but not explicitly confirmed in
-scope. Still not implemented -- a genuinely separate follow-up
-decision from everything below, not blocking it.
+**`TOTAL_POL_FLUX.MAP.FITS` -- confirmed and implemented as a same-day
+follow-up (2026-08-07).** `sum(CLEAN.AMP_i)`, no `dphi` weighting (see
+Part C below for why no weighting is correct for a discrete/additive
+component list): float32, `BUNIT` matches `CLEAN.AMP`'s own units
+(`clean_bunit`), written unconditionally (not gated on
+`n_components>=2` the way `COMP_RM_SPREAD` is) -- an empty sum over
+zero components is a genuine, well-defined 0.0, not an undefined 0/0,
+so a CLEANed pixel with zero components gets a real 0.0, never NaN;
+only genuinely not-CLEANed pixels stay NaN, matching every other float
+map here. Now 7 diagnostic maps total, ~21 bytes/pixel (was 6, ~17).
+Cross-validated in `check_diagnostic_maps.py` against
+`sum(CLEAN.AMP, axis=0)` computed independently from the real
+`CLEAN.AMP.RMCUBE.FITS` cube. Full suite: 165/165.
 
 **Parts A-D: Status DONE (2026-08-07).** Implemented and committed in
 this order (matching this ticket's own stated priority -- header-only

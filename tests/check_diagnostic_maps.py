@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""T19 Part B: cross-validate the 6 CLEAN diagnostic maps against the
-6 real (already-independently-verified) RM cubes from the SAME run,
-not just against themselves -- catches bugs a self-consistent-looking
-map could still hide (e.g. reading the wrong pixel, an off-by-one in
-the global-vs-per-block reset).
+"""T19 Part B (+ TOTAL_POL_FLUX follow-up): cross-validate the 7 CLEAN
+diagnostic maps against the 6 real (already-independently-verified) RM
+cubes from the SAME run, not just against themselves -- catches bugs a
+self-consistent-looking map could still hide (e.g. reading the wrong
+pixel, an off-by-one in the global-vs-per-block reset).
 """
 import sys
 from pathlib import Path
@@ -25,6 +25,7 @@ def main():
     resid_rms = fits.getdata(f"{base}.RESID_RMS.MAP.FITS")
     n_components = fits.getdata(f"{base}.N_COMPONENTS.MAP.FITS")
     comp_rm_spread = fits.getdata(f"{base}.COMP_RM_SPREAD.MAP.FITS")
+    total_pol_flux = fits.getdata(f"{base}.TOTAL_POL_FLUX.MAP.FITS")
 
     if niter.dtype.byteorder in ("=", "<", ">") and niter.dtype.itemsize != 2:
         print(f"FAIL: NITER dtype expected 2-byte int, got {niter.dtype}")
@@ -96,6 +97,22 @@ def main():
         print("FAIL: RESID_RMS has a negative or non-finite value at a CLEANed pixel")
         ok = False
 
+    # TOTAL_POL_FLUX: plain UNweighted sum(CLEAN.AMP) -- no dphi factor,
+    # since CLEAN components are discrete/additive (T19 Part C's own
+    # Faraday-thin-source thought experiment). Finite (including a
+    # genuine 0.0, not NaN) everywhere CLEANed, matching NITER/
+    # STOP_REASON's own "cleaned means a real value" convention, unlike
+    # COMP_RM_SPREAD which stays NaN at <2 components.
+    computed_total_pol_flux = np.sum(clean_amp_cube, axis=0)
+    if not np.allclose(
+        total_pol_flux[cleaned_mask], computed_total_pol_flux[cleaned_mask], rtol=1e-5
+    ):
+        print("FAIL: TOTAL_POL_FLUX.MAP.FITS does not match sum(CLEAN.AMP) per pixel")
+        ok = False
+    if np.isnan(total_pol_flux[cleaned_mask]).any():
+        print("FAIL: TOTAL_POL_FLUX is NaN at a CLEANed pixel (should be a real sum, even 0.0)")
+        ok = False
+
     # HISTORY cards on STOP_REASON's own header.
     hdr = fits.getheader(f"{base}.STOP_REASON.MAP.FITS")
     history = " ".join(str(h) for h in hdr.get("HISTORY", []))
@@ -105,7 +122,7 @@ def main():
 
     if ok:
         print(
-            f"OK: all 6 diagnostic maps cross-validated against "
+            f"OK: all 7 diagnostic maps cross-validated against "
             f"RESID.AMP/CLEAN.AMP ({cleaned_mask.sum()} CLEANed pixels, "
             f"{(n_components >= 2).sum()} with >=2 components)"
         )
