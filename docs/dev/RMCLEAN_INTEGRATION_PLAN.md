@@ -3682,7 +3682,7 @@ to be entirely outside coverage) from T17's own coverage-fraction
 compute skip, not a duplicate of it. Not scoped or designed yet --
 this entry exists only so the gap isn't silently forgotten.
 
-### T19 -- Final sanity-check batch: per-pixel CLEAN diagnostics, BUNIT correctness, restoring-beam header, consolidated pending-ticket roadmap (NOT STARTED)
+### T19 -- Final sanity-check batch: per-pixel CLEAN diagnostics, BUNIT correctness, restoring-beam header, consolidated pending-ticket roadmap (Parts A-D DONE; Part E is the roadmap itself, not a code change)
 
 **Purpose of this ticket:** the user's own request -- rather than
 scattering several real, separately-motivated findings from one
@@ -3755,7 +3755,38 @@ convention is used for the weights, only φ's own units matter.
 (`sum(CLEAN.AMP_i)`, no `dphi` weighting -- see Part C below for why
 no weighting is correct for a discrete/additive component list) was
 discussed as a natural complement but not explicitly confirmed in
-scope. Decide before implementing Part B.
+scope. Still not implemented -- a genuinely separate follow-up
+decision from everything below, not blocking it.
+
+**Parts A-D: Status DONE (2026-08-07).** Implemented and committed in
+this order (matching this ticket's own stated priority -- header-only
+parts first): Part C (`2453452`), Part D (`c9eb097`), Part A
+(`e4ca579`), Part B (`652b6b7`). Full suite 165/165 after Part B (up
+from 160 at the start of this ticket). Implementation notes worth
+recording, all found DURING verification, not assumed correct upfront:
+- **Part D's own first attempt SIGSEGVed under `nwriters>1`** -- writing
+  `RMSFFWHM` from the caller, after `open_output_cube` returned, raced
+  against that subroutine's own `nwriters_eff>1` branch, which closes
+  `out_unit(idx)` before returning. Fixed by moving the write inside
+  `open_output_cube` itself (a new `rmsffwhm_override` argument, same
+  pattern as Part C's own `bunit_override`), before that close.
+- **Part C's `BUNIT` override needed `FTUKYS`, not `FTPKYS`** -- `FTPKYS`
+  does not update a keyword that arrived via `copy_generic_header_rmclean`'s
+  own raw `FTPREC` card copy; it silently appends a DUPLICATE keyword
+  instead, leaving the original (wrong) value as the first occurrence,
+  which is what every reader (`FTGKYS`, astropy, ds9) returns. Confirmed
+  directly via header-card inspection before switching to `FTUKYS`
+  (CFITSIO's dedicated update routine).
+- **Part B's `COMP_RM_SPREAD` uses `comp_rm_refined_p`** (each bin's true
+  flux-weighted sub-pixel RM location), not the coarse `rm_samp` grid --
+  matching the same reasoning that already motivated using
+  `comp_rm_refined_p` for phase derotation elsewhere in this file.
+- **Part B's `RESID_RMS` does NOT call `rmclean_mod`'s own
+  `rms_about_mean`** (it's deliberately `private`, a documented local
+  copy of `rm_synthesis_mod`'s `compute_rms` -- see that subroutine's
+  own comment) -- inlined the same 2-line computation directly in
+  `rmclean_cubes.f90` instead of exposing it across the module boundary,
+  matching that same precedent a second time.
 
 **Part C -- `BUNIT` correctness (found via a deep units discussion,
 verified against RM-Tools' own documented convention and source code,
