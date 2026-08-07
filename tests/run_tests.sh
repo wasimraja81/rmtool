@@ -1929,6 +1929,40 @@ sys.exit(0 if abs(printed - restored) < 1e-3 else 1)
             else
                 fail "rmclean_cubes: small-tile RESTORED.AMP peak RM check failed"
             fi
+
+            # T19 Part A: forced 3x5 tiles on this fixture produces
+            # MANY blocks (unlike section 29's own default single-tile
+            # run) -- exactly what's needed to check the per-block
+            # tallies aren't just mirroring the global ones. Sums
+            # across every "Block N CLEAN stop-reasons" line must equal
+            # this SAME run's own global summary exactly.
+            if python3 -c "
+import re
+with open('$rmc_tiled_log') as f:
+    log = f.read()
+blk = re.findall(
+    r'Block \d+ CLEAN stop-reasons: CLEANed=(\d+) niter=(\d+) .*? '
+    r'abs_flux=(\d+) .*? auto_nsigma=(\d+) ',
+    log)
+assert len(blk) > 1, f'expected >1 block, found {len(blk)}'
+sum_cleaned = sum(int(b[0]) for b in blk)
+sum_niter = sum(int(b[1]) for b in blk)
+sum_abs_flux = sum(int(b[2]) for b in blk)
+sum_auto_nsigma = sum(int(b[3]) for b in blk)
+g_cleaned = int(re.search(r'CLEANed (\d+) pixels\.', log).group(1))
+g_niter = int(re.search(r'hit niter cap:\s+(\d+)', log).group(1))
+g_abs_flux = int(re.search(r'stopped at abs_flux:\s+(\d+)', log).group(1))
+g_auto_nsigma = int(re.search(r'stopped at auto_nsigma:(\d+)', log).group(1))
+assert sum_cleaned == g_cleaned, f'CLEANed {sum_cleaned} != global {g_cleaned}'
+assert sum_niter == g_niter, f'niter {sum_niter} != global {g_niter}'
+assert sum_abs_flux == g_abs_flux, f'abs_flux {sum_abs_flux} != global {g_abs_flux}'
+assert sum_auto_nsigma == g_auto_nsigma, f'auto_nsigma {sum_auto_nsigma} != global {g_auto_nsigma}'
+print(f'{len(blk)} blocks, sums match global exactly (CLEANed={g_cleaned})')
+"; then
+                pass "rmclean_cubes: per-block CLEAN stop-reason tallies sum exactly to the global summary (T19)"
+            else
+                fail "rmclean_cubes: per-block CLEAN stop-reason tallies do not sum to the global summary (see $rmc_tiled_log)"
+            fi
         else
             fail "rmclean_cubes: forced small-tile run failed (see $rmc_tiled_log)"
         fi

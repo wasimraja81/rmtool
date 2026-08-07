@@ -371,6 +371,20 @@ program rmclean_cubes
    integer(kind=8) :: n_stopped_niter, n_stopped_abs_flux, n_stopped_auto_nsigma
    integer(kind=8) :: n_iter_used_sum
    integer :: n_iter_used_min, n_iter_used_max
+   ! T19 Part A (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): the SAME 6
+   ! tallies, reset at the START of each block instead of accumulated
+   ! for the whole run -- printed right after that block's own "Block N
+   ! of 32 processed." line, so "why did CLEAN stop" is visible PER
+   ! BLOCK, not only once at the very end. Motivated by the mosaic-edge
+   ! noise hypothesis investigation: the whole-run summary above cannot
+   ! reveal whether niter-cap hits cluster in specific (edge) blocks.
+   ! The GLOBAL tallies above are unchanged and still the authoritative
+   ! whole-run summary; these are a separate, additional breakdown.
+   integer(kind=8) :: n_stopped_niter_blk, n_stopped_abs_flux_blk,&
+   &n_stopped_auto_nsigma_blk
+   integer(kind=8) :: n_iter_used_sum_blk
+   integer :: n_iter_used_min_blk, n_iter_used_max_blk
+   integer :: n_pixels_done_blk
    ! total_cleaned_flux_sum: sum, over every CLEANed pixel, of that
    ! pixel's own sum(|comp|) across all nrm bins -- how much flux CLEAN
    ! actually extracted into components, run-wide. peak_residual_*: each
@@ -762,6 +776,16 @@ program rmclean_cubes
          ! call (see update_mask_pattern_cache_for_tile's own comment).
          call update_mask_pattern_cache_for_tile(tx, ty)
 
+         ! T19 Part A: reset this block's own tallies right before its
+         ! own parallel CLEAN loop starts.
+         n_pixels_done_blk = 0
+         n_stopped_niter_blk = 0_8
+         n_stopped_abs_flux_blk = 0_8
+         n_stopped_auto_nsigma_blk = 0_8
+         n_iter_used_sum_blk = 0_8
+         n_iter_used_min_blk = huge(n_iter_used_min_blk)
+         n_iter_used_max_blk = 0
+
          call timer_start(t_stage)
          !$omp parallel default(shared)&
          !$omp& private(ix, iy, tid_local, t_thread_start, t_thread_elapsed, thread_msg)
@@ -793,6 +817,24 @@ program rmclean_cubes
 
          write(*,'(A,I0,A,I0,A)') 'Block ', tile_seq, ' of ', n_blocks_total,&
          &' processed.'
+         if (n_pixels_done_blk.gt.0) then
+            block
+               real(dp) :: n_total_blk_dp
+               n_total_blk_dp = real(n_pixels_done_blk, dp)
+               write(*,'(A,I0,A,I0,A,I0,A,F6.2,A,I0,A,F6.2,A,I0,A,F6.2,'//&
+               &'A,F0.2,A,I0,A,I0,A)')&
+               &'  Block ', tile_seq, ' CLEAN stop-reasons: CLEANed=',&
+               &n_pixels_done_blk, ' niter=', n_stopped_niter_blk, ' (',&
+               &100.0_dp*real(n_stopped_niter_blk,dp)/n_total_blk_dp,&
+               &'%) abs_flux=', n_stopped_abs_flux_blk, ' (',&
+               &100.0_dp*real(n_stopped_abs_flux_blk,dp)/n_total_blk_dp,&
+               &'%) auto_nsigma=', n_stopped_auto_nsigma_blk, ' (',&
+               &100.0_dp*real(n_stopped_auto_nsigma_blk,dp)/n_total_blk_dp,&
+               &'%) n_iter_used: mean=',&
+               &real(n_iter_used_sum_blk,dp)/n_total_blk_dp,&
+               &' min=', n_iter_used_min_blk, ' max=', n_iter_used_max_blk
+            end block
+         endif
 
          write_job(cur_slot)%ix_tile_beg = ix_tile_beg
          write_job(cur_slot)%iy_tile_beg = iy_tile_beg
@@ -3860,6 +3902,26 @@ contains
          n_stopped_niter = n_stopped_niter + 1_8
       end select
 
+      ! T19 Part A: same 6 tallies, per-block (reset at the start of
+      ! this pixel's own block, in the main tile loop above).
+      !$omp atomic
+      n_iter_used_sum_blk = n_iter_used_sum_blk + int(n_iter_used_p, 8)
+      !$omp atomic
+      n_iter_used_min_blk = min(n_iter_used_min_blk, n_iter_used_p)
+      !$omp atomic
+      n_iter_used_max_blk = max(n_iter_used_max_blk, n_iter_used_p)
+      select case (trim(stop_reason_p))
+      case ('abs_flux')
+         !$omp atomic
+         n_stopped_abs_flux_blk = n_stopped_abs_flux_blk + 1_8
+      case ('auto_nsigma')
+         !$omp atomic
+         n_stopped_auto_nsigma_blk = n_stopped_auto_nsigma_blk + 1_8
+      case default
+         !$omp atomic
+         n_stopped_niter_blk = n_stopped_niter_blk + 1_8
+      end select
+
       call restore_clean(rm_samp, nrm, comp_re_p, comp_im_p, resid_re_p,&
       &resid_im_p, fwhm_rm, restore_plan_fwd, restore_plan_bwd,&
       &restored_re_p, restored_im_p)
@@ -3903,6 +3965,8 @@ contains
       deallocate(valid_idx_p, l_sq_valid_p)
       !$omp atomic
       n_pixels_done = n_pixels_done + 1
+      !$omp atomic
+      n_pixels_done_blk = n_pixels_done_blk + 1
    end subroutine clean_one_pixel
 
 end program rmclean_cubes
