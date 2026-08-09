@@ -19,7 +19,7 @@ import argparse
 import re
 import textwrap
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -48,17 +48,40 @@ THREAD_CPU_RE = re.compile(
     r"thread_timing\s+stage=(?P<stage>\w+)\s+event=(?P<event>start|done)\s+"
     r"tid=(?P<tid>\d+)\s+"
     r"(?:rm_block=(?P<rm_block>\d+)\s+nrm_now=(?P<nrm_now>\d+)"
-    r"|block=(?P<block>\d+)\s+unit_count=(?P<unit_count>\d+))"
-    r"(?:\s+dur_ms=(?P<dur_ms>[0-9]+\.[0-9]+))?"
+    r"|block=(?P<block>\d+)\s+unit_count=(?P<unit_count>\d+)"
+    r"|block=(?P<block_pl>\d+)\s+plane=(?P<plane>\d+)\s+nthreads=(?P<nthreads>\d+))"
+    # \s* (not requiring but allowing whitespace) right after 'dur_ms='
+    # -- Fortran's F10.3 right-justifies into a fixed field, so smaller
+    # values (e.g. a single plane's ~8s) print with leading spaces
+    # ('dur_ms=  8212.996') where larger ones (e.g. a whole block's
+    # cumulative time) happen not to need any -- confirmed directly:
+    # requiring digits immediately after '=' silently dropped dur_ms
+    # for every smaller value, a real pre-existing gap this project's
+    # own larger-value test cases never happened to expose.
+    r"(?:\s+dur_ms=\s*(?P<dur_ms>[0-9]+\.[0-9]+))?"
 )
-# rm_synthesis_mod.f90's own 'thread_timing stage=cpu_extract ... rm_block=
-# ... nrm_now=...' convention and convolve_cubes.f90/match_cubes.f90/
-# reproject_cubes.f90/rmclean_cubes.f90's own logging_mod.f90-based
-# 'thread_timing stage=<convolve|resample|clean> ... block=... unit_count=
-# ...' convention are just two field-name spellings of the same shape (a
-# per-thread, per-work-unit start/done pair) -- both alternatives above
-# feed the same rm_block/nrm_now attributes downstream so one code path
-# (build_cpu_thread_intervals) handles either.
+# Three field-name spellings feed the same downstream (tid, sub, slot,
+# stage) interval key (build_cpu_thread_intervals):
+# - rm_synthesis_mod.f90's own 'rm_block=...nrm_now=...' (paired start/
+#   done lines -- sub=rm_block, slot=nrm_now).
+# - convolve_cubes.f90/reproject_cubes.f90/rmclean_cubes.f90's own
+#   'block=...unit_count=...' (also paired start/done -- sub=block,
+#   slot=unit_count).
+# - convolve_cubes.f90/match_cubes.f90's own per-PLANE 'block=...
+#   plane=...nthreads=...' (sub=block, slot=plane) -- 2026-08-09,
+#   T30 item 7 follow-up. This third shape is DONE-ONLY, no matching
+#   start line exists for it at all (confirmed directly: it produced
+#   zero plotted intervals before this fix, a real pre-existing gap,
+#   not a hypothetical one) -- build_cpu_thread_intervals derives the
+#   interval directly from this event's own dur_ms instead of pairing
+#   it with a start event. match_cubes.f90's reproject stage uses this
+#   same shape too (T30 item 3/7's spatial-tile redesign): since every
+#   thread in the team works the SAME plane together (row-split, not
+#   plane-split), each thread still logs its OWN done line with its
+#   real tid, all sharing the identical team-elapsed dur_ms for that
+#   plane -- keeps the swim-lane honest (N simultaneous lanes for a
+#   team-parallel plane, not 1), see docs/dev/MULTI_BAND_TOMOGRAPHY_
+#   PLAN.md T30 item 7 for the full reasoning.
 
 
 @dataclass(frozen=True)
@@ -218,8 +241,8 @@ def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
             if cat == "tile_thread":
                 mt = THREAD_CPU_RE.search(msg)
                 if mt:
-                    sub = mt.group("rm_block") or mt.group("block")
-                    slot = mt.group("nrm_now") or mt.group("unit_count")
+                    sub = mt.group("rm_block") or mt.group("block") or mt.group("block_pl")
+                    slot = mt.group("nrm_now") or mt.group("unit_count") or mt.group("plane")
                     events.append(
                         Event(
                             ts=ts,
@@ -252,6 +275,15 @@ def build_cpu_thread_intervals(
     stage is included in the pairing key regardless, so this is a belt-
     and-suspenders filter -- pass None to keep every stage present (the
     original single-stage rm_synthesis behaviour).
+
+    Two shapes handled, not one: most stages log a paired start+done
+    (interval = the gap between the two real timestamps). convolve's own
+    per-plane lines, and match_cubes' reproject per-plane lines (T30 item
+    7, 2026-08-09), log DONE ONLY, with the duration already computed and
+    attached as dur_ms -- there is no start line to pair with (confirmed
+    directly: before this fix, these produced zero intervals, silently,
+    not an edge case that never occurs). For those, the interval is
+    derived directly (start = done_ts - dur_ms) instead of paired.
     """
     starts: Dict[Tuple[int, int, int, str], List[datetime]] = {}
     intervals: List[ThreadInterval] = []
@@ -286,6 +318,22 @@ def build_cpu_thread_intervals(
                             dur_ms=dur_ms,
                         )
                     )
+            elif dur_ms is not None:
+                # No paired start line for this event -- self-contained
+                # done-only shape (convolve/reproject per-plane lines).
+                # Derive the interval directly from its own dur_ms.
+                st = ev.ts - timedelta(milliseconds=dur_ms)
+                intervals.append(
+                    ThreadInterval(
+                        tid=ev.tid,
+                        rm_block=ev.sub,
+                        nrm_now=ev.slot,
+                        start=st,
+                        end=ev.ts,
+                        stage=ev.kind or "cpu_extract",
+                        dur_ms=dur_ms,
+                    )
+                )
 
     intervals.sort(key=lambda x: (x.start, x.tid, x.rm_block))
     return intervals

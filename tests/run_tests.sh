@@ -116,6 +116,7 @@ BIN_GPU_HOSTOMP="$REPO_ROOT/bin/rm_synthesis_release_gpu_offload_hostomp"
 PASS=0
 FAIL=0
 SKIP=0
+WARN=0
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -123,6 +124,14 @@ SKIP=0
 pass() { echo "[PASS] $*"; PASS=$((PASS + 1)); }
 fail() { echo "[FAIL] $*"; FAIL=$((FAIL + 1)); }
 skip() { echo "[SKIP] $*"; SKIP=$((SKIP + 1)); }
+# warn(): a real check that failed, but deliberately does NOT flip the
+# suite's exit code -- for capabilities that should keep being noticed if
+# they silently break, without blocking every other test/deploy on them
+# (e.g. swim-lane plot generation: a real, useful diagnostic, but not
+# something any test's own correctness should depend on). Counted and
+# printed separately in the final summary so it's never silently lost,
+# just never fatal.
+warn() { echo "[WARN] $*"; WARN=$((WARN + 1)); }
 section() { echo; echo "──────────────────────────────────────────────────────"; echo "$*"; echo "──────────────────────────────────────────────────────"; }
 
 make_cfg() {
@@ -3957,6 +3966,51 @@ else
     skip "rmclean_cubes: min_valid_chan_frac check skipped (bin/rmclean_cubes or section 51's own fixtures not available)"
 fi
 
+section "56. rmclean_cubes: swim-lane plot generation (reminder check, non-blocking)"
+
+# Not a correctness check on rmclean_cubes itself -- a reminder that the
+# swim-lane plotting PATH (thread_timing log lines -> scripts/
+# plot_tile_async_swimlane.py -> a real PNG) still works end to end.
+# Found worth having (2026-08-09) after a real multi-hour WALLABY+EMU
+# rmclean run finished with no swim-lane plot ever generated for it --
+# the capability existed (scripts/plot_tile_async_swimlane.py, already
+# used for the earlier Jennifer e2e run) but nothing prompted using it.
+# Deliberately uses warn(), not fail(): this is a diagnostics/visibility
+# tool, not a correctness property of rmclean_cubes' own output -- it
+# should never be why the suite (or anything gating on it) goes red, but
+# it also should never silently stop working without anyone noticing.
+if [[ -x bin/rmclean_cubes && -f "$rmc_lsqref_amp" && -f "$cep_pha" && -f "$cep_mask" && -x "$RMCLEAN_VENV_PY" ]]; then
+    swimtest_out="$OUT_DIR/rmc_swimtest"
+    swimtest_log="$OUT_DIR/rmc_swimtest.log"
+    swimtest_png="$OUT_DIR/rmc_swimtest_swimlane.png"
+    rm -f "${swimtest_out}".*.FITS "$swimtest_png"
+    if bin/rmclean_cubes ampfile="$rmc_lsqref_amp" phafile="$cep_pha" \
+            maskfile="$cep_mask" outfile="$swimtest_out" \
+            abs_flux_floor=0.01 niter=200 gain=0.1 \
+            log_level=debug timing_enabled=y \
+            > "$swimtest_log" 2>&1; then
+        if "$RMCLEAN_VENV_PY" scripts/plot_tile_async_swimlane.py \
+                --log "$swimtest_log" --out "$swimtest_png" \
+                --run latest --thread-stage clean \
+                > "$OUT_DIR/rmc_swimtest_plot.log" 2>&1 \
+                && [[ -s "$swimtest_png" ]]; then
+            png_bytes=$(stat -c%s "$swimtest_png" 2>/dev/null || stat -f%z "$swimtest_png")
+            if [[ "$png_bytes" -gt 1000 ]]; then
+                pass "rmclean_cubes: swim-lane plot generated ($png_bytes bytes, $swimtest_png)"
+            else
+                warn "rmclean_cubes: swim-lane plot written but suspiciously small ($png_bytes bytes) -- see $OUT_DIR/rmc_swimtest_plot.log"
+            fi
+        else
+            warn "rmclean_cubes: swim-lane plot generation failed -- see $OUT_DIR/rmc_swimtest_plot.log (thread_timing log format may have drifted from what plot_tile_async_swimlane.py expects)"
+        fi
+    else
+        warn "rmclean_cubes: swim-lane test run itself failed -- see $swimtest_log (cannot check plot generation without a real thread_timing log)"
+    fi
+    rm -f "${swimtest_out}".*.FITS
+else
+    skip "rmclean_cubes: swim-lane plot check skipped (bin/rmclean_cubes, section 51's own fixtures, or ~/venv/rmtool python3 not available)"
+fi
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
@@ -3966,6 +4020,7 @@ echo "Total : $TOTAL"
 echo "Pass  : $PASS"
 echo "Fail  : $FAIL"
 echo "Skip  : $SKIP"
+echo "Warn  : $WARN (does not affect RESULT -- see individual [WARN] lines above)"
 
 if [[ "$FAIL" -gt 0 ]]; then
     echo ""
