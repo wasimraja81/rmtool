@@ -388,6 +388,14 @@ program match_cubes
          &' channels, ', count(isbad_f(i,1:nfreq_f(i))), ' flagged bad'
       enddo
 
+      ! T30: advisory only, never changes reffile= itself -- see
+      ! advise_reference_band's own header comment and
+      ! docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md T30.
+      if (do_reproject) then
+         call advise_reference_band(infiles, n_inputs, reffile, nfreq_f,&
+         &sky1_f, sky2_f, cdelt1_f, cdelt2_f)
+      endif
+
       if (have_target) then
          common_bmaj = target_bmaj
          common_bmin = target_bmin
@@ -1439,6 +1447,108 @@ contains
       call safe_ftclos(unit, fitsstat)
    end subroutine read_axis_info
 
+   subroutine advise_reference_band(infiles, n_inputs, reffile, nfreq_f,&
+   &sky1_f, sky2_f, cdelt1_f, cdelt2_f)
+      !! T30: advisory only -- never changes reffile itself. Groups
+      !! infiles by identical sky grid (CRVAL1/CRVAL2/CDELT1/CDELT2 --
+      !! same pointing AND same pixel scale, confirmed directly on the
+      !! real WALLABY+EMU data to be exactly what makes reproject cheap:
+      !! WALLABY-Q and WALLABY-U share identical CRVAL/CRPIX/NAXIS, EMU-Q
+      !! and EMU-U likewise share identical CRVAL/CRPIX/NAXIS with each
+      !! other but NOT with WALLABY -- reprojecting within a group is a
+      !! near-identity transform (~0.44s/plane measured), across groups
+      !! is genuine resampling (~22.75s/plane measured, ~52x). Sums each
+      !! group's total plane count and recommends reffile come from
+      !! whichever group has the most, since that group's planes get the
+      !! cheap treatment for free while every other group's planes pay
+      !! the expensive one regardless of which file within it is chosen.
+      character(len=*), intent(in) :: infiles(:)
+      integer, intent(in) :: n_inputs
+      character(len=*), intent(in) :: reffile
+      integer, intent(in) :: nfreq_f(:)
+      integer, intent(in) :: sky1_f(:), sky2_f(:)
+      real(dp), intent(in) :: cdelt1_f(:), cdelt2_f(:)
+
+      real(dp) :: crval1_f(max_inputs), crval2_f(max_inputs)
+      integer :: group_id(max_inputs), group_planes(max_inputs)
+      integer :: group_first(max_inputs)
+      integer :: n_groups, i, j, this_group, ref_group, best_group
+      integer :: unit, blocksize, fitsstat, status
+      character(len=68) :: comment
+      character(len=8) :: axstr
+      real(dp), parameter :: tol = 1.0d-9
+
+      do i = 1, n_inputs
+         fitsstat = 0
+         call safe_ftopen(unit, trim(infiles(i)), 0, blocksize, fitsstat)
+         if (fitsstat.ne.0) then
+            call free_fits_unit(unit)
+            return ! advisory only -- silently skip on any read trouble
+         endif
+         write(axstr,'(I0)') sky1_f(i)
+         call FTGKYD(unit, 'CRVAL'//trim(axstr), crval1_f(i), comment, fitsstat)
+         write(axstr,'(I0)') sky2_f(i)
+         call FTGKYD(unit, 'CRVAL'//trim(axstr), crval2_f(i), comment, fitsstat)
+         call safe_ftclos(unit, fitsstat)
+         if (fitsstat.ne.0) return
+      enddo
+
+      ! Group by matching (CRVAL1, CRVAL2, CDELT1, CDELT2) within tol.
+      n_groups = 0
+      do i = 1, n_inputs
+         this_group = 0
+         do j = 1, n_groups
+            if (abs(crval1_f(i)-crval1_f(group_first(j))).lt.tol .and.&
+            &abs(crval2_f(i)-crval2_f(group_first(j))).lt.tol .and.&
+            &abs(cdelt1_f(i)-cdelt1_f(group_first(j))).lt.tol .and.&
+            &abs(cdelt2_f(i)-cdelt2_f(group_first(j))).lt.tol) then
+               this_group = j
+               exit
+            endif
+         enddo
+         if (this_group.eq.0) then
+            n_groups = n_groups + 1
+            this_group = n_groups
+            group_first(this_group) = i
+            group_planes(this_group) = 0
+         endif
+         group_id(i) = this_group
+         group_planes(this_group) = group_planes(this_group) + nfreq_f(i)
+      enddo
+
+      if (n_groups.lt.2) return ! nothing to recommend -- single grid
+
+      ref_group = 0
+      do i = 1, n_inputs
+         if (trim(infiles(i)).eq.trim(reffile)) then
+            ref_group = group_id(i)
+            exit
+         endif
+      enddo
+      if (ref_group.eq.0) return ! reffile not one of infiles -- skip
+
+      best_group = 1
+      do j = 2, n_groups
+         if (group_planes(j).gt.group_planes(best_group)) best_group = j
+      enddo
+
+      if (best_group.ne.ref_group) then
+         write(*,'(A)') 'ADVISORY: reffile= is not from the band with'//&
+         &' the most total planes.'
+         write(*,'(A,I0,A,I0,A,A,A)') '  Current reference band totals ',&
+         &group_planes(ref_group), ' planes; ', group_planes(best_group),&
+         &' planes are available from another band (e.g. ',&
+         &trim(infiles(group_first(best_group))), ')'
+         write(*,'(A)') '  Reprojecting within a band (same pointing/'//&
+         &'pixel scale) is a near-identity transform; reprojecting'//&
+         &' across bands is genuine resampling and much more'//&
+         &' expensive per plane -- using the largest-plane-count band'//&
+         &' as reffile= minimizes total reproject cost. Not changed'//&
+         &' automatically -- reffile= also determines the output grid,'//&
+         &' a choice this program leaves to you.'
+      endif
+   end subroutine advise_reference_band
+
    subroutine check_no_rotation(unit, sky1, sky2, filename, status)
       integer, intent(in) :: unit, sky1, sky2
       character(len=*), intent(in) :: filename
@@ -2307,6 +2417,14 @@ contains
       integer :: t_map_in2ref
 
       integer :: lbnd_in(2), ubnd_in(2), lbnd_o(2), ubnd_o(2), nbad
+      ! T30 item 3/7: spatial/tile reproject parallelism -- each thread
+      ! resamples its own row-range of the SAME plane (AST's native
+      ! REGION-vs-FULL output-bounds support), rather than each thread
+      ! taking a whole separate plane. See docs/dev/
+      ! MULTI_BAND_TOMOGRAPHY_PLAN.md T30 item 7 for the full
+      ! measurement/derivation (verified against the real cross-band
+      ! WCS transform, not just a synthetic one).
+      integer :: lbnd_reg(2), ubnd_reg(2), row0, row1, rows_per, rem
       real :: badval
       double precision :: params_dummy(1)
       real(dp) :: t_stage
@@ -2488,12 +2606,13 @@ contains
       !$omp& nx_in, ny_in, nx_out, ny_out, block_planes, block_data_in,&
       !$omp& block_data_out, n_groups, axis1_extent, cur_slot, io_overlap_l,&
       !$omp& write_dispatched_ok, write_pending, write_thread_id,&
-      !$omp& write_failed, write_job_general, t_stage, nwriters_eff)&
+      !$omp& write_failed, write_job_general, t_stage, nwriters_eff, nthreads)&
       !$omp& private(t_status, t_wcs_ref, t_skymap_ref, t_skyframe_ref,&
       !$omp& t_naxes_ref, t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
       !$omp& t_naxes_in, t_pixaxes_in, t_map_in2ref, other_idx, remainder,&
       !$omp& radix, k, igroup, chan_start, chan_len, local_iplane, nbad,&
-      !$omp& lbnd_in, ubnd_in, lbnd_o, ubnd_o, badval, params_dummy,&
+      !$omp& lbnd_in, ubnd_in, lbnd_o, ubnd_o, lbnd_reg, ubnd_reg, row0, row1,&
+      !$omp& rows_per, rem, badval, params_dummy,&
       !$omp& iblock, tid_local, t_thread_start, t_thread_elapsed, thread_msg)
 
       ! T20 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): each thread still
@@ -2552,12 +2671,27 @@ contains
 
             iblock = iblock + 1
             tid_local = omp_get_thread_num()
-            t_thread_start = omp_get_wtime()
-            write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=resample event=start tid=',&
-            &tid_local,' block=',iblock,' unit_count=',chan_len
-            call log_message('debug','tile_thread',trim(thread_msg))
-            !$omp do schedule(static)
+            ! T30 item 3/7: spatial/tile parallelism -- every thread
+            ! processes every plane (no worksharing over local_iplane
+            ! any more), each working its own row-range of the OUTPUT
+            ! footprint via AST's native REGION-vs-FULL output-bounds
+            ! support. Verified no worse than plane-parallel when
+            ! chan_len is a multiple of nthreads, real win otherwise --
+            ! see docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md T30 item 7.
+            ! Explicit barrier at the end of each plane iteration:
+            ! block_data_out(:,:,local_iplane,cur_slot) must be fully
+            ! written by every thread before the loop moves on.
+            rows_per = ny_out / nthreads
+            rem = mod(ny_out, nthreads)
+            if (tid_local < rem) then
+               row0 = tid_local*(rows_per+1) + 1
+               row1 = row0 + rows_per
+            else
+               row0 = rem*(rows_per+1) + (tid_local-rem)*rows_per + 1
+               row1 = row0 + rows_per - 1
+            endif
             do local_iplane = 1, chan_len
+               t_thread_start = omp_get_wtime()
                if (t_status.eq.0 .and. status_par.eq.0) then
                   lbnd_in(1) = 1
                   lbnd_in(2) = 1
@@ -2567,13 +2701,17 @@ contains
                   lbnd_o(2) = nint(lbnd_out_d(2))
                   ubnd_o(1) = nint(ubnd_out_d(1))
                   ubnd_o(2) = nint(ubnd_out_d(2))
+                  lbnd_reg(1) = lbnd_o(1)
+                  lbnd_reg(2) = lbnd_o(2) + row0 - 1
+                  ubnd_reg(1) = ubnd_o(1)
+                  ubnd_reg(2) = lbnd_o(2) + row1 - 1
                   badval = ieee_value(badval, ieee_quiet_nan)
                   params_dummy(1) = 0.0d0
                   nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
                   &block_data_in(:,:,local_iplane),&
                   &block_data_in(:,:,local_iplane),&
                   &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval,&
-                  &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
+                  &2, lbnd_o, ubnd_o, lbnd_reg, ubnd_reg,&
                   &block_data_out(:,:,local_iplane,cur_slot),&
                   &block_data_out(:,:,local_iplane,cur_slot), t_status)
                   if (t_status.ne.0) then
@@ -2581,12 +2719,24 @@ contains
                      status_par = -1
                   endif
                endif
+               !$omp barrier
+               t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+               ! T30 item 7 follow-up (2026-08-09): per-PLANE, not
+               ! per-block, team timing -- every thread in the team
+               ! works the SAME plane together (row-split), so every
+               ! thread logs its OWN line, all sharing the identical
+               ! team-elapsed dur_ms for that one plane -- keeps a
+               ! swim-lane plot honest (nthreads simultaneous lanes for
+               ! this one plane, not 1 -- see scripts/
+               ! plot_tile_async_swimlane.py's THREAD_CPU_RE comment).
+               ! Matches convolve's own per-plane 'block=...plane=...
+               ! nthreads=...' shape exactly; replaces the old per-block
+               ! start/done pair entirely (redundant with this).
+               write(thread_msg,'(A,I0,A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=resample event=done tid=',&
+               &tid_local,' block=',iblock,' plane=',chan_start+local_iplane-1,&
+               &' nthreads=',nthreads,' dur_ms=',t_thread_elapsed
+               call log_message('debug','tile_thread',trim(thread_msg))
             enddo
-            !$omp end do
-            t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
-            write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=resample event=done tid=',&
-            &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
-            call log_message('debug','tile_thread',trim(thread_msg))
 
             !$omp single
             call timer_stop('block_resample', t_stage)
@@ -2999,6 +3149,9 @@ contains
       integer :: t_naxes_in2(max_axes), t_pixaxes_in(2)
       integer :: t_map_in2ref
       integer :: lbnd_in(2), ubnd_in(2), lbnd_o(2), ubnd_o(2), nbad
+      ! T30 item 3/7: spatial/tile reproject parallelism -- see
+      ! process_one_file_general's own identical comment.
+      integer :: lbnd_reg(2), ubnd_reg(2), row0, row1, rows_per, rem
       real :: badval_sp
       double precision :: params_dummy(1)
       real(dp) :: t_stage
@@ -3378,21 +3531,18 @@ contains
                !$omp parallel num_threads(nthreads) default(none)&
                !$omp& shared(chan_len, nx_in, ny_in, nx_out, ny_out, cur_slot,&
                !$omp& block_in, block_out, isbad, chan_start, status_par,&
-               !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock)&
+               !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock, nthreads)&
                !$omp& private(local_iplane, ich, nanval, plane_native_sp,&
                !$omp& plane_out_sp, t_status, t_wcs_ref, t_skymap_ref,&
                !$omp& t_skyframe_ref, t_naxes_ref, t_pixaxes_ref, t_wcs_in,&
                !$omp& t_skymap_in, t_skyframe_in, t_naxes_in2, t_pixaxes_in,&
                !$omp& t_map_in2ref, lbnd_in, ubnd_in, lbnd_o, ubnd_o,&
+               !$omp& lbnd_reg, ubnd_reg, row0, row1, rows_per, rem,&
                !$omp& badval_sp, params_dummy, nbad, tid_local,&
                !$omp& t_thread_start, t_thread_elapsed, thread_msg,&
                !$omp& t_resamp_local)
 
                tid_local = omp_get_thread_num()
-               t_thread_start = omp_get_wtime()
-               write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=reproject event=start tid=',&
-               &tid_local,' block=',iblock,' unit_count=',chan_len
-               call log_message('debug','tile_thread',trim(thread_msg))
 
                ! Own private AST Mapping per thread -- required, see
                ! process_one_file_general's own comment on why (this
@@ -3417,51 +3567,77 @@ contains
                   status_par = -1
                endif
 
-               !$omp do schedule(dynamic)
+               ! T30 item 3/7: spatial/tile parallelism -- see
+               ! process_one_file_general's own identical comment. No
+               ! worksharing over local_iplane any more -- every thread
+               ! processes every plane, each working its own row-range.
+               rows_per = ny_out / nthreads
+               rem = mod(ny_out, nthreads)
+               if (tid_local < rem) then
+                  row0 = tid_local*(rows_per+1) + 1
+                  row1 = row0 + rows_per
+               else
+                  row0 = rem*(rows_per+1) + (tid_local-rem)*rows_per + 1
+                  row1 = row0 + rows_per - 1
+               endif
                do local_iplane = 1, chan_len
                   ich = chan_start + local_iplane - 1
-                  if (t_status.ne.0 .or. status_par.ne.0) cycle
-                  if (isbad(ich)) then
-                     nanval = ieee_value(1.0_dp, ieee_quiet_nan)
-                     block_out(:,:,local_iplane,cur_slot) = real(nanval)
-                     cycle
+                  if (t_status.eq.0 .and. status_par.eq.0) then
+                     if (isbad(ich)) then
+                        nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+                        block_out(:,row0:row1,local_iplane,cur_slot) = real(nanval)
+                     else
+                        lbnd_in(1) = 1
+                        lbnd_in(2) = 1
+                        ubnd_in(1) = nx_in
+                        ubnd_in(2) = ny_in
+                        lbnd_o(1) = nint(lbnd_out_d(1))
+                        lbnd_o(2) = nint(lbnd_out_d(2))
+                        ubnd_o(1) = nint(ubnd_out_d(1))
+                        ubnd_o(2) = nint(ubnd_out_d(2))
+                        lbnd_reg(1) = lbnd_o(1)
+                        lbnd_reg(2) = lbnd_o(2) + row0 - 1
+                        ubnd_reg(1) = ubnd_o(1)
+                        ubnd_reg(2) = lbnd_o(2) + row1 - 1
+                        params_dummy(1) = 0.0d0
+                        if (.not. allocated(plane_native_sp)) allocate(plane_native_sp(nx_in,ny_in))
+                        if (.not. allocated(plane_out_sp)) allocate(plane_out_sp(nx_out,ny_out))
+                        ! block_in already holds the CONVOLVED result
+                        ! (pass 1, above) -- same real(4) kind as
+                        ! plane_native_sp, no cast needed, unlike pass
+                        ! 1's own real(dp) conversion.
+                        plane_native_sp = block_in(:,:,local_iplane)
+                        badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
+                        t_thread_start = omp_get_wtime()
+                        call timer_start(t_resamp_local)
+                        nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
+                        &plane_native_sp, plane_native_sp,&
+                        &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
+                        &2, lbnd_o, ubnd_o, lbnd_reg, ubnd_reg,&
+                        &plane_out_sp, plane_out_sp, t_status)
+                        call timer_stop('reproject_compute', t_resamp_local)
+                        if (t_status.ne.0) then
+                           !$omp atomic write
+                           status_par = -1
+                        else
+                           block_out(:,row0:row1,local_iplane,cur_slot) = plane_out_sp(:,row0:row1)
+                        endif
+                     endif
                   endif
-                  lbnd_in(1) = 1
-                  lbnd_in(2) = 1
-                  ubnd_in(1) = nx_in
-                  ubnd_in(2) = ny_in
-                  lbnd_o(1) = nint(lbnd_out_d(1))
-                  lbnd_o(2) = nint(lbnd_out_d(2))
-                  ubnd_o(1) = nint(ubnd_out_d(1))
-                  ubnd_o(2) = nint(ubnd_out_d(2))
-                  params_dummy(1) = 0.0d0
-                  if (.not. allocated(plane_native_sp)) allocate(plane_native_sp(nx_in,ny_in))
-                  if (.not. allocated(plane_out_sp)) allocate(plane_out_sp(nx_out,ny_out))
-                  ! block_in already holds the CONVOLVED result (pass 1,
-                  ! above) -- same real(4) kind as plane_native_sp, no
-                  ! cast needed, unlike pass 1's own real(dp) conversion.
-                  plane_native_sp = block_in(:,:,local_iplane)
-                  badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
-                  call timer_start(t_resamp_local)
-                  nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
-                  &plane_native_sp, plane_native_sp,&
-                  &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
-                  &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
-                  &plane_out_sp, plane_out_sp, t_status)
-                  call timer_stop('reproject_compute', t_resamp_local)
-                  if (t_status.ne.0) then
-                     !$omp atomic write
-                     status_par = -1
-                     cycle
+                  !$omp barrier
+                  ! T30 item 7 follow-up (2026-08-09): per-PLANE, not
+                  ! per-block, team timing -- see process_one_file_
+                  ! general's own identical comment. Skips isbad planes,
+                  ! matching convolve's own per-plane logging convention
+                  ! (no line for a plane it never actually worked).
+                  if (t_status.eq.0 .and. status_par.eq.0 .and. .not.isbad(ich)) then
+                     t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+                     write(thread_msg,'(A,I0,A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=reproject event=done tid=',&
+                     &tid_local,' block=',iblock,' plane=',ich,' nthreads=',nthreads,&
+                     &' dur_ms=',t_thread_elapsed
+                     call log_message('debug','tile_thread',trim(thread_msg))
                   endif
-                  block_out(:,:,local_iplane,cur_slot) = plane_out_sp
                enddo
-               !$omp end do
-               t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
-               tid_local = omp_get_thread_num()
-               write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=reproject event=done tid=',&
-               &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
-               call log_message('debug','tile_thread',trim(thread_msg))
                call ast_end(t_status)
                !$omp end parallel
             endif
@@ -3473,19 +3649,16 @@ contains
             !$omp parallel num_threads(nthreads) default(none)&
             !$omp& shared(chan_len, nx_in, ny_in, nx_out, ny_out, cur_slot,&
             !$omp& block_in, block_out, isbad, chan_start, status_par,&
-            !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock)&
+            !$omp& reffile_l, infile, lbnd_out_d, ubnd_out_d, iblock, nthreads)&
             !$omp& private(local_iplane, ich, nanval, t_status,&
             !$omp& t_wcs_ref, t_skymap_ref, t_skyframe_ref, t_naxes_ref,&
             !$omp& t_pixaxes_ref, t_wcs_in, t_skymap_in, t_skyframe_in,&
             !$omp& t_naxes_in2, t_pixaxes_in, t_map_in2ref, lbnd_in, ubnd_in,&
-            !$omp& lbnd_o, ubnd_o, badval_sp, params_dummy, nbad, tid_local,&
+            !$omp& lbnd_o, ubnd_o, lbnd_reg, ubnd_reg, row0, row1, rows_per, rem,&
+            !$omp& badval_sp, params_dummy, nbad, tid_local,&
             !$omp& t_thread_start, t_thread_elapsed, thread_msg, t_resamp_local)
 
             tid_local = omp_get_thread_num()
-            t_thread_start = omp_get_wtime()
-            write(thread_msg,'(A,I0,A,I0,A,I0)') 'thread_timing stage=reproject event=start tid=',&
-            &tid_local,' block=',iblock,' unit_count=',chan_len
-            call log_message('debug','tile_thread',trim(thread_msg))
 
             t_status = 0
             !$omp critical (ast_setup)
@@ -3504,43 +3677,67 @@ contains
                status_par = -1
             endif
 
-            !$omp do schedule(dynamic)
+            ! T30 item 3/7: spatial/tile parallelism -- see
+            ! process_one_file_general's own identical comment. No
+            ! worksharing over local_iplane any more -- every thread
+            ! processes every plane, each working its own row-range.
+            rows_per = ny_out / nthreads
+            rem = mod(ny_out, nthreads)
+            if (tid_local < rem) then
+               row0 = tid_local*(rows_per+1) + 1
+               row1 = row0 + rows_per
+            else
+               row0 = rem*(rows_per+1) + (tid_local-rem)*rows_per + 1
+               row1 = row0 + rows_per - 1
+            endif
             do local_iplane = 1, chan_len
                ich = chan_start + local_iplane - 1
-               if (t_status.ne.0 .or. status_par.ne.0) cycle
-               if (isbad(ich)) then
-                  nanval = ieee_value(1.0_dp, ieee_quiet_nan)
-                  block_out(:,:,local_iplane,cur_slot) = real(nanval)
-                  cycle
+               if (t_status.eq.0 .and. status_par.eq.0) then
+                  if (isbad(ich)) then
+                     nanval = ieee_value(1.0_dp, ieee_quiet_nan)
+                     block_out(:,row0:row1,local_iplane,cur_slot) = real(nanval)
+                  else
+                     lbnd_in(1) = 1
+                     lbnd_in(2) = 1
+                     ubnd_in(1) = nx_in
+                     ubnd_in(2) = ny_in
+                     lbnd_o(1) = nint(lbnd_out_d(1))
+                     lbnd_o(2) = nint(lbnd_out_d(2))
+                     ubnd_o(1) = nint(ubnd_out_d(1))
+                     ubnd_o(2) = nint(ubnd_out_d(2))
+                     lbnd_reg(1) = lbnd_o(1)
+                     lbnd_reg(2) = lbnd_o(2) + row0 - 1
+                     ubnd_reg(1) = ubnd_o(1)
+                     ubnd_reg(2) = lbnd_o(2) + row1 - 1
+                     params_dummy(1) = 0.0d0
+                     badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
+                     t_thread_start = omp_get_wtime()
+                     call timer_start(t_resamp_local)
+                     nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
+                     &block_in(:,:,local_iplane), block_in(:,:,local_iplane),&
+                     &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
+                     &2, lbnd_o, ubnd_o, lbnd_reg, ubnd_reg,&
+                     &block_out(:,:,local_iplane,cur_slot), block_out(:,:,local_iplane,cur_slot), t_status)
+                     call timer_stop('reproject_compute', t_resamp_local)
+                     if (t_status.ne.0) then
+                        !$omp atomic write
+                        status_par = -1
+                     endif
+                  endif
                endif
-               lbnd_in(1) = 1
-               lbnd_in(2) = 1
-               ubnd_in(1) = nx_in
-               ubnd_in(2) = ny_in
-               lbnd_o(1) = nint(lbnd_out_d(1))
-               lbnd_o(2) = nint(lbnd_out_d(2))
-               ubnd_o(1) = nint(ubnd_out_d(1))
-               ubnd_o(2) = nint(ubnd_out_d(2))
-               params_dummy(1) = 0.0d0
-               badval_sp = ieee_value(badval_sp, ieee_quiet_nan)
-               call timer_start(t_resamp_local)
-               nbad = ast_resampler(t_map_in2ref, 2, lbnd_in, ubnd_in,&
-               &block_in(:,:,local_iplane), block_in(:,:,local_iplane),&
-               &ast__linear, ast_null, params_dummy, 0, 0.0d0, 100, badval_sp,&
-               &2, lbnd_o, ubnd_o, lbnd_o, ubnd_o,&
-               &block_out(:,:,local_iplane,cur_slot), block_out(:,:,local_iplane,cur_slot), t_status)
-               call timer_stop('reproject_compute', t_resamp_local)
-               if (t_status.ne.0) then
-                  !$omp atomic write
-                  status_par = -1
+               !$omp barrier
+               ! T30 item 7 follow-up (2026-08-09): per-PLANE, not
+               ! per-block, team timing -- see process_one_file_
+               ! general's own identical comment. Skips isbad planes,
+               ! matching convolve's own per-plane logging convention.
+               if (t_status.eq.0 .and. status_par.eq.0 .and. .not.isbad(ich)) then
+                  t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+                  write(thread_msg,'(A,I0,A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=reproject event=done tid=',&
+                  &tid_local,' block=',iblock,' plane=',ich,' nthreads=',nthreads,&
+                  &' dur_ms=',t_thread_elapsed
+                  call log_message('debug','tile_thread',trim(thread_msg))
                endif
             enddo
-            !$omp end do
-            t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
-            tid_local = omp_get_thread_num()
-            write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') 'thread_timing stage=reproject event=done tid=',&
-            &tid_local,' block=',iblock,' unit_count=',chan_len,' dur_ms=',t_thread_elapsed
-            call log_message('debug','tile_thread',trim(thread_msg))
             call ast_end(t_status)
             !$omp end parallel
 

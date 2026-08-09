@@ -3272,3 +3272,588 @@ no design work done beyond capturing the idea and its own precondition
 here. Any future implementation should also finally resolve
 `remove_qu_bias`'s own long-dormant placeholder (T6) rather than add a
 second, parallel I-based mechanism.
+
+### T30 -- Match-Stage Wall-Clock Reduction: Reference-Band Choice, Per-Thread AST Mapping Caching, Pixel-Level Parallelism, FFTW_MEASURE (in progress)
+
+**Found analyzing the first real post-T20/T28 WALLABY+EMU `match` run**
+(2026-08-07/08, `stages=match,rmsynth,rmclean` chained on the new
+`/scratch` SSD -- see `project_hardware_swap_and_e2e_rerun` memory):
+match took 9h38m total. Breaking this down from the run's own
+`thread_timing` debug log (per-plane/per-block timestamps, unambiguous)
+rather than guessing: convolve compute (T28's own serial-per-plane/
+threaded-within-plane design) accounted for 4.55h -- consistent with
+this host's real achieved FFT throughput at this problem size (Xeon
+E5-2650 v2, no FMA, out-of-cache 2D FFT: 0.34-0.65 GFLOP/s/thread,
+5-20% of the ~20.8 GFLOP/s/core theoretical DP peak, expected for a
+memory-bandwidth-bound transform this size against a ~20MB L3). Convolve
+is NOT the problem. **Reproject compute was 3.69h -- essentially the
+whole rest of the runtime** -- and unlike convolve, this is genuinely
+addressable, three independent ways:
+
+**1. Reference-band choice (`reffile=`) determines which band gets the
+expensive treatment.** `reffile=` (currently WALLABY-Q) defines the
+output WCS/grid that every input file's reproject step resamples onto.
+Reprojecting a file onto ITS OWN grid (i.e. the reference file itself)
+measures at ~0.44s/plane (near-identity transform: same projection
+type, same pixel scale, only a translated pointing center). Reprojecting
+a genuinely different band onto that grid (EMU, in this run) measures at
+~22.75s/plane -- a real ~52x per-plane cost difference, confirmed
+directly from the log (WALLABY block-transitions ~44-46s/10-plane-block,
+EMU ~237-241s/8-plane-block), not inferred. Since WALLABY (144 planes)
+currently gets the cheap treatment and EMU (288 planes, 2x as many)
+gets the expensive treatment, **swapping which band is the reference
+would move the LARGER plane count into the cheap bucket**: current
+3.68h -> ~1.89h (real measured per-plane rates, reweighted by real
+plane counts) -- confirmed via `astropy`-verified header check that
+WALLABY and EMU share identical `CDELT1`/`CDELT2` (0.00055556 deg/px)
+and projection (`RA---SIN`/`DEC--SIN`), so the swap does not change the
+output grid's pixel count -- no hidden size penalty, this is a clean
+win. General principle, not specific to this dataset: **the band with
+the most total planes (summed across all its own files) should be the
+reference**, not whichever file happens to be listed first.
+
+**2. Per-thread AST Mapping is rebuilt every BLOCK, not once per FILE.**
+Confirmed directly from source (`match_cubes.f90`, both
+`order=convolve_reproject`'s and `order=reproject_convolve`'s reproject
+passes): the `!$omp critical (ast_setup)` block (T20's own fix for the
+real concurrent-creation deadlock) sits INSIDE the per-block loop, so
+for a 36-block file (EMU), up to 6 threads x 36 blocks = up to 216
+redundant Mapping rebuilds happen, when only 6 (one per thread, built
+once and reused for every block of that file) are actually necessary.
+**This does not reintroduce or need to touch T20's actual fix** -- the
+lock is specifically on Mapping CREATION (`ast_begin`/`load_wcs`/
+`compose_pix2pix`), never on Mapping APPLICATION (`ast_resampler`,
+already proven safe under full concurrency by T20's own verification,
+confirmed again directly by re-reading that ticket's text before
+starting this one). Caching does not fight the lock, it just pays the
+locked cost once per file instead of once per block.
+
+**3. Reproject parallelizes across whole PLANES, not pixels --
+real, measurable, extra thread-idle cost on top of (1) and (2).**
+`block_planes` (chosen for convolve's own memory budget: 10 for
+WALLABY's smaller padded FFT, 8 for EMU's larger one) does not divide
+evenly into `nthreads=6` for either file: WALLABY gets ~83.3% thread
+utilization (6+4 across two dynamic-schedule waves, 2 idle in the
+second), EMU ~66.7% (6+2, 4 idle in the second). Since the geometric
+Mapping is plane-independent -- the exact same transform applies to
+every plane in a file -- there is no correctness reason the ACTUAL
+resampling work (`ast_resampler`, per (2) above) has to be divided by
+whole plane rather than by output pixel/tile; pixel-level division
+would keep all 6 threads busy regardless of block size or plane-count
+divisibility.
+
+**Combined estimate (utilization-corrected extrapolation from real
+measured rates, not a fresh guess -- see conversation record for the
+full derivation):** same reference + (2)+(3): ~2.46h reproject (from
+3.69h), ~8.4h total match (~13% off 9.63h). Reference swapped to EMU +
+(2)+(3): ~1.27h reproject, ~7.2h total match (~25% off 9.63h, ~2.4h
+saved). The two levers roughly stack multiplicatively on the reproject
+bucket, since they're independent (band choice picks which plane-count
+goes in which bucket; utilization/caching shrink both buckets' own
+per-plane cost).
+
+**Implementation staging, explicit per this project's own practice
+(document, cross-check, implement in small tested increments -- same
+discipline T28 itself used, restated here because (2) and (3) touch the
+same AST code T20 already had a real deadlock in):**
+
+1. **Advisory only (low risk, additive, no computational-path change):**
+   at startup, group `infiles=` by identical native grid (`NAXIS1`/
+   `NAXIS2`/`CDELT1`/`CDELT2`), sum total planes per group, and if
+   `reffile=` isn't already in the largest-plane group, print a
+   recommendation (same style as T15's build-time advisory). Does not
+   auto-switch `reffile=` -- footprint/output-grid choice can have other
+   implications a human should confirm, this only surfaces the
+   information.
+   **2026-08-08: acted on.** All three real WALLABY+EMU cfgs
+   (`cfg/pipeline-multiband-wallaby-emu.cfg`,
+   `cfg/pipeline-multiband-wallaby-emu-match.cfg`,
+   `cfg/pipeline-multiband-wallaby-emu-e2e.cfg`) switched `reffile=`
+   from WALLABY-Q to EMU-Q, following the advisory's own reasoning
+   (EMU's 576 total planes vs WALLABY's 288). Does not apply to the
+   real e2e run already in progress at the time of this edit (cfg read
+   once at process startup) -- takes effect on the next invocation.
+2. **Per-thread Mapping caching + pixel-level reproject parallelism
+   (higher risk -- real structural change, deferred as its own
+   carefully-tested increment, not bundled with (1)):** requires
+   hoisting the `!$omp parallel` region to span the whole per-block
+   loop (currently re-entered fresh every block) so each thread's
+   Mapping, once built via the critical section, survives across
+   blocks; and restructuring the reproject inner loop to divide by
+   output pixel/tile rather than by `local_iplane`. Both changes touch
+   the exact code T20's deadlock was in -- full `tests/run_tests.sh`
+   after each sub-step, not just at the end, and a direct rerun of the
+   two regression tests T20's own postmortem named (grid-only-mismatch,
+   long-`infiles=`) as the ones that caught the previous broken attempt
+   immediately.
+
+**Verification plan (once (2)/(3) land):** bit-identical output against
+today's known-good result on the existing synthetic multi-band test
+fixtures (this is a parallelization-strategy change, not a math change
+-- output must not move at all, matching T28's own bit-identical bar);
+then, disk space permitting, a real re-run on the WALLABY+EMU data
+(folds into T28's own still-outstanding real-scale TODO above) to
+confirm the actual wall-clock/utilization gains predicted here.
+
+**4. Convolve itself also has a real fix, contrary to this ticket's own
+original framing above ("reproject is the bottleneck, not convolve") --
+convolve's FFT was assumed to already be near its own real floor
+(memory-bandwidth-bound, 5-20% of theoretical peak, "normal" for an
+out-of-cache 2D FFT on this host). That floor assumption was right for
+the ALGORITHM, wrong for the PLANNING STRATEGY: `plan_convolution`
+(`gaussft.f90`) used `FFTW_ESTIMATE`, which picks a decomposition
+without ever timing alternatives. Measured directly on this host, at
+both real FFT sizes in this project, new-array-execute style (planned
+against a throwaway array, executed against the real one -- exactly
+this codebase's own usage): `FFTW_MEASURE` is 1.26x faster at
+11664x11664 (WALLABY, radix-2/3-only, FFTW's easy case) and **2.83x
+faster at 14336x12500** (EMU, 2^11x7 and 2^2x5^5 -- radix-5/7 codelets,
+where ESTIMATE's blind guess is measurably worse). Implemented:
+`fftw_measure` + `fftw_unaligned` constants added, both
+`sfftw_plan_dft_2d` calls in `plan_convolution` switched from
+`fftw_estimate` to `ior(fftw_measure, fftw_unaligned)`
+(`src/gaussft.f90`) -- shared by both `match_cubes.f90` and
+`convolve_cubes.f90` (same module), so both binaries benefit from one
+change. `FFTW_UNALIGNED` is not optional here, not just a nicety: every
+real call executes the plan against `cimg`/`cmsk`/`g_final` (plain
+Fortran `ALLOCATABLE`, no alignment guarantee), never against the
+`scratch` array the plan was built against -- FFTW's own docs describe
+this as capable of "crash or incorrect results" for a non-UNALIGNED
+plan on an architecture with strict SIMD alignment needs, not merely
+slower (the pre-T30 comment here undersold this as a speed-only
+concern). Confirmed empirically, not assumed: MEASURE+UNALIGNED was NOT
+slower than plain MEASURE at the EMU size in the same new-array-execute
+pattern -- slightly faster (0.92x the time), so there was no
+safety-for-speed tradeoff to weigh.
+
+Also found while digging into why convolve's per-plane cost was so much
+higher than a naive single-FFT estimate: `convolve_to_beam`
+(`gaussft.f90`) runs the ENTIRE forward+inverse FFT pair TWICE per
+plane whenever the plane has any NaN pixel -- once for the data, once
+more for a 0/1 validity mask used to normalise partially-NaN-contaminated
+output pixels (see the subroutine's own header comment on `C_D`/`C_M`).
+Checked directly against the real WALLABY+EMU input (not assumed): EMU
+has 18.8%-28.7% NaN pixels on every sampled channel (0 through 287);
+WALLABY's genuinely bad channels are already skipped before convolve
+runs, but its real, processed channels still carry 7-10% NaN each. So
+this doubled-FFT path is not a rare case for this data -- it is
+effectively the ONLY path taken, on both bands. This, not some other
+mystery non-FFT cost, is most of what "13.9s/plane of non-FFT overhead"
+in this ticket's own earlier analysis actually was: closer to 4 FFT
+executions per plane than 2, not ~13.9s of something else.
+
+**TODO, NOT implemented, flagged for future exploration (T14-style mask-
+pattern caching, applied to convolve instead of rmclean):** the mask's
+own convolved result depends only on the plane's NaN PATTERN, not its
+data values, and the SAME `g_final` kernel-transform is reused for both
+the data and mask passes already (confirmed directly from source, both
+`cimg*g_final` and `cmsk*g_final` use the identical array). If NaN
+patterns repeat across nearby planes/channels -- not yet checked; the
+EMU NaN fraction trends smoothly from 18.8% to 28.7% across the band,
+which may mean patterns DON'T repeat exactly channel-to-channel, unlike
+rmclean's own mask-pattern cache where exact repeats are common -- a
+Belady-style (or even simple LRU/LFU) cache keyed on the NaN pattern's
+hash could skip the mask's own forward+inverse FFT pair entirely for a
+repeated pattern, the same idea T14 already proved out for rmclean's
+RMSF tables. Not started: real repetition in this data has not been
+measured, and doing so requires checking actual bit-pattern equality
+across many planes' own `nan_mask`, not just a percentage trend. Do not
+implement without first confirming genuine repetition exists -- caching
+infrastructure for patterns that never repeat would be pure overhead
+with no payoff.
+
+**Verification (item 4, FFTW_MEASURE+UNALIGNED):** full
+`tests/run_tests.sh`, particularly `test_gaussft_threading.f90` (T28's
+own bit-identical NaN-handling check, `nthreads=1` vs `nthreads=4`) --
+this change alters the CHOSEN algorithm/decomposition, not the math, so
+output must stay bit-identical, same bar as T28 itself.
+
+**Real regression found by that same test suite, fixed before calling
+item 4 done:** three bit-identical-across-configuration tests broke
+(`convolve_cubes`/`match_cubes` `io_overlap=y` vs `n`, `nwriters=4` vs
+`1`) -- confirmed via direct numeric diff, NOT a math bug: max abs diff
+2.235e-8, relative 1.4e-7, 80% of pixels differing by that tiny amount,
+the exact signature of FFTW_MEASURE picking a DIFFERENT (but equally
+valid) decomposition between two separate process invocations of the
+identical transform. MEASURE times candidate algorithms for real during
+planning; that timing is subject to real-world jitter run-to-run, so
+two independent invocations can legitimately choose different
+decompositions, which sum in a different order and produce tiny,
+pervasive floating-point differences -- not wrong, just not bit-
+identical, which this project's own test convention requires.
+FFTW_ESTIMATE never had this problem (a pure function of transform
+size, never measures anything, always the same plan).
+
+**Fix: FFTW wisdom caching**, not a revert to ESTIMATE. `plan_convolution`
+now imports wisdom from a fixed, repo-relative, gitignored file
+(`wisdom/fftw_wisdom_sp.dat`) before planning, and exports the
+(possibly-updated) wisdom back after -- both best-effort, never fatal
+(no wisdom yet, or an unwritable path, just falls through to ordinary
+MEASURE behaviour, same as before this fix). Once ANY run has measured
+and saved wisdom for a given (size, precision, thread count), every
+subsequent run -- this process or a later one -- reuses that identical
+decomposition deterministically instead of re-measuring, restoring
+bit-identical output while keeping MEASURE's real speed win. Uses
+`iso_c_binding` for just these two calls (`fftwf_export_wisdom_to_filename`/
+`fftwf_import_wisdom_from_filename`) -- confirmed via `nm -D` on the
+linked library that the legacy `sfftw_*` F77 wrapper layer this file
+otherwise uses never got a "to_filename" variant, only the modern C API
+did. Verified directly: re-ran the exact failing scenario (two separate
+`convolve_cubes` invocations, `io_overlap=n` then `y`) after this fix --
+`cmp` bit-identical, wisdom file created (plain-text FFTW wisdom
+format, confirmed by inspection). Full suite re-run to confirm no other
+regressions.
+
+**5. Convolve/reproject pipelining -- raised by the user, real
+potential, NOT started, flagged as a research item given its
+complexity (research this before attempting implementation, not a
+short increment like items 1-4):** today, within a block, convolve and
+reproject run strictly sequentially (convolve ALL of the block's planes
+serially, only then does reproject's parallel-across-planes pass
+begin) -- zero overlap between the two phases. If they instead
+pipelined (reproject starts on plane N as soon as convolve finishes
+plane N, while convolve moves on to plane N+1), the theoretical floor
+per block drops from `convolve_phase + reproject_phase` to
+`max(convolve_phase, reproject_phase)`.
+
+Whether this is worth the complexity is highly file-dependent, using
+this ticket's own real measured numbers: WALLABY blocks (convolve
+~95s/block vs reproject ~0.44-2s/block) have almost nothing to gain --
+overlap saves at most ~2s/block. EMU blocks (convolve ~191s/block
+[8 x ~23.9s], reproject ~45-180s/block depending on how many threads
+it gets) are the case where the two phases are comparable in size and
+overlap could genuinely matter.
+
+**The real tension, not just an implementation detail:** achieving
+this requires freeing at least one thread from convolve's own internal
+6-way FFT threading to dedicate to reproject work concurrently --
+e.g. 5 threads for convolve, 1 dedicated to reproject. That means
+reproject goes from parallel-across-planes-with-6-threads (today) to
+serial-on-1-thread-across-the-whole-block -- a real de-optimization on
+reproject's OWN axis (its own per-block total could grow from ~45s
+thread-parallel to ~180s single-threaded, using this ticket's own
+thread-summed numbers) even though overall block wall-clock could
+still improve by running concurrently with convolve instead of after
+it. Net benefit depends on how close convolve-with-5-threads' own time
+lands to reproject-with-1-thread's own time -- not yet modelled
+precisely enough to know if this nets positive without also folding in
+item 3's own tile-level reproject change first (which changes
+reproject's own thread-utilization numbers this whole comparison is
+based on).
+
+**Implementation would require** an actual producer-consumer pipeline
+(a dedicated worker thread pulling finished planes off a queue while
+the convolve driver continues), not a parameter tweak -- and touches
+the same AST-lock-sensitive reproject code T20 already deadlocked in
+once, now with an added correctness dependency (reproject on plane N
+must never start before convolve has FULLY written plane N -- real
+synchronization required, not just thread-count arithmetic). Given
+items 2/3 above are already the higher-risk, deferred, structural
+pieces of this ticket, treat this as a further, even-later item -- do
+not attempt alongside 2/3, and re-derive the WALLABY/EMU numbers above
+against whatever item 3 lands as before deciding if it's worth doing
+at all.
+
+**6. Plan-stage strategy selection: plane-parallel convolve for small
+cubes, spatial-parallel (today's default) for large ones -- raised by
+the user, ATTEMPTED, then REVERTED after a real implementation-level
+conflict was found; final decision below is "always spatial-parallel,"
+not the dual-strategy design originally implemented.**
+
+**Motivation:** T28's serial-over-planes/threaded-within-plane
+redesign was motivated entirely by LARGE, real-scale data (T26's own
+memory-multiplication finding, "on real ASKAP-scale data" -- the
+per-thread transient memory cost of the OLD concurrent-multi-plane
+strategy is what made it unsafe at that scale). That reasoning doesn't
+apply to small cubes -- T28 became the UNCONDITIONAL default regardless
+of size, which raised a real question: does FFTW's own internal
+multi-threading actually help at small sizes, or does per-call
+threading overhead dominate there?
+
+**Measured directly on this host, single-plane FFTW execution time,
+1-thread vs FFTW-internal-6-thread** (same transform, `FFTW_ESTIMATE`,
+isolating just the threading-overhead question from the MEASURE-vs-
+ESTIMATE question already settled in item 4):
+
+| size | 1 thread | 6 threads (internal) | speedup |
+|---|---|---|---|
+| 32 (this project's own test fixtures) | 2.94e-6s | 3.48e-6s | **0.843x (slower)** |
+| 64 | 1.74e-5s | 1.74e-5s | 0.999x (no benefit) |
+| 128 | 8.85e-5s | 8.84e-5s | 1.001x (no benefit) |
+| 1024 | 4.82e-2s | 2.48e-2s | 1.944x (real benefit) |
+
+(256 and 2048 also measured but discarded -- wildly non-monotonic
+0.096x readings, almost certainly contaminated by the real WALLABY+EMU
+`rmclean_cubes` e2e run still active on this host at measurement time;
+re-measure those two once the host is quiet before relying on them.)
+So: real, confirmed overhead-dominance at small sizes (worse than
+single-threaded at 32, break-even through 128), real benefit at 1024.
+Exact crossover not yet pinned down cleanly, but the trend is
+unambiguous.
+
+**Design principle (the user's own framing, and the key simplification
+that makes this tractable): the two directions of getting this wrong
+are NOT symmetric, so the decision doesn't need to be precisely tuned
+-- it needs to be precisely SAFE in one direction and can be loose in
+the other.**
+- Choosing spatial-parallel (today's default) for a cube that's
+  actually small: costs a few percent of a few seconds. Totally
+  irrelevant in absolute terms -- small cubes are already fast either
+  way, matching the user's own "seconds/minutes vs hours/days" framing
+  directly: only absolute wall-clock time matters, not relative
+  speedup/slowdown.
+- Choosing plane-parallel (concurrent multi-thread, each thread its
+  own whole plane, T26's OLD strategy) for a cube that's actually
+  large: not just slower -- this is T26's own real memory-
+  multiplication failure mode again (peak transient memory scales with
+  thread count under this strategy). On a memory-constrained target
+  (the user's own Raspberry Pi case), this is a potential OOM crash,
+  not a performance regression.
+
+So the threshold is memory-driven, not speed-driven, and asymmetric on
+purpose: default to spatial-parallel (safe) whenever in doubt, only
+switch to plane-parallel when CONFIDENTLY memory-safe to do so. A
+simple, generously-conservative check suffices -- no need for a
+runtime empirical probe (the self-calibrating "measure both strategies
+live" idea raised and then superseded in this same discussion), since
+imprecision on the safe side costs nothing in practice.
+
+**Concrete check designed (`gaussft_mod`, `use_plane_parallel_convolve`,
+since REMOVED -- see below):** plane-parallel would be chosen only if
+`transient_bytes_per_plane * nthreads` (the peak memory the OLD
+strategy would need) fit within `mem_safe_bytes`. The memory-safety
+LOGIC itself was correct and was never what failed.
+
+**Implementation attempted, then reverted after a REAL hang, found
+directly (not assumed):** built a second, conditional branch
+(`!$omp parallel do if(conv_use_plane_parallel)`) at all three
+convolve call sites (`match_cubes.f90`'s two `order=` branches,
+`convolve_cubes.f90`'s equivalent pass), each thread using its own
+`nthreads=1` plan via the historical concurrent-callers pattern. First
+test run: 3 tests failed with a genuine Fortran runtime error (an
+`I0`-vs-argument-count format-string mismatch in the new debug log
+line -- a real bug in the new code, fixed). Second test run, after
+that fix: a genuine HANG -- `bin/convolve_cubes` sat at 0.6% CPU for
+minutes on a trivial 32x32 test image, confirmed via every thread's own
+`/proc/<pid>/task/<tid>/wchan` showing `futex_wait_queue` (`gdb`
+unavailable on this host, `ptrace_scope` restricted). Killed and
+diagnosed rather than left running.
+
+**Root cause, confirmed against this module's own header comment, not
+guessed:** `convolve_to_beam` (`gaussft.f90`) contains its OWN internal
+`!$omp workshare`/`!$omp parallel do collapse(2)` constructs -- added
+BY T28 ITSELF, specifically *because* T28 committed callers to invoking
+it serially, one plane at a time ("convolve_to_beam's own internals...
+are now parallelized in-place... rather than relying on the caller to
+run multiple concurrent instances," this module's own header). T28's
+own historical claim used to justify plane-parallel here -- "16 OpenMP
+threads calling convolve_to_beam concurrently against the SAME shared
+plan... matched a serial run exactly" -- is real, but was measured
+against the PRE-T28 version of this function, which had NO internal
+OMP constructs of its own and relied entirely on the caller for
+parallelism. The CURRENT function is different: its `workshare` regions
+assume they are the only active parallel activity, coordinating ONE
+team. Having up to 16 outer threads (all members of ONE team, T30's own
+new caller pattern) each independently, asynchronously enter their OWN
+copy of that same internal construct -- from 16 different loop
+iterations, not as a single coordinated team action -- is not a
+scenario `workshare` is defined for, and manifests exactly as observed:
+threads parked on implicit barriers waiting for "team members" that
+are in unrelated code and will never arrive. An initial attempted fix
+(skip `sfftw_init_threads`/`sfftw_plan_with_nthreads` for the
+`nthreads=1` case, on the hypothesis that FFTW's OWN threading API was
+the culprit) was tried and did NOT resolve the hang -- confirming the
+real cause is the nested-`workshare` conflict above, not anything
+FFTW-side.
+
+**Final decision (discussed directly with the user, both directions
+weighed): REVERT to always spatial-parallel, for every cube size --
+not a compromise, the actually-correct choice, for three independent
+reasons:**
+1. **The measured overhead at small sizes is negligible in ABSOLUTE
+   terms** -- the whole motivation for this ticket item. 0.843x at
+   32x32 is real, but it is 0.843x of a microsecond-scale transform;
+   this project's own governing standard (stated explicitly by the
+   user) is seconds/minutes vs hours/days, not relative percentages --
+   and by that standard there was never a real problem to fix here.
+2. **Making plane-parallel actually safe again would mean duplicating
+   `convolve_to_beam`** (a second implementation without its own
+   internal OMP constructs, matching the pre-T28 function) or rewriting
+   its internals to conditionally disable their own parallelism --
+   real, ongoing correctness/maintenance risk (two copies of nontrivial
+   NaN-handling math that can drift apart, or new complexity in the
+   one that exists) for a benefit already established as immaterial by
+   point 1.
+3. **Always-spatial-parallel is what the chaining goal actually
+   needs.** Convolve processing exactly one plane at a time,
+   internally threaded across its own spatial extent, with no
+   plane-parallel buffering exception, is precisely the shape reproject
+   needs to match once its own tile-level parallelism (item 3) lands --
+   one plane, all cores, spatially, for BOTH stages, uniformly. A
+   convolve that sometimes buffers multiple planes for its own compute
+   would be a second, inconsistent shape actively working against that
+   architecture, not toward it.
+
+I/O buffering itself -- `block_planes`, reading many planes per disk
+operation -- was never at risk from this revert and needed no design
+change: it is already, and remains, fully decoupled from compute
+strategy (confirmed directly: `block_planes` sizing depends only on
+`mem_safe_bytes`/`bytes_per_plane`, never on how the buffered planes
+are subsequently processed). The revert also restores the ORIGINAL,
+simpler `block_planes` formula (single-plane reservation only),
+slightly increasing buffer size versus the now-removed dual-strategy
+version's own (unneeded) larger reservation.
+
+**Net outcome:** `use_plane_parallel_convolve` removed from
+`gaussft_mod` entirely; all three call sites reverted to T28's original
+unconditional serial-per-plane/internally-threaded loop, byte-for-byte
+matching the pre-T30-item-6 code. Full `tests/run_tests.sh` re-run
+clean, 165/165, after the revert. Items 1 (advisory) and 4
+(`FFTW_MEASURE`+wisdom) are structurally independent of this item and
+were confirmed unaffected -- neither their code paths nor their own
+call sites reference anything item 6 introduced.
+
+**7. Reproject spatial/tile parallelism (item 3 above, investigated in
+depth) -- VERIFIED against the real cross-band WCS transform. Decision:
+drop plane-based reproject parallelism entirely, adopt spatial/tile
+parallelism as the single, uniform strategy. Implementation started,
+not yet landed.**
+
+**Methodology failures found and fixed along the way, documented
+because each one silently invalidated real-looking numbers before being
+caught -- matching this ticket's own standing practice of recording
+mistakes, not just conclusions:**
+
+1. **A genuine KIND mismatch, not an AST/data problem.** Every
+   standalone benchmark built while investigating this item declared
+   `ast_resampler`'s bound arrays as `integer(kind=8)`. The real
+   production code (`match_cubes.f90:2419,3111` and all three call
+   sites) declares them as plain default `integer` (4-byte). Since
+   `ast_resampler` is called as an untyped `external` function (no
+   Fortran interface block -- this project's own established F77-style
+   AST binding convention), there is no compile-time check: passing
+   8-byte integers where the underlying C library reads 4-byte `int`s
+   corrupts the entire argument list from that point on. Symptom: a
+   declared 11559x6704 array only ever had ~11559 pixels (one row, 0.015%
+   of the image) genuinely touched -- confirmed via a sentinel-fill
+   check (`img_out` pre-filled with a value AST would never produce,
+   then counting how much of it survived the call). Fixed by matching
+   the real declaration exactly; re-verified with the same sentinel
+   check, 100% of pixels touched.
+2. **A cheap synthetic transform is not a stand-in for the real one --
+   confirmed, not assumed, this time.** Initial A/B/C benchmarking used
+   a trivial `ast_matrixmap`+`ast_shiftmap` affine (pure translation,
+   matching WALLABY/EMU's real `CDELT`/rotation relationship) for speed
+   of iteration. Cross-checked against the real e2e log
+   (`match.20260807T210950.stdout.log`): blocks 1-15 (WALLABY, still
+   the reference band in that run) measured ~2.3s/plane, matching the
+   synthetic test closely -- but blocks 16-36 (EMU, the genuine
+   cross-band reproject) measured ~91s/plane, ~40x more expensive. Root
+   cause, confirmed by reading `compose_pix2pix`
+   (`match_cubes.f90:1788-1818`): the real Mapping is built from
+   `ast_convert` between two actual `SkyFrame`s plus each file's own
+   FITS-derived pixel<->sky `SkyMap` -- genuine spherical-projection
+   trigonometry per pixel, not a constant-time affine multiply. All
+   absolute timings from the synthetic-transform phase were discarded;
+   only the *qualitative* thread-idle-avoidance mechanism (independent
+   of per-pixel cost) carried over, and was later independently
+   reconfirmed against the real transform (below).
+3. **Two distinct AST per-thread-ownership failures, not one.**
+   Building the real Mapping once (single-threaded, safe) and handing
+   copies to other threads was tried twice, both wrong:
+   - First attempt: `ast_copy` called by the MASTER thread, for every
+     thread, before entering the parallel region. Every non-master
+     thread's later `ast_resampler` call failed at runtime ("Invalid
+     Object pointer given ... currently owned by another thread"),
+     silently doing almost nothing (sentinel check: only ~17% of the
+     image touched) instead of erroring loudly enough to be obviously
+     wrong.
+   - Second attempt: each thread calling `ast_copy` itself, from its
+     own context, inside the parallel region. Still failed -- `ast_copy`
+     itself errored for every thread except thread 0 (the one that
+     built the ORIGINAL master Mapping and so was copying an
+     object it already owned). Confirms this project's own existing
+     comment at `match_cubes.f90:2615-2617` (*"this Fortran binding
+     exports neither astLock nor astUnlock to hand one off"*) applies
+     to `ast_copy` too, not just `ast_resampler` -- there is no
+     handoff mechanism of any kind between threads, full stop.
+   - **Fix: every thread independently builds its own complete Mapping
+     from scratch** (`load_wcs`/`extract_sky_mapping`/`compose_pix2pix`,
+     serialized via `!$omp critical`), exactly matching what
+     `process_one_file_restricted`/`process_one_file_general` already
+     do today (`match_cubes.f90:2622-2635`, `3513-3524`, `3600-3611`).
+     This investigation did not discover a new technique -- it
+     confirmed the existing production pattern is the *only* correct
+     one, and that no cheaper alternative exists.
+
+**Final, trustworthy measurement** (real cross-band WCS Mapping, real
+WALLABY/EMU FITS files, genuinely idle cores confirmed via `mpstat`
+before every run, one persistent `!$omp parallel` region spanning
+Mapping-build and both timed phases so each thread's Mapping is
+provably still owned by the same OS thread throughout, Mapping-build
+and any AST first-use caching cost excluded from the timed region --
+matching how the real per-thread cost is already amortized across many
+planes in production, not paid once per plane):
+
+| plane size | 1 thread | 6 threads (row-tiled) | speedup |
+|---|---|---|---|
+| 32x32 | 0.0020s | 0.0006s | 3.50x (both trivial, ~1.4ms apart) |
+| 1024x1024 | 1.595s | 0.319s | 5.00x |
+| 4096x4096 | 25.09s | 3.84s | 6.54x |
+| 14300x12395 (real native EMU plane) | 271.58s | 41.10s | **6.61x** |
+
+100% pixel-completeness verified (sentinel check) at every size, no
+ownership errors, no regression at any size -- even 32x32 is faster in
+absolute terms under tiling, not slower.
+
+**Applying this to the real production numbers** (`block_planes=8`,
+`nthreads=6` for the 21 dominant EMU blocks, ~91s/plane measured
+directly from the log): current method (B) per 8-plane block ~182s
+(2 of 6 threads do a second plane under `schedule(static,1)`, matching
+the log exactly). Candidate (C, always-tile, serial-across-planes) per
+8-plane block: 8 x (91/6.61) ~ 110s. Estimated ~1.65x speedup, ~25
+minutes saved across those 21 blocks (~64min -> ~39min) for this run's
+reproject stage. **Flagged explicitly as an estimate, not a fourth
+direct measurement**: the 6.61x ratio and the 91s/plane baseline are
+each independently measured, but combining them assumes the ratio
+transfers unchanged to the real block-level case -- reasonable (same
+mechanism, same transform) but not itself re-verified end-to-end.
+
+**Decision (user's own three-part argument, each part checked against
+the real transform above, not just reasoned about in the abstract):**
+adopt spatial/tile parallelism as the ONLY reproject strategy --
+process one plane at a time, every thread working its own row-tile of
+that plane, no plane-parallel branch at all. Not a dual-strategy
+design:
+1. Exact-multiple case (`nplanes` a multiple of `nthreads`): no worse
+   than today, and the measured 6.61x (mildly super-linear) vs the
+   plane-parallel scheme's own ~6.0x-at-best ideal means tiling may
+   even have a slight edge here -- never a regression.
+2. Non-integral case (the common real case, `block_planes` not a
+   multiple of 6): tiling wins outright, both in the cheap-transform
+   sweep (1/2/3 planes vs 6 threads: 5.39x/2.70x/1.95x) and the real
+   production estimate above (~1.65x on the dominant blocks).
+3. Small planes: verified negligible in absolute terms against the
+   REAL transform (table above), not just the earlier synthetic one --
+   no small-plane penalty exists at any tested size.
+
+This also completes the architectural consistency goal from item 6:
+convolve already processes one plane at a time, threaded across its
+own spatial extent, with no plane-buffering exception. Reproject
+moving to the identical shape (one plane, all cores, spatially) means
+both stages now chain uniformly -- a plane finishing convolve is ready
+for reproject to work on with full core utilization immediately,
+regardless of `block_planes`/`nthreads` divisibility, matching the
+chaining goal raised earlier in this ticket.
+
+**Implementation status:** not yet landed. Requires restructuring all
+three `ast_resampler` call sites (`match_cubes.f90:2682`, `3556`,
+`3637`) from `!$omp do schedule(dynamic)` over `local_iplane` (plane-
+parallel) to a plain serial loop over planes with each thread computing
+its own row-range (`lbnd_reg`/`ubnd_reg`, AST's native REGION-vs-FULL
+output-bounds support, already used successfully in every benchmark
+above) and an `!$omp barrier` at the end of each plane iteration. The
+existing per-thread Mapping-build pattern is untouched -- only the
+work-distribution changes, not Mapping ownership/creation.
+Bit-identical output required against today's known-good result before
+this is considered done, same bar as every other item in this ticket.

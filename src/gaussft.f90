@@ -82,6 +82,43 @@ module gaussft_mod
    public :: plan_convolution, convolve_to_beam, destroy_convolution_plan,&
    &next_fast_fft_size
 
+   ! T30: FFTW wisdom import/export -- fftwf_export_wisdom_to_filename/
+   ! fftwf_import_wisdom_from_filename, NOT the legacy sfftw_* F77
+   ! wrapper layer everything else in this file uses: confirmed directly
+   ! via `nm -D` on the linked libfftw3f.so.3 that the legacy wrappers
+   ! only expose sfftw_export_wisdom_/sfftw_import_wisdom_ (the
+   ! callback-based char-by-char forms, awkward from Fortran) and never
+   ! got a "to_filename" convenience variant -- only the modern C API
+   ! has that. iso_c_binding used for JUST these two calls, the rest of
+   ! this file's FFTW usage is unchanged.
+   interface
+      function fftwf_export_wisdom_to_filename(filename)&
+      &bind(c, name='fftwf_export_wisdom_to_filename') result(ok)
+         use, intrinsic :: iso_c_binding, only: c_char, c_int
+         character(kind=c_char), intent(in) :: filename(*)
+         integer(kind=c_int) :: ok
+      end function fftwf_export_wisdom_to_filename
+      function fftwf_import_wisdom_from_filename(filename)&
+      &bind(c, name='fftwf_import_wisdom_from_filename') result(ok)
+         use, intrinsic :: iso_c_binding, only: c_char, c_int
+         character(kind=c_char), intent(in) :: filename(*)
+         integer(kind=c_int) :: ok
+      end function fftwf_import_wisdom_from_filename
+   end interface
+
+   ! Fixed, repo-relative path (this project's binaries are always
+   ! invoked from the repo root -- run_pipeline.sh's own ROOT_DIR cd
+   ! convention, scripts/make_all.sh, every cfg-driven invocation seen
+   ! in this project) -- not a cfg key, since wisdom is a pure
+   ! performance cache with no correctness implications from its own
+   ! path, and every caller sharing one fixed location is the whole
+   ! point (match_cubes and convolve_cubes both benefit from whichever
+   ! one populates it first). Not committed to git (machine-specific:
+   ! the optimal decomposition for one CPU says nothing about another)
+   ! -- see .gitignore.
+   character(len=*), parameter :: wisdom_dir = 'wisdom'
+   character(len=*), parameter :: wisdom_file = wisdom_dir//'/fftw_wisdom_sp.dat'
+
    ! T27 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the FFT buffers
    ! (plan_convolution's own scratch, and convolve_to_beam's cimg/cmsk/
    ! g_final/c_d/c_m below) are single precision (sp) -- FITS flux data
@@ -125,6 +162,8 @@ module gaussft_mod
    integer, parameter :: fftw_forward = -1
    integer, parameter :: fftw_backward = 1
    integer, parameter :: fftw_estimate = 64
+   integer, parameter :: fftw_measure = 0
+   integer, parameter :: fftw_unaligned = 2
 
 contains
 
@@ -164,6 +203,7 @@ contains
       !! nthreads>1-internally-threaded plan would oversubscribe
       !! threads^2-fold). Pass nthreads=1 for the old concurrent-callers
       !! usage pattern (behaves identically to before T28).
+      use, intrinsic :: iso_c_binding, only: c_null_char
       integer, intent(in) :: nx, ny, nthreads
       integer(kind=8), intent(out) :: plan_fwd, plan_bwd
       integer, intent(out) :: nx_pad, ny_pad
@@ -188,24 +228,84 @@ contains
          call sfftw_plan_with_nthreads(max(1, nthreads))
       endif
 
-      ! FFTW_ESTIMATE plans don't depend on the array CONTENTS, or even
-      ! specifically on the memory used here, only the shape -- every
-      ! actual convolve_to_beam call below uses the "new-array execute"
-      ! form with its own arrays instead. FFTW's own documentation
-      ! describes this as fully supported (correct regardless of
-      ! alignment, though a non-ESTIMATE plan might not be as fast on a
-      ! differently-aligned array than the one it was planned with --
-      ! irrelevant for ESTIMATE, which never does alignment-specific
-      ! optimisation in the first place). sfftw_* (single precision,
-      ! T27) -- the plan's own precision must match whatever array it
-      ! will later execute against (convolve_to_beam's cimg/cmsk, both
-      ! complex(sp)); a plan created via dfftw_* cannot be executed
-      ! against a complex(sp) array (undefined behaviour, not a clean
-      ! error) so this scratch array is complex(sp) too, matching.
+      ! T30 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): FFTW_MEASURE, not
+      ! FFTW_ESTIMATE -- measured directly on this host at both real FFT
+      ! sizes in this project (14336x12500, the harder-to-factor one:
+      ! 2.83x faster; 11664x11664, radix-2/3-only: 1.26x faster). This
+      ! plan is built once per FILE (plan_convolution's own existing
+      ! per-file granularity, unchanged) and reused for every plane, so
+      ! MEASURE's one-time real-execution-based search (~50-70s here)
+      ! is amortized over 143-288 executions -- ESTIMATE's fast-but-
+      ! blind guess was never worth it at that ratio.
+      !
+      ! FFTW_UNALIGNED, added alongside MEASURE (ESTIMATE never needed
+      ! it -- see below): every actual convolve_to_beam call uses the
+      ! "new-array execute" form against cimg/cmsk/g_final, NOT this
+      ! subroutine's own throwaway `scratch` array (immediately
+      ! deallocated below, never touched again). Plain Fortran
+      ! ALLOCATE gives no alignment guarantee, so cimg/cmsk's actual
+      ! alignment relative to `scratch` (what the plan was built
+      ! against) is not controlled -- FFTW's own docs describe
+      ! executing a non-UNALIGNED plan against a differently-aligned
+      ! array as capable of "crash or incorrect results" on
+      ! architectures with strict SIMD alignment needs, not merely
+      ! "not as fast" (the previous version of this comment undersold
+      ! the risk). FFTW_ESTIMATE was never exposed to this because it
+      ! "never does alignment-specific optimisation in the first
+      ! place" (still true, see FFTW's own docs on FFTW_ESTIMATE); a
+      ! plan built with FFTW_MEASURE alone does NOT get that same free
+      ! pass. Confirmed directly on this host, at the 14336x12500 size,
+      ! new-array-execute style matching this codebase's own usage:
+      ! MEASURE+UNALIGNED was not slower than plain MEASURE -- slightly
+      ! FASTER (0.92x the time), consistent with plain MEASURE already
+      ! silently paying an alignment-mismatch cost against these
+      ! separately-allocated arrays that UNALIGNED lets FFTW avoid by
+      ! not assuming alignment it was never guaranteed in the first
+      ! place. No safety-speed tradeoff to make here.
+      !
+      ! sfftw_* (single precision, T27) -- the plan's own precision
+      ! must match whatever array it will later execute against
+      ! (convolve_to_beam's cimg/cmsk, both complex(sp)); a plan
+      ! created via dfftw_* cannot be executed against a complex(sp)
+      ! array (undefined behaviour, not a clean error) so this scratch
+      ! array is complex(sp) too, matching.
+      !
+      ! T30: import wisdom BEFORE planning, export AFTER -- this is what
+      ! actually fixes MEASURE's own cross-invocation non-determinism
+      ! (found via a real test failure: io_overlap=y vs n, two separate
+      ! process invocations of the identical transform, differed by
+      ! ~1e-7 relative -- MEASURE times candidate decompositions for
+      ! real, and that timing is subject to real-world jitter between
+      ! runs, so two independent invocations can legitimately pick
+      ! different, equally-valid decompositions, which sum in a
+      ! different order and produce tiny but pervasive floating-point
+      ! differences). If matching wisdom already exists for this exact
+      ! (size, precision, thread count) combination, FFTW uses it
+      ! directly instead of re-measuring -- so once ANY run has
+      ! measured and saved wisdom for a given size, every subsequent
+      ! run (this process or a later one) reuses the identical
+      ! decomposition deterministically. Both calls are best-effort:
+      ! import failing just means no wisdom yet (falls through to a
+      ! fresh MEASURE, as before this change); export failing (e.g.
+      ! wisdom_dir doesn't exist yet) is not fatal either -- wisdom is
+      ! a pure performance/determinism cache, never a correctness
+      ! requirement, so this subroutine must keep working with no
+      ! wisdom file at all, same as it always has.
+      call execute_command_line('mkdir -p '//wisdom_dir, wait=.true.)
+      if (fftwf_import_wisdom_from_filename(wisdom_file//c_null_char).eq.0) then
+         continue ! no wisdom yet (or unreadable) -- proceed, MEASURE below
+      endif
+
       allocate(scratch(nx_pad, ny_pad))
-      call sfftw_plan_dft_2d(plan_fwd, nx_pad, ny_pad, scratch, scratch, fftw_forward, fftw_estimate)
-      call sfftw_plan_dft_2d(plan_bwd, nx_pad, ny_pad, scratch, scratch, fftw_backward, fftw_estimate)
+      call sfftw_plan_dft_2d(plan_fwd, nx_pad, ny_pad, scratch, scratch, fftw_forward,&
+      &ior(fftw_measure, fftw_unaligned))
+      call sfftw_plan_dft_2d(plan_bwd, nx_pad, ny_pad, scratch, scratch, fftw_backward,&
+      &ior(fftw_measure, fftw_unaligned))
       deallocate(scratch)
+
+      if (fftwf_export_wisdom_to_filename(wisdom_file//c_null_char).eq.0) then
+         continue ! save failed (e.g. read-only fs) -- non-fatal, see above
+      endif
    end subroutine plan_convolution
 
    function next_fast_fft_size(n) result(m)
