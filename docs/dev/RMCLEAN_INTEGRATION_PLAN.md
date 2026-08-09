@@ -3884,3 +3884,141 @@ starting with Part C (BUNIT, lowest risk -- header-only, no new
 compute or output files) and Part D (also header-only), before Parts A
 and B (real new compute + new output files, need real test fixtures
 with known expected niter/stop-reason/residual/component values).
+
+### T20 -- Output cube creation: CFITSIO eagerly zero-fills each ~36GB
+output file on finalize, wasting real disk I/O for data that gets
+fully overwritten anyway (found live, on a real WALLABY+EMU run;
+DONE)
+
+**Found investigating why a real rmclean run's cores sat almost
+completely idle for ~35-40 minutes right after Pass 0 (pattern
+pre-scan) finished and block 1's real CLEAN compute completed in a
+normal 7.9s.** `ps`/`/proc/<pid>/status` showed the main (I/O) thread
+in kernel state `D` (uninterruptible disk sleep), stuck in
+`balance_dirty_pages` (the kernel throttling a writer that's dirtying
+page cache faster than the disk can flush it); the other 5 compute
+threads were genuinely idle (near 100% idle on their own cores) with
+nothing queued for them. `/proc/<pid>/io` showed ~193GB already
+written with 0 bytes read in a live 3-second sample, and `ls -la` on
+the 6 output cubes showed them being realized to their full ~36GB
+size ONE AT A TIME, sequentially, well before any real per-block CLEAN
+data for blocks 2-36 had even been computed.
+
+**Root cause, confirmed directly from this project's own code comment
+(`open_output_cube`, `src/rmclean_cubes.f90:2337-2347`), not guessed:**
+CFITSIO itself physically writes real zero bytes to realize a newly
+`FTINIT`-created file's declared-but-empty data segment up to its full
+NAXIS-implied size -- for `nwriters_eff>1`, this happens at the
+immediate `FTCLOS` right after `open_output_cube` opens the file (the
+code's own comment: *"this FTCLOS is what makes CFITSIO actually
+define/flush the HDU to its full declared NAXIS extent on disk"*); for
+`nwriters_eff==1` (default), the file is left open across the whole
+tile loop, so the same physical realization instead happens at (or is
+triggered by) the first `FTPSSE` subset write. Either way, CFITSIO
+does a real, physical, ~O(file size) write -- almost certainly for
+portability, since a general-purpose library can't safely assume every
+filesystem it might run on supports sparse files.
+
+**A real false lead, tried and disproven, not just reasoned about:**
+hypothesized that setting `nwriters>1` would avoid this (since it uses
+a different, raw-stream write path for actual pixel data). Set
+`nwriters=4`, killed and relaunched the real run to test it -- the
+SAME eager full-realize happened again, confirmed via the same
+`ls -la`/`/proc/<pid>/io` checks, just moved earlier (upfront, at
+`open_output_cube` time) instead of deferred to the first tile write.
+`nwriters` does not control this at all; the cause is CFITSIO's own
+close/first-write finalize behavior, independent of which write path
+pixel data eventually takes.
+
+**Proposed fix, not yet implemented:** bypass CFITSIO for the
+file-sizing step specifically. Set the file's final logical size via a
+raw POSIX `ftruncate()` (or equivalently, Fortran `STREAM` access: seek
+to the last byte offset and write a single byte) immediately after the
+header is written, instead of relying on CFITSIO's own `FTCLOS`/first-
+write finalize. This creates a genuinely *sparse* file -- confirmed
+this project's real filesystem for these outputs, `/scratch`, is XFS,
+which supports sparse files natively -- so the size-setting step
+becomes a near-instant metadata-only operation, with physical disk
+blocks allocated lazily only as real pixel data is actually written
+later (exactly the writes `write_output_tile`/`write_rm_chunk_raw_rmclean`
+already do today, unchanged).
+
+**Verified correct by construction, not just assumed:** POSIX
+guarantees that reading a never-written region ("hole") of a sparse
+file returns zero bytes -- identical, byte-for-byte, to what CFITSIO's
+own eager zero-fill already produces for not-yet-written pixels today
+(CFITSIO doesn't write NaN or any other sentinel there either, just
+IEEE-754 zero). So this fix changes NOTHING about what any byte of the
+file reads as, at any point during a run, whether it completes
+normally or is interrupted partway (e.g. the real block-34 reboot
+earlier this same investigation) -- only WHEN physical disk blocks get
+allocated changes: upfront and unconditional today, versus only if/when
+real data actually lands there. One benign, non-correctness side
+effect: `du` (actual disk blocks used) would under-report versus the
+file's logical size mid-run for a sparse file, while `ls -la`/`stat`
+would still report the full size immediately (set by `ftruncate`) --
+already true of `nwriters_eff>1`'s own existing `FTGHAD`-then-close
+design today, just for a different reason.
+
+**Real measured cost this would eliminate:** ~35-40 minutes of the 6
+compute threads sitting almost entirely idle, per real run, confirmed
+TWICE independently (once under the `nwriters_eff==1` default, once
+under `nwriters=4`) -- not a one-off fluke or a small effect at this
+data scale (6 files x ~36GB = ~216GB of real, unnecessary physical
+writes).
+
+**Status: DONE.** Implemented as designed above: new
+`raw_create_sized_output_file` subroutine (`src/rmclean_cubes.f90`)
+writes the same minimal structural header `FTPHPR` itself would have
+written (SIMPLE/BITPIX/NAXIS/NAXIS1-3/PCOUNT/GCOUNT/END -- matching
+`FTPHPR(unit,.true.,-32,3,naxes,0,1,.false.,status)`'s own real
+defaults exactly, confirmed by reading its actual call site, not
+assumed), sets the file's final size via a single trailing-byte stream
+write (sparse, confirmed on this project's real output filesystem,
+XFS), replacing `safe_ftinit`+`FTPHPR` entirely. `open_output_cube`
+then uses `safe_ftopen` (existing-file open, never `FTINIT`) for all
+subsequent header work -- `copy_generic_header_rmclean`,
+`bunit_override`, `rmsffwhm_override` -- unchanged otherwise, and its
+own `status='new'` check preserves the original refuse-if-exists
+safety net. Design validated with 3 standalone probes before touching
+production code (see this ticket's own body above: probe 1 disproved
+a pre-size-before-FTCLOS variant, definitively isolating `FTINIT`
+itself -- not `FTCLOS` -- as the trigger; probe 2 confirmed `FTOPEN`+
+`FTCLOS` on an already-existing, already-sized file preserves
+sparseness; probe 3 confirmed real CFITSIO header work -- the exact
+`FTUKYS`/`FTPKYD` calls `bunit_override`/`rmsffwhm_override` use --
+still preserves sparseness and round-trips correctly on read-back).
+Full `tests/run_tests.sh` re-run clean, 165/165, including the tests
+that write and verify real rmclean output cubes end to end (T14/T15/
+T17's own sections) -- bit-identical, same bar as every other ticket.
+
+**Second real bug found and fixed along the way, unrelated to CFITSIO:**
+the first production attempt at this fix crashed with a real heap
+corruption (`malloc(): corrupted top size` / `invalid size (unsorted)`,
+reproducible even at `-O0`) -- traced, via a minimal standalone
+reproducer, to this host's gfortran 13.3.0 corrupting the heap on a
+`character(len=:), allocatable` local variable, sized at runtime via
+`allocate(character(len=N) :: var)`, the moment a substring assignment
+is made into it (even a single, fully in-bounds one). Switching to a
+Fortran *automatic* array instead (length expression built directly
+from dummy arguments in the declaration itself, e.g.
+`character(len=(max(1,(n_template_cards+55)/36))*2880) :: header_block`
+-- no `allocatable`, no heap `allocate`/`deallocate` at all) resolved it
+cleanly, confirmed both in isolation and back in production. `tests/
+run_tests.sh` re-run clean again after this second fix, 165/165.
+
+**Re-verified against the real WALLABY+EMU run this was found on
+(2026-08-09), not just left as a future step:** killed the still-running
+old-binary job (confirmed not sparse, same slow path as before this
+ticket), cleaned up its 6 partial output cubes, relaunched with the
+fixed binary. Directly confirmed via the log: block 1's real CLEAN work
+started at 01:43:23, immediately after Pass 0's advisory finished
+writing -- no ~35-40 minute stall this time, versus every prior attempt
+(the original `nwriters_eff==1` default run, and the disproven
+`nwriters=4` "fix") hitting that exact wall. Run completed successfully
+end to end: 36/36 blocks, 59,334,010 pixels CLEANed, ~7h55m total
+wall-clock, stop-reason distribution healthy (0% hit the niter cap,
+2.76% abs_flux floor, 97.24% auto_nsigma) -- both parts of this fix
+(never let CFITSIO create the file; reserve real, not guessed, header
+space) hold up under actual production conditions, not just synthetic
+test fixtures.

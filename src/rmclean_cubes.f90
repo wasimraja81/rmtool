@@ -2302,6 +2302,126 @@ contains
       deallocate(amp_chunk, pha_chunk)
    end subroutine read_amp_pha_chunk
 
+   subroutine raw_create_sized_output_file(outname, nx_in, ny_in, nrm_in,&
+   &n_template_cards, status)
+      !! T20 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): replaces safe_ftinit+
+      !! FTPHPR for creating each output cube. CFITSIO's own FTINIT
+      !! (create-new-file), confirmed directly with standalone probes
+      !! (not assumed), unconditionally, physically zero-fills the WHOLE
+      !! declared NAXIS-implied data section on FTCLOS (or the first
+      !! FTPSSE write for nwriters_eff==1) -- real, ~O(file size) disk
+      !! I/O, ~35-40 minutes wall-clock across 6 x ~36GB real WALLABY+EMU
+      !! output cubes, almost all of it with 5 of 6 compute threads
+      !! sitting idle. A pre-sizing trick tried BEFORE letting CFITSIO's
+      !! own FTINIT-created-file FTCLOS run did NOT help (same eager
+      !! full write happened regardless) -- the trigger is specifically
+      !! FTINIT creating the file, not FTCLOS in general.
+      !!
+      !! Fix, confirmed by standalone probe (not assumed): if CFITSIO
+      !! never CREATES the file itself -- i.e. we create it ourselves
+      !! via plain POSIX/Fortran stream I/O first, then only ever FTOPEN
+      !! (open EXISTING) it -- opening and closing via CFITSIO does NOT
+      !! undo sparseness, even after real CFITSIO header work (FTUKYS/
+      !! FTPKYD, the exact calls bunit_override/rmsffwhm_override use
+      !! below).
+      !!
+      !! SECOND real trigger found, missed by the first round of
+      !! probes (which only tested a handful of header cards): if the
+      !! header needs to GROW past its currently-reserved 2880-byte
+      !! block(s) -- confirmed directly with a standalone probe, 60
+      !! dummy FTPREC calls into a single reserved block -- CFITSIO
+      !! shifts the data section to make room, which ALSO physically
+      !! realizes the whole file, even before FTCLOS. copy_generic_
+      !! header_rmclean copies every real card from the ampfile
+      !! template (51 on the real WALLABY+EMU ampfile, confirmed via
+      !! astropy) -- comfortably more than fit in one block (36 card
+      !! slots). Fix: reserve n_template_cards + 20 cards' worth of
+      !! header space upfront (the +20 covers our own 8 structural
+      !! cards, bunit_override/rmsffwhm_override's own 2, END, and
+      !! margin), rounded up to whole 2880-byte blocks, filled with
+      !! blank (all-space) filler cards between our structural cards
+      !! and END -- confirmed by a standalone probe (55 real-scale
+      !! FTPREC/FTUKYS/FTPKYD calls into a 4-block reservation) that
+      !! this keeps the file sparse through real header-copying volume
+      !! AND reads back correctly (BUNIT/RMSFFWHM/NAXIS1-3 round-
+      !! tripped via a normal FTOPEN+FTGKY* read).
+      !!
+      !! Writes ONLY the minimal structural header FTPHPR itself would
+      !! have written (SIMPLE, BITPIX, NAXIS, NAXIS1-3, PCOUNT, GCOUNT
+      !! -- matching FTPHPR(unit,.true.,-32,3,naxes,0,1,.false.,
+      !! status)'s own real defaults exactly, pcount=0/gcount=1/no
+      !! EXTEND card since extend=.false.), then blank filler cards,
+      !! then END at the very last reserved card slot, then sets the
+      !! file's final logical size via a single trailing-byte stream
+      !! write (sparse on this project's real output filesystem,
+      !! confirmed XFS). Every OTHER header card is still copied by
+      !! copy_generic_header_rmclean afterward, via CFITSIO, exactly
+      !! as before -- its own skip-list (SIMPLE/BITPIX/NAXIS/EXTEND/
+      !! PCOUNT/GCOUNT/END/NAXISn) already assumes these exact cards
+      !! are already present, which remains true.
+      character(len=*), intent(in) :: outname
+      integer, intent(in) :: nx_in, ny_in, nrm_in, n_template_cards
+      integer, intent(out) :: status
+      integer :: sunit, ios
+      integer(kind=8) :: full_size
+      character(len=80) :: card
+      ! Automatic-length array (size expression uses only dummy
+      ! arguments, no executable statement in between) -- NOT
+      ! allocatable. A allocatable character(len=:) + runtime
+      ! allocate(character(len=...) ::...) here reproducibly corrupted
+      ! the heap on this host's gfortran 13.3.0 (confirmed directly: a
+      ! minimal standalone reproducer crashed at program exit/
+      ! deallocation with "corrupted size vs. prev_size" after nothing
+      ! more than a single in-bounds substring assignment into it; the
+      ! same logic using an automatic array instead had zero issues,
+      ! -O0 through -O3/-march=native/-fopenmp, in isolation and here).
+      character(len=(max(1,(n_template_cards+55)/36))*2880) :: header_block
+      integer :: pos_in_block, header_bytes, end_pos
+
+      status = 0
+      header_bytes = len(header_block)
+      header_block = ' '
+      pos_in_block = 1
+      card = 'SIMPLE  =                    T'
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      card = 'BITPIX  =                  -32'
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      card = 'NAXIS   =                    3'
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      write(card,'(A,I20)') 'NAXIS1  = ', nx_in
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      write(card,'(A,I20)') 'NAXIS2  = ', ny_in
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      write(card,'(A,I20)') 'NAXIS3  = ', nrm_in
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      card = 'PCOUNT  =                    0'
+      header_block(pos_in_block:pos_in_block+79) = card; pos_in_block = pos_in_block+80
+      card = 'GCOUNT  =                    1'
+      header_block(pos_in_block:pos_in_block+79) = card
+      ! Everything between here and end_pos stays blank filler
+      ! (already initialized above) -- END goes at the very last card
+      ! slot of the last reserved block, matching the validated probe.
+      end_pos = header_bytes - 79
+      header_block(end_pos:end_pos+2) = 'END'
+
+      full_size = int(header_bytes,8) + int(nx_in,8)*int(ny_in,8)*int(nrm_in,8)*4_8
+      full_size = ((full_size + 2879_8) / 2880_8) * 2880_8
+
+      ! status='new': fails if outname already exists -- same safety
+      ! check safe_ftinit's own FTINIT provided (see open_output_cube's
+      ! own comment on why that matters).
+      open(newunit=sunit, file=trim(outname), access='stream',&
+      &form='unformatted', status='new', action='readwrite', iostat=ios)
+      if (ios.ne.0) then
+         write(*,*) 'ERROR: cannot create (already exists?): ', trim(outname)
+         status = -1
+         return
+      endif
+      write(sunit, pos=1) header_block
+      write(sunit, pos=full_size) achar(0)
+      close(sunit)
+   end subroutine raw_create_sized_output_file
+
    subroutine open_output_cube(template_file, outname, nx_in, ny_in, nrm_in,&
    &idx, status, bunit_override, rmsffwhm_override)
       !! T4a/T4c: creates outname and writes its header ONLY (no pixel
@@ -2336,15 +2456,16 @@ contains
       !! intermediate state that later FTPSSE subset writes fill in. If
       !! nwriters_eff>1, fetches this HDU's pixel-data byte offset
       !! (FTGHAD) into out_datastart(idx) and closes the handle
-      !! IMMEDIATELY -- this FTCLOS is what makes CFITSIO actually define/
-      !! flush the HDU to its full declared NAXIS extent on disk (ported
-      !! lesson from rm_synthesis.f90's own T6 postmortem: closing late
-      !! risks CFITSIO flushing a stale internal buffer over raw-written
-      !! bytes at ffclos time, since CFITSIO has no idea the raw writes
-      !! happened; closing right after FTGHAD makes that race impossible
-      !! rather than merely unlikely, and only after this close is the
-      !! file's on-disk size guaranteed to already span every byte offset
-      !! write_output_tile's raw-write path will ever compute).
+      !! IMMEDIATELY -- ported lesson from rm_synthesis.f90's own T6
+      !! postmortem: closing late risks CFITSIO flushing a stale
+      !! internal buffer over raw-written bytes at ffclos time, since
+      !! CFITSIO has no idea the raw writes happened; closing right
+      !! after FTGHAD makes that race impossible rather than merely
+      !! unlikely. (T20: the file's on-disk size already spans every
+      !! byte offset write_output_tile's raw-write path will ever
+      !! compute BEFORE this point now -- raw_create_sized_output_file
+      !! sets it, not this close -- but the race this close avoids is a
+      !! separate concern and still applies.)
       character(len=*), intent(in) :: template_file, outname
       integer, intent(in) :: nx_in, ny_in, nrm_in
       integer, intent(in) :: idx
@@ -2352,18 +2473,12 @@ contains
       character(len=*), intent(in), optional :: bunit_override
       real(dp), intent(in), optional :: rmsffwhm_override
       integer :: src_unit, fitsstat, blocksize
-      integer :: naxes_out(3)
-      logical :: simple, extend
       integer(kind=8) :: headstart, dataend, local_datastart
       integer :: local_unit
+      integer :: n_template_cards, n_more_hdu
 
       status = 0
       out_path(idx) = outname
-      naxes_out(1) = nx_in
-      naxes_out(2) = ny_in
-      naxes_out(3) = nrm_in
-      simple = .true.
-      extend = .false.
 
       fitsstat = 0
       call safe_ftopen(src_unit, trim(template_file), 0, blocksize, fitsstat)
@@ -2374,25 +2489,36 @@ contains
          return
       endif
 
-      ! safe_ftinit's FTINIT fails (nonzero fitsstat) if outname already
-      ! exists on disk -- checked and bailed out on IMMEDIATELY, before
-      ! any further CFITSIO call on out_unit(idx): every call after a
-      ! failed FTINIT operates on a unit CFITSIO never actually set up,
-      ! which is not a clean no-op but undefined behaviour (confirmed
-      ! directly: this previously crashed with a SIGSEGV inside CFITSIO
-      ! when an output file from an earlier run was left on disk --
-      ! tests/run_tests.sh must therefore also clean up its own rmc_*
-      ! outputs before each run, which it does).
+      ! T20: how many header cards does the template ACTUALLY have --
+      ! sizes the reserved header space in raw_create_sized_output_file
+      ! below (real, not guessed; see that subroutine's own comment on
+      ! why an under-sized reservation defeats the whole fix).
       fitsstat = 0
-      call safe_ftinit(out_unit(idx), trim(outname), blocksize, fitsstat)
+      call FTGHSP(src_unit, n_template_cards, n_more_hdu, fitsstat)
+      if (fitsstat.ne.0) n_template_cards = 200  ! generous fallback
+
+      ! T20: create+size the file ourselves (raw stream I/O, sparse on
+      ! this filesystem), never via CFITSIO's own FTINIT -- see
+      ! raw_create_sized_output_file's own comment for why. Its own
+      ! status='new' check replicates safe_ftinit's original
+      ! refuse-if-exists safety (a real prior SIGSEGV, still guarded
+      ! against): every CFITSIO call after a failed create would
+      ! otherwise operate on a unit CFITSIO never actually set up.
+      call raw_create_sized_output_file(trim(outname), nx_in, ny_in, nrm_in,&
+      &n_template_cards, status)
+      if (status.ne.0) then
+         call safe_ftclos(src_unit, fitsstat)
+         return
+      endif
+      fitsstat = 0
+      call safe_ftopen(out_unit(idx), trim(outname), 1, blocksize, fitsstat)
       if (fitsstat.ne.0) then
-         write(*,*) 'ERROR: cannot create (already exists?): ', trim(outname)
+         write(*,*) 'ERROR: cannot open just-created file: ', trim(outname)
          status = -1
          call safe_ftclos(src_unit, fitsstat)
          call free_fits_unit(out_unit(idx))
          return
       endif
-      call FTPHPR(out_unit(idx), simple, -32, 3, naxes_out, 0, 1, extend, fitsstat)
       call copy_generic_header_rmclean(src_unit, out_unit(idx), status)
       if (fitsstat.ne.0 .or. status.ne.0) then
          write(*,*) 'ERROR: failed to write header for: ', trim(outname)
