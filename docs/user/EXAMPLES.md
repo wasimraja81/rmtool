@@ -160,6 +160,17 @@ where possible so both land on the identical output grid by
 construction. Full detail:
 [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#4-match_cubes).
 
+**Choosing `reffile=` when combining more than two bands:** if your
+bands split into more than one distinct sky pointing, pick the
+reference from whichever pointing has the most total channels — every
+band sharing that SAME pointing gets a fast, near-identity resample,
+while every band from a genuinely different pointing pays the full
+(much slower) resampling cost regardless of which specific file within
+it you chose. `match_cubes` checks this for you automatically and
+prints an `ADVISORY:` message if your chosen `reffile=` looks like the
+less efficient pick — it never changes your choice for you, since
+`reffile=` also fixes the output grid.
+
 **Rule of thumb:** if you're not sure which situation you're in, just
 try `rm_synthesis` directly first (2a) — it will refuse loudly and
 tell you exactly what mismatched (WCS or otherwise), rather than

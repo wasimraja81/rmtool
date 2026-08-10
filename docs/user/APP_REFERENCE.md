@@ -360,6 +360,20 @@ Same `key=value`-only convention as the other two.
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
 | `dry_run` | `n` | no | `y`: check the first `infiles=` entry's own target disk (rotational vs. SSD/NVMe, via `/sys/block/.../queue/rotational`), print a suggested `io_overlap`/`nwriters` starting point for that disk type, write it to `match_cubes_dryrun.cfg`, then exit — no pixel data read, no output written. |
 
+### Reference-band advisory
+
+When `stages` includes `reproject` and `infiles=` spans more than one
+distinct sky pointing/pixel scale, `match_cubes` checks whether
+`reffile=` was chosen from the group of inputs with the most total
+channels, and prints an `ADVISORY:` message if not. Matching a file
+onto its own kind of pointing (the reference's own group) is fast;
+matching it onto a genuinely different one is much slower — so the
+group with the most channels should generally be the one that defines
+the output grid, since that's the group that gets the cheap treatment.
+This is advice only: `reffile=` is never changed automatically, since
+it also determines the output grid extent, a choice this program
+leaves to you.
+
 ### Output files
 
 One output cube per input (unless skipped — see below), `<infile-without-extension><outsuffix>`. `manifest=<path>` additionally writes the skip/process record described above.

@@ -58,13 +58,27 @@ resolution:
   real multi-hundred-GB cube sizes.
 - Beam metadata (`BMAJ`/`BMIN`/`BPA`) is carried faithfully through the
   whole chain, not silently dropped at any stage.
-- The resolution-matching step (convolution) processes one image plane
-  at a time, using several CPU cores to speed up that single plane
-  rather than handing whole planes to separate cores in parallel — so
-  peak memory use no longer grows with how many cores a run is given.
-  That's what makes a real multi-hundred-GB survey run practical on
-  ordinary hardware, and keeps the same code path usable on much
-  smaller machines too, down to something like a Raspberry Pi.
+- Both the resolution-matching step (convolution) and the grid-matching
+  step (resampling onto a common sky grid) process one image plane at a
+  time, using several CPU cores to speed up that single plane rather
+  than handing whole planes to separate cores in parallel — so peak
+  memory use no longer grows with how many cores a run is given. That's
+  what makes a real multi-hundred-GB survey run practical on ordinary
+  hardware, and keeps the same code path usable on much smaller
+  machines too, down to something like a Raspberry Pi.
+- When combining bands that don't share the same sky pointing,
+  `match_cubes` tells you if the band you picked to define the output
+  grid isn't the most efficient choice, and explains why — matching a
+  band onto its own kind of pointing is fast, matching it onto a
+  genuinely different one is much slower, so the choice matters.
+  Nothing is changed automatically; you decide.
+- Choosing the reference band well genuinely matters: measured on a
+  genuine two-survey dataset (a 144-channel, 11559×11655-pixel band and
+  a 288-channel, 14300×12395-pixel band, different pointings and
+  resolutions, ~563GB combined), the grid-matching step alone took
+  about 3h40m with a poorly-chosen reference band versus about 1h53m
+  with a well-chosen one — nearly half the time, from this one choice
+  alone.
 
 ### RM-CLEAN deconvolution
 
@@ -79,39 +93,51 @@ so the dirty cube only needs ordinary resolution-level sampling.
 Building and stress-testing this against real data surfaced and fixed
 a genuine data-corruption bug (see Validation) — not a hypothetical
 edge case, something that was silently producing wrong answers at
-scale until it was found.
+scale until it was found. A separate real-data finding fixed a large,
+avoidable delay at the very start of a run: creating each output cube
+was wasting a long stretch of time writing empty placeholder space
+that the real cleaned results were always going to overwrite anyway —
+for the largest real cubes tested, this alone was costing over half an
+hour of otherwise-idle run time before any actual cleaning could even
+begin. Output now starts flowing essentially immediately instead.
 
 ## Validation
 
 The two feature areas have different validation stories, stated
 plainly rather than blended into one blanket claim:
 
-- **RM-CLEAN has been validated at real, meaningful scale.** Beyond
-  the full regression suite, it was stress-tested against a real,
-  moderately large-scale ~46GB ASKAP test dataset — a complete
-  4501×4501-pixel run (20,259,001 pixels). That run surfaced a real
-  32-bit integer overflow silently corrupting CLEAN's mask-cube input
-  for any sufficiently large image. Fixed and reconfirmed on the same
-  real data: the fraction of pixels wrongly exhausting their full
+- **RM-CLEAN has been validated at real, meaningful scale, twice
+  over.** Beyond the full regression suite, it was first stress-tested
+  against a real, moderately large-scale ~46GB ASKAP test dataset — a
+  complete 4501×4501-pixel run (20,259,001 pixels). That run surfaced a
+  real 32-bit integer overflow silently corrupting CLEAN's mask-cube
+  input for any sufficiently large image. Fixed and reconfirmed on the
+  same real data: the fraction of pixels wrongly exhausting their full
   iteration budget dropped from 99.05% to 0.00%, and a follow-up
   memory-management redesign was confirmed byte-for-byte identical to
-  that fix on a full repeat run.
+  that fix on a full repeat run. More recently, RM-CLEAN was also run to
+  completion against the much larger genuine multi-survey dataset
+  described below — an 11715×6664-pixel cube, 59,334,010 pixels
+  actually cleaned, no errors.
 - **Multi-band preprocessing is proven correct end-to-end against
-  synthetic test data, and has now also completed a genuine real-scale
-  run.** A dedicated test fixture with deliberately mismatched sky grid
-  and resolution is run through `reproject_cubes`/`convolve_cubes`/
-  `match_cubes`, and the known injected sources are confirmed recovered
-  at the correct RM afterward — this exercises the real toolchain
-  against a real mismatch, not a no-op. Beyond that, the full chain has
-  now also been run on genuine ASKAP survey data: two real bands
-  (a 144-channel WALLABY cube and a 288-channel EMU cube, ~563GB of
-  Stokes Q/U input between them) with different sky footprints and
-  different resolutions, matched onto one common grid/beam by
-  `match_cubes`, then merged by `rm_synthesis` into a single RM
-  synthesis run across all channels — completed successfully end to
-  end. RM-CLEAN against this same real multi-band output is the
-  immediate next step (see What's next).
-- Full automated regression suite: 143/143, covering both feature
+  synthetic test data, and has now completed a genuine real-scale run
+  through the entire pipeline, start to finish.** A dedicated test
+  fixture with deliberately mismatched sky grid and resolution is run
+  through `reproject_cubes`/`convolve_cubes`/`match_cubes`, and the
+  known injected sources are confirmed recovered at the correct RM
+  afterward — this exercises the real toolchain against a real
+  mismatch, not a no-op. Beyond that, the full chain has now also been
+  run on genuine ASKAP survey data: two real bands — a 144-channel,
+  11559×11655-pixel WALLABY cube and a 288-channel, 14300×12395-pixel
+  EMU cube, ~563GB of Stokes Q/U input between them — with different
+  sky footprints and different resolutions, matched onto one common
+  grid/beam by `match_cubes` (the matched working cube: 11715×6664
+  pixels, the overlap region of both surveys' footprints), merged by
+  `rm_synthesis` into a single RM synthesis run across all channels,
+  and then cleaned by `rmclean_cubes` — the complete
+  preprocessing-through-CLEAN pipeline, run on real multi-survey data,
+  completed successfully end to end with no manual intervention.
+- Full automated regression suite: 166/166, covering both feature
   areas plus every tool's own parameter handling, I/O parallelism
   consistency, and GPU/CPU numerical agreement.
 
@@ -129,11 +155,12 @@ plainly rather than blended into one blanket claim:
 
 ## What's next
 
-- Running RM-CLEAN against the real multi-band RM synthesis output
-  described above (see Validation) — closing out validation of the
-  full pipeline, not just its individual stages, at real scale.
 - Further CLEAN stopping-criteria work: detecting a peak residual that
   diverges or stalls without real progress, a case none of today's
   three stopping criteria catches on its own.
 - GPU support for `rmclean_cubes` (currently CPU-only; `rm_synthesis`
   already supports GPU offload).
+- Spreading a single large multi-band run across more than one
+  machine, so a run that would otherwise take hours on one computer can
+  be split up and finish faster — early design work has started, real
+  implementation has not.
