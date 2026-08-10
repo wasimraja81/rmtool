@@ -6,11 +6,11 @@ specific situations — "my bands don't share a sky grid," "I don't know
 whether to stop CLEAN on flux or on sigma," "how much memory should I
 give this." Jump straight to whichever one matches what you're facing.
 
-Every command below has actually been run against this repository's own
-synthetic test fixtures and produces the output shown — none of this is
-hypothetical. Where a scenario needs data this repo doesn't ship (e.g.
-two bands with genuinely different angular resolution), that's called
-out explicitly rather than faked.
+Every command below has been run against this repository's own
+synthetic test fixtures, and the output shown is what it actually
+produces. A few scenarios need data this repo doesn't ship (e.g. two
+bands with genuinely different angular resolution) — those are noted
+where they come up.
 
 ## Contents
 
@@ -26,9 +26,13 @@ out explicitly rather than faked.
 
 ## 1. Single-band quickstart
 
-If you have exactly one Q cube and one U cube, already on the same sky
-grid at the same resolution, you don't need any of the preprocessing
-tools below — just `rm_synthesis` directly. See
+If you have exactly one Q cube and one U cube, with all channels
+already at the same angular resolution, you don't need any of the
+preprocessing tools below — just `rm_synthesis` directly. If your
+channels' native beam varies with frequency (common even for a single
+band), see [§2c](#2c-resolution-mismatched-sky-grid-already-matched--convolve_cubes-only)
+— `convolve_cubes` works the same way with one input file as with
+several. See
 [docs/user/TUTORIAL.md](TUTORIAL.md) for the full walkthrough (build,
 generate a test cube, run, inspect the output) and
 [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#1-rm_synthesis) for every
@@ -44,14 +48,16 @@ already share a sky grid and resolution, or be missing one, the other,
 or both. Each needs a different amount of preprocessing before
 `rm_synthesis` will accept them together — doing more than necessary
 just wastes time, and doing less means `rm_synthesis` will (correctly)
-refuse to run rather than silently combine misaligned data.
+refuse to run rather than silently combine misaligned data. The
+resolution half of this ([§2c](#2c-resolution-mismatched-sky-grid-already-matched--convolve_cubes-only))
+applies equally to a single band whose own channels don't share one
+resolution — sky-grid mismatch is the only genuinely cross-band-only
+case here.
 
-All four recipes below are backed by permanent, automated regression
-tests (`tests/run_tests.sh` sections 38-40) — not just commands that
-happened to work once when this document was written. Each test takes
-genuinely mismatched synthetic data, runs it through the exact recipe
-shown, and confirms `rm_synthesis` recovers the known injected sources
-at the end; see `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md` ticket T15.
+The four recipes below are covered by regression tests
+(`tests/run_tests.sh` sections 38-40): each takes mismatched synthetic
+data, runs it through the recipe shown, and confirms `rm_synthesis`
+recovers the known injected sources.
 
 ### 2a. Bands already matched — no preprocessing needed
 
@@ -66,10 +72,10 @@ infileU = bandA_U.fits,bandB_U.fits
 
 Every other per-band key (`resiQ`/`slopeQ`/`resiU`/`slopeU`/
 `badchan_file`/`subim_chan_blc`/`subim_chan_trc`/`subim_chan_inc`) also
-accepts a comma list, one entry per band, in the same order. This is
-genuinely verified, not assumed — run against this repo's own two-band
-test fixture (`tests/data/TEST.Q.FITSCUBE` + `tests/data/
-TEST_BAND2.Q.FITSCUBE`, which share the same sky grid by construction):
+accepts a comma list, one entry per band, in the same order. Run
+against this repo's own two-band test fixture (`tests/data/
+TEST.Q.FITSCUBE` + `tests/data/TEST_BAND2.Q.FITSCUBE`, which share the
+same sky grid by construction):
 
 ```bash
 bin/rm_synthesis_release_cpu_omp cfg/rmsynth-e2e-multiband-smalltest.cfg
@@ -120,7 +126,12 @@ instead — see [docs/user/APP_REFERENCE.md](APP_REFERENCE.md#2-reproject_cubes)
 If your bands share a sky grid but were taken at different angular
 resolutions (a very common real case — different frequencies naturally
 have different native beams), convolve every band down to one common
-resolution before combining them:
+resolution before combining them. The same tool applies just as much
+to a *single* band whose own channels don't share one resolution —
+this is the normal case for any cube with a real per-channel `BEAMS`
+table (`CASAMBM=T`) or ASCII beam log, since the native beam varies
+channel-to-channel even within one band; just pass one `infiles=`
+entry instead of several:
 
 ```bash
 make convolve_cubes
@@ -189,7 +200,7 @@ actually know about your data:
 |---|---|---|
 | You know your noise floor in physical flux units (e.g. from a previous run, or the survey's own sensitivity documentation) | `abs_flux_floor=<value>` alone | A direct, unambiguous "stop below this flux" — no per-pixel estimation involved, so it can't be fooled by an unusual sightline. |
 | You don't know the noise floor ahead of time, or it varies significantly across the image | `auto_nsigma=<n>` alone | Estimates each pixel's own noise from its own dirty spectrum — adapts automatically, no prior knowledge needed. |
-| Production runs on real data (recommended default) | **Both together** | Whichever fires first wins per pixel. `auto_nsigma` handles the typical case; `abs_flux_floor` is a safety net for the pixels where the per-pixel sigma estimate itself is untrustworthy (it can be biased for individual pixels even though it's accurate on average — see `docs/dev/RMCLEAN_INTEGRATION_PLAN.md` ticket T9). |
+| Production runs on real data (recommended default) | **Both together** | Whichever fires first wins per pixel. `auto_nsigma` handles the typical case; `abs_flux_floor` is a safety net for the pixels where the per-pixel sigma estimate itself is untrustworthy (it can be biased for individual pixels even though it's accurate on average). |
 | You're debugging, or want to see the FULL iteration history regardless of convergence | Neither — `niter` alone | CLEAN runs every pixel for the full `niter` budget; combine with `trace_ix`/`trace_iy`/`log_every` to inspect one pixel's own per-iteration trend. |
 
 **A worked example**, anchored to this dataset's own measured noise

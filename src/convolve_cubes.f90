@@ -38,13 +38,14 @@
 !
 ! Target beam: by default, automatically derived via commonbeam_mod as the
 ! smallest common beam every GOOD channel of every input file can be
-! deconvolved from -- pooled across ALL input files (multi-band support
-! needs no extra machinery here: for multiple bands convolved to one common
-! resolution, every channel of every band's own per-channel beam is simply
-! added to the same pool before finding one common beam, then every file is
-! convolved to that single shared target -- matching the physical
-! requirement that the target resolution be identical across every channel
-! of every band). Can also be set explicitly (target_bmaj/target_bmin/
+! deconvolved from -- pooled across ALL input files (one file for a
+! single-band run, several for multi-band; multi-band support needs no
+! extra machinery here: every channel of every input's own per-channel
+! beam is simply added to the same pool before finding one common beam,
+! then every file is convolved to that single shared target -- matching
+! the physical requirement that the target resolution be identical
+! across every channel, whether those channels come from one band or
+! several). Can also be set explicitly (target_bmaj/target_bmin/
 ! target_bpa), which skips auto-derivation entirely -- gaussft_mod itself
 ! does no target-vs-source beam validity checking (a deliberate scope
 ! decision, see its own header comment: "We can of course have target beam

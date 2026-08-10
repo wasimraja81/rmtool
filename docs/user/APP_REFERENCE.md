@@ -261,10 +261,16 @@ bin/reproject_cubes mode=intersection reffile=ref.fits infiles=a.fits,b.fits
 ## 3. `convolve_cubes`
 
 Convolves all channels, across all input files, to one common angular
-resolution — needed before a multi-band `rm_synthesis` run whose bands
-were observed at different resolutions. Reads per-channel beams from a
-CASA-style `BEAMS` binary table (`beamfiles=auto`) or a portable ASCII/
-CSV beam log (see `cfg/example_beamLog.txt`/`.csv`). A channel missing
+resolution — needed whenever channels don't already share one
+resolution, whether that's because of combining bands observed at
+different resolutions, or because a single band's own native beam
+varies channel-to-channel with frequency (the normal case for any cube
+with a real per-channel beam). `rm_synthesis` needs a spectrally
+consistent PSF across all channels for a well-defined RMSF, so this
+applies with one `infiles=` entry just as much as with several. Reads
+per-channel beams from a CASA-style `BEAMS` binary table
+(`beamfiles=auto`) or a portable ASCII/CSV beam log (see
+`cfg/example_beamLog.txt`/`.csv`). A channel missing
 from the beam log, or with `BMAJ`/`BMIN`=0, is written as an all-NaN
 plane rather than convolved (and is automatically excluded by
 `rm_synthesis`'s own NaN detection later). Each input must have exactly

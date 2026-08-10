@@ -12,11 +12,11 @@ things, usable independently or as one pipeline:
   from frequency/λ² space to Faraday depth space, producing a dirty RM
   cube (amplitude + phase) from one or more Stokes Q/U input cubes.
 - **Multi-band preprocessing** (`reproject_cubes`, `convolve_cubes`,
-  `match_cubes`): prepares bands observed at different pointings and/or
-  different angular resolutions so they can genuinely be combined —
-  matching sky grid, matching resolution, or both at once — before
-  `rm_synthesis` merges their frequency channels into one RM synthesis
-  run.
+  `match_cubes`): matches sky grid and/or angular resolution before
+  `rm_synthesis` merges frequency channels into one run. Grid-matching
+  is a cross-band concern; resolution-matching isn't — a single band's
+  own channels commonly need it too, since native beam size varies
+  with frequency.
 - **RM-CLEAN** (`rmclean_cubes`): deconvolves the RMSF (Rotation
   Measure Spread Function) sidelobes out of a dirty RM cube, the
   standard cleanup step between raw RM synthesis and a publication-ready
@@ -50,9 +50,11 @@ resolution:
 
 - `reproject_cubes` resamples mismatched bands onto one common sky
   grid (Starlink AST).
-- `convolve_cubes` convolves mismatched bands to one common angular
-  resolution (auto-derives the smallest common beam every input can
-  actually be deconvolved from, or accepts an explicit target).
+- `convolve_cubes` convolves channels to one common angular resolution
+  (auto-derives the smallest common beam every input can actually be
+  deconvolved from, or accepts an explicit target). This applies
+  within a single band too — its own channels' native beam varies with
+  frequency — not only when combining bands.
 - `match_cubes` chains both through memory when a band needs both
   fixes — no intermediate FITS file written to disk, which matters at
   real multi-hundred-GB cube sizes.

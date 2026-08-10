@@ -26,11 +26,13 @@ High-level flow:
 - `src/rm_synthesis_mod.f90`: shared module utilities, timers/logging,
   configuration parsing, and helper routines.
 
-### Cross-Band Preprocessing Toolchain
+### Grid- and Resolution-Matching Preprocessing Toolchain
 Standalone tools, own binaries, independent of the Core Runtime build graph
-above -- prepare mismatched-geometry/mismatched-resolution bands for a
-multi-band `rm_synthesis` run. See "Cross-Band Preprocessing Toolchain"
-below for the architecture, and
+above -- prepare mismatched-geometry/mismatched-resolution data for
+`rm_synthesis`: grid-matching is a cross-band concern, but
+resolution-matching applies equally within a single band, since native
+beam size varies with frequency. See "Grid- and Resolution-Matching
+Preprocessing Toolchain" below for the architecture, and
 [docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md](../dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 (tickets T10-T14) for full design/verification detail.
 - `src/reproject_cubes.f90`: reprojects cubes onto a common sky grid
@@ -1037,16 +1039,19 @@ same at-a-glance baseline record the 2.0 entry provides:
 
 ---
 
-## Cross-Band Preprocessing Toolchain
+## Grid- and Resolution-Matching Preprocessing Toolchain
 
 Three standalone tools -- own binaries, own build targets (`make
 reproject_cubes`, `make convolve_cubes`, `make match_cubes`), independent
-of the Core Runtime build graph above -- prepare real multi-band data for
-`rm_synthesis`: real bands rarely share one sky grid or one angular
-resolution, and merging mismatched channels without addressing that first
-is exactly the kind of silent correctness gap this project's design
-philosophy exists to close (loudly refuse or visibly warn, never silently
-produce a misleading answer). Full design rationale, decisions, and
+of the Core Runtime build graph above -- prepare real data for
+`rm_synthesis`. Real bands rarely share one sky grid (a cross-band-only
+concern), and channels rarely share one angular resolution -- true
+across bands, and just as true within a single band, since native beam
+size varies with frequency. Merging mismatched channels without
+addressing that first is exactly the kind of silent correctness gap
+this project's design philosophy exists to close (loudly refuse or
+visibly warn, never silently produce a misleading answer). Full design
+rationale, decisions, and
 verification evidence are recorded in
 [docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md](../dev/MULTI_BAND_TOMOGRAPHY_PLAN.md)
 (tickets T10-T14); this section is the architecture summary, not a
@@ -1125,9 +1130,11 @@ table extension (auto-detected) or a portable ASCII/CSV fallback (`cfg/
 example_beamLog.txt`/`.csv`). A channel is bad -- written as an all-NaN
 plane, not convolved -- if it's missing from the beam source entirely, or
 present with BMAJ or BMIN equal to 0 (either alone is enough). Pools every
-good channel across ALL input files before calling `commonbeam_mod` once,
-so multi-band support needs no extra machinery: every band gets convolved
-to the exact same shared target. `max_common_bmaj` lets a user cap the
+good channel across ALL input files (one file for a single-band run, several
+for multi-band) before calling `commonbeam_mod` once, so multi-band
+support needs no extra machinery: every band gets convolved to the
+exact same shared target, and a single band's own channels are just
+the one-file case of the same pooling. `max_common_bmaj` lets a user cap the
 auto-derived target and refuse to proceed if it comes out coarser than
 expected. `mem_frac_ram`-budgeted block I/O + OpenMP, same concept as
 `reproject_cubes`.

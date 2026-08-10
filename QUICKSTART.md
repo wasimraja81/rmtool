@@ -8,7 +8,7 @@
 5. [Requirements](#5-requirements)
 6. [Swim-lane plots](#6-swim-lane-plots)
 7. [Architecture notes](#7-architecture-notes)
-8. [Multi-band preprocessing: reproject_cubes, convolve_cubes, match_cubes](#8-multi-band-preprocessing-reproject_cubes-convolve_cubes-match_cubes)
+8. [Preprocessing: reproject_cubes, convolve_cubes, match_cubes](#8-preprocessing-reproject_cubes-convolve_cubes-match_cubes)
 9. [RM-CLEAN: rmclean_cubes](#9-rm-clean-rmclean_cubes)
 
 ---
@@ -306,15 +306,18 @@ and GPU lanes from the run log.
 
 ---
 
-## 8. Multi-band preprocessing: reproject_cubes, convolve_cubes, match_cubes
+## 8. Preprocessing: reproject_cubes, convolve_cubes, match_cubes
 
 Real multi-band data rarely arrives on the same sky grid or at the same
-angular resolution. Three standalone tools (own binaries, independent of
-the main `rm_synthesis` build) close that gap before a multi-band run —
-either as two separate calls:
+angular resolution — and even a single band's own channels often don't
+share one resolution, since native beam size varies with frequency.
+Three standalone tools (own binaries, independent of the main
+`rm_synthesis` build) close that gap before a run — either as two
+separate calls:
 
 ```bash
-# 1. Match angular resolution (across ALL bands together, one call)
+# 1. Match angular resolution (all input files together, one call --
+#    works the same with one file for a single band or several for multi-band)
 make convolve_cubes
 bin/convolve_cubes infiles=a.fits,b.fits mem_frac_ram=0.25
 
@@ -340,11 +343,9 @@ bin/match_cubes stages=both order=convolve_reproject \
 `convolve_cubes`'/`match_cubes`' per-channel beam input (a CASA-style
 `BEAMS` table, or a portable ASCII/CSV beam log — see `cfg/
 example_beamLog.txt`/`.csv`) and target-beam derivation are covered in
-[docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md) and, in full
-design/verification detail, in `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md`
-(tickets T10-T14). All three tools propagate `CASAMBM`/`BEAMS` beam
-metadata through to their outputs, the same way `rm_synthesis` does for
-its own.
+[docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md). All three
+tools propagate `CASAMBM`/`BEAMS` beam metadata through to their
+outputs, the same way `rm_synthesis` does for its own.
 
 ```bash
 python scripts/plot_tile_async_swimlane.py \

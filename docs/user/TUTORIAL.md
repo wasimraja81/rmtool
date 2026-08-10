@@ -167,8 +167,9 @@ print(f"Peak amplitude {spectrum[peak_idx]:.4f} at RM={rm:.2f} rad/m^2")
 
 Steps 3-4 above can also be run as a single chained call via
 `scripts/run_pipeline.sh`, which additionally supports a `match_cubes`
-pre-processing stage for multi-band data whose bands don't already
-share a common sky grid/resolution:
+pre-processing stage for data that doesn't already share a common sky
+grid and/or resolution — whether that's bands that don't match each
+other, or a single band whose own channels don't share one resolution:
 
 ```bash
 scripts/run_pipeline.sh --help          # full option list, read this first

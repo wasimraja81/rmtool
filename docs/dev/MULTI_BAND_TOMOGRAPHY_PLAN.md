@@ -1626,7 +1626,7 @@ still-open gap -- see T9 below.
   after being initially flagged as a documented future gap rather than
   assumed absent.
 
-### T11 — Cross-Band Resolution Matching (`gaussft_mod`, `commonbeam_mod`, `convolve_cubes`)
+### T11 — Angular-Resolution Matching, Within and Across Bands (`gaussft_mod`, `commonbeam_mod`, `convolve_cubes`)
 
 - **Status:** done.
 - **Objective:** T10 solves grid alignment; this ticket solves the

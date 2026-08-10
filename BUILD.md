@@ -128,7 +128,7 @@ than installing these directly.
 | `make` | Build release executable |
 | `make MODE=debug` | Build with debugging info |
 | `make reproject_cubes` | Build the cross-band sky-grid alignment tool (`bin/reproject_cubes`) |
-| `make convolve_cubes` | Build the cross-band resolution-matching tool (`bin/convolve_cubes`) |
+| `make convolve_cubes` | Build the angular-resolution-matching tool, within a band or across bands (`bin/convolve_cubes`) |
 | `make match_cubes` | Build the consolidated reproject+convolve tool, chainable through memory (`bin/match_cubes`) |
 | `make rmclean_cubes` | Build the standalone RM-CLEAN tool (`bin/rmclean_cubes`) |
 | `make clean` | Remove build artifacts |
@@ -149,7 +149,8 @@ rmtool/
 │   ├── reproject_cubes.f90       # Standalone: cross-band sky-grid alignment
 │   ├── gaussft.f90               # gaussft_mod: beam-matching convolution (pure)
 │   ├── commonbeam.f90            # commonbeam_mod: smallest common beam
-│   ├── convolve_cubes.f90        # Standalone: cross-band resolution matching
+│   ├── convolve_cubes.f90        # Standalone: angular-resolution matching,
+│   │                              # within a band or across bands
 │   ├── match_cubes.f90           # Standalone: reproject_cubes + convolve_cubes
 │   │                              # consolidated, chainable through memory
 │   ├── rmclean.f90               # rmclean_mod: RM-CLEAN core (pure computation)
