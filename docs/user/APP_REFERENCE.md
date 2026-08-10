@@ -51,7 +51,7 @@ unparsable values are all hard errors). `<addreq>` is accepted but not
 currently used by anything downstream; omit it. There is no `--help`
 flag for this tool — running it with no arguments prints a two-line
 usage pointer, not a full option list (that's what this document and
-the README's own "Configuration" section are for).
+[cfg/rmsynth.cfg](../../cfg/rmsynth.cfg)'s annotated template are for).
 
 ### Config keys
 

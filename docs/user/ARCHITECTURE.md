@@ -123,6 +123,13 @@ constrained host RAM and device VRAM.
   `mem_frac_ram`.
 - This limits peak host memory while keeping enough work per tile to amortize
   IO overhead.
+- `mem_frac_ram` is a fraction of the machine's **total** system RAM, not
+  whatever happens to be free at the moment a run starts — so the tile
+  size for a given cube and config is reproducible on the same machine
+  regardless of what else is running on it. The tradeoff: on a busy
+  shared node, the budget is *not* automatically reduced for other jobs'
+  usage, so a conservative fraction is worth choosing there deliberately
+  rather than relying on the tool to detect contention.
 
 #### Device VRAM staging
 - For GPU-enabled runs, tiles can be further partitioned into Dec-strip

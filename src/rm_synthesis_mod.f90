@@ -98,7 +98,7 @@ module rm_synthesis_mod
   ! One field per read_cfg_keyval argument (cfgfile/status excluded --
   ! cfgfile is the input path, status is a plain error-code out-arg, both
   ! stay as direct subroutine arguments). Field grouping mirrors the
-  ! sectioning in README.md's "Configuration" reference and the cfg
+  ! sectioning in cfg/rmsynth.cfg's annotated template and the cfg
   ! parser's own case-statement clusters, purely for readability -- it
   ! carries no behavioural meaning. Character lengths match the caller's
   ! existing declared lengths in rm_synthesis.f90 exactly (172/16/272),

@@ -235,8 +235,9 @@ real signal left to remove.
 
 `mem_frac_ram` is a fraction (0, 0.95] of your machine's **total**
 system RAM (not whatever happens to be free at that moment — see
-README's own "Motivation" section for why that distinction matters on
-a shared machine), budgeted for one chunk's own working set. **All
+[docs/user/ARCHITECTURE.md](ARCHITECTURE.md#host-ram-tiling) for why
+that distinction matters on a shared machine), budgeted for one chunk's
+own working set. **All
 five tools in this package share the same key, same (0, 0.95] range,
 and the same underlying philosophy** — load data in memory-budgeted
 chunks so a run scales down to fit a small machine and scales up to use
@@ -306,7 +307,8 @@ Full mechanics for `rm_synthesis`/`rmclean_cubes` (the exact per-pixel
 byte formula, the auto-tiling shrink policy, and the
 `io_read_threads`/`nwriters`/`io_overlap` keys that ride
 alongside tile sizing) are in [docs/user/PARALLELISM.md](PARALLELISM.md) and
-README's own "Tile Memory Planning and I/O Parallelism" section. For
+[docs/user/ARCHITECTURE.md](ARCHITECTURE.md)'s "When `io_overlap=y` can
+be detrimental" section. For
 `reproject_cubes`/`convolve_cubes`/`match_cubes`, the equivalent
 per-tool detail (their own `mem_frac_ram`/`io_overlap` keys and exact
 defaults) is in each tool's own section of
@@ -319,9 +321,9 @@ just the decision guide, not the full mechanism.
 
 Three independent keys — `io_read_threads`, `nwriters`,
 `io_overlap` — all default to fully serial. Quick picks, not the full
-reasoning (see README's own "Tile Memory Planning and I/O Parallelism"
-section for the complete rule-of-thumb table and when `io_overlap` can
-actually hurt):
+reasoning (see [docs/user/ARCHITECTURE.md](ARCHITECTURE.md)'s "When
+`io_overlap=y` can be detrimental" section for the complete
+rule-of-thumb table and when `io_overlap` can actually hurt):
 
 - **Single local disk, small-to-medium cube**: leave everything at
   default. Parallel I/O mostly helps parallel/shared storage.
@@ -357,8 +359,8 @@ actually hurt):
 - **Same cfg file works on both** — leave `use_gpu=n` on a CPU-only
   binary (default behaviour), or leave it `y` anyway: a CPU-only binary
   prints a warning and falls back to CPU rather than failing.
-- Full detail: README's own "GPU Acceleration" and "GPU Runtime
-  Behaviour" sections.
+- Full detail: [README.md](../../README.md#gpu-support-work-in-progress)'s
+  "GPU Support" section.
 
 ---
 

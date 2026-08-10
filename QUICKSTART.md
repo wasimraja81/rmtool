@@ -237,10 +237,10 @@ out-of-memory (`nvptx_alloc error`), lower `mem_frac_vram` (e.g. 0.4) or set
 `gpu_vram_mib` to your card's size. `io_overlap=y` opts into running tile
 N's write on a background thread concurrent with tile N+1's read/compute
 (CFITSIO is already built reentrant -- nothing extra to install; default
-`n`). Doubles the per-tile output buffer RAM; see "Tile Memory Planning
-and I/O Parallelism" in `README.md` for when this helps vs. hurts, and
-`io_read_threads`/`io_write_threads` for parallelising the read/write
-themselves (independent of `io_overlap`).
+`n`). Doubles the per-tile output buffer RAM; see "When `io_overlap=y`
+can be detrimental" in `docs/user/ARCHITECTURE.md` for when this helps
+vs. hurts, and `io_read_threads`/`io_write_threads` for parallelising
+the read/write themselves (independent of `io_overlap`).
 Or run a dry-run first to read the auto-tuned tile hint:
 ```bash
 # Temporarily set dry_run=y in cfg, then:
@@ -340,7 +340,7 @@ bin/match_cubes stages=both order=convolve_reproject \
 `convolve_cubes`'/`match_cubes`' per-channel beam input (a CASA-style
 `BEAMS` table, or a portable ASCII/CSV beam log — see `cfg/
 example_beamLog.txt`/`.csv`) and target-beam derivation are covered in
-the README's "Multi-Band Preprocessing Toolchain" section and, in full
+[docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md) and, in full
 design/verification detail, in `docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md`
 (tickets T10-T14). All three tools propagate `CASAMBM`/`BEAMS` beam
 metadata through to their outputs, the same way `rm_synthesis` does for

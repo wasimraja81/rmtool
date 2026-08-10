@@ -178,8 +178,8 @@ scripts/run_pipeline.sh cfg/pipeline-example.cfg
 `cfg/pipeline-example.cfg` is a fully annotated template — edit its
 paths for your own data, or see `cfg/pipeline-e2e-smalltest.cfg` for a
 complete working example using this same synthetic fixture. See
-[README.md](../../README.md#end-to-end-pipeline) for the full chaining/
-provenance behaviour.
+`scripts/run_pipeline.sh`'s own header comment (or `--help`) for the
+full chaining/provenance behaviour.
 
 ## Where to go next
 
@@ -190,7 +190,7 @@ provenance behaviour.
   every tool, fully explained.
 - [QUICKSTART.md](../../QUICKSTART.md) — build variants, GPU builds, the
   full validation test suite, running on real data.
-- [README.md](../../README.md) — motivation, feature overview, multi-band
-  preprocessing toolchain, tile memory/IO-parallelism tuning.
+- [README.md](../../README.md) — top-level overview: what each tool
+  does, and which one to use for your data.
 - `cfg/rmsynth.cfg`, `cfg/rmclean-example.cfg` — fully annotated
   templates to copy and adapt for real data.

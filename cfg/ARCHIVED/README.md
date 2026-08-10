@@ -32,10 +32,10 @@ These configurations contain:
 
 ## For Current Development
 
-See the top-level [`README.md`](../../README.md) ("Configuration" section)
-for a full annotated, sectioned reference of every cfg key, or
-`../rmsynth-subim.cfg` for a runnable example. (`example_myfits_spec2rm.cfg`,
-previously linked here, no longer exists.)
+See [`../rmsynth.cfg`](../rmsynth.cfg) for a full annotated, sectioned
+reference of every cfg key, or `../rmsynth-subim.cfg` for a runnable
+example. (`example_myfits_spec2rm.cfg`, previously linked here, no
+longer exists.)
 
 ## If You Need One of These Files
 
@@ -44,8 +44,7 @@ If you need to adapt one of the archived configs for your own work:
 1. Find the appropriate file (e.g., `myfits_spec2rm.cfg` for basic RM-synthesis)
 2. Copy it to the parent `cfg/` directory
 3. Update paths and filenames to match your data
-4. Refer to the top-level `README.md`'s Configuration section for what
-   each key means
+4. Refer to [`../rmsynth.cfg`](../rmsynth.cfg) for what each key means
 
 Example:
 ```bash
