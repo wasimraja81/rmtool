@@ -1,30 +1,47 @@
 # rmtool
 
-rmtool performs Faraday rotation-measure (RM) tomography on radio
-spectro-polarimetric data: RM synthesis, the multi-band preprocessing
-needed to combine mismatched bands (matching sky grid, angular
-resolution, or both), and RM-CLEAN deconvolution. Each tool runs
-independently or as one pipeline. Built to scale unchanged from a
-low-RAM desktop to an HPC cluster.
+The rmtool package is intended for performing Faraday tomography (or
+rotation-measure (RM) synthesis) on radio spectro-polarimetric data.
+In addition to processing data from a single contiguous band, rmtool
+provides the necessary applications to appropriately combine
+heterogeneous multi-band data from different telescopes/bands with
+different native projections and angular resolutions. Deconvolution
+becomes critical for data sparsely sampled in the spectral domain; the
+RM-CLEAN algorithm provided handles this appropriately.
+
+One key motivation for this package is to address Faraday tomography
+of the big data cubes that modern observatories are generating at
+present. Current packages are unable to handle this data, either
+because of the narrow scope they were designed for (i.e. aimed at
+small-to-moderate sized data cubes), or because of limited HPC
+strategies built into these algorithms. This package addresses both —
+every application in it can process really big data cubes optimally on
+both PCs with small core counts and RAM, as well as HPC-grade nodes
+with hundreds of cores and TBs worth of shared memory.
 
 **Highlights**
 
 - **Handles cubes larger than RAM.** Data is processed in tiles sized
   to a user-set fraction of system memory (`mem_frac_ram`) — the same
-  config runs on a laptop or an HPC node without editing.
-- **Multi-band preprocessing built in.** Sky-grid reprojection and
-  angular-resolution matching ship as first-class tools, chainable
-  through memory with no intermediate FITS file.
+  config runs on a laptop or an HPC node without need for changes.
+- **Multi-band pre-processing built in.** Provides tools for matching
+  sky-grid projections between multi-band data, and angular resolution
+  across multiple bands as well as across the spectral axis of a
+  single band. These two stages can be chained together to avoid
+  writing intermediate files, saving huge amounts of disk space for
+  large cubes.
 - **RM-CLEAN included**, sharing the same tiled, memory-budgeted I/O
-  engine as RM synthesis — CLEAN scales to the same cube sizes.
+  engine as RM synthesis. Correctly handles "gaps" in data due to RFI,
+  and from multiple widely separated bands.
 - **Parallel, overlapped I/O** for HPC filesystems: multiple concurrent
   read/write channels, with a tile's write overlapped against the next
   tile's read and compute.
 - **Optional GPU offload** for the core RM synthesis transform
   (work in progress — see [GPU Support](#gpu-support-work-in-progress)).
-- **Everything is configuration, not code** — plain-text `KEY=VALUE`
-  files control memory budget, threading, I/O parallelism, and GPU use;
-  no recompilation needed to change any of them.
+- **Configuration files.** Flexible run configuration using plain-text
+  `KEY=VALUE` pair files to control memory budget, threading, I/O
+  parallelism, GPU use, etc., in addition to RM-synthesis-specific
+  parameters.
 
 ## What's Included
 
