@@ -102,10 +102,11 @@ Conditionally required keys:
 ## Example
 
 See:
-- The full annotated, sectioned cfg reference in the top-level
-  [`README.md`](../README.md) ("Configuration" section) -- every key the
-  parser accepts, marked required/required-if/optional with its real
-  default.
+- [`cfg/rmsynth.cfg`](rmsynth.cfg) for a full annotated, sectioned cfg
+  template -- every key the parser accepts, marked required/required-if/
+  optional with its real default. Also documented in
+  [`docs/user/APP_REFERENCE.md`](../docs/user/APP_REFERENCE.md)'s
+  rm_synthesis section.
 - `cfg/rmsynth-subim.cfg` for a runnable example.
 
 (`cfg/myfits_spec2rm.cfg` and `cfg/example_myfits_spec2rm.cfg`, previously

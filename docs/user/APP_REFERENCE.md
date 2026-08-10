@@ -174,6 +174,20 @@ true; anything else (including blank) is false.
 - Always (unless disabled): `<outfile>.MASK.CUBE.FITS`, `<outfile>.NVALID.MAP.FITS`
 - If `cubestat=y`: `<outfile>.PEAK.MAP.FITS`, `<outfile>.RM_PEAK.MAP.FITS`, `<outfile>.ANG_PEAK.MAP.FITS`, `<outfile>.SNR.MAP.FITS`
 
+**Beam metadata:** if the input Q cube carries `BMAJ`/`BMIN`/`BPA`,
+every output above carries the same values, unchanged. If the input
+instead has `CASAMBM=T` (a genuinely per-channel-varying restoring
+beam, e.g. an un-convolved CASA multi-beam cube), that propagated
+scalar is only the input's own nominal/reference value and means
+nothing on its own — so the AMP/PHA cubes and the PEAK/RMPEAK/ANGPEAK/
+SNR maps (not MASK or NVALID, which are validity bookkeeping, not flux
+data) also get `CASAMBM=T` plus the input's own real per-channel
+`BEAMS` table attached as an extension, plus a `HISTORY` note
+explaining why. Run `convolve_cubes` first if a single, well-defined
+resolution is required. In multi-band mode, a mismatch between bands'
+own beam metadata is reported as a runtime warning (not a hard error —
+RM synthesis itself doesn't depend on beam metadata for correctness).
+
 ### Example
 
 ```bash
@@ -181,8 +195,11 @@ make OMP=1 GPU=0
 bin/rm_synthesis_release_cpu_omp cfg/rmsynth.cfg
 ```
 
-See `README.md`'s "Configuration" section for a full annotated example
-cfg file with every key shown in context.
+[cfg/rmsynth.cfg](../../cfg/rmsynth.cfg) is a full annotated template
+with every key shown in context, grouped by section (required vs.
+optional, with defaults). See also [cfg/CONFIG_README.md](../../cfg/CONFIG_README.md)
+for the parser's own rules (required keys, validation, output-filename
+conventions).
 
 ---
 
