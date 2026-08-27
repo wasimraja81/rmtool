@@ -19,6 +19,12 @@ every application in it can process really big data cubes optimally on
 both PCs with small core counts and RAM, as well as HPC-grade nodes
 with hundreds of cores and TBs worth of shared memory.
 
+## Demo
+
+RM-CLEAN's restored output from a real WALLABY/EMU multi-band cube reveals line of sight components of the magnetic fields that are in opposite direction at the two edges of this supernova remnant PKS1209-52.
+
+![RM-CLEAN Faraday-depth channel-map animation](docs/user/images/rmclean_channelmap_demo.gif)
+
 **Highlights**
 
 - **Handles cubes larger than RAM.** Data is processed in tiles sized

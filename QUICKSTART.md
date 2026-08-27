@@ -272,6 +272,7 @@ cat scratch/runtime_estimate.txt       # wall-time estimate
 | Python 3 + astropy + numpy | `pip install astropy numpy` | `pip install astropy numpy` |
 | GPU compiler (optional) | `nvfortran` (NVIDIA HPC SDK) or `gfortran ≥ 14` with libgomp offload | same |
 | Starlink AST + FFTW3 (only for `reproject_cubes`/`convolve_cubes`/`match_cubes`) | `libstarlink-ast-dev libstarlink-ast-err9 libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev` | see BUILD.md |
+| matplotlib + ffmpeg (only for `scripts/plot_tile_async_swimlane.py`/`scripts/animate_fits_cube.py`) | `pip install matplotlib` + `apt-get install ffmpeg` | `pip install matplotlib` + `brew install ffmpeg` |
 
 ```bash
 # Minimal Ubuntu install
