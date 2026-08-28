@@ -25,6 +25,18 @@ from the running binary) and please report the doc as stale.
 
 ---
 
+## Shared Parameters
+
+**`mem_frac_ram`** (all 5 tools): a fraction of the machine's **total**
+system RAM, not whatever happens to be free at the moment a run
+starts — so the tile/block size for a given cube and config is
+reproducible on the same machine regardless of what else is running on
+it. On a busy shared node, the budget is *not* automatically reduced
+for other jobs' usage, so a conservative fraction is worth choosing
+there deliberately.
+
+---
+
 ## 1. `rm_synthesis`
 
 The main RM-synthesis tool. Given Stokes Q and U spectral-line FITS
@@ -80,6 +92,7 @@ usage pointer, not a full option list (that's what this document and
 | `subim_ra_blc` / `subim_ra_trc` / `subim_ra_inc` | `1` / `0` (=max) / `1` | RA first pixel (≥1) / last pixel (0=max) / step (≥1). |
 | `subim_dec_blc` / `subim_dec_trc` / `subim_dec_inc` | `1` / `0` (=max) / `1` | Same, for Dec. |
 | `subim_chan_blc` / `subim_chan_trc` / `subim_chan_inc` | `0` (=first) / `0` (=max) / `1` | Same, for channel; per-band comma list allowed. |
+| `subim_parfile` | `subimage.par` | **Deprecated, no-op.** Accepted by the parser for backward compatibility but never read — superseded entirely by the `subim_*` KEY=VALUE keys above. Setting it has no effect. |
 
 **Q/U processing & bias correction:**
 
@@ -87,7 +100,7 @@ usage pointer, not a full option list (that's what this document and
 |---|---|---|
 | `rem_mean` | — (required) | `0`/`1`: subtract per-pixel mean from Q/U before synthesis. |
 | `remove_qu_bias` | — (required) | `y`/`n`: apply I-cube-based bias correction (needs `path_I`/`infileI`). |
-| `resiQ` / `slopeQ` / `resiU` / `slopeU` | `0.0` each | Bias-correction residual/slope terms; only meaningful when `remove_qu_bias=y`. |
+| `resiQ` / `slopeQ` / `resiU` / `slopeU` | `0.0` each (required) | Bias-correction residual/slope terms. Always required (a hard parse error if any is missing, regardless of `remove_qu_bias`) — but the *values* only matter when `remove_qu_bias=y`; leave at `0.0` otherwise. |
 | `path_I` | = `path` | Directory of the I-cube; required if `remove_qu_bias=y`. |
 | `infileI` | — | Stokes-I input filename; required if `remove_qu_bias=y`; per-band comma list for multi-band. |
 
@@ -141,7 +154,7 @@ usage pointer, not a full option list (that's what this document and
 |---|---|---|
 | `tile_auto` | `y` | Auto-size tiles from `mem_frac_ram` (recommended). |
 | `tile_ra` / `tile_dec` | `0`/`0` (auto) | Manual tile-size override; ignored when `tile_auto=y`. |
-| `mem_frac_ram` | `0.25` | Fraction (0,0.95] of system RAM budgeted per tile. |
+| `mem_frac_ram` | `0.25` | Fraction (0,0.95] of system RAM budgeted per tile (see [Shared Parameters](#shared-parameters) above). |
 | `io_read_threads` | `1` | N independent read-only FITS handles per input cube. |
 | `nwriters` | `1` | N-way parallel AMP/PHA writes via raw stream I/O. |
 | `io_overlap` | `n` | `y`: overlap tile N's write with tile N+1's read/compute on a background thread. |
@@ -237,7 +250,7 @@ No positional arguments — every value is `key=value` (no spaces around
 | `mode` | — | yes | `intersection`: output grid shrinks to the overlap of all inputs with the reference. `union`: output grid grows to cover all inputs and the reference. `reference`: output grid is the reference file's own extent. Zero overlap between any input and the running grid is always a hard failure regardless of mode. |
 | `reffile` | — | yes | Reference FITS cube whose WCS anchors the output grid. |
 | `infiles` | — | yes | Comma-separated list of 1–50 input FITS cube paths. |
-| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/resample/write block of planes. Threads parallelize only *within* one block, never across blocks — too small a value both increases CFITSIO call count and discards most of the OpenMP speedup (a WARNING is printed if this looks likely). |
+| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/resample/write block of planes (see [Shared Parameters](#shared-parameters) above). Threads parallelize only *within* one block, never across blocks — too small a value both increases CFITSIO call count and discards most of the OpenMP speedup (a WARNING is printed if this looks likely). |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+resample. Only one background write is ever in flight. |
 | `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
 | `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `block_convolve`/`reproject_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/process/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
@@ -302,7 +315,7 @@ Same `key=value`-only, no-positional-args convention as `reproject_cubes`.
 | `badchan_file` | none | no | Comma list, one entry per infile, in order — genuinely per-band (each infile's own list is independent; leave an entry blank, e.g. `,file2.txt`, for an infile with none of its own). If given, must list exactly as many entries as `infiles`. Each file is one channel index per line, 1-indexed — same convention as `rm_synthesis`'s `global_badchan_file`. Independent of, and in addition to, the automatic per-file bad-channel detection already done from each infile's own CASA BEAMS table (a degenerate near-zero beam entry); use this for channels known bad for reasons a beam table alone wouldn't capture (e.g. RFI). |
 | `target_bmaj` / `target_bmin` / `target_bpa` | none (auto-derive) | no | Explicit target beam (arcsec/arcsec/deg) — give all three together to skip automatic common-beam derivation entirely. |
 | `max_common_bmaj` | none | no | If the AUTO-derived common beam's BMAJ exceeds this (arcsec), refuse to proceed. Ignored when an explicit target is given. |
-| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/convolve/write block of planes. |
+| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/convolve/write block of planes (see [Shared Parameters](#shared-parameters) above). |
 | `npts` | `2000` | no | Boundary points sampled per beam (≥12), passed to `commonbeam_mod`'s `find_common_beam`. |
 | `khachiyan_tol` | `1.0e-5` | no | Khachiyan-algorithm convergence tolerance for the common-beam fit. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+convolve. |
@@ -371,7 +384,7 @@ Same `key=value`-only convention as the other two.
 | `badchan_file` | none | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
 | `target_bmaj` / `target_bmin` / `target_bpa` | none | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
 | `max_common_bmaj` | none | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
-| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of RAM budgeted for one read/process/write block. |
+| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of RAM budgeted for one read/process/write block (see [Shared Parameters](#shared-parameters) above). |
 | `outsuffix` | `_REPROJ.FITS` / `_CONV.FITS` / `_MATCHED.FITS` | no | Default depends on `stages` if not given explicitly. |
 | `npts` | `2000` | no | Used when `stages` includes `convolve` — same as `convolve_cubes`. |
 | `khachiyan_tol` | `1.0e-5` | no | Used when `stages` includes `convolve` — same as `convolve_cubes`. |
@@ -452,6 +465,7 @@ bin/rmclean_cubes ampfile=<f> phafile=<f> maskfile=<f> outfile=<base>
     [mem_frac_ram=<f>] [tile_ra=<n>] [tile_dec=<n>] [tile_auto=y|n]
     [io_read_threads=<n>] [nwriters=<n>] [io_overlap=y|n]
     [log_level=<level>] [timing_enabled=y|n] [log_output_file=<path>]
+    [write_clean_diagnostics=y|n]
 bin/rmclean_cubes --config <cfgfile>
 bin/rmclean_cubes --help | -h
 ```
@@ -536,11 +550,11 @@ useful for checking a run's real progress against what Pass 0 expected
 (`--csv` is auto-detected from a `log_level=debug` run log via
 `--actual-log` alone, no need to locate the CSV by hand).
 
-**Memory/tiling (identical scheme/defaults to `rm_synthesis`, now covering the mask cube too — see `docs/user/PARALLELISM.md`):**
+**Memory/tiling (identical scheme/defaults to `rm_synthesis`, now covering the mask cube too):**
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mem_frac_ram` | `0.25` | Fraction (0,0.95] of system RAM budgeted for one tile's own read+compute+write working set — now including the mask's own footprint. |
+| `mem_frac_ram` | `0.25` | Fraction (0,0.95] of system RAM budgeted for one tile's own read+compute+write working set — now including the mask's own footprint (see [Shared Parameters](#shared-parameters) above). |
 | `tile_ra` / `tile_dec` | `0`/`0` (auto) | Manual tile-size override in pixels; ignored unless `tile_auto=n`. |
 | `tile_auto` | `y` | `y`: derive `tile_ra`/`tile_dec` from `mem_frac_ram`; `n`: use the manual override (still clamped to image size). |
 
@@ -560,11 +574,23 @@ useful for checking a run's real progress against what Pass 0 expected
 | `timing_enabled` | `n` | Print a stage timing summary. |
 | `log_output_file` | empty (stdout) | Non-empty: append to this file instead. |
 
+**Per-pixel diagnostic maps:**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `write_clean_diagnostics` | `y` | Write 7 additional per-pixel 2D diagnostic maps at run end (see Output files below). Negligible extra compute (all 7 are computed from values CLEAN already produces); the memory cost is a small fixed amount for the whole image regardless of tile size (~21 bytes/pixel), already accounted for in the `mem_frac_ram` tile-size budget. Set `n` to skip them. |
+
 ### Output files
 
 `<outfile>.CLEAN.AMP.RMCUBE.FITS`, `<outfile>.CLEAN.PHA.RMCUBE.FITS`,
 `<outfile>.RESID.AMP.RMCUBE.FITS`, `<outfile>.RESID.PHA.RMCUBE.FITS`,
 `<outfile>.RESTORED.AMP.RMCUBE.FITS`, `<outfile>.RESTORED.PHA.RMCUBE.FITS`.
+
+If `write_clean_diagnostics=y` (the default), also 7 per-pixel 2D maps:
+`<outfile>.NITER.MAP.FITS`, `<outfile>.STOP_REASON.MAP.FITS`,
+`<outfile>.RESID_PEAK.MAP.FITS`, `<outfile>.RESID_RMS.MAP.FITS`,
+`<outfile>.N_COMPONENTS.MAP.FITS`, `<outfile>.COMP_RM_SPREAD.MAP.FITS`,
+`<outfile>.TOTAL_POL_FLUX.MAP.FITS`.
 
 ### Example
 

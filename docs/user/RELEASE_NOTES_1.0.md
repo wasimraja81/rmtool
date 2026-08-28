@@ -143,9 +143,12 @@ plainly rather than blended into one blanket claim:
   areas plus every tool's own parameter handling, I/O parallelism
   consistency, and GPU/CPU numerical agreement.
 
+That same real WALLABY/EMU run is what the README's landing-page demo
+GIF is generated from — see [../../README.md](../../README.md#demo).
+
 ## Getting started
 
-- [../../QUICKSTART.md](../../QUICKSTART.md) — build the tools, quick
+- [QUICKSTART.md](../../QUICKSTART.md) — build the tools, quick
   reference for every tool.
 - [TUTORIAL.md](TUTORIAL.md) — a full walkthrough from a fresh checkout
   to a cleaned RM cube, every command actually run and verified.

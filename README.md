@@ -127,10 +127,9 @@ for guidance on choosing CPU vs. GPU.
 | [docs/user/EXAMPLES.md](docs/user/EXAMPLES.md) | Recipes by scenario: single/multi-band, CLEAN stopping criteria, memory/IO tuning, GPU vs. CPU, subimage extraction |
 | [docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md) | Full parameter reference for every tool: every key, every default, output files |
 | [cfg/CONFIG_README.md](cfg/CONFIG_README.md) | `rm_synthesis` config parser rules |
-| [docs/user/ARCHITECTURE.md](docs/user/ARCHITECTURE.md) | Implemented architecture and design rationale |
-| [docs/user/PARALLELISM.md](docs/user/PARALLELISM.md) | Parallelism and memory decomposition deep-dive |
-| [docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md) | Tiling, RM chunking, CPU/GPU offload strategy, swim-lane diagnostics |
 | [docs/user/RELEASE_NOTES_1.0.md](docs/user/RELEASE_NOTES_1.0.md) | What's in R1.0 "Confluent Brahmaputra" and what's been validated |
+
+Internal architecture/engineering documentation lives under `docs/dev/`.
 
 ## Development
 

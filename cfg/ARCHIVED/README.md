@@ -15,10 +15,10 @@ These files are organized by the type of analysis they performed:
 ### Image Extraction Configs (3 files)
 - `extract_image_from_cube*.cfg` - Extracting 2D images from 3D RM cubes at specific RM values
 
-### Statistics Configs (4 files)
+### Statistics Configs (5 files)
 - `rmstat_*.cfg`, `rmpspec_*.cfg` - Statistical analysis of RM spectra
 
-### General Purpose Configs (40 files)
+### General Purpose Configs (39 files)
 - FITS image operations (align, combine, compare, compute statistics)
 - SILO format conversion
 - Frequency plane extraction

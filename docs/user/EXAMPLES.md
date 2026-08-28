@@ -78,7 +78,7 @@ TEST.Q.FITSCUBE` + `tests/data/TEST_BAND2.Q.FITSCUBE`, which share the
 same sky grid by construction):
 
 ```bash
-bin/rm_synthesis_release_cpu_omp cfg/rmsynth-e2e-multiband-smalltest.cfg
+bin/rm_synthesis_release_cpu_omp cfg/rmsynth-e2e-multiband-matched-smalltest.cfg
 ```
 
 completes cleanly, no preprocessing step involved.
@@ -246,7 +246,7 @@ real signal left to remove.
 
 `mem_frac_ram` is a fraction (0, 0.95] of your machine's **total**
 system RAM (not whatever happens to be free at that moment — see
-[docs/user/ARCHITECTURE.md](ARCHITECTURE.md#host-ram-tiling) for why
+[docs/user/APP_REFERENCE.md](APP_REFERENCE.md#shared-parameters) for why
 that distinction matters on a shared machine), budgeted for one chunk's
 own working set. **All
 five tools in this package share the same key, same (0, 0.95] range,
@@ -314,13 +314,7 @@ their per-pixel work is different in shape:
   via `mem_frac_vram`/`gpu_vram_mib` — unrelated to `mem_frac_ram`,
   which still governs the *host*-side tile size on a GPU run.
 
-Full mechanics for `rm_synthesis`/`rmclean_cubes` (the exact per-pixel
-byte formula, the auto-tiling shrink policy, and the
-`io_read_threads`/`nwriters`/`io_overlap` keys that ride
-alongside tile sizing) are in [docs/user/PARALLELISM.md](PARALLELISM.md) and
-[docs/user/ARCHITECTURE.md](ARCHITECTURE.md)'s "When `io_overlap=y` can
-be detrimental" section. For
-`reproject_cubes`/`convolve_cubes`/`match_cubes`, the equivalent
+For `reproject_cubes`/`convolve_cubes`/`match_cubes`, the equivalent
 per-tool detail (their own `mem_frac_ram`/`io_overlap` keys and exact
 defaults) is in each tool's own section of
 [docs/user/APP_REFERENCE.md](APP_REFERENCE.md) — this EXAMPLES.md section is deliberately
@@ -332,9 +326,7 @@ just the decision guide, not the full mechanism.
 
 Three independent keys — `io_read_threads`, `nwriters`,
 `io_overlap` — all default to fully serial. Quick picks, not the full
-reasoning (see [docs/user/ARCHITECTURE.md](ARCHITECTURE.md)'s "When
-`io_overlap=y` can be detrimental" section for the complete
-rule-of-thumb table and when `io_overlap` can actually hurt):
+reasoning:
 
 - **Single local disk, small-to-medium cube**: leave everything at
   default. Parallel I/O mostly helps parallel/shared storage.

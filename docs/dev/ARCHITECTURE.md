@@ -1215,3 +1215,19 @@ stages it runs) propagate `CASAMBM`/`BEAMS` the same way, upstream of
   ticket T14 in the multi-band plan for the full decision record and
   verification evidence.
 
+---
+
+## Contributing: Adding a New `rm_synthesis` Config Variable
+
+(Relocated from `cfg/CONFIG_README.md`, which is a user-facing doc and
+shouldn't carry contributor instructions.)
+
+If you add a new KEY=VALUE variable in cfg files, you must also update
+`src/rm_synthesis_mod.f90`:
+1. Add handling in `read_cfg_keyval` (select case block).
+2. Add duplicate tracking for strict mode.
+3. Add required-key validation if it is mandatory.
+4. Add parse/type checks.
+
+If this is not done, strict validation will fail on unknown keys.
+

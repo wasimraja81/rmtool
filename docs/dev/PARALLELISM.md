@@ -18,10 +18,10 @@ loop itself* is always serial (tile N+1 is never computed before tile N
 is), but each tile's read, write, and the boundary between consecutive
 tiles can each independently be made concurrent via three orthogonal cfg
 keys — `io_read_threads`, `nwriters`, and `io_overlap`. All three
-default to the fully serial behaviour below; see
-`docs/user/ARCHITECTURE.md` ("Parallel read/write" and "Async read/write
-overlap") and `docs/dev/IO_PARALLEL_OPTIMISATION_PLAN.md` for the full
-design, safety history, and postmortems.
+default to the fully serial behaviour below; see `ARCHITECTURE.md`
+("Parallel read" and "Parallel write") and
+`IO_PARALLEL_OPTIMISATION_PLAN.md` for the full design, safety
+history, and postmortems.
 
 ```
 DISK  ─────────────────────────────────────────────────────────────────────────
@@ -465,8 +465,8 @@ slow-converging ones finish.
 inputs (Q/U) into 2 outputs (AMP/PHA, or REAL/IMAG); `rmclean_cubes`
 tiles 3 inputs (dirty AMP, dirty PHA, mask) into 6 outputs
 (CLEAN/RESID/RESTORED × AMP/PHA). The mask cube joined this tiled
-scheme later than the two float cubes did (`planning/
-RMCLEAN_INTEGRATION_PLAN.md` ticket T10b) — before that, it was held
+scheme later than the two float cubes did (`RMCLEAN_INTEGRATION_PLAN.md`
+ticket T10b) — before that, it was held
 whole in memory regardless of tile size, budgeted separately from
 (and invisibly to) `mem_frac_ram`. `plan_rmclean_tile`'s own memory
 formula now accounts for all three inputs plus the 6 (double-buffered)
@@ -494,7 +494,7 @@ the time any thread looks it up. `mask_pattern_cache_max` (default
 uniform channel flagging across the whole image typically needs only
 1-2 distinct patterns in practice.
 
-Full design/evidence for both differences: `planning/
-RMCLEAN_INTEGRATION_PLAN.md` tickets T4 (original tiled I/O port) and
+Full design/evidence for both differences: `RMCLEAN_INTEGRATION_PLAN.md`
+tickets T4 (original tiled I/O port) and
 T10a/T10b (the mask-read overflow fix and the RAM-aware retiling that
 followed it).

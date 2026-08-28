@@ -7,7 +7,7 @@
 4. [Running on real data](#4-running-on-real-data)
 5. [Requirements](#5-requirements)
 6. [Swim-lane plots](#6-swim-lane-plots)
-7. [Architecture notes](#7-architecture-notes)
+7. [Further reading](#7-further-reading)
 8. [Preprocessing: reproject_cubes, convolve_cubes, match_cubes](#8-preprocessing-reproject_cubes-convolve_cubes-match_cubes)
 9. [RM-CLEAN: rmclean_cubes](#9-rm-clean-rmclean_cubes)
 
@@ -16,7 +16,7 @@
 ## 1. Build variants and binary capabilities
 
 Four independent binaries can be produced; each lives under `bin/` and is also
-symlinked to `bin/rm_synthesis` (last build wins the symlink).
+copied to `bin/rm_synthesis` (last build wins the copy).
 
 | Make flags | Binary produced | What it can do |
 |---|---|---|
@@ -27,7 +27,7 @@ symlinked to `bin/rm_synthesis` (last build wins the symlink).
 
 Key points:
 - `MODE=release` (the default) enables `-O3 -march=native`; never compile production runs with `MODE=debug`.
-- The GPU binary is built with `-ffast-math -DUSE_GPU`. Setting `use_gpu=n` in the config at runtime makes it behave like the serial CPU binary.
+- The GPU binary always defines `-DUSE_GPU`; the `gfortran`-offload path additionally adds `-ffast-math` (the default, auto-selected-first `nvfortran` path does not). Setting `use_gpu=n` in the config at runtime makes it behave like the serial CPU binary.
 - GPU and OMP can be enabled together at compile time (`GPU=1 OMP=1`).
 - `OMP_NUM_THREADS` controls thread count at runtime for the OMP binary.
 
@@ -108,7 +108,7 @@ validation workflow that currently includes:
 - timing summary/CSV emission checks
 - `io_overlap` bit-identical comparison plus a structural "no two tile
   writes ever overlap" invariant check
-- `io_write_threads>1` bit-identical comparison across all 8 output products
+- `nwriters>1` bit-identical comparison across all 8 output products
 
 ### 3a. One-shot run (builds + tests everything)
 
@@ -237,10 +237,12 @@ out-of-memory (`nvptx_alloc error`), lower `mem_frac_vram` (e.g. 0.4) or set
 `gpu_vram_mib` to your card's size. `io_overlap=y` opts into running tile
 N's write on a background thread concurrent with tile N+1's read/compute
 (CFITSIO is already built reentrant -- nothing extra to install; default
-`n`). Doubles the per-tile output buffer RAM; see "When `io_overlap=y`
-can be detrimental" in `docs/user/ARCHITECTURE.md` for when this helps
-vs. hurts, and `io_read_threads`/`io_write_threads` for parallelising
-the read/write themselves (independent of `io_overlap`).
+`n`). Doubles the per-tile output buffer RAM -- helps most on
+dedicated machines with parallel/fast storage and RAM to spare, less
+on a single disk or a RAM-constrained box (see
+[docs/user/EXAMPLES.md](docs/user/EXAMPLES.md#5-io-parallelism-quick-picks)
+for the decision guide). `io_read_threads`/`nwriters` parallelise the
+read/write themselves (independent of `io_overlap`).
 Or run a dry-run first to read the auto-tuned tile hint:
 ```bash
 # Temporarily set dry_run=y in cfg, then:
@@ -265,17 +267,14 @@ cat scratch/runtime_estimate.txt       # wall-time estimate
 
 ## 5. Requirements
 
-| Package | Ubuntu/Debian | macOS (Homebrew) |
-|---|---|---|
-| Fortran compiler | `gfortran` | `brew install gcc` |
-| CFITSIO | `libcfitsio-dev` | `brew install cfitsio` |
-| Python 3 + astropy + numpy | `pip install astropy numpy` | `pip install astropy numpy` |
-| GPU compiler (optional) | `nvfortran` (NVIDIA HPC SDK) or `gfortran ≥ 14` with libgomp offload | same |
-| Starlink AST + FFTW3 (only for `reproject_cubes`/`convolve_cubes`/`match_cubes`) | `libstarlink-ast-dev libstarlink-ast-err9 libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev` | see BUILD.md |
-| matplotlib + ffmpeg (only for `scripts/plot_tile_async_swimlane.py`/`scripts/animate_fits_cube.py`) | `pip install matplotlib` + `apt-get install ffmpeg` | `pip install matplotlib` + `brew install ffmpeg` |
+| Package | Notes |
+|---|---|
+| Fortran compiler, CFITSIO, GPU compiler, Starlink AST + FFTW3 | See [BUILD.md](BUILD.md#requirements) for exact install commands per platform and which tool needs which dependency (`rmclean_cubes` needs only FFTW3 of that last group, not Starlink AST). |
+| Python 3 + astropy + numpy | `pip install astropy numpy` |
+| matplotlib + ffmpeg (diagnostic/plotting scripts only, not needed to build or run any Fortran tool) | `pip install matplotlib`, plus `ffmpeg` via your package manager -- used by `scripts/plot_tile_async_swimlane.py`, `scripts/plot_rmclean_advisory.py`, `scripts/animate_fits_cube.py`, `scripts/benchmark_omp.py` |
 
 ```bash
-# Minimal Ubuntu install
+# Minimal Ubuntu install (core build only -- see BUILD.md for the rest)
 sudo apt-get install gfortran libcfitsio-dev make
 pip install astropy numpy
 ```
@@ -284,26 +283,16 @@ pip install astropy numpy
 
 ## 6. Swim-lane plots
 
-Design and interpretation notes for memory strategy, RM chunking, and
-CPU/GPU timeline diagnostics are documented in:
-
-- [docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
+Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
+and GPU lanes from the run log.
 
 ---
 
-## 7. Architecture notes
+## 7. Further reading
 
-- [docs/user/ARCHITECTURE.md](docs/user/ARCHITECTURE.md) -- master architecture
-  document (start here); includes the IO parallelism design
-  (`io_read_threads`/`io_write_threads`/`io_overlap`) and their postmortems.
-- [docs/user/PARALLELISM.md](docs/user/PARALLELISM.md) -- memory/execution
-  decomposition deep-dive, including the thread-pool interplay between
-  `OMP_NUM_THREADS` and the I/O thread keys.
-- [docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md](docs/user/DESIGN_CPU_GPU_TIMELINE_AND_RM_BLOCKING.md)
-  -- timeline/RM-chunking and swim-lane interpretation deep-dive.
-
-Use `scripts/plot_tile_async_swimlane.py` to visualize overlap across I/O, CPU,
-and GPU lanes from the run log.
+Internal architecture and design documentation (memory/tiling
+strategy, RM chunking, CPU/GPU timeline diagnostics, I/O parallelism
+postmortems) lives under `docs/dev/`.
 
 ---
 
@@ -401,7 +390,7 @@ opt-in — give either, both, or neither.
 ```
 
 Memory/tiling and I/O parallelism (`mem_frac_ram`/`tile_ra`/`tile_dec`/
-`io_read_threads`/`io_write_threads`/`io_overlap`) work exactly like
+`io_read_threads`/`nwriters`/`io_overlap`) work exactly like
 `rm_synthesis`'s own keys of the same name (see section 4 above) — a
 cube far larger than available RAM CLEANs in bounded memory on any
 machine, from a laptop to an HPC node.
