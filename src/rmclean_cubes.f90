@@ -178,6 +178,7 @@ program rmclean_cubes
    ! missed even if log_every doesn't divide n_iter_used.
    integer :: log_every
    integer :: table_oversample
+   integer :: table_oversample_eff
    logical :: have_restore_fwhm
    real(sp) :: restore_fwhm_override
    integer :: lsq_ref_report_mode_sel
@@ -626,6 +627,21 @@ program rmclean_cubes
       write(*,'(A,F0.6,A,F0.6)') 'lsq_ref_compute=', lsq_ref_compute,&
       &' differs from lsq_ref_native=', lsq_ref_native,&
       &' -- each pixel''s dirty spectrum will be derotated before CLEANing.'
+   endif
+
+   ! T21 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md, src/rmclean.f90's own
+   ! table_oversample_floor doc comment for the full rationale): the
+   ! table's own Nyquist floor, computed once here from the full,
+   ! cube-wide l_sq/nchan -- a safe, conservative bound for every
+   ! per-pattern table built later regardless of that pattern's own
+   ! flagging.
+   table_oversample_eff = table_oversample_floor(l_sq, nchan,&
+   &lsq_ref_compute, real(cdelt3_amp, sp), table_oversample)
+   if (table_oversample_eff.gt.table_oversample) then
+      write(*,'(A,I0,A,I0,A)') 'NOTE: table_oversample raised from ',&
+      &table_oversample, ' to ', table_oversample_eff, ' to satisfy'//&
+      &' the RMSF table''s own Nyquist floor for this run''s'//&
+      &' lsq_ref_compute (see APP_REFERENCE.md, table_oversample).'
    endif
 
    call get_lsq_ref_report(l_sq, nchan, lsq_ref_report_mode_sel,&
@@ -1470,7 +1486,10 @@ contains
       &' beyond that the full local search runs for that iteration.'
       write(*,'(A)') 'table_oversample (default 20): rmsf_table_t''s own'//&
       &' interpolation-table fineness (build_rmsf_offset_table''s own'//&
-      &' oversample argument).'
+      &' oversample argument). A floor, not always the value actually'//&
+      &' used: raised automatically (a printed NOTE) if this run''s own'//&
+      &' lsq_ref_compute would otherwise leave the table under-sampling'//&
+      &' its own fastest oscillation below Nyquist (see APP_REFERENCE.md).'
       write(*,'(A)') 'trace_ix/trace_iy (default 0, disabled): 1-indexed'//&
       &' GLOBAL pixel to log a per-iteration CLEAN trend for (peak_val/'//&
       &'rms_val/cumulative cleaned flux, plus the exact stop_reason --'//&
@@ -3699,7 +3718,7 @@ contains
                call system_clock(c0)
                call build_rmsf_offset_table(l_sq_valid_s(1:nvalid_s), nvalid_s,&
                &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
-               &table_oversample, table_s)
+               &table_oversample_eff, table_s)
                call system_clock(c1)
 
                sample_total_ms = sample_total_ms +&
@@ -4051,7 +4070,7 @@ contains
             t_table_build_start_l = omp_get_wtime()
             call build_rmsf_offset_table(l_sq_valid_l(1:nvalid_l), nvalid_l,&
             &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
-            &table_oversample, cache_entries(target_slot)%table)
+            &table_oversample_eff, cache_entries(target_slot)%table)
             t_table_build_ms_l = (omp_get_wtime()-t_table_build_start_l)*1000.0_dp
             write(table_build_msg_l,'(A,I0,A,I0,A,F0.3)')&
             &'table_build stage=cache_populate block=', tile_seq,&
@@ -4184,7 +4203,7 @@ contains
          t_table_build_start_p = omp_get_wtime()
          call build_rmsf_offset_table(l_sq_valid_p(1:nvalid_p), nvalid_p,&
          &lsq_ref_compute, rm_samp(nrm)-rm_samp(1), real(cdelt3_amp, sp),&
-         &table_oversample, throwaway_table)
+         &table_oversample_eff, throwaway_table)
          t_table_build_ms_p = (omp_get_wtime()-t_table_build_start_p)*1000.0_dp
          write(table_build_msg_p,'(A,I0,A,I0,A,I0,A,F0.3)')&
          &'table_build stage=oneoff block=', tile_seq, ' tid=',&

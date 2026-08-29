@@ -21,7 +21,7 @@ module rmclean_mod
    public :: rmsf_point_direct, refine_peak_matched_filter
    public :: clean_complex
    public :: compute_rmsf_fwhm, compute_rmsf_fwhm_multiband, restore_clean
-   public :: get_drm, derotate_to_lsq_ref
+   public :: get_drm, derotate_to_lsq_ref, table_oversample_floor
    public :: get_lsq_ref_compute, get_lsq_ref_report
    public :: lsq_ref_compute_mid, lsq_ref_compute_intrinsic, lsq_ref_compute_centroid
    public :: lsq_ref_compute_min, lsq_ref_compute_max, lsq_ref_compute_fixed
@@ -1361,6 +1361,57 @@ contains
       max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref_compute, dp)))
       drm = real(pi/(2.0_dp*os*max_offset), sp)
    end subroutine get_drm
+
+   function table_oversample_floor(l_sq, nchan, lsq_ref_compute,&
+   &native_ddelta, table_oversample_user) result(table_oversample_eff)
+      !! rmsf_table_t's own Nyquist floor (planning/RMCLEAN_INTEGRATION_
+      !! PLAN.md ticket T21, from a design discussion with the user).
+      !! build_rmsf_offset_table's table is built at native_ddelta/
+      !! table_oversample spacing, but what it has to represent -- the
+      !! real/imag carrier, not the lsq_ref-INDEPENDENT magnitude
+      !! envelope Gate 0's own min_samples_per_fwhm check already
+      !! protects -- oscillates at max_offset=max_k|l_sq(k)-
+      !! lsq_ref_compute|, the SAME quantity get_drm above and
+      !! refine_peak_matched_filter's own escalation search both use.
+      !! Gate 0's bound only happens to guarantee this table's own
+      !! Nyquist condition at lsq_ref_compute_mode=mid (where
+      !! max_offset is provably span/2, exactly half of Gate 0's own
+      !! span-based bound) -- every other mode has no such guarantee,
+      !! confirmed: a constructed span=1, lsq range [99,100] case fails
+      !! Nyquist by >3x at mode=zero even at the default
+      !! table_oversample=20 (tests/test_table_oversample_floor.f90).
+      !!
+      !! Floor multiplier 4 (not bare-Nyquist 2) mirrors get_drm's own
+      !! hard-enforced oversample>=2 floor just above -- bare Nyquist
+      !! recovers a wrong, not just imprecise, answer there (this
+      !! module's own get_drm doc comment, tests/test_drm_floor.f90),
+      !! and there is no reason this table's own carrier would be any
+      !! more forgiving of bare Nyquist than get_drm's carrier is.
+      !!
+      !! Caller passes the FULL, cube-wide l_sq/nchan, not any one
+      !! pattern's own valid-channel subset -- a safe, conservative
+      !! bound for every pattern a run will ever build a table for,
+      !! since a max taken over any pattern's own smaller subset can
+      !! only be <= this value, never exceed it. This deliberately
+      !! keeps every pattern's table the same size (simpler, and keeps
+      !! mask_pattern_cache_max's own per-slot memory accounting
+      !! uniform) rather than computing a tighter, pattern-specific
+      !! floor that would vary the table size per pattern.
+      !!
+      !! Never LOWERS table_oversample_user -- only ever raises it, and
+      !! only when the floor genuinely exceeds it.
+      integer, intent(in) :: nchan, table_oversample_user
+      real(sp), intent(in) :: l_sq(nchan), lsq_ref_compute, native_ddelta
+      integer :: table_oversample_eff
+      real(dp), parameter :: pi = 3.14159265358979_dp
+      real(dp) :: max_offset, table_oversample_min_dp
+      integer :: table_oversample_min
+
+      max_offset = maxval(abs(real(l_sq, dp) - real(lsq_ref_compute, dp)))
+      table_oversample_min_dp = 4.0_dp*real(native_ddelta, dp)*max_offset/pi
+      table_oversample_min = max(1, ceiling(table_oversample_min_dp))
+      table_oversample_eff = max(table_oversample_user, table_oversample_min)
+   end function table_oversample_floor
 
    subroutine get_lsq_ref_compute(l_sq, nchan, mode, lsq_ref_compute, fixed_value)
       !! Computes lsq_ref_compute for the requested mode -- see the

@@ -4012,6 +4012,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 57. RM-CLEAN table_oversample's own Nyquist floor (T21)
+# ---------------------------------------------------------------------------
+section "57. RM-CLEAN table_oversample Nyquist floor (T21)"
+
+tosfloor_bin="$RMCLEAN_BUILD_DIR/test_table_oversample_floor"
+tosfloor_log="$OUT_DIR/test_table_oversample_floor.log"
+
+if [[ -f "$rmclean_o" ]]; then
+    if gfortran -cpp -std=gnu -fallow-argument-mismatch -ffree-line-length-none \
+            -O3 -fopenmp -I"$rmclean_mod_dir" -J"$rmclean_mod_dir" \
+            "$TESTS_DIR/test_table_oversample_floor.f90" "$rmclean_o" \
+            -o "$tosfloor_bin" -lfftw3 2>"$OUT_DIR/rmclean_tosfloor_build.log"; then
+        if "$tosfloor_bin" > "$tosfloor_log" 2>&1; then
+            while IFS= read -r line; do
+                case "$line" in
+                    *"[PASS]"*) pass "${line#*\[PASS\] }" ;;
+                    *"[FAIL]"*) fail "${line#*\[FAIL\] }" ;;
+                esac
+            done < "$tosfloor_log"
+        else
+            fail "RM-CLEAN table_oversample Nyquist floor: program exited non-zero (see $tosfloor_log)"
+        fi
+    else
+        fail "RM-CLEAN table_oversample Nyquist floor: build failed (see $OUT_DIR/rmclean_tosfloor_build.log)"
+    fi
+else
+    skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN table_oversample Nyquist floor test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"

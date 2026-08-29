@@ -28,42 +28,32 @@ from the running binary) and please report the doc as stale.
 ## Shared Parameters
 
 **`mem_frac_ram`** (all 5 tools): a fraction of the machine's **total**
-system RAM, not whatever happens to be free at the moment a run
-starts — so the tile/block size for a given cube and config is
-reproducible on the same machine regardless of what else is running on
-it. On a busy shared node, the budget is *not* automatically reduced
-for other jobs' usage, so a conservative fraction is worth choosing
-there deliberately.
+system RAM.
 
 ---
 
 ## 1. `rm_synthesis`
 
-The main RM-synthesis tool. Given Stokes Q and U spectral-line FITS
+The main RM-synthesis tool. Given Stokes Q and U spectral FITS
 cubes (optionally several bands at once — "multi-band tomography"), it
 performs pixel-by-pixel Faraday rotation-measure synthesis (a
 Fourier-like transform from λ² to Faraday depth φ), producing RM cubes
 of linear polarized intensity and polarization angle (or real/
 imaginary) as a function of RA, Dec, RM. It supports bad-channel
-removal, Q/U mean-subtraction and I-cube bias correction, subimage/
-sub-channel extraction, automatic or manual RM-grid selection, mask/
-peak-map diagnostics, GPU offload, and a memory-budgeted, multithreaded,
-tileable I/O pipeline.
+removal, subimage/sub-channel extraction, automatic or manual RM-grid 
+selection, mask/peak-map diagnostics, GPU offload, and a memory-budgeted, multi-threaded, tileable I/O pipeline.
 
 ### Invocation
 
 ```bash
-bin/rm_synthesis <cfgfile> [<addreq>]
+bin/rm_synthesis <cfgfile> 
 ```
 
 Purely positional — **not** `key=value` on the command line. `<cfgfile>`
 is a required path to a `KEY=VALUE` text config file (one key per line,
 `#` for comments; strict parser — duplicate keys, unknown keys, and
-unparsable values are all hard errors). `<addreq>` is accepted but not
-currently used by anything downstream; omit it. There is no `--help`
-flag for this tool — running it with no arguments prints a two-line
-usage pointer, not a full option list (that's what this document and
-[cfg/rmsynth.cfg](../../cfg/rmsynth.cfg)'s annotated template are for).
+unparsable values are all hard errors). See 
+[cfg/rmsynth.cfg](../../cfg/rmsynth.cfg) for an annotated template.
 
 ### Config keys
 
@@ -94,7 +84,20 @@ usage pointer, not a full option list (that's what this document and
 | `subim_chan_blc` / `subim_chan_trc` / `subim_chan_inc` | `0` (=first) / `0` (=max) / `1` | Same, for channel; per-band comma list allowed. |
 | `subim_parfile` | `subimage.par` | **Deprecated, no-op.** Accepted by the parser for backward compatibility but never read — superseded entirely by the `subim_*` KEY=VALUE keys above. Setting it has no effect. |
 
-**Q/U processing & bias correction:**
+**Q/U processing & bias correction: TODO (not implemented)**
+
+> `resiQ`/`slopeQ`/`resiU`/`slopeU` are parsed,
+> required, and stored, but never combined with the I-cube data (or
+> anything else) in an actual bias-correction computation anywhere in
+> `rm_synthesis`/`rm_synthesis_mod` — the I-cube is read into memory
+> when `remove_qu_bias=y` but never applied to Q/U afterward. Multi-band
+> runs (more than one band) with `remove_qu_bias=y` hit an explicit
+> hard stop (`ERROR: multi-band Q/U bias correction is not yet
+> implemented.`). Single-band `remove_qu_bias=y` has no such stop but
+> also performs no correction — the feature is a no-op today regardless
+> of `remove_qu_bias`'s value. This is however left as a TODO that will allow 
+> for example, leakage correction, as well as tomography on suitably normalised 
+> polarised fractions. 
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -187,19 +190,19 @@ true; anything else (including blank) is false.
 - Always (unless disabled): `<outfile>.MASK.CUBE.FITS`, `<outfile>.NVALID.MAP.FITS`
 - If `cubestat=y`: `<outfile>.PEAK.MAP.FITS`, `<outfile>.RM_PEAK.MAP.FITS`, `<outfile>.ANG_PEAK.MAP.FITS`, `<outfile>.SNR.MAP.FITS`
 
-**Beam metadata:** if the input Q cube carries `BMAJ`/`BMIN`/`BPA`,
-every output above carries the same values, unchanged. If the input
-instead has `CASAMBM=T` (a genuinely per-channel-varying restoring
-beam, e.g. an un-convolved CASA multi-beam cube), that propagated
-scalar is only the input's own nominal/reference value and means
-nothing on its own — so the AMP/PHA cubes and the PEAK/RMPEAK/ANGPEAK/
-SNR maps (not MASK or NVALID, which are validity bookkeeping, not flux
-data) also get `CASAMBM=T` plus the input's own real per-channel
-`BEAMS` table attached as an extension, plus a `HISTORY` note
-explaining why. Run `convolve_cubes` first if a single, well-defined
-resolution is required. In multi-band mode, a mismatch between bands'
-own beam metadata is reported as a runtime warning (not a hard error —
-RM synthesis itself doesn't depend on beam metadata for correctness).
+**Beam metadata:** if the input Q cube has `CASAMBM=T` (a per-channel
+CASA multi-beam cube, e.g. not yet run through `convolve_cubes`), the
+AMP/PHA cubes and PEAK/RMPEAK/ANGPEAK/SNR maps get that same
+`CASAMBM=T` plus the input's real per-channel `BEAMS` table — this is
+the one to trust; ignore the single `BMAJ`/`BMIN`/`BPA` these outputs
+also carry, since with a varying beam it's just the input's nominal
+value, not a real common resolution. Otherwise (no `CASAMBM`), those
+same outputs simply carry the input's single `BMAJ`/`BMIN`/`BPA`
+unchanged. (MASK/NVALID are validity bookkeeping, not flux data, and
+always just get the plain scalar.) In multi-band mode, a mismatch
+between bands' own beam metadata is a runtime warning, not a hard
+error — RM synthesis itself doesn't depend on beam metadata for
+correctness.
 
 ### Example
 
@@ -499,12 +502,16 @@ printed saying so.
 
 **RM-resolution / peak-refinement tuning:**
 
+These four rarely need touching — Gate 0 and the tiered peak-refinement
+strategy work well at their defaults. They exist for tuning, not
+day-to-day use.
+
 | Key | Default | Meaning |
 |---|---|---|
-| `min_samples_per_fwhm` | `2.0` (floor `1.0`) | Gate 0's RM-resolution criterion: the cube's `\|CDELT3\|` must be ≤ `fwhm/min_samples_per_fwhm`. |
-| `refine_nsigma` | `3.0` | Escalation threshold for tiered peak refinement — the cheap fixed-location fit is accepted when its leftover misfit is within `refine_nsigma`×the per-iteration noise estimate; beyond that a full local search runs. |
-| `table_oversample` | `20` | Interpolation-table fineness for the RMSF offset table. |
-| `restore_fwhm` | derived from the data | Override the restoring beam FWHM (rad/m²). |
+| `min_samples_per_fwhm` | `2.0` | Gate 0's RM-resolution check: `\|CDELT3\| ≤ fwhm/min_samples_per_fwhm`. `\|CDELT3\|` (the RM grid spacing) is already fixed by whatever `rm_synthesis` run produced the input cube — this tool never resamples the RM axis, it only validates it, and `stop`s immediately if the check fails. `min_samples_per_fwhm` doesn't touch the grid; it only sets how strict that check is. Raising it demands a finer grid (more likely to fail on a given cube); lowering it accepts a coarser one (more likely to pass), down to a hard floor of `1.0` (the parser rejects anything less — below 1 sample per FWHM the grid can't resolve the RMSF's main lobe at all). So if Gate 0 fails at the default `2.0`, the fix is either to re-run `rm_synthesis` with a finer `cdelt3`, or to explicitly set `min_samples_per_fwhm=` lower here (as low as `1.0`) to accept the grid you already have. |
+| `refine_nsigma` | `3.0` | Controls the two-tier peak-refinement strategy CLEAN runs every iteration: a cheap fixed-location matched-filter fit runs first, and is accepted as-is if its leftover misfit is within `refine_nsigma`× that iteration's noise estimate; only when the misfit exceeds this threshold does the slower full local search run instead. Raising it accepts the cheap fit more often (faster, slightly less precise peak location); lowering it escalates to the full search more often (slower, more precise). |
+| `table_oversample` | `20` | Fineness of the per-pattern RMSF lookup table's own fine grid — see *Mask-pattern cache* below for what this table is and how it gets queried during CLEAN. Grid spacing = native `\|CDELT3\|` / `table_oversample`; every grid point holds an *exact* RMSF evaluation. Raising it shrinks the gap between neighboring grid points, which shrinks linear-interpolation error roughly quadratically (double the value, ~4x smaller worst-case error), at the cost of a bigger one-time table build/memory footprint. The default of `20` is empirical, and this value is a **floor, not always what actually gets used**: `rmclean_cubes` computes the table's own Nyquist requirement from this run's real `max_offset=max_k\|l_sq(k)-lsq_ref_compute\|` (cube-wide, so every pattern's table stays the same size) and raises `table_oversample` automatically — printing a `NOTE` when it does — whenever this setting would otherwise leave the table under-sampling its own fastest oscillation. At `lsq_ref_compute_mode=mid` this floor is provably never binding — Gate 0's own `min_samples_per_fwhm` check (`\|CDELT3\| <= fwhm/min_samples_per_fwhm`, `fwhm=pi/lambda^2-span`) already guarantees 2x the required margin there, since `max_offset=span/2` exactly at that mode — checked against the real WALLABY+EMU validation run, `20` gave 150 samples/cycle at `mid`, comfortable margin with room to spare. At other modes (`zero` in particular, where `max_offset` can exceed the band's own span) the floor genuinely can and does raise the value — a constructed case (span=1, λ² range [99,100], a real ~30 MHz band) needed more than `20` even though it passed Gate 0 cleanly. With Nyquist now handled automatically for every mode, the only reason left to raise `table_oversample` yourself is sharpening the linear interpolation's own accuracy beyond that floor, which matters most when your data's own S/N is high enough for that extra precision to be visible above the noise. |
+| `restore_fwhm` | derived from the data | The restoring beam FWHM (rad/m²) used to convolve CLEAN components into the RESTORED cube. By default this is computed automatically from the RMSF itself (`compute_rmsf_fwhm_multiband`); set this to force a specific value instead, e.g. to match a restoring beam used elsewhere for comparison. |
 
 **Debug/tracing:**
 
@@ -522,7 +529,34 @@ printed saying so.
 | `lsq_ref_compute_mode` | `mid` (recommended) | `native\|zero\|centroid\|min\|max\|fixed` — the reference this program's own RMSF table/CLEAN computation uses internally. `mid` minimizes per-pixel escalation-search cost and does not change the RM grid size. |
 | `lsq_ref_compute_value` | — | Used only with `lsq_ref_compute_mode=fixed`. |
 
+> Confirmed in code: unlike `rm_synthesis`'s dirty AMP/PHA cube (whose
+> `LSQREF` header keyword faithfully records the actual reference the
+> data was built at), `rmclean_cubes` writes no header keyword on its
+> CLEAN/RESID/RESTORED outputs recording either `lsq_ref_compute` or
+> `lsq_ref_report`. The RESID/RESTORED pixel data and CLEAN component
+> list are derotated to `lsq_ref_report` before writing whenever it
+> differs from `lsq_ref_compute` — so the phase actually on disk is at
+> the *report* reference, not the compute one, and no FITS header field
+> tells you which value either one was. Keep a record of the cfg used
+> for any run where this distinction matters.
+
 **Mask-pattern cache:**
+
+> Confirmed in code: the RMSF table (`table_oversample` above) is a
+> single, fixed, unit-strength curve — the RMSF's own value at each of
+> many finely-spaced offsets — built once per distinct valid-channel
+> pattern and never shifted, rescaled, or otherwise modified for the
+> rest of the run. Peak location and amplitude are always found
+> *exactly* beforehand (see *RM-resolution / peak-refinement tuning*
+> above) and never come from this table. Each CLEAN iteration, for
+> each of the `nrm` native output points independently, what moves is
+> the *query* — that point's own exact distance to the found peak —
+> not the table: the two table entries bracketing that distance are
+> blended, rotated by the peak's own phase, scaled by its own measured
+> flux, and subtracted, one output point at a time. Building the whole
+> per-point beam this way, `nrm` separate small lookups against one
+> unmoving table, is what avoids ever having to shift a discretely
+> sampled RMSF onto a fractional peak location as a single operation.
 
 `belady` is L. A. Belady's offline-optimal page-replacement algorithm
 (also called OPT/MIN) — L. A. Belady, "A Study of Replacement
@@ -533,7 +567,7 @@ project's own addition on top of that algorithm.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mask_pattern_cache_max` | `4096` | Pixels sharing the same valid-channel mask pattern share one RMSF table, built once during an incremental per-tile pre-scan; past this many distinct patterns, additional patterns fall back to a one-off table per pixel (a performance safety valve, not a correctness issue). |
+| `mask_pattern_cache_max` | `4096` | Pixels sharing the same valid-channel mask pattern share one RMSF table: it's built once, on that pattern's first encounter during the real per-tile CLEAN pass (not during the lookahead pre-scan below, which only records which patterns exist and where — it never builds a real table itself), and reused by every later pixel with the same pattern. Past this many distinct patterns resident at once, additional new patterns fall back to a one-off table built and discarded per pixel (a performance safety valve, not a correctness issue). |
 | `cache_eviction_policy` | `belady` | `belady\|hitcount` — which cached pattern to evict once `mask_pattern_cache_max` is reached, rather than simply refusing new entries. `belady`: offline-optimal, informed by a one-time whole-mask-cube pre-scan (Pass 0) that evicts whichever cached pattern isn't needed again for the longest time (or ever) — no tuning parameter, provably the best possible for a given cache size. `hitcount`: a plain least-frequently-used fallback needing no pre-scan — cheaper to start, but not competitive with `belady`; an opt-out, not the recommended choice. Pass 0 has its own safety valve: if distinct patterns exceed 10% of total image pixels (too little reuse for a lookahead cache to be worth its cost), it aborts with a warning and falls back to `hitcount` for that run. |
 | `min_valid_chan_frac` | `0.0` (off) | Pixels whose own valid-channel fraction (summed across ALL bands, out of the full channel count) falls below this are never CLEANed — output NaN across every RM-bin instead. `0.0` means every pixel with at least 1 valid channel is CLEANed (original behaviour); e.g. `0.7` skips any pixel with less than 70% of channels valid. Sparse-coverage pixels have a coarser/noisier RMSF regardless of compute spent on them, so skipping them saves real time — the skipped pixels are also never registered in Pass 0's pattern registry or the runtime cache. |
 

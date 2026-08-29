@@ -4022,3 +4022,93 @@ wall-clock, stop-reason distribution healthy (0% hit the niter cap,
 (never let CFITSIO create the file; reserve real, not guessed, header
 space) hold up under actual production conditions, not just synthetic
 test fixtures.
+
+### T21 -- `table_oversample` has no Nyquist floor for non-`mid` `lsq_ref_compute` modes (a real gap, not just a documentation note)
+
+**Motivation:** a long user-driven Socratic review of exactly what
+`table_oversample` does (this session) established, step by step and
+each claim checked directly against the code: `build_rmsf_offset_table`
+builds its lookup table at `native |CDELT3| / table_oversample`
+spacing, to cheaply approximate the RMSF's real/imag carrier during
+`compute_dirty_rmbeam`'s per-iteration subtraction -- a genuinely
+different oscillation than the lsq_ref-INDEPENDENT magnitude envelope
+Gate 0's `min_samples_per_fwhm` check protects. The carrier's own speed
+is set by `max_offset=max_k|l_sq(k)-lsq_ref_compute|`, the same
+quantity `get_drm` (retired for grid-sizing, still exported) and
+`refine_peak_matched_filter`'s own escalation search both use.
+
+Proven directly (not assumed) that Gate 0's own bound only happens to
+guarantee this table's Nyquist condition at
+`lsq_ref_compute_mode=mid`: at `mid`, `max_offset` is provably `span/2`
+(the midpoint minimizes the max distance to either band edge, a basic
+minimax fact), exactly half of Gate 0's own span-based bound
+(`drm_required=fwhm/min_samples_per_fwhm=(pi/span)/2` at the default
+`min_samples_per_fwhm=2`), so passing Gate 0 forces Nyquist for this
+table too, with a clean 2x margin, for any dataset. At every other
+mode -- `zero` prominently, where `max_offset=max(l_sq)=span+min(l_sq)
+>= span` -- there is no such relationship, and nothing else in the
+codebase checks it (`get_drm` has zero production call sites, confirmed
+via `grep "call get_drm"` across the whole repo -- test files only).
+
+Constructed a concrete counter-example proving this is a real gap, not
+theoretical: `span=1`, `lsq` range `[99,100]` (a genuine, physically
+sensible ~30 MHz low-frequency band, not a contrived number -- `lsq=99`
+-> `freq=30.13 MHz`, `lsq=100` -> `freq=29.98 MHz`, comparable to
+LOFAR-LBA/MWA/NenuFAR-scale observing). At `drm=1.0` (comfortably
+inside Gate 0's own `min_samples_per_fwhm=2` bound of `~1.571`), `zero`
+mode's own Nyquist requirement is `<=0.0157` -- **`table_oversample=20`
+(the shipped default) still under-samples this by >3x** (`0.05` vs the
+`0.0157` needed), not just `table_oversample=1`. Checked against the
+real, validated WALLABY+EMU run's own actual numbers (`.rm_axis.npy`:
+`drm=8.6207`; real channel `lsq` range `0.043404-0.140434`) for
+comparison: `20` gives `150` samples/cycle at `mid`, `52` at `zero` --
+real headroom for that specific dataset, but headroom the code never
+checked for or guaranteed, and the constructed case shows it can
+genuinely run out for other, realistic bands.
+
+**Design:** a new pure function, `table_oversample_floor` (`src/
+rmclean.f90`, exported from `rmclean_mod` alongside `get_drm`), mirrors
+`get_drm`'s own hard-enforced `oversample>=2` floor (`tests/
+test_drm_floor.f90`: bare Nyquist recovers a wrong, not just imprecise,
+answer -- no reason this table's carrier would be any more forgiving)
+applied to the table instead of to the native grid:
+```fortran
+table_oversample_eff = max(table_oversample_user,
+&  ceiling(4 * native_ddelta * max_offset / pi))
+```
+Never lowers the user's/default's own value -- only ever raises it, and
+only when the floor genuinely exceeds it (a printed `NOTE` when it
+does). Computed **once**, in `rmclean_cubes.f90`'s main program body
+right after `lsq_ref_compute` is finalized, from the **full, cube-wide**
+`l_sq`/`nchan` -- not any one pattern's own valid-channel subset. This
+was a deliberate, user-confirmed design choice over the mathematically
+tighter alternative (a per-pattern `max_offset`, which the true RMSF
+formula would technically support, since a max over a smaller subset
+can only be <= the full-cube value): the cube-wide bound is a safe,
+conservative upper bound for *every* pattern a run will ever build a
+table for, and keeps every pattern's table the same size -- simpler,
+and keeps `mask_pattern_cache_max`'s own per-slot memory accounting
+uniform, at the modest cost of occasionally sizing larger than the
+mathematically tightest per-pattern value would require. `table_
+oversample_eff` (host-associated, visible to every internal subroutine
+via the same mechanism `table_oversample` itself already relied on)
+replaces the raw `table_oversample` at all 3 `build_rmsf_offset_table`
+call sites (the cache-populate path, the report-build-time-advisory
+sampling path, and the cache-overflow throwaway-table path) -- their
+own per-pattern `l_sq_valid` content is completely unaffected, exactly
+as intended: only the shared grid *structure* changes, never any
+pattern's own correctly-computed RMSF *values*.
+
+**Verified:** `tests/test_table_oversample_floor.f90` (registered as
+`run_tests.sh` section 57), 5 checks: `mid` mode at real WALLABY+EMU
+scale does not raise the default 20 (Gate 0's guarantee holds); `zero`
+mode at the same real scale also doesn't need raising (real margin,
+smaller than `mid`'s); the constructed pathological case raises it
+above 20; the raised value itself genuinely clears >=4 samples/cycle
+(`get_drm`'s own floor standard); the floor never lowers an
+already-generous user value. Full suite re-run this same session:
+172/172 (166 prior + 6 new -- `test_table_oversample_floor`'s own 5
+per-check `[PASS]` lines plus its 1 aggregate `[PASS]`, matching
+`test_drm_floor`'s own convention of counting both).
+
+**Status: DONE.**
