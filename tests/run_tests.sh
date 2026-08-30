@@ -1901,6 +1901,33 @@ sys.exit(0 if abs(printed - restored) < 1e-3 else 1)
                 fail "rmclean_cubes: RMSFFWHM check failed (printed=$t19_fwhm_printed restored.amp=$t19_fwhm_restored_amp restored.pha=$t19_fwhm_restored_pha clean.amp=$t19_fwhm_clean_amp)"
             fi
 
+            # T22 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): this fixture's
+            # own dirty ampfile has LSQREF=$lsqref_val (lsq_ref_native,
+            # rm_synthesis's own lsq_ref_mode=mid, confirmed nonzero
+            # above) -- this run passed no lsq_ref_report_mode, so
+            # lsq_ref_report defaults to intrinsic=0.0. Before T22, every
+            # output's LSQREF was copied verbatim from ampfile (i.e. this
+            # exact native!=report divergence silently wrote the WRONG
+            # value); the fix must write 0.0 on every one of the 6 outputs
+            # instead.
+            t22_lsqref_ok=1
+            for t22_suffix in CLEAN.AMP CLEAN.PHA RESID.AMP RESID.PHA RESTORED.AMP RESTORED.PHA; do
+                t22_got=$(python3 -c "
+from astropy.io import fits
+print(fits.getheader('${rmc_out}.${t22_suffix}.RMCUBE.FITS').get('LSQREF'))
+")
+                if ! python3 -c "
+import sys
+sys.exit(0 if abs(float('$t22_got')) < 1e-9 else 1)
+"; then
+                    fail "rmclean_cubes: ${t22_suffix}.RMCUBE.FITS LSQREF expected 0.0 (lsq_ref_report default), got '$t22_got' (native was $lsqref_val)"
+                    t22_lsqref_ok=0
+                fi
+            done
+            if [ "$t22_lsqref_ok" = "1" ]; then
+                pass "rmclean_cubes: all 6 outputs' LSQREF=0.0 (lsq_ref_report), not the dirty cube's own nonzero lsq_ref_native=$lsqref_val (T22)"
+            fi
+
             # T19 Part B: cross-validate all 6 new diagnostic maps
             # against the REAL RESID.AMP/CLEAN.AMP cubes from this same
             # run (check_diagnostic_maps.py's own module docstring for

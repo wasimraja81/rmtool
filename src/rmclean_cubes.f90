@@ -745,16 +745,17 @@ program rmclean_cubes
    ! take NO override, correctly inheriting ampfile's own '/RMSF'-suffixed
    ! BUNIT (both are RMSF-convolution-smeared densities, same as dirty).
    call open_output_cube(ampfile, trim(outfile)//'.CLEAN.AMP.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_clean_amp, status, bunit_override=trim(clean_bunit))
+   &nx, ny, nrm, idx_clean_amp, lsq_ref_report, status,&
+   &bunit_override=trim(clean_bunit))
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.CLEAN.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_clean_pha, status, bunit_override='rad')
+   &nx, ny, nrm, idx_clean_pha, lsq_ref_report, status, bunit_override='rad')
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESID.AMP.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_resid_amp, status)
+   &nx, ny, nrm, idx_resid_amp, lsq_ref_report, status)
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESID.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_resid_pha, status, bunit_override='rad')
+   &nx, ny, nrm, idx_resid_pha, lsq_ref_report, status, bunit_override='rad')
    if (status.ne.0) stop 1
    ! T19 Part D (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): RESTORED's own
    ! RMSFFWHM header keyword (restoring beam FWHM, rad/m^2) -- passed as
@@ -773,11 +774,11 @@ program rmclean_cubes
    ! fix it. Makes the 'Jy/beam/RMSF' BUNIT label (Part C) actionable: a
    ! user needs this width for the phi-integration correction.
    call open_output_cube(ampfile, trim(outfile)//'.RESTORED.AMP.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_restored_amp, status,&
+   &nx, ny, nrm, idx_restored_amp, lsq_ref_report, status,&
    &rmsffwhm_override=dble(fwhm_rm))
    if (status.ne.0) stop 1
    call open_output_cube(ampfile, trim(outfile)//'.RESTORED.PHA.RMCUBE.FITS',&
-   &nx, ny, nrm, idx_restored_pha, status, bunit_override='rad',&
+   &nx, ny, nrm, idx_restored_pha, lsq_ref_report, status, bunit_override='rad',&
    &rmsffwhm_override=dble(fwhm_rm))
    if (status.ne.0) stop 1
 
@@ -2442,13 +2443,17 @@ contains
    end subroutine raw_create_sized_output_file
 
    subroutine open_output_cube(template_file, outname, nx_in, ny_in, nrm_in,&
-   &idx, status, bunit_override, rmsffwhm_override)
+   &idx, lsq_ref_report_out, status, bunit_override, rmsffwhm_override)
       !! T4a/T4c: creates outname and writes its header ONLY (no pixel
       !! data -- that now comes tile-by-tile via write_output_tile below,
       !! since the whole cube is never resident in memory at once).
       !! Header copied verbatim from template_file (always ampfile: same
       !! WCS on every axis, since this program never resamples anything --
-      !! Gate 0 validates the existing RM grid rather than changing it).
+      !! Gate 0 validates the existing RM grid rather than changing it) --
+      !! EXCEPT LSQREF (see copy_generic_header_rmclean's own comment):
+      !! lsq_ref_report_out is written fresh here instead (T22), the
+      !! actual reference this output's own pixel data is derotated to,
+      !! which is not generally the same as ampfile's own inherited value.
       !!
       !! T19 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): bunit_override, if
       !! present, overwrites the BUNIT card the verbatim header copy just
@@ -2488,6 +2493,7 @@ contains
       character(len=*), intent(in) :: template_file, outname
       integer, intent(in) :: nx_in, ny_in, nrm_in
       integer, intent(in) :: idx
+      real(sp), intent(in) :: lsq_ref_report_out
       integer, intent(out) :: status
       character(len=*), intent(in), optional :: bunit_override
       real(dp), intent(in), optional :: rmsffwhm_override
@@ -2571,6 +2577,13 @@ contains
          &'Restoring beam FWHM, rad/m^2 (ONE global value -- T13)',&
          &fitsstat)
       endif
+      ! T22: LSQREF, absent from the verbatim copy (excluded in
+      ! copy_generic_header_rmclean above), so plain FTPKYD -- same
+      ! no-existing-card-to-fight-with reasoning as RMSFFWHM just above.
+      fitsstat = 0
+      call ftpkyd(out_unit(idx), 'LSQREF', dble(lsq_ref_report_out), 13,&
+      &'Phase reference lambda^2 (m^2) this output is derotated to',&
+      &fitsstat)
       out_is_open(idx) = .true.
       if (nwriters_eff.gt.1) then
          fitsstat = 0
@@ -2909,6 +2922,16 @@ contains
          key = adjustl(card(1:8))
          select case (trim(key))
          case ('SIMPLE', 'BITPIX', 'NAXIS', 'EXTEND', 'PCOUNT', 'GCOUNT', 'END')
+            cycle
+         ! T22 (docs/dev/RMCLEAN_INTEGRATION_PLAN.md): LSQREF excluded
+         ! here deliberately -- ampfile's own LSQREF records lsq_ref_
+         ! native (whatever rm_synthesis built the dirty cube at), which
+         ! is NOT generally what this program's own outputs are actually
+         ! written at (lsq_ref_report, after derotate_to_lsq_ref). Copying
+         ! it through verbatim would silently misrepresent every output
+         ! whenever lsq_ref_report != lsq_ref_native. open_output_cube's
+         ! own lsq_ref_report argument writes the correct value instead.
+         case ('LSQREF')
             cycle
          end select
          if (is_naxis_keyword(key)) cycle

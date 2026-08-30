@@ -510,7 +510,7 @@ day-to-day use.
 |---|---|---|
 | `min_samples_per_fwhm` | `2.0` | Gate 0's RM-resolution check: `\|CDELT3\| ≤ fwhm/min_samples_per_fwhm`. `\|CDELT3\|` (the RM grid spacing) is already fixed by whatever `rm_synthesis` run produced the input cube — this tool never resamples the RM axis, it only validates it, and `stop`s immediately if the check fails. `min_samples_per_fwhm` doesn't touch the grid; it only sets how strict that check is. Raising it demands a finer grid (more likely to fail on a given cube); lowering it accepts a coarser one (more likely to pass), down to a hard floor of `1.0` (the parser rejects anything less — below 1 sample per FWHM the grid can't resolve the RMSF's main lobe at all). So if Gate 0 fails at the default `2.0`, the fix is either to re-run `rm_synthesis` with a finer `cdelt3`, or to explicitly set `min_samples_per_fwhm=` lower here (as low as `1.0`) to accept the grid you already have. |
 | `refine_nsigma` | `3.0` | Controls the two-tier peak-refinement strategy CLEAN runs every iteration: a cheap fixed-location matched-filter fit runs first, and is accepted as-is if its leftover misfit is within `refine_nsigma`× that iteration's noise estimate; only when the misfit exceeds this threshold does the slower full local search run instead. Raising it accepts the cheap fit more often (faster, slightly less precise peak location); lowering it escalates to the full search more often (slower, more precise). |
-| `table_oversample` | `20` | Fineness of the per-pattern RMSF lookup table's own fine grid — see *Mask-pattern cache* below for what this table is and how it gets queried during CLEAN. Grid spacing = native `\|CDELT3\|` / `table_oversample`; every grid point holds an *exact* RMSF evaluation. Raising it shrinks the gap between neighboring grid points, which shrinks linear-interpolation error roughly quadratically (double the value, ~4x smaller worst-case error), at the cost of a bigger one-time table build/memory footprint. The default of `20` is empirical, and this value is a **floor, not always what actually gets used**: `rmclean_cubes` computes the table's own Nyquist requirement from this run's real `max_offset=max_k\|l_sq(k)-lsq_ref_compute\|` (cube-wide, so every pattern's table stays the same size) and raises `table_oversample` automatically — printing a `NOTE` when it does — whenever this setting would otherwise leave the table under-sampling its own fastest oscillation. At `lsq_ref_compute_mode=mid` this floor is provably never binding — Gate 0's own `min_samples_per_fwhm` check (`\|CDELT3\| <= fwhm/min_samples_per_fwhm`, `fwhm=pi/lambda^2-span`) already guarantees 2x the required margin there, since `max_offset=span/2` exactly at that mode — checked against the real WALLABY+EMU validation run, `20` gave 150 samples/cycle at `mid`, comfortable margin with room to spare. At other modes (`zero` in particular, where `max_offset` can exceed the band's own span) the floor genuinely can and does raise the value — a constructed case (span=1, λ² range [99,100], a real ~30 MHz band) needed more than `20` even though it passed Gate 0 cleanly. With Nyquist now handled automatically for every mode, the only reason left to raise `table_oversample` yourself is sharpening the linear interpolation's own accuracy beyond that floor, which matters most when your data's own S/N is high enough for that extra precision to be visible above the noise. |
+| `table_oversample` | `20` | Fineness of the per-pattern RMSF lookup table (see *Mask-pattern cache* below). Grid spacing = native `\|CDELT3\|` / `table_oversample`. Higher values interpolate the RMSF more accurately between grid points, at the cost of a larger one-time table build. This is a floor, not a fixed value: `rmclean_cubes` raises it automatically for a run (printing a `NOTE`) if the chosen `lsq_ref_compute` would otherwise undersample the table, and never lowers it below what you set. Raise it manually for extra interpolation accuracy on high-S/N data. |
 | `restore_fwhm` | derived from the data | The restoring beam FWHM (rad/m²) used to convolve CLEAN components into the RESTORED cube. By default this is computed automatically from the RMSF itself (`compute_rmsf_fwhm_multiband`); set this to force a specific value instead, e.g. to match a restoring beam used elsewhere for comparison. |
 
 **Debug/tracing:**
@@ -529,16 +529,12 @@ day-to-day use.
 | `lsq_ref_compute_mode` | `mid` (recommended) | `native\|zero\|centroid\|min\|max\|fixed` — the reference this program's own RMSF table/CLEAN computation uses internally. `mid` minimizes per-pixel escalation-search cost and does not change the RM grid size. |
 | `lsq_ref_compute_value` | — | Used only with `lsq_ref_compute_mode=fixed`. |
 
-> Confirmed in code: unlike `rm_synthesis`'s dirty AMP/PHA cube (whose
-> `LSQREF` header keyword faithfully records the actual reference the
-> data was built at), `rmclean_cubes` writes no header keyword on its
-> CLEAN/RESID/RESTORED outputs recording either `lsq_ref_compute` or
-> `lsq_ref_report`. The RESID/RESTORED pixel data and CLEAN component
-> list are derotated to `lsq_ref_report` before writing whenever it
-> differs from `lsq_ref_compute` — so the phase actually on disk is at
-> the *report* reference, not the compute one, and no FITS header field
-> tells you which value either one was. Keep a record of the cfg used
-> for any run where this distinction matters.
+> The `LSQREF` keyword on every CLEAN/RESID/RESTORED output records
+> `lsq_ref_report` — the reference the phase actually on disk is
+> derotated to — not `lsq_ref_compute` (an internal-only value that
+> never appears in any output) and not the input dirty cube's own
+> `LSQREF` (`lsq_ref_native`, which can differ from `lsq_ref_report`
+> whenever either tool is set away from its own default).
 
 **Mask-pattern cache:**
 

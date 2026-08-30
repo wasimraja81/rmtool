@@ -4112,3 +4112,65 @@ per-check `[PASS]` lines plus its 1 aggregate `[PASS]`, matching
 `test_drm_floor`'s own convention of counting both).
 
 **Status: DONE.**
+
+### T22 -- `LSQREF` on CLEAN/RESID/RESTORED outputs was inherited from the input, not the actual reference the data is written at
+
+**Motivation:** a follow-up question in the same user-driven review
+that found T21 (this session): does the missing `LSQREF`/reference
+information on `rmclean_cubes`' own outputs (flagged as a documentation
+gap in `APP_REFERENCE.md`'s `lsq_ref_report_mode` callout) actually
+mean the information is *absent*, or could the input cube's own
+`LSQREF` already cover it? Checked directly: `open_output_cube` builds
+every one of the 6 real outputs (`CLEAN`/`RESID`/`RESTORED` x
+`AMP`/`PHA`) from `ampfile` as its header template, via
+`copy_generic_header_rmclean`, whose own exclusion list (`SIMPLE`,
+`BITPIX`, `NAXIS`, `EXTEND`, `PCOUNT`, `GCOUNT`, `END`, plus the
+NAXIS-family) did **not** include `LSQREF` -- so `LSQREF` WAS present
+on every output, just copied verbatim from the input, unexamined.
+
+That is worse than the documentation gap it was found while
+investigating: the input's own `LSQREF` records `lsq_ref_native`
+(whatever `rm_synthesis` built the dirty cube at), but the RESID/
+RESTORED pixel data and CLEAN component list are derotated to
+`lsq_ref_report` (`derotate_to_lsq_ref`, whenever it differs from
+`lsq_ref_compute`) before writing -- a value computed independently by
+`rmclean_cubes` itself and not generally equal to `lsq_ref_native` at
+all. `lsq_ref_native` and `lsq_ref_report` coincide (both `0.0`) only
+when both tools are left at their own defaults (`rm_synthesis`'s
+`zero`, `rmclean_cubes`'s `intrinsic`) -- confirmed reachable, not
+theoretical, the moment either deviates: `lsq_ref_report_mode` is a
+fully wired, real cfg key (every assignment to `lsq_ref_report_mode_
+sel` checked directly -- one default-init, one branch per real mode in
+the parser, no post-parse override anywhere), and `rm_synthesis`'s own
+`lsq_ref_mode=mid` is already used by this project's own T2 end-to-end
+fixture (`tests/run_tests.sh` section 29). So the inherited `LSQREF`
+was actively wrong, not just uninformative, for any run combining a
+non-`zero` `rm_synthesis` reference with `rmclean_cubes`'s own default
+report mode -- silently, with nothing downstream ever correcting it
+(confirmed: `RMSFFWHM` is the only other `ftpky*` call anywhere in
+`rmclean_cubes.f90`).
+
+**Design:** `LSQREF` added to `copy_generic_header_rmclean`'s exclusion
+list (so the stale, inherited value is never copied through at all),
+and a new required `lsq_ref_report_out` argument added to
+`open_output_cube`, written via a plain `FTPKYD` after the existing
+`bunit_override`/`rmsffwhm_override` block -- same "no existing card to
+fight with" reasoning `rmsffwhm_override`'s own comment already
+documents (plain `FTPKYD` after exclusion, not `FTUKYD`, since the card
+genuinely won't exist). All 6 `open_output_cube` call sites pass
+`lsq_ref_report` (already computed earlier in the same program, before
+any of these calls run).
+
+**Verified:** extended `tests/run_tests.sh` section 29's own existing
+T2 end-to-end fixture -- built with `rm_synthesis lsq_ref_mode=mid`
+(confirmed nonzero `LSQREF`, already checked earlier in that same
+section) and CLEANed with no explicit `lsq_ref_report_mode` (defaults
+to `intrinsic=0.0`) -- exactly the divergent-reference case this ticket
+is about, already present in the suite, not a new fixture. Added a
+check that all 6 outputs' own `LSQREF` reads `0.0` (the run's real
+`lsq_ref_report`), not the fixture's own nonzero `lsq_ref_native` --
+before this fix, the pre-existing behavior would have copied the
+nonzero value through unchanged. Full suite: pending confirmation this
+session.
+
+**Status: DONE.**
