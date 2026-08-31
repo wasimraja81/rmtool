@@ -9,7 +9,7 @@ give this." Jump straight to whichever one matches what you're facing.
 Every command below has been run against this repository's own
 synthetic test fixtures, and the output shown is what it actually
 produces. A few scenarios need data this repo doesn't ship (e.g. two
-bands with genuinely different angular resolution) — those are noted
+bands with different angular resolution) — those are noted
 where they come up.
 
 ## Contents
@@ -51,7 +51,7 @@ just wastes time, and doing less means `rm_synthesis` will (correctly)
 refuse to run rather than silently combine misaligned data. The
 resolution half of this ([§2c](#2c-resolution-mismatched-sky-grid-already-matched--convolve_cubes-only))
 applies equally to a single band whose own channels don't share one
-resolution — sky-grid mismatch is the only genuinely cross-band-only
+resolution — sky-grid mismatch is the only cross-band-only
 case here.
 
 The four recipes below are covered by regression tests
@@ -175,7 +175,7 @@ construction. Full detail:
 bands split into more than one distinct sky pointing, pick the
 reference from whichever pointing has the most total channels — every
 band sharing that SAME pointing gets a fast, near-identity resample,
-while every band from a genuinely different pointing pays the full
+while every band from a different pointing pays the full
 (much slower) resampling cost regardless of which specific file within
 it you chose. `match_cubes` checks this for you automatically and
 prints an `ADVISORY:` message if your chosen `reffile=` looks like the
@@ -255,9 +255,9 @@ chunks so a run scales down to fit a small machine and scales up to use
 a big one, never hardcoding "must fit the whole cube in RAM." This
 applies just as much to the three preprocessing tools as it does to
 `rm_synthesis`/`rmclean_cubes`; it's easy to miss because they don't
-show up together in one place elsewhere in the docs, but the source
-confirms it directly (`mem_frac_ram` cfg key, default `0.25`, same
-validation range, in every one of `rm_synthesis_mod.f90`,
+show up together in one place elsewhere in the docs — `mem_frac_ram`
+(default `0.25`, same validation range) is defined independently in
+every one of `rm_synthesis_mod.f90`,
 `rmclean_cubes.f90`, `reproject_cubes.f90`, `convolve_cubes.f90`, and
 `match_cubes.f90`).
 
@@ -271,7 +271,7 @@ their per-pixel work is different in shape:
   Q/U spectra plus whichever outputs you've requested for
   `rm_synthesis` (AMP/PHA or REAL/IMAG, mask, nvalid, cubestat maps);
   2 input + 6 double-buffered output arrays plus the mask cube's own
-  channel depth for `rmclean_cubes` — genuinely more per-pixel memory
+  channel depth for `rmclean_cubes` — more per-pixel memory
   than `rm_synthesis` for a comparable image size.
 - **`reproject_cubes`/`convolve_cubes`/`match_cubes`** chunk along the
   **frequency/plane axis instead** — each block holds the *full*
@@ -338,10 +338,10 @@ reasoning:
   `io_overlap=n` — it doubles the per-tile output buffer RAM for a
   benefit that mostly doesn't exist on a single physical drive anyway.
 - **Dedicated machine, parallel storage, RAM to spare**: this is where
-  `io_overlap=y` genuinely helps — hides tile N's write behind tile
+  `io_overlap=y` helps — hides tile N's write behind tile
   N+1's read/compute.
 - **Always give `OMP_NUM_THREADS` all your cores** — it's the only
-  genuinely CPU-bound thread count here; the I/O thread keys are mostly
+  CPU-bound thread count here; the I/O thread keys are mostly
   waiting on disk/network, not competing for compute.
 
 ---
@@ -369,7 +369,7 @@ reasoning:
 
 ## 7. Subimage extraction: iterate fast before committing to a full run
 
-Before running RM synthesis on a genuinely large cube, it's often worth
+Before running RM synthesis on a large cube, it's often worth
 testing your config on a small spatial cutout first — a wrong
 `beg_rm`/`end_rm`/`nrm` choice, or a config typo, is much cheaper to
 discover on a 9×9-pixel subimage than after an hour-long full run.
@@ -385,9 +385,9 @@ subim_dec_trc = 14
 ```
 
 (1-indexed, inclusive on both ends — the example above extracts a
-9×9-pixel region.) Verified directly: running this against a 32×32
-test cube produces exactly a 9×9×(RM depth) output cube, nothing more.
-Channel-axis subsetting works the same way via
+9×9-pixel region.) Running this against a 32×32 test cube produces
+exactly a 9×9×(RM depth) output cube. Channel-axis subsetting works the
+same way via
 `subim_chan_blc`/`subim_chan_trc`/`subim_chan_inc` — useful for
 excluding a known-bad edge of the band without a separate
 `badchan_file` entry per channel. Once you're satisfied with the

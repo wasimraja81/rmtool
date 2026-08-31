@@ -2934,7 +2934,11 @@ fi
 #     also get (incorrectly) excluded from band B, and vice versa. Fixed
 #     to be a comma list, one entry per infile, exactly like beamfiles.
 #     Verifies each band's own designated bad channel is excluded from
-#     THAT band's own output, and NOT from the other band's.
+#     THAT band's own output, and NOT from the other band's. Extended by
+#     T32 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the literal value
+#     'none' for one infile's entry must behave identically to leaving
+#     that entry blank -- no crash, no bad channels excluded for that
+#     infile, and the other infile's own real list still applies.
 # ---------------------------------------------------------------------------
 section "41. convolve_cubes/match_cubes: badchan_file is genuinely per-band (T16)"
 
@@ -3029,6 +3033,90 @@ print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()
     fi
 else
     skip "bin/match_cubes not built; skipping per-band badchan_file test"
+fi
+
+# T32: 'none' as an explicit per-infile badchan_file entry, same meaning as
+# leaving that entry blank.
+if [[ -x bin/convolve_cubes ]]; then
+    pbbcn_band1="$OUT_DIR/pbbcn_band1.Q.FITSCUBE"
+    pbbcn_band2="$OUT_DIR/pbbcn_band2.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$pbbcn_band1"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$pbbcn_band2"
+    pbbcn_band2_badchan="$OUT_DIR/pbbcn_band2_badchan.txt"
+    printf '77\n' > "$pbbcn_band2_badchan"
+    pbbcn_band1_conv="${pbbcn_band1%.FITSCUBE}_CONV.FITS"
+    pbbcn_band2_conv="${pbbcn_band2%.FITSCUBE}_CONV.FITS"
+    rm -f "$pbbcn_band1_conv" "$pbbcn_band2_conv"
+
+    pbbcn_convolve_log="$OUT_DIR/pbbcn_convolve.log"
+    if bin/convolve_cubes infiles="$pbbcn_band1,$pbbcn_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            badchan_file="none,$pbbcn_band2_badchan" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$pbbcn_convolve_log" 2>&1; then
+        pbbcn_band1_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbcn_band1_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        pbbcn_band2_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbcn_band2_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        if [[ "$pbbcn_band1_bad_planes" == "" && "$pbbcn_band2_bad_planes" == "77" ]]; then
+            pass "convolve_cubes: badchan_file='none' for band1 behaves as no list (band1 has zero bad planes, band2's own chan 77 still excluded)"
+        else
+            fail "convolve_cubes: badchan_file='none' check failed (band1 bad=[$pbbcn_band1_bad_planes], expected none; band2 bad=[$pbbcn_band2_bad_planes], expected 77) (see $pbbcn_convolve_log)"
+        fi
+    else
+        fail "convolve_cubes: badchan_file='none' run failed (see $pbbcn_convolve_log)"
+    fi
+else
+    skip "bin/convolve_cubes not built; skipping badchan_file='none' test"
+fi
+
+if [[ -x bin/match_cubes ]]; then
+    pbbcmn_band1="$OUT_DIR/pbbcmn_band1.Q.FITSCUBE"
+    pbbcmn_band2="$OUT_DIR/pbbcmn_band2.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$pbbcmn_band1"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$pbbcmn_band2"
+    pbbcmn_band2_badchan="$OUT_DIR/pbbcmn_band2_badchan.txt"
+    printf '77\n' > "$pbbcmn_band2_badchan"
+    pbbcmn_band1_conv="${pbbcmn_band1%.FITSCUBE}_CONV.FITS"
+    pbbcmn_band2_conv="${pbbcmn_band2%.FITSCUBE}_CONV.FITS"
+    rm -f "$pbbcmn_band1_conv" "$pbbcmn_band2_conv"
+
+    pbbcmn_convolve_log="$OUT_DIR/pbbcmn_convolve.log"
+    if bin/match_cubes stages=convolve infiles="$pbbcmn_band1,$pbbcmn_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            badchan_file="none,$pbbcmn_band2_badchan" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$pbbcmn_convolve_log" 2>&1; then
+        pbbcmn_band1_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbcmn_band1_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        pbbcmn_band2_bad_planes=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+data = fits.getdata('$pbbcmn_band2_conv')[0]
+print(','.join(str(i+1) for i in range(data.shape[0]) if np.isnan(data[i]).all()))
+")
+        if [[ "$pbbcmn_band1_bad_planes" == "" && "$pbbcmn_band2_bad_planes" == "77" ]]; then
+            pass "match_cubes: badchan_file='none' for band1 behaves as no list (band1 has zero bad planes, band2's own chan 77 still excluded)"
+        else
+            fail "match_cubes: badchan_file='none' check failed (band1 bad=[$pbbcmn_band1_bad_planes], expected none; band2 bad=[$pbbcmn_band2_bad_planes], expected 77) (see $pbbcmn_convolve_log)"
+        fi
+    else
+        fail "match_cubes: badchan_file='none' run failed (see $pbbcmn_convolve_log)"
+    fi
+else
+    skip "bin/match_cubes not built; skipping badchan_file='none' test"
 fi
 
 # ---------------------------------------------------------------------------
@@ -4066,6 +4154,102 @@ if [[ -f "$rmclean_o" ]]; then
     fi
 else
     skip "rmclean_mod.o not built (section 23 skipped); skipping RM-CLEAN table_oversample Nyquist floor test"
+fi
+
+# ---------------------------------------------------------------------------
+# 58. rm_synthesis: badchan_file 'none' sentinel for a band with nothing to
+#     list (T31, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md) -- checks BOTH
+#     edited code sites: 'none' on the reference band (case B) and 'none'
+#     on a non-reference band (case A), each paired with a REAL bad-channel
+#     file on the other band, confirming neither disables bad-channel
+#     removal globally (if it did, the real band's own channel would come
+#     back un-flagged too) and neither requires a throwaway empty file.
+# ---------------------------------------------------------------------------
+section "58. rm_synthesis: badchan_file 'none' sentinel (T31)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    t31_badchan="$OUT_DIR/t31_badchan.txt"
+    printf '13\n' > "$t31_badchan"
+
+    t31_run() {
+        # $1=label $2=global_badchan_file value $3=outfile
+        local t31_cfg="$OUT_DIR/t31_$1.cfg"
+        local t31_log="$OUT_DIR/t31_$1.log"
+        rm -f "${3}".*.FITS
+        cat > "$t31_cfg" <<CFGEOF
+path                = $DATA_DIR/
+infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
+outfile             = $3
+
+remove_badchan      = y
+global_badchan_file = $2
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 101
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        "$BIN_SERIAL" "$t31_cfg" > "$t31_log" 2>&1
+    }
+
+    # Case A: reference band (1) real, non-reference band (2) 'none'.
+    t31_out_a="$OUT_DIR/t31_case_a_out"
+    t31_run "case_a" "$t31_badchan,none" "$t31_out_a"
+    t31_log_a="$OUT_DIR/t31_case_a.log"
+    if [[ -f "${t31_out_a}.MASK.CUBE.FITS" ]] && grep -qE "\(band[[:space:]]+2[[:space:]]*\): 0 \(none\)" "$t31_log_a"; then
+        t31_a_check=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+m = fits.getdata('${t31_out_a}.MASK.CUBE.FITS')[:,0,0]
+bad = [i+1 for i,v in enumerate(m) if v==0]
+print('OK' if bad==[13] else 'BAD:'+str(bad))
+")
+        if [[ "$t31_a_check" == "OK" ]]; then
+            pass "rm_synthesis: badchan_file 'none' on a non-reference band gives it 0 bad channels, reference band's real channel 13 still flagged (T31 case A)"
+        else
+            fail "rm_synthesis: T31 case A mask check failed ($t31_a_check, see $t31_log_a)"
+        fi
+    else
+        fail "rm_synthesis: T31 case A run failed or missing 'none' log marker (see $t31_log_a)"
+    fi
+
+    # Case B: reference band (1) 'none', non-reference band (2) real
+    # (channel 13 of band 2 -> global channel 200+13=213).
+    t31_out_b="$OUT_DIR/t31_case_b_out"
+    t31_run "case_b" "none,$t31_badchan" "$t31_out_b"
+    t31_log_b="$OUT_DIR/t31_case_b.log"
+    if [[ -f "${t31_out_b}.MASK.CUBE.FITS" ]] && grep -q "Number of Bad Channels: 0 (none)" "$t31_log_b"; then
+        t31_b_check=$(python3 -c "
+from astropy.io import fits
+import numpy as np
+m = fits.getdata('${t31_out_b}.MASK.CUBE.FITS')[:,0,0]
+bad = [i+1 for i,v in enumerate(m) if v==0]
+print('OK' if bad==[213] else 'BAD:'+str(bad))
+")
+        if [[ "$t31_b_check" == "OK" ]]; then
+            pass "rm_synthesis: badchan_file 'none' on the reference band gives it 0 bad channels, non-reference band's real channel still flagged (T31 case B)"
+        else
+            fail "rm_synthesis: T31 case B mask check failed ($t31_b_check, see $t31_log_b)"
+        fi
+    else
+        fail "rm_synthesis: T31 case B run failed or missing 'none' log marker (see $t31_log_b)"
+    fi
+else
+    skip "bin/rm_synthesis_release_cpu_serial not built; skipping badchan_file 'none' sentinel test"
 fi
 
 # ---------------------------------------------------------------------------

@@ -72,10 +72,10 @@ resolution:
   `match_cubes` tells you if the band you picked to define the output
   grid isn't the most efficient choice, and explains why — matching a
   band onto its own kind of pointing is fast, matching it onto a
-  genuinely different one is much slower, so the choice matters.
+  different one is much slower, so the choice matters.
   Nothing is changed automatically; you decide.
-- Choosing the reference band well genuinely matters: measured on a
-  genuine two-survey dataset (a 144-channel, 11559×11655-pixel band and
+- Choosing the reference band well matters: measured on a
+  two-survey dataset (a 144-channel, 11559×11655-pixel band and
   a 288-channel, 14300×12395-pixel band, different pointings and
   resolutions, ~563GB combined), the grid-matching step alone took
   about 3h40m with a poorly-chosen reference band versus about 1h53m
@@ -93,10 +93,10 @@ own estimated noise sigma). Sub-pixel peak location uses a tiered
 matched-filter refinement against the analytically-known RMSF model,
 so the dirty cube only needs ordinary resolution-level sampling.
 Building and stress-testing this against real data surfaced and fixed
-a genuine data-corruption bug (see Validation) — not a hypothetical
-edge case, something that was silently producing wrong answers at
-scale until it was found. A separate real-data finding fixed a large,
-avoidable delay at the very start of a run: creating each output cube
+a data-corruption bug (see Validation) that was silently producing
+wrong answers at scale until it was found. A separate real-data
+finding fixed a large, avoidable delay at the very start of a run:
+creating each output cube
 was wasting a long stretch of time writing empty placeholder space
 that the real cleaned results were always going to overwrite anyway —
 for the largest real cubes tested, this alone was costing over half an
@@ -122,14 +122,13 @@ plainly rather than blended into one blanket claim:
   described below — an 11715×6664-pixel cube, 59,334,010 pixels
   actually cleaned, no errors.
 - **Multi-band preprocessing is proven correct end-to-end against
-  synthetic test data, and has now completed a genuine real-scale run
+  synthetic test data, and has now completed a real-scale run
   through the entire pipeline, start to finish.** A dedicated test
   fixture with deliberately mismatched sky grid and resolution is run
   through `reproject_cubes`/`convolve_cubes`/`match_cubes`, and the
   known injected sources are confirmed recovered at the correct RM
-  afterward — this exercises the real toolchain against a real
-  mismatch, not a no-op. Beyond that, the full chain has now also been
-  run on genuine ASKAP survey data: two real bands — a 144-channel,
+  afterward. Beyond that, the full chain has now also been
+  run on real ASKAP survey data: two bands — a 144-channel,
   11559×11655-pixel WALLABY cube and a 288-channel, 14300×12395-pixel
   EMU cube, ~563GB of Stokes Q/U input between them — with different
   sky footprints and different resolutions, matched onto one common
@@ -151,7 +150,7 @@ GIF is generated from — see [../../README.md](../../README.md#demo).
 - [QUICKSTART.md](../../QUICKSTART.md) — build the tools, quick
   reference for every tool.
 - [TUTORIAL.md](TUTORIAL.md) — a full walkthrough from a fresh checkout
-  to a cleaned RM cube, every command actually run and verified.
+  to a cleaned RM cube.
 - [EXAMPLES.md](EXAMPLES.md) — recipes for real scenarios: single-band
   vs. multi-band, choosing RM-CLEAN stopping criteria, memory/IO
   tuning, GPU vs. CPU.

@@ -3,7 +3,7 @@
 A step-by-step walkthrough for a brand-new user: build the tools,
 generate a small synthetic dataset with known answers, run RM synthesis
 and RM-CLEAN on it, and inspect the result. Every command below has
-been run and verified — this is not a hypothetical walkthrough.
+been run against this repository's own test fixtures.
 
 Run everything from the repository root.
 
@@ -36,8 +36,7 @@ known rotation measures, recorded in `tests/data/truth.json`:
 | `src_B` | (22, 20) | +22.0 |
 
 This is the exact same fixture `tests/run_tests.sh` uses throughout the
-regression suite, so everything below is also continuously verified by
-that suite, not just this document.
+regression suite.
 
 ## 3. Run RM synthesis
 

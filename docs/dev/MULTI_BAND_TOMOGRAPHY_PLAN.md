@@ -3857,3 +3857,148 @@ existing per-thread Mapping-build pattern is untouched -- only the
 work-distribution changes, not Mapping ownership/creation.
 Bit-identical output required against today's known-good result before
 this is considered done, same bar as every other item in this ticket.
+
+### T31 -- `badchan_file`'s multi-band path in `rm_synthesis` forces a real file per band, even for bands with nothing to list
+
+**Motivation:** found while reviewing `convolve_cubes`/`match_cubes`'
+own `badchan_file` docs (T16 above). T16 gave those two tools a
+genuine per-file opt-out: an empty comma-list entry means "no manual
+list for this infile," no file ever opened for it. `rm_synthesis`'s
+own, separate, earlier per-band implementation (T7 -- see this file's
+own top-of-section comment, and `rm_synthesis.f90:1993`'s "always
+required") never had that option: both `open` call sites --
+`rm_synthesis.f90:1245` (reference band) and `rm_synthesis.f90:2008`
+(each non-reference band, inside `if (cfg%remove_badchan)`) -- use
+`status='old'`, so a band with zero real bad channels still needs a
+real, pre-existing file, or the run hard-stops (`ERROR: failed to open
+bad-channel file for band N`). Today the only workaround is creating a
+throwaway empty file per such band. `reproject_cubes`/`rmclean_cubes`
+have no `badchan_file` at all (checked directly -- `reproject_cubes`
+never touches channels/beams; `rmclean_cubes` reads bad-channel
+handling already baked into `rm_synthesis`'s own MASK cube), so this
+gap is specific to `rm_synthesis`'s multi-band path.
+
+**Design:** accept `none` (case as
+typed, matching this project's existing literal-token conventions) as
+a per-band sentinel at both call sites -- checked before the `open`,
+skipping it entirely and leaving that band's own bad-channel flag
+array untouched (zero bad channels) when the entry is `none`. Purely
+additive: any cfg already giving every band a real file keeps working
+exactly as today; this only removes the forced-dummy-file requirement
+for bands that have nothing to list. Single-band `badchan_file` (no
+comma list) is unaffected -- APP_REFERENCE.md already documents that
+key as needing to be present but not needing to exist when
+`remove_badchan=n`; multi-band's own per-band entries are the only
+place `status='old'` is unconditionally enforced regardless of
+`remove_badchan`.
+
+**Files touched:** `src/rm_synthesis.f90` (the two
+`open(...,status='old'...)` sites above), `docs/user/APP_REFERENCE.md`
+(`badchan_file` row, `rm_synthesis` section) and the `cfg/rmsynth*.cfg`
+templates that demonstrate multi-band bad-channel handling.
+
+**Verification:** both call sites needed their own case, since either
+could independently regress -- checked with the real 2-band matched
+fixture (`TEST.Q/U.FITSCUBE` + `TEST_BAND2.Q/U.FITSCUBE`, 200+150
+channels): case A (reference band real, band 2 `none`) and case B
+(reference band `none`, band 2 real) each confirmed via the actual
+`.MASK.CUBE.FITS` -- exactly the real band's own designated channel
+(global index 13 for case A, 213 for case B) came out flagged, nothing
+else, proving `none` neither crashes nor silently disables
+`remove_badchan` for the *other* band (which would have shown up as
+the real band's own channel coming back un-flagged too). New permanent
+`tests/run_tests.sh` section 58. Full suite: 175/175 (173 prior + 2).
+`docs/user/APP_REFERENCE.md`'s `rm_synthesis` `badchan_file` row
+updated, and the 3 existing multi-band cfg templates
+(`cfg/rmsynth-e2e-multiband-matched-smalltest.cfg`,
+`cfg/rmsynth-e2e-multiband-smalltest.cfg`,
+`cfg/rmsynth-multiband-wallaby-emu.cfg`) switched from their own
+`/dev/null,/dev/null` workaround to `none,none` -- confirmed zero
+behavioral change (all three already run with `remove_badchan=n`,
+so neither value was ever actually opened) and the matched-smalltest
+one re-run directly to confirm it still completes cleanly.
+
+**Status: DONE.**
+
+### T32 -- `none` Badchan Sentinel Extended to `convolve_cubes`/`match_cubes`; `reference_band` Doc Entry Rewritten
+
+**Motivation:** two independent loose ends from the T31 discussion.
+(1) T31 gave `rm_synthesis`'s own multi-band `badchan_file` an explicit
+`none` sentinel. `convolve_cubes`/`match_cubes` never needed a fix for
+correctness -- a blank per-file entry there has always safely meant
+"nothing to list" (T16) -- but now that `rm_synthesis` accepts the word
+`none` for the same concept, having two different spellings of "nothing
+to list" across sibling tools that already share this project's
+bad-channel-file format is worth resolving for consistency, not
+correctness. (2) Separately, reviewing `reference_band`'s
+`APP_REFERENCE.md` entry found two problems: "populates single-band-era
+scalar fields" is internal-development jargon a user has no way to
+parse, and it points at the wrong level of detail --
+`infileQ`/`infileU`/`infileI`/`badchan_file`/channel-window limits are
+already correctly per-band regardless of `reference_band`. Checked
+directly against `src/rm_synthesis_mod.f90:737-858`
+(`extract_general_setup`): the per-band ordering inside the merged
+`L_sq` array (`rm_synthesis.f90:1176-1190`) has no effect on the
+computed RM spectrum -- the DFT template build indexes each channel's
+own `L_sq` value by position (`cos_arr(kk,i) = cos(omega*(t(kk)-lsq_ref))`),
+so channel order is not a user-visible effect and must not be
+documented as one. `reference_band`'s two real, visible effects are
+beam-metadata provenance on a beam mismatch across bands
+(`rm_synthesis.f90:3337`) and which band's sky-pixel geometry every
+other band is validated against (`rm_synthesis.f90:934`).
+
+**Design:**
+
+Part A -- `none` for `convolve_cubes`/`match_cubes`:
+`src/convolve_cubes.f90:293` and `src/match_cubes.f90:381` extend
+`if (len_trim(badchan_file(i)).gt.0)` to also require
+`.and. trim(badchan_file(i)).ne.'none'`, mirroring T31's own condition
+exactly. Purely additive: blank keeps working exactly as today; `none`
+becomes a second, equally valid spelling of "nothing to list" for that
+position. Each tool's own `--help` text (`convolve_cubes.f90:816` and
+match_cubes' equivalent block) gains a clause mentioning `none` as an
+alternative to leaving a position blank. `reproject_cubes` is out of
+scope -- confirmed directly, it has no `badchan_file` handling at all.
+
+Part B -- `reference_band` doc rewrite: `docs/user/APP_REFERENCE.md:67`
+row text changes from "populates single-band-era scalar fields" to "is
+treated as the primary band in multi-band mode -- see callout below."
+New callout added directly after the "Input / output paths" table:
+
+> **`reference_band`:** rm_synthesis was originally single-band; a few
+> internal values are still tracked as a single value rather than a
+> per-band list, and `reference_band` picks which configured band
+> supplies that value. Two effects are visible in the output: if bands'
+> beams differ, the output header's BMAJ/BMIN/BPA are the reference
+> band's (a WARNING prints when this happens); and every other band's
+> sky-pixel geometry is checked against the reference band's (a
+> mismatch is a hard error). `infileQ`/`infileU`/`infileI`,
+> `badchan_file`, and the channel-window limits already use each band's
+> own value regardless of `reference_band` -- this setting doesn't
+> affect those.
+
+**Files touched:** `src/convolve_cubes.f90` (badchan condition at line
+293, `--help` text), `src/match_cubes.f90` (badchan condition at line
+381 -- its own `--help` already deferred to `convolve_cubes`'s, so
+needed no separate wording change), `docs/user/APP_REFERENCE.md`
+(`convolve_cubes` `badchan_file` row gains a clause on `none`;
+`rm_synthesis` `reference_band` row rewritten + new callout added),
+`tests/run_tests.sh` (section 41/T16 extended with a `none`-sentinel
+case for each of `convolve_cubes` and `match_cubes`).
+
+**Verification:** both tools' own `--help` output checked directly
+after rebuild (no stale/duplicated text). Manually ran `convolve_cubes`
+with `badchan_file=none,<real file>` on the 2-band fixture
+(`TEST.Q.FITSCUBE` + `TEST_BAND2.Q.FITSCUBE`) before trusting the
+suite: band 1 (`none`) read as "0 flagged bad" and its output has zero
+NaN planes; band 2 keeps its own real channel (77) excluded -- proving
+`none` neither crashes (pre-fix, a literal file named `none` would be
+opened and fail) nor leaks into the other infile. New permanent
+`tests/run_tests.sh` section-41 checks for both `convolve_cubes` and
+`match_cubes` confirm the same. Full suite: 177/177 (175 prior + 2).
+Part B (doc-only, no code touched, no test run needed): `reference_band`
+row and callout applied as drafted after removing the channel-ordering
+claim (see Motivation) -- verified the DFT-template-build code cited
+there directly rather than trusting the earlier draft's own citation.
+
+**Status: DONE.**

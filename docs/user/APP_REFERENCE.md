@@ -64,15 +64,27 @@ unparsable values are all hard errors). See
 | `path` | — | Directory containing the input Q/U cubes. |
 | `infileQ` | — | Stokes-Q input filename, relative to `path`. Comma-separated for multi-band (e.g. `bandA.fits,bandB.fits`); band count is derived from this list's length. |
 | `infileU` | — | Stokes-U input filename; must have the same band count as `infileQ`. |
-| `reference_band` | `1` | Which band (1-indexed) populates single-band-era scalar fields (see below) when running multi-band. |
+| `reference_band` | `1` | Which band (1-indexed) is treated as the primary band in multi-band mode — see callout below. |
 | `outfile` | — | Output basename; cube-type suffixes are appended automatically. |
+
+> **`reference_band`:** rm_synthesis was originally single-band; a few
+> internal values are still tracked as a single value rather than a
+> per-band list, and `reference_band` picks which configured band
+> supplies that value. Two effects are visible in the output: if bands'
+> beams differ, the output header's BMAJ/BMIN/BPA are the reference
+> band's (a WARNING prints when this happens); and every other band's
+> sky-pixel geometry is checked against the reference band's (a
+> mismatch is a hard error). `infileQ`/`infileU`/`infileI`,
+> `badchan_file`, and the channel-window limits already use each band's
+> own value regardless of `reference_band` — this setting doesn't
+> affect those.
 
 **Bad-channel handling (required):**
 
 | Key | Default | Meaning |
 |---|---|---|
 | `remove_badchan` | — | `y`/`n`: drop channels listed in `badchan_file`. |
-| `badchan_file` (alias `global_badchan_file`) | — | One channel index per line. Must be present even when `remove_badchan=n` (the file need not exist in that case). Comma-separated per-band list for multi-band. |
+| `badchan_file` (alias `global_badchan_file`) | — | One channel index per line. Must be present even when `remove_badchan=n` (the file need not exist in that case). Comma-separated per-band list for multi-band — every band needs its own entry, but a band with nothing to list can use the literal value `none` instead of pointing at a real (even if empty) file. |
 
 **Subimage extraction (`subim` required; the rest optional, default = full cube):**
 
@@ -87,8 +99,8 @@ unparsable values are all hard errors). See
 **Q/U processing & bias correction: TODO (not implemented)**
 
 > `resiQ`/`slopeQ`/`resiU`/`slopeU` are parsed,
-> required, and stored, but never combined with the I-cube data (or
-> anything else) in an actual bias-correction computation anywhere in
+> required, and stored, but never combined with the I-cube data in a
+> bias-correction computation anywhere in
 > `rm_synthesis`/`rm_synthesis_mod` — the I-cube is read into memory
 > when `remove_qu_bias=y` but never applied to Q/U afterward. Multi-band
 > runs (more than one band) with `remove_qu_bias=y` hit an explicit
@@ -255,7 +267,7 @@ No positional arguments — every value is `key=value` (no spaces around
 | `infiles` | — | yes | Comma-separated list of 1–50 input FITS cube paths. |
 | `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/resample/write block of planes (see [Shared Parameters](#shared-parameters) above). Threads parallelize only *within* one block, never across blocks — too small a value both increases CFITSIO call count and discards most of the OpenMP speedup (a WARNING is printed if this looks likely). |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+resample. Only one background write is ever in flight. |
-| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
+| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
 | `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `block_convolve`/`reproject_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/process/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
 | `timing_enabled` | `n` | no | Print a whole-run (all files combined) stage timing summary at exit, in addition to the always-on per-file summary described under `log_level` above. |
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
@@ -281,9 +293,7 @@ resolution — needed whenever channels don't already share one
 resolution, whether that's because of combining bands observed at
 different resolutions, or because a single band's own native beam
 varies channel-to-channel with frequency (the normal case for any cube
-with a real per-channel beam). `rm_synthesis` needs a spectrally
-consistent PSF across all channels for a well-defined RMSF, so this
-applies with one `infiles=` entry just as much as with several. Reads
+with channel-wise varying beams). Reads
 per-channel beams from a CASA-style `BEAMS` binary table
 (`beamfiles=auto`) or a portable ASCII/CSV beam log (see
 `cfg/example_beamLog.txt`/`.csv`). A channel missing
@@ -315,14 +325,14 @@ Same `key=value`-only, no-positional-args convention as `reproject_cubes`.
 | `infiles` | — | yes | 1–50 comma-separated FITS cube paths. |
 | `outsuffix` | `_CONV.FITS` | no | Appended to each infile's own path (trailing `.fits`/`.FITS` stripped first). |
 | `beamfiles` | `auto` for every input | no | Comma list, one entry per infile, in order. Each entry is either the literal word `auto` (read that infile's own CASA BEAMS table) or a path to an ASCII/CSV beam-log file (`channel bmaj_arcsec bmin_arcsec bpa_deg`, 1-indexed, `#`-comments allowed). If given, must list exactly as many entries as `infiles`. |
-| `badchan_file` | none | no | Comma list, one entry per infile, in order — genuinely per-band (each infile's own list is independent; leave an entry blank, e.g. `,file2.txt`, for an infile with none of its own). If given, must list exactly as many entries as `infiles`. Each file is one channel index per line, 1-indexed — same convention as `rm_synthesis`'s `global_badchan_file`. Independent of, and in addition to, the automatic per-file bad-channel detection already done from each infile's own CASA BEAMS table (a degenerate near-zero beam entry); use this for channels known bad for reasons a beam table alone wouldn't capture (e.g. RFI). |
+| `badchan_file` | none | no | One entry per `infiles` entry, same order, comma-separated — the list must have exactly as many entries as `infiles`, including a position for every file with nothing to list: leave that position empty, or give it the literal value `none`, rather than leaving it out. E.g. with `infiles=a.fits,b.fits`, `badchan_file=,file2.txt` and `badchan_file=none,file2.txt` are equivalent — both give `a.fits` no manual list and `b.fits` the second position (`file2.txt`). Each file is one channel index per line, 1-indexed — same convention as `rm_synthesis`'s `global_badchan_file`. Independent of, and in addition to, automatic bad-channel detection from each infile's own CASA BEAMS table (a degenerate near-zero beam entry) — use this for channels known bad for reasons a beam table alone wouldn't capture (e.g. RFI). Either way, a bad channel is written as an all-NaN plane, not convolved. |
 | `target_bmaj` / `target_bmin` / `target_bpa` | none (auto-derive) | no | Explicit target beam (arcsec/arcsec/deg) — give all three together to skip automatic common-beam derivation entirely. |
 | `max_common_bmaj` | none | no | If the AUTO-derived common beam's BMAJ exceeds this (arcsec), refuse to proceed. Ignored when an explicit target is given. |
 | `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/convolve/write block of planes (see [Shared Parameters](#shared-parameters) above). |
 | `npts` | `2000` | no | Boundary points sampled per beam (≥12), passed to `commonbeam_mod`'s `find_common_beam`. |
 | `khachiyan_tol` | `1.0e-5` | no | Khachiyan-algorithm convergence tolerance for the common-beam fit. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+convolve. |
-| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
+| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
 | `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `convolve_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/convolve/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
 | `timing_enabled` | `n` | no | Print a whole-run (all files combined) stage timing summary at exit, in addition to the always-on per-file summary described under `log_level` above. |
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
@@ -393,7 +403,7 @@ Same `key=value`-only convention as the other two.
 | `khachiyan_tol` | `1.0e-5` | no | Used when `stages` includes `convolve` — same as `convolve_cubes`. |
 | `manifest` | none | no | Path to write a tab-separated `<infile> SKIPPED\|PROCESSED <effective_path>` record, one line per input. Aborts if the manifest path already exists. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+process. |
-| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that genuinely benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
+| `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
 | `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `convolve_compute`, `reproject_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/process/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
 | `timing_enabled` | `n` | no | Print a whole-run (all files combined) stage timing summary at exit, in addition to the always-on per-file summary described under `log_level` above. |
 | `log_output_file` | empty (stdout) | no | Non-empty: append log/timing output to this file instead. |
@@ -406,7 +416,7 @@ distinct sky pointing/pixel scale, `match_cubes` checks whether
 `reffile=` was chosen from the group of inputs with the most total
 channels, and prints an `ADVISORY:` message if not. Matching a file
 onto its own kind of pointing (the reference's own group) is fast;
-matching it onto a genuinely different one is much slower — so the
+matching it onto a different one is much slower — so the
 group with the most channels should generally be the one that defines
 the output grid, since that's the group that gets the cheap treatment.
 This is advice only: `reffile=` is never changed automatically, since
@@ -538,16 +548,16 @@ day-to-day use.
 
 **Mask-pattern cache:**
 
-> Confirmed in code: the RMSF table (`table_oversample` above) is a
-> single, fixed, unit-strength curve — the RMSF's own value at each of
-> many finely-spaced offsets — built once per distinct valid-channel
-> pattern and never shifted, rescaled, or otherwise modified for the
-> rest of the run. Peak location and amplitude are always found
-> *exactly* beforehand (see *RM-resolution / peak-refinement tuning*
-> above) and never come from this table. Each CLEAN iteration, for
-> each of the `nrm` native output points independently, what moves is
-> the *query* — that point's own exact distance to the found peak —
-> not the table: the two table entries bracketing that distance are
+> The RMSF table (`table_oversample` above) is a single, fixed,
+> unit-strength curve — the RMSF's own value at each of many
+> finely-spaced offsets — built once per distinct valid-channel pattern
+> and never shifted, rescaled, or otherwise modified for the rest of
+> the run. Peak location and amplitude are always found beforehand (see
+> *RM-resolution / peak-refinement tuning* above) and never come from
+> this table. Each CLEAN iteration, for each of the `nrm` native output
+> points independently, what moves is the *query* — that point's own
+> distance to the found peak — not the table: the two table entries
+> bracketing that distance are
 > blended, rotated by the peak's own phase, scaled by its own measured
 > flux, and subtracted, one output point at a time. Building the whole
 > per-point beam this way, `nrm` separate small lookups against one

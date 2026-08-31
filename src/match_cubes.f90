@@ -378,7 +378,7 @@ program match_cubes
          endif
 
          n_badchan = 0
-         if (len_trim(badchan_file(i)).gt.0) then
+         if (len_trim(badchan_file(i)).gt.0 .and. trim(badchan_file(i)).ne.'none') then
             call read_badchan_file(badchan_file(i), badchan_list, n_badchan, status)
             if (status.ne.0) stop 1
          endif

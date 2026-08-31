@@ -15,7 +15,7 @@ present. Current packages are unable to handle this data, either
 because of the narrow scope they were designed for (i.e. aimed at
 small-to-moderate sized data cubes), or because of limited HPC
 strategies built into these algorithms. This package addresses both —
-every application in it can process really big data cubes optimally on
+every application in it can process large data cubes optimally on
 both PCs with small core counts and RAM, as well as HPC-grade nodes
 with hundreds of cores and TBs worth of shared memory.
 

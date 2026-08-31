@@ -290,7 +290,7 @@ program convolve_cubes
       endif
 
       n_badchan = 0
-      if (len_trim(badchan_file(i)).gt.0) then
+      if (len_trim(badchan_file(i)).gt.0 .and. trim(badchan_file(i)).ne.'none') then
          call read_badchan_file(badchan_file(i), badchan_list, n_badchan, status)
          if (status.ne.0) stop 1
       endif
@@ -814,9 +814,10 @@ contains
       &' cfg/example_beamLog.txt and cfg/example_beamLog.csv for ready examples.'
       write(*,'(A)') ''
       write(*,'(A)') 'badchan_file: per-infile bad-channel list, in the same order as'//&
-      &' infiles (comma-separated, one entry per infile -- leave an entry empty,'
-      write(*,'(A)') '  e.g. ",file2.txt", for an infile with no manual list of its own).'//&
-      &' Each file is the same one-integer-per-line, 1-indexed convention as'
+      &' infiles (comma-separated, one entry per infile -- leave an entry empty'
+      write(*,'(A)') '  or give it the literal value ''none'', e.g. ",file2.txt", for'//&
+      &' an infile with no manual list of its own). Each file is the same'
+      write(*,'(A)') '  one-integer-per-line, 1-indexed convention as'
       write(*,'(A)') '  rm_synthesis''s own global_badchan_file. Independent of, and in'//&
       &' addition to, automatic bad-channel detection from each infile''s own'
       write(*,'(A)') '  BEAMS table (a degenerate near-zero beam entry) -- use this for'//&

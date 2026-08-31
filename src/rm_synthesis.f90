@@ -1242,33 +1242,47 @@ allocate(bad_chan(nz_totpix))
 
  ! Read the bad channel list now that nz_totpix is known
 if(cfg%remove_badchan)then
-   open(71,file=cfg%badchan_file(&
-   &1:nchar(cfg%badchan_file)),&
-   &status='old',iostat=ios_mem)
-   if(ios_mem .ne. 0)then
-      write(*,*)"Error opening bad channel file:"
-      write(*,*)cfg%badchan_file(&
-      &1:nchar(cfg%badchan_file))
-      write(*,*)"Skipping bad channel flagging."
-      cfg%remove_badchan = .false.
-   else
+   ! T31 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): 'none' means this
+   ! band genuinely has nothing to list -- skip the open entirely
+   ! rather than requiring a throwaway empty file to satisfy
+   ! status='old' below. Deliberately NOT routed through the ios_mem
+   ! error path: that path disables cfg%remove_badchan GLOBALLY (every
+   ! band, via the per-band loop's own `if (cfg%remove_badchan)` guard
+   ! further down), which is correct for a genuine open failure but
+   ! would be wrong here -- 'none' for THIS band must never suppress a
+   ! different band's own real bad-channel file.
+   if(trim(cfg%badchan_file).eq.'none')then
       nbad_chan = 0
-      do while(.true.)
-         nbad_chan = nbad_chan + 1
-         if(nbad_chan .gt. nz_totpix)then
-            write(*,*)"Too many bad channels"
-            write(*,*)"Max by cube:"
-            write(*,*)nz_totpix
-            close(71)
-            stop
-         endif
-         read(71,*,end=711)bad_chan(nbad_chan)
-         write(*,*)"bad-chan: ",bad_chan(nbad_chan)
-      enddo
-711   continue
-      nbad_chan = nbad_chan - 1
-      write(*,*)"Number of Bad Channels: ",nbad_chan
-      close(71)
+      write(*,*)"Number of Bad Channels: 0 (none)"
+   else
+      open(71,file=cfg%badchan_file(&
+      &1:nchar(cfg%badchan_file)),&
+      &status='old',iostat=ios_mem)
+      if(ios_mem .ne. 0)then
+         write(*,*)"Error opening bad channel file:"
+         write(*,*)cfg%badchan_file(&
+         &1:nchar(cfg%badchan_file))
+         write(*,*)"Skipping bad channel flagging."
+         cfg%remove_badchan = .false.
+      else
+         nbad_chan = 0
+         do while(.true.)
+            nbad_chan = nbad_chan + 1
+            if(nbad_chan .gt. nz_totpix)then
+               write(*,*)"Too many bad channels"
+               write(*,*)"Max by cube:"
+               write(*,*)nz_totpix
+               close(71)
+               stop
+            endif
+            read(71,*,end=711)bad_chan(nbad_chan)
+            write(*,*)"bad-chan: ",bad_chan(nbad_chan)
+         enddo
+711      continue
+         nbad_chan = nbad_chan - 1
+         write(*,*)"Number of Bad Channels: ",nbad_chan
+         close(71)
+      endif
    endif
 endif
 
@@ -2004,39 +2018,48 @@ if (n_bands_t2.gt.1) then
       flag_arr_band_t7 = 1
       nbad_chan_band_t7 = 0
       if (cfg%remove_badchan) then
-         allocate(bad_chan_band_t7(band_naxes(iband,freq_axis)))
-         open(71,file=cfg%band(iband)%badchan_file(&
-         &1:nchar(cfg%band(iband)%badchan_file)),&
-         &status='old',iostat=ios_band_t7)
-         if (ios_band_t7 .ne. 0)then
-            write(*,*)'ERROR: failed to open bad-channel file for band ',&
-            &iband
-            write(*,*)cfg%band(iband)%badchan_file(&
-            &1:nchar(cfg%band(iband)%badchan_file))
-            write(*,*)'Quitting now...'
-            stop
+         ! T31 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): 'none' means
+         ! this band has nothing to list -- skip open/allocate entirely
+         ! (nbad_chan_band_t7 stays at its already-initialized 0, flag_
+         ! arr_band_t7 stays all-1) rather than requiring a throwaway
+         ! empty file to satisfy status='old' below.
+         if (trim(cfg%band(iband)%badchan_file).eq.'none') then
+            write(*,*)'Number of Bad Channels (band ',iband,'): 0 (none)'
          else
-            do while(.true.)
-               nbad_chan_band_t7 = nbad_chan_band_t7 + 1
-               if (nbad_chan_band_t7 .gt. band_naxes(iband,freq_axis))then
-                  write(*,*)'Too many bad channels for band ',iband
-                  write(*,*)'Max by cube:'
-                  write(*,*)band_naxes(iband,freq_axis)
-                  close(71)
-                  stop
-               endif
-               read(71,*,end=712)bad_chan_band_t7(nbad_chan_band_t7)
-            enddo
-712         continue
-            nbad_chan_band_t7 = nbad_chan_band_t7 - 1
-            write(*,*)'Number of Bad Channels (band ',iband,'): ',&
-            &nbad_chan_band_t7
-            close(71)
-            do i7 = 1,nbad_chan_band_t7
-               flag_arr_band_t7(int(bad_chan_band_t7(i7))) = 0
-            enddo
+            allocate(bad_chan_band_t7(band_naxes(iband,freq_axis)))
+            open(71,file=cfg%band(iband)%badchan_file(&
+            &1:nchar(cfg%band(iband)%badchan_file)),&
+            &status='old',iostat=ios_band_t7)
+            if (ios_band_t7 .ne. 0)then
+               write(*,*)'ERROR: failed to open bad-channel file for band ',&
+               &iband
+               write(*,*)cfg%band(iband)%badchan_file(&
+               &1:nchar(cfg%band(iband)%badchan_file))
+               write(*,*)'Quitting now...'
+               stop
+            else
+               do while(.true.)
+                  nbad_chan_band_t7 = nbad_chan_band_t7 + 1
+                  if (nbad_chan_band_t7 .gt. band_naxes(iband,freq_axis))then
+                     write(*,*)'Too many bad channels for band ',iband
+                     write(*,*)'Max by cube:'
+                     write(*,*)band_naxes(iband,freq_axis)
+                     close(71)
+                     stop
+                  endif
+                  read(71,*,end=712)bad_chan_band_t7(nbad_chan_band_t7)
+               enddo
+712            continue
+               nbad_chan_band_t7 = nbad_chan_band_t7 - 1
+               write(*,*)'Number of Bad Channels (band ',iband,'): ',&
+               &nbad_chan_band_t7
+               close(71)
+               do i7 = 1,nbad_chan_band_t7
+                  flag_arr_band_t7(int(bad_chan_band_t7(i7))) = 0
+               enddo
+            endif
+            deallocate(bad_chan_band_t7)
          endif
-         deallocate(bad_chan_band_t7)
          nbad_chan_total_t7 = nbad_chan_total_t7 + nbad_chan_band_t7
       endif
       if (band_czval(iband).ge.30.and.band_czval(iband).le.1.0e4)then
