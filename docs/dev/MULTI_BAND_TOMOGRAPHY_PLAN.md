@@ -4002,3 +4002,64 @@ claim (see Motivation) -- verified the DFT-template-build code cited
 there directly rather than trusting the earlier draft's own citation.
 
 **Status: DONE.**
+
+### T33 -- Blank `badchan_file`/`global_badchan_file` Entry Is Now a Hard Parse-Time Error When `remove_badchan=y`
+
+**Motivation:** T31 gave `rm_synthesis` an explicit `none` sentinel for
+"this band has nothing to list," but left a blank comma-list entry
+unfixed as a documented sharp edge -- flagged as an open design
+question, not resolved. Called out directly as unacceptable to leave
+sitting once identified: with `remove_badchan=y`, a blank entry never
+gets caught by any existing validation and reaches
+`rm_synthesis.f90`'s own `open(...,status='old')` calls, producing two
+different outcomes depending on which band hit it, both bad. Reference
+band's own entry blank (`rm_synthesis.f90:1245`): the `open` fails,
+and the existing `ios_mem` error path sets `cfg%remove_badchan =
+.false.` -- a **silent, run-wide disable** of bad-channel removal for
+every band, with a normal exit code and no indication anything is
+wrong. Any other band's entry blank (`rm_synthesis.f90:2016`): the
+`open` fails and the run `stop`s with a generic "failed to open"
+message that doesn't mention the entry was simply left empty. Checked
+directly (`src/rm_synthesis_mod.f90:3546-3554`,
+`split_key_value`): a single-band `badchan_file=` with truly nothing
+after the `=` is a different, already-safe case -- the generic
+key=value line parser itself skips a line whose value is blank after
+trimming, so the key is never marked "seen" and the existing "Missing
+required cfg key" check already catches it unambiguously. The danger
+is specific to a blank *position inside an otherwise non-blank
+multi-band comma list* (e.g. `global_badchan_file = ,file2.txt`),
+where the overall value is non-blank so parsing succeeds, but one
+extracted per-band item is empty.
+
+**Design:** reject a blank per-band entry outright, at config-parse
+time, whenever `remove_badchan=y` -- before any `open` is attempted for
+any band. `n_bands_local==1` (plain single-band configs) goes through
+the exact same per-band array (`cfg%band(1)%badchan_file`) as
+multi-band, so one loop covers both; single-band configs can't
+actually hit this in practice per the `split_key_value` finding above,
+but the check costs nothing extra to also cover them. The existing
+`open(...)` failure handling at both `rm_synthesis.f90` call sites is
+untouched -- it still correctly reports a genuine open failure on a
+non-blank path (bad permissions, typo'd filename, etc.), which is a
+different problem this ticket does not change.
+
+**Files touched:** `src/rm_synthesis_mod.f90` (new validation block,
+`read_cfg_keyval`, right after the per-band parse loop and before the
+legacy-scalar-copy block).
+
+**Verification:** rebuilt both CPU variants via this project's own
+documented convention (`make GPU=0 OMP=0`, `make OMP=1 GPU=0` --
+BUILD.md's own table), not a bare `make`. Manually reproduced both
+pre-fix dangerous outcomes on the real 2-band fixture
+(`TEST.Q/U.FITSCUBE` + `TEST_BAND2.Q/U.FITSCUBE`) before trusting the
+suite: blank reference-band entry and blank non-reference-band entry
+each now produce the same clear, band-numbered error
+(`badchan_file/global_badchan_file is blank for band N`) instead of a
+silent disable or a generic crash, confirmed identical on both the
+serial and OMP binaries. `remove_badchan=n` with blank entries on both
+bands confirmed still runs to completion unaffected. New permanent
+`tests/run_tests.sh` section 59 (3 cases: blank reference band, blank
+non-reference band, `remove_badchan=n` unaffected). Full suite:
+180/180 (177 prior + 3).
+
+**Status: DONE.**

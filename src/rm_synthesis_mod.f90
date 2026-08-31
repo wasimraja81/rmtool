@@ -3077,6 +3077,32 @@ contains
       end do
     end if
 
+    ! T33 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): reject a blank
+    ! badchan_file/global_badchan_file entry outright when remove_badchan=y,
+    ! for every band (n_bands_local==1 covers plain single-band runs too,
+    ! since this loop is the only badchan_file parse path there is). Blank
+    ! only ever reaches rm_synthesis.f90's own open() calls when
+    ! remove_badchan=y, where it previously produced two different, both
+    ! dangerous-or-confusing outcomes depending on which band hit it: a
+    ! silent, run-wide disable of bad-channel removal if it was the
+    ! reference band's entry (rm_synthesis.f90's own ios_mem error path
+    ! sets cfg%remove_badchan=.false. globally), or a hard crash with a
+    ! generic "failed to open" message for any other band. Rejecting it
+    ! here, before any file is opened, replaces both with one clear error
+    ! naming the exact band and the fix (use 'none' explicitly).
+    if (status == 0 .and. cfg%remove_badchan) then
+      do ib = 1, n_bands_local
+        if (len_trim(cfg%band(ib)%badchan_file) == 0) then
+          write(*,*) 'Error: badchan_file/global_badchan_file is blank for band ', ib
+          write(*,*) '  remove_badchan=y requires either a real file path or the'
+          write(*,*) '  literal value ''none'' for every band -- blank is not'
+          write(*,*) '  accepted.'
+          status = -238
+          exit
+        end if
+      end do
+    end if
+
     ! Populate the legacy scalar fields from the reference band, so every
     ! existing single-band code path in rm_synthesis.f90 (which reads
     ! cfg%infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I

@@ -4253,6 +4253,97 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 59. rm_synthesis: a blank badchan_file/global_badchan_file entry is a hard
+#     parse-time error when remove_badchan=y (T33, docs/dev/
+#     MULTI_BAND_TOMOGRAPHY_PLAN.md) -- before this ticket, a blank entry
+#     reached rm_synthesis.f90's own open() calls: silently disabling
+#     bad-channel removal for EVERY band if it was the reference band's
+#     entry, or crashing with a generic message if it was any other band's.
+#     Both are now replaced by one clear error naming the exact band,
+#     raised before any file is opened. Checks both band positions, and
+#     confirms remove_badchan=n with blank entries is still completely
+#     unaffected (badchan_file's content only matters when
+#     remove_badchan=y).
+# ---------------------------------------------------------------------------
+section "59. rm_synthesis: blank badchan_file is a hard error when remove_badchan=y (T33)"
+
+if [[ -x "$BIN_SERIAL" ]]; then
+    t33_run() {
+        # $1=label $2=remove_badchan $3=global_badchan_file value $4=outfile
+        local t33_cfg="$OUT_DIR/t33_$1.cfg"
+        local t33_log="$OUT_DIR/t33_$1.log"
+        rm -f "${4}".*.FITS
+        cat > "$t33_cfg" <<CFGEOF
+path                = $DATA_DIR/
+infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
+outfile             = $4
+
+remove_badchan      = $2
+global_badchan_file = $3
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0,0.0
+slopeQ              = 0.0,0.0
+resiU               = 0.0,0.0
+slopeU              = 0.0,0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 101
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+        "$BIN_SERIAL" "$t33_cfg" > "$t33_log" 2>&1
+    }
+
+    # Case A: reference band (1) blank, band 2 'none'. Pre-T33 this
+    # silently disabled bad-channel removal for BOTH bands (exit 0, no
+    # error at all) -- must now be a clear, named error instead.
+    t33_out_a="$OUT_DIR/t33_case_a_out"
+    t33_run "case_a" "y" ",none" "$t33_out_a"
+    t33_log_a="$OUT_DIR/t33_case_a.log"
+    if grep -qE "badchan_file/global_badchan_file is blank for band[[:space:]]+1" "$t33_log_a" \
+            && [[ ! -f "${t33_out_a}.MASK.CUBE.FITS" ]]; then
+        pass "rm_synthesis: blank badchan_file for the reference band is a clear named error (band 1), no output written (T33 case A)"
+    else
+        fail "rm_synthesis: T33 case A did not error as expected (see $t33_log_a)"
+    fi
+
+    # Case B: reference band (1) 'none', band 2 blank. Pre-T33 this
+    # crashed with a generic 'failed to open' message.
+    t33_out_b="$OUT_DIR/t33_case_b_out"
+    t33_run "case_b" "y" "none," "$t33_out_b"
+    t33_log_b="$OUT_DIR/t33_case_b.log"
+    if grep -qE "badchan_file/global_badchan_file is blank for band[[:space:]]+2" "$t33_log_b" \
+            && [[ ! -f "${t33_out_b}.MASK.CUBE.FITS" ]]; then
+        pass "rm_synthesis: blank badchan_file for a non-reference band is a clear named error (band 2), no output written (T33 case B)"
+    else
+        fail "rm_synthesis: T33 case B did not error as expected (see $t33_log_b)"
+    fi
+
+    # Case C: remove_badchan=n with BOTH bands blank -- must still run to
+    # completion exactly as before (badchan_file's content is irrelevant
+    # when remove_badchan=n).
+    t33_out_c="$OUT_DIR/t33_case_c_out"
+    t33_run "case_c" "n" "," "$t33_out_c"
+    t33_log_c="$OUT_DIR/t33_case_c.log"
+    if [[ -f "${t33_out_c}.MASK.CUBE.FITS" ]]; then
+        pass "rm_synthesis: remove_badchan=n with blank badchan_file entries is unaffected (T33 case C)"
+    else
+        fail "rm_synthesis: T33 case C (remove_badchan=n, blank entries) unexpectedly failed to produce output (see $t33_log_c)"
+    fi
+else
+    skip "bin/rm_synthesis_release_cpu_serial not built; skipping blank badchan_file hard-error test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"
