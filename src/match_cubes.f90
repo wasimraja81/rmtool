@@ -794,13 +794,30 @@ contains
       if (len_trim(raw_badchan_file).gt.0) then
          if (cfg_csv_count(raw_badchan_file).ne.n_inputs) then
             write(*,*) 'ERROR: badchan_file must list exactly ', n_inputs,&
-            &' entries (one per infile; leave an entry empty -- e.g.',&
-            &' ",file2.txt" -- for a file with no manual bad-channel list)'
+            &' entries (one per infile; give an entry the literal value',&
+            &' ''none'' -- e.g. ''none,file2.txt'' -- for a file with no',&
+            &' manual bad-channel list)'
             status = -1
             return
          endif
          do i = 1, n_inputs
             call cfg_csv_get_item(raw_badchan_file, i, badchan_file(i))
+         enddo
+         ! T34 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): once badchan_file=
+         ! is given at all, every position must be explicit -- a real path
+         ! or the literal value 'none' -- matching rm_synthesis's own T33
+         ! convention. Omitting badchan_file= entirely is untouched (this
+         ! whole block is skipped, raw_badchan_file stays blank); this only
+         ! rejects a blank POSITION inside an otherwise-given list, which
+         ! was previously silently accepted as "nothing to list."
+         do i = 1, n_inputs
+            if (len_trim(badchan_file(i)).eq.0) then
+               write(*,*) 'ERROR: badchan_file entry ', i, ' is blank --',&
+               &' use the literal value ''none'' for a file with nothing',&
+               &' to list'
+               status = -1
+               return
+            endif
          enddo
       endif
 

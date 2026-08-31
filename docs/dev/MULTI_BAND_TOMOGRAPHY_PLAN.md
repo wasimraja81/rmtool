@@ -4063,3 +4063,60 @@ non-reference band, `remove_badchan=n` unaffected). Full suite:
 180/180 (177 prior + 3).
 
 **Status: DONE.**
+
+### T34 -- Blank `badchan_file` Position in `convolve_cubes`/`match_cubes` Now a Hard Error Too, Matching `rm_synthesis`'s T33 Convention
+
+**Motivation:** raised directly after T33: T33 made a blank per-band
+`badchan_file` entry a hard error in `rm_synthesis` when
+`remove_badchan=y`, but `convolve_cubes`/`match_cubes` still silently
+accepted a blank position (T16's original design) even after T32 added
+`none` as an equally-valid alternative spelling. T32 deliberately left
+blank alone there because it isn't *dangerous* the way rm_synthesis's
+blank was (no asymmetric global side-effect -- confirmed in T32's own
+motivation: convolve_cubes/match_cubes have no `remove_badchan`-style
+flag at all, so blank there was always self-contained and safe). But
+"not dangerous" and "the right design" are different bars: a blank
+position is still an unmarked, silent way to fail to notice a missing
+entry, and now that `none` is an established, uniform way to say
+"nothing to list" everywhere in this project, keeping blank silently
+valid in two of three tools while rejecting it in the third is
+inconsistency for no remaining reason. Fixed for genuine consistency,
+not because of a newly-found danger.
+
+**Design:** `src/convolve_cubes.f90` and `src/match_cubes.f90`, inside
+the existing `if (len_trim(raw_badchan_file).gt.0) then ... endif`
+block (i.e. only once `badchan_file=` is given at all -- omitting the
+key entirely remains fully valid and untouched, same as always): after
+the existing per-position `cfg_csv_get_item` loop, a new loop rejects
+any position that comes back blank, naming the exact entry number and
+telling the user to use `none`. The pre-existing count-mismatch error
+message (fires when the comma list has the wrong number of entries)
+also had its own "leave an entry empty" guidance corrected to say
+`none` instead, since that's no longer valid advice. Each tool's own
+`--help` text updated the same way.
+
+**Files touched:** `src/convolve_cubes.f90` (new validation loop after
+line ~637; count-mismatch error wording; `--help` text),
+`src/match_cubes.f90` (identical new validation loop, own duplicated
+code path; count-mismatch error wording), `docs/user/APP_REFERENCE.md`
+(`convolve_cubes` `badchan_file` row rewritten -- blank is now a hard
+error, not "equivalent" to `none`; `rm_synthesis`'s own `badchan_file`
+row also tightened while here, since T33 itself never updated it: it
+now states blank is a hard parse-time error when `remove_badchan=y`,
+closing a gap T33 left open by relying on the row's older, softer
+"can use `none`" phrasing to implicitly cover it -- it didn't).
+`match_cubes`'s own `badchan_file` row needed no change (still an
+accurate "same semantics as convolve_cubes" pointer, verified true
+again by fixing the code first).
+
+**Verification:** rebuilt both tools (`make convolve_cubes
+match_cubes`). Manually confirmed before trusting the suite: a blank
+first position with a real second position now exits 1 with `ERROR:
+badchan_file entry 1 is blank -- use the literal value 'none' ...`,
+for both tools; omitting `badchan_file=` entirely still runs to
+completion unaffected; `none` (T32) still works as before. New
+`tests/run_tests.sh` section 60 (3 cases: convolve_cubes blank-position
+error + no output, convolve_cubes omitted-key unaffected, match_cubes
+blank-position error + no output). Full suite: 183/183 (180 prior + 3).
+
+**Status: DONE.**

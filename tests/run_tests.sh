@@ -4344,6 +4344,88 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 60. convolve_cubes/match_cubes: a blank badchan_file position is now a hard
+#     error once badchan_file= is given at all (T34, docs/dev/
+#     MULTI_BAND_TOMOGRAPHY_PLAN.md) -- matches rm_synthesis's own T33
+#     convention: a real path or the literal value 'none' is required for
+#     every position, blank is rejected. Omitting badchan_file= entirely is
+#     unaffected (still valid, still means "no list for any infile").
+# ---------------------------------------------------------------------------
+section "60. convolve_cubes/match_cubes: blank badchan_file position is a hard error (T34)"
+
+if [[ -x bin/convolve_cubes ]]; then
+    t34_band1="$OUT_DIR/t34_band1.Q.FITSCUBE"
+    t34_band2="$OUT_DIR/t34_band2.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$t34_band1"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$t34_band2"
+    t34_band2_badchan="$OUT_DIR/t34_band2_badchan.txt"
+    printf '77\n' > "$t34_band2_badchan"
+    t34_band1_conv="${t34_band1%.FITSCUBE}_CONV.FITS"
+    t34_band2_conv="${t34_band2%.FITSCUBE}_CONV.FITS"
+    rm -f "$t34_band1_conv" "$t34_band2_conv"
+
+    t34_log="$OUT_DIR/t34_convolve_blank.log"
+    if bin/convolve_cubes infiles="$t34_band1,$t34_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            badchan_file=",$t34_band2_badchan" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$t34_log" 2>&1; then
+        fail "convolve_cubes: blank badchan_file entry unexpectedly succeeded (see $t34_log)"
+    else
+        if grep -qE "badchan_file entry[[:space:]]+1[[:space:]]+is blank" "$t34_log" \
+                && [[ ! -f "$t34_band1_conv" ]] && [[ ! -f "$t34_band2_conv" ]]; then
+            pass "convolve_cubes: blank badchan_file entry is a clear named error, no output written (T34)"
+        else
+            fail "convolve_cubes: blank badchan_file entry error message/output check failed (see $t34_log)"
+        fi
+    fi
+
+    # badchan_file= omitted entirely must still work fine (unaffected).
+    t34_log_omit="$OUT_DIR/t34_convolve_omit.log"
+    rm -f "$t34_band1_conv" "$t34_band2_conv"
+    if bin/convolve_cubes infiles="$t34_band1,$t34_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$t34_log_omit" 2>&1; then
+        pass "convolve_cubes: omitting badchan_file= entirely is still unaffected (T34)"
+    else
+        fail "convolve_cubes: omitting badchan_file= entirely unexpectedly failed (see $t34_log_omit)"
+    fi
+else
+    skip "bin/convolve_cubes not built; skipping blank badchan_file position hard-error test"
+fi
+
+if [[ -x bin/match_cubes ]]; then
+    t34m_band1="$OUT_DIR/t34m_band1.Q.FITSCUBE"
+    t34m_band2="$OUT_DIR/t34m_band2.Q.FITSCUBE"
+    cp "$DATA_DIR/TEST.Q.FITSCUBE" "$t34m_band1"
+    cp "$DATA_DIR/TEST_BAND2.Q.FITSCUBE" "$t34m_band2"
+    t34m_band2_badchan="$OUT_DIR/t34m_band2_badchan.txt"
+    printf '77\n' > "$t34m_band2_badchan"
+    t34m_band1_conv="${t34m_band1%.FITSCUBE}_CONV.FITS"
+    t34m_band2_conv="${t34m_band2%.FITSCUBE}_CONV.FITS"
+    rm -f "$t34m_band1_conv" "$t34m_band2_conv"
+
+    t34m_log="$OUT_DIR/t34_match_blank.log"
+    if bin/match_cubes stages=convolve infiles="$t34m_band1,$t34m_band2" \
+            beamfiles="$DATA_DIR/band1_beamlog.txt,$DATA_DIR/band2_beamlog.txt" \
+            badchan_file=",$t34m_band2_badchan" \
+            target_bmaj=30.0 target_bmin=30.0 target_bpa=0.0 \
+            > "$t34m_log" 2>&1; then
+        fail "match_cubes: blank badchan_file entry unexpectedly succeeded (see $t34m_log)"
+    else
+        if grep -qE "badchan_file entry[[:space:]]+1[[:space:]]+is blank" "$t34m_log" \
+                && [[ ! -f "$t34m_band1_conv" ]] && [[ ! -f "$t34m_band2_conv" ]]; then
+            pass "match_cubes: blank badchan_file entry is a clear named error, no output written (T34)"
+        else
+            fail "match_cubes: blank badchan_file entry error message/output check failed (see $t34m_log)"
+        fi
+    fi
+else
+    skip "bin/match_cubes not built; skipping blank badchan_file position hard-error test"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 section "Test Summary"
