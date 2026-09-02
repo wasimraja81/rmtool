@@ -64,6 +64,7 @@ program match_cubes
    &c_null_ptr, c_funloc, c_loc, c_f_pointer
    use logging_mod
    use fitsio_unit_mod
+   use wcs_match_mod
    implicit none
 
    ! --- Logging & timing (planning-doc ticket) -- see convolve_cubes.f90
@@ -2124,150 +2125,10 @@ contains
       endif
    end subroutine copy_one_matrix_entry
 
-   logical function sky_wcs_matches_target(cand_unit, cand_axis1, cand_axis2,&
-   &nx_cand, ny_cand, ref_unit, ref_axis1, ref_axis2, crpix_shift1,&
-   &crpix_shift2, nx_out, ny_out) result(matches)
-      !! Verbatim duplicate of reproject_cubes.f90's own
-      !! sky_wcs_matches_target (this file's own established convention:
-      !! adapt/duplicate small shared logic rather than factor out a
-      !! module -- see this file's own top-of-file comment). Tight,
-      !! "already-processed-identically" comparison of a candidate
-      !! file's own sky-axis WCS against what THIS run's own output grid
-      !! will actually be: the reference's own CTYPE/CRVAL/CDELT/rotation
-      !! UNCHANGED, CRPIX shifted by crpix_shift1/2 -- the exact values
-      !! copy_axis_keywords/copy_sky_rotation_matrix above would
-      !! themselves write.
-      integer, intent(in) :: cand_unit, cand_axis1, cand_axis2, nx_cand, ny_cand
-      integer, intent(in) :: ref_unit, ref_axis1, ref_axis2
-      double precision, intent(in) :: crpix_shift1, crpix_shift2
-      integer, intent(in) :: nx_out, ny_out
-
-      double precision, parameter :: tol_val = 1.0d-9
-      double precision, parameter :: tol_rot = 1.0d-9
-      character(len=68) :: ctype_c1, ctype_c2, ctype_r1, ctype_r2
-      double precision :: crval_c1, crval_c2, crval_r1, crval_r2
-      double precision :: crpix_c1, crpix_c2, crpix_r1, crpix_r2
-      double precision :: cdelt_c1, cdelt_c2, cdelt_r1, cdelt_r2
-      double precision :: pc_c(2,2), pc_r(2,2), crota_c1, crota_c2, crota_r1, crota_r2
-      logical :: have_pc_c, have_pc_r
-
-      matches = .false.
-
-      if (nx_cand.ne.nx_out .or. ny_cand.ne.ny_out) return
-
-      call get_axis_sval_match(cand_unit, 'CTYPE', cand_axis1, ctype_c1)
-      call get_axis_sval_match(cand_unit, 'CTYPE', cand_axis2, ctype_c2)
-      call get_axis_sval_match(ref_unit, 'CTYPE', ref_axis1, ctype_r1)
-      call get_axis_sval_match(ref_unit, 'CTYPE', ref_axis2, ctype_r2)
-      if (trim(ctype_c1).ne.trim(ctype_r1) .or. trim(ctype_c2).ne.trim(ctype_r2)) return
-
-      call get_axis_dval_match(cand_unit, 'CRVAL', cand_axis1, 0.0d0, crval_c1)
-      call get_axis_dval_match(cand_unit, 'CRVAL', cand_axis2, 0.0d0, crval_c2)
-      call get_axis_dval_match(ref_unit, 'CRVAL', ref_axis1, 0.0d0, crval_r1)
-      call get_axis_dval_match(ref_unit, 'CRVAL', ref_axis2, 0.0d0, crval_r2)
-      if (abs(crval_c1-crval_r1).gt.tol_val .or. abs(crval_c2-crval_r2).gt.tol_val) return
-
-      call get_axis_dval_match(cand_unit, 'CDELT', cand_axis1, 1.0d0, cdelt_c1)
-      call get_axis_dval_match(cand_unit, 'CDELT', cand_axis2, 1.0d0, cdelt_c2)
-      call get_axis_dval_match(ref_unit, 'CDELT', ref_axis1, 1.0d0, cdelt_r1)
-      call get_axis_dval_match(ref_unit, 'CDELT', ref_axis2, 1.0d0, cdelt_r2)
-      if (abs(cdelt_c1-cdelt_r1).gt.tol_val .or. abs(cdelt_c2-cdelt_r2).gt.tol_val) return
-
-      call get_axis_dval_match(cand_unit, 'CRPIX', cand_axis1, 1.0d0, crpix_c1)
-      call get_axis_dval_match(cand_unit, 'CRPIX', cand_axis2, 1.0d0, crpix_c2)
-      call get_axis_dval_match(ref_unit, 'CRPIX', ref_axis1, 1.0d0, crpix_r1)
-      call get_axis_dval_match(ref_unit, 'CRPIX', ref_axis2, 1.0d0, crpix_r2)
-      if (abs(crpix_c1-(crpix_r1-crpix_shift1)).gt.tol_val) return
-      if (abs(crpix_c2-(crpix_r2-crpix_shift2)).gt.tol_val) return
-
-      call get_matrix_2x2_match(cand_unit, cand_axis1, cand_axis2, pc_c, have_pc_c)
-      call get_matrix_2x2_match(ref_unit, ref_axis1, ref_axis2, pc_r, have_pc_r)
-      if (have_pc_c .or. have_pc_r) then
-         if (any(abs(pc_c-pc_r).gt.tol_rot)) return
-      else
-         call get_axis_dval_match(cand_unit, 'CROTA', cand_axis1, 0.0d0, crota_c1)
-         call get_axis_dval_match(cand_unit, 'CROTA', cand_axis2, 0.0d0, crota_c2)
-         call get_axis_dval_match(ref_unit, 'CROTA', ref_axis1, 0.0d0, crota_r1)
-         call get_axis_dval_match(ref_unit, 'CROTA', ref_axis2, 0.0d0, crota_r2)
-         if (abs(crota_c1-crota_r1).gt.tol_rot .or. abs(crota_c2-crota_r2).gt.tol_rot) return
-      endif
-
-      matches = .true.
-   end function sky_wcs_matches_target
-
-   subroutine get_axis_sval_match(unit, prefix, axis, val)
-      integer, intent(in) :: unit, axis
-      character(len=*), intent(in) :: prefix
-      character(len=*), intent(out) :: val
-      character(len=8) :: axstr
-      character(len=68) :: comment
-      integer :: fitsstat
-      val = ' '
-      write(axstr,'(I0)') axis
-      fitsstat = 0
-      call FTGKYS(unit, trim(prefix)//trim(axstr), val, comment, fitsstat)
-      if (fitsstat.ne.0) val = ' '
-   end subroutine get_axis_sval_match
-
-   subroutine get_axis_dval_match(unit, prefix, axis, default_val, val)
-      integer, intent(in) :: unit, axis
-      character(len=*), intent(in) :: prefix
-      double precision, intent(in) :: default_val
-      double precision, intent(out) :: val
-      character(len=8) :: axstr
-      character(len=68) :: comment
-      integer :: fitsstat
-      write(axstr,'(I0)') axis
-      fitsstat = 0
-      call FTGKYD(unit, trim(prefix)//trim(axstr), val, comment, fitsstat)
-      if (fitsstat.ne.0) val = default_val
-   end subroutine get_axis_dval_match
-
-   subroutine get_matrix_2x2_match(unit, axis1, axis2, m, have_any)
-      integer, intent(in) :: unit, axis1, axis2
-      double precision, intent(out) :: m(2,2)
-      logical, intent(out) :: have_any
-      logical :: any_pc, any_cd
-      double precision :: mcd(2,2)
-
-      m = reshape((/1.0d0, 0.0d0, 0.0d0, 1.0d0/), (/2,2/))
-      any_pc = .false.
-      call get_matrix_entry_track_match(unit, 'PC', axis1, axis1, m(1,1), any_pc)
-      call get_matrix_entry_track_match(unit, 'PC', axis1, axis2, m(1,2), any_pc)
-      call get_matrix_entry_track_match(unit, 'PC', axis2, axis1, m(2,1), any_pc)
-      call get_matrix_entry_track_match(unit, 'PC', axis2, axis2, m(2,2), any_pc)
-
-      mcd = reshape((/1.0d0, 0.0d0, 0.0d0, 1.0d0/), (/2,2/))
-      any_cd = .false.
-      call get_matrix_entry_track_match(unit, 'CD', axis1, axis1, mcd(1,1), any_cd)
-      call get_matrix_entry_track_match(unit, 'CD', axis1, axis2, mcd(1,2), any_cd)
-      call get_matrix_entry_track_match(unit, 'CD', axis2, axis1, mcd(2,1), any_cd)
-      call get_matrix_entry_track_match(unit, 'CD', axis2, axis2, mcd(2,2), any_cd)
-      if (any_cd) m = mcd
-
-      have_any = any_pc .or. any_cd
-   end subroutine get_matrix_2x2_match
-
-   subroutine get_matrix_entry_track_match(unit, prefix, a, b, val, found_any)
-      integer, intent(in) :: unit, a, b
-      character(len=*), intent(in) :: prefix
-      double precision, intent(inout) :: val
-      logical, intent(inout) :: found_any
-      character(len=16) :: key
-      character(len=68) :: comment
-      character(len=4) :: sa, sb
-      integer :: fitsstat
-      double precision :: dval
-      write(sa,'(I0)') a
-      write(sb,'(I0)') b
-      key = trim(prefix)//trim(sa)//'_'//trim(sb)
-      fitsstat = 0
-      call FTGKYD(unit, trim(key), dval, comment, fitsstat)
-      if (fitsstat.eq.0) then
-         val = dval
-         found_any = .true.
-      endif
-   end subroutine get_matrix_entry_track_match
+   ! sky_wcs_matches_target: now shared (T36, docs/dev/
+   ! MULTI_BAND_TOMOGRAPHY_PLAN.md), see src/wcs_match_mod.f90. Formerly
+   ! this file's own verbatim duplicate of reproject_cubes.f90's own
+   ! copy of the same function.
 
    subroutine copy_wcs_system_keywords(src_unit, dst_unit, status)
       integer, intent(in) :: src_unit, dst_unit

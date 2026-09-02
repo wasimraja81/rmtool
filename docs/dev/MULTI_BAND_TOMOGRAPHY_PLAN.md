@@ -4187,3 +4187,104 @@ four `rm_synthesis` variants (serial/OMP/GPU/GPU+HostOMP) and the other
 four tools included, zero skips.
 
 **Status: DONE.**
+
+### T36 -- Shared WCS-Equivalence Check (`sky_wcs_matches_target`), Extended With RADESYS/EQUINOX/LONPOLE/LATPOLE, Wired Into `rm_synthesis`
+
+**Motivation:** `rm_synthesis`'s own multi-band validation
+(`NAXIS`/`CRVAL`/`CRPIX`/`CDELT`) does not check `CTYPE`, pixel-grid
+rotation (`PC`/`CD`/`CROTA`), or the celestial reference frame
+(`RADESYS`/`EQUINOX`/`LONPOLE`/`LATPOLE`). Two bands can pass every
+existing check and still not represent the same sky -- a different
+projection, a rotated pixel grid, or a different reference frame, with
+identical pixel scale and reference position. `match_cubes`/
+`reproject_cubes` already have this exact check (`sky_wcs_matches_target`,
+used for their own skip-if-already-matched optimization), independently
+duplicated once between those two tools. Consolidated into one shared
+module instead of a third copy, and extended with the fields
+`rm_synthesis` needed, so all three tools use the same logic.
+
+**Design:** new `src/wcs_match_mod.f90`, a module (not a program-
+internal procedure, so it can be `use`d from all three tools).
+`sky_wcs_matches_target`'s existing `CTYPE`/`CRVAL`/`CDELT`/`CRPIX`/
+rotation logic is unchanged. Added: `RADESYS`/`EQUINOX`, resolved
+through the FITS WCS standard's own default chain before comparing
+(`RADESYS` absent: infer from `EQUINOX`, `<1984` -> FK4, `>=1984` ->
+FK5; both absent -> ICRS; `EQUINOX` absent for an FK4/FK5 frame: infer
+from the resolved `RADESYS`, FK4 -> 1950.0, FK5 -> 2000.0) -- comparing
+raw keyword strings would reject files that legitimately match but
+express it differently (one explicit, one relying on the default).
+`LONPOLE`/`LATPOLE` also default from `CTYPE`/`CRVAL` through a
+projection-dependent formula this check does not reimplement; compared
+only when at least one side states a value explicitly (both absent is
+accepted; exactly one explicit is treated as a mismatch rather than
+guessed at).
+
+`match_cubes.f90`/`reproject_cubes.f90`: each file's own internal copy
+of the function (and its four/five helper subroutines) deleted, `use
+wcs_match_mod` added. Call sites unchanged -- same signature. This is a
+deliberate behavior change, accepted directly: both tools' own
+skip-if-already-matched checks are now stricter, so an input that
+previously counted as "already matches, skip it" because it only
+differed in a field the old check didn't cover no longer does.
+
+`rm_synthesis.f90`: `use wcs_match_mod` added. Two call sites, both new:
+(1) inside the existing per-band cross-band validation loop, right
+after the existing `NAXIS`/`CRVAL`/`CRPIX`/`CDELT` checks pass, for
+each non-reference band's own Q and U against the reference band's own
+Q and U respectively; (2) inside the original Q-vs-U check that already
+ran unconditionally for the reference band (single-band and multi-band
+both), for the reference band's own Q against its own U. Site 2 closes
+a gap site 1 alone would have left: without it, Q-vs-U consistency for
+the new fields was never checked in a single-band run, and not even
+transitively guaranteed across bands in a multi-band run, because the
+reference band's own Q and U were never cross-checked on the new
+fields anywhere. With both sites in place, every band's Q and every
+band's U are equal on every checked field, either directly (site 1,
+against the reference) or transitively through the reference (site 2).
+Both call sites use `crpix_shift1/2=0`, `nx_out/ny_out=` the
+comparison's own reference file's `NAXIS` -- `rm_synthesis` has no
+`mode=union`/`intersection` concept, so this is always a plain "must
+match exactly" comparison, never a grown/cropped-canvas one.
+`myfits_info` always closes its own FITS unit before returning, so
+both sites open the files being compared themselves, on units (91/92)
+not used elsewhere in this program, and close them again immediately
+after.
+
+**Files touched:** `src/wcs_match_mod.f90` (new), `src/match_cubes.f90`,
+`src/reproject_cubes.f90`, `src/rm_synthesis.f90`, `Makefile`
+(`wcs_match_mod.o` built into and linked from all three tools' own
+build graphs -- the first module `rm_synthesis`'s own build has ever
+shared with the other tools'), `docs/user/APP_REFERENCE.md`
+(`reference_band` callout).
+
+**Verification:** all three tools built clean on the first attempt.
+Full suite caught a real bug before any targeted testing: `cfg%infileQ`/
+`cfg%infileU` are mutated in place to already include `cfg%path` early
+in `rm_synthesis.f90` (line 625) -- the new code prepended `cfg%path` a
+second time, producing a doubled, unopenable path and failing every
+single multi-band test (24 failures). Fixed by using `cfg%infileQ`/
+`cfg%infileU` directly, matching how every other existing call site in
+the file already does. Re-ran clean: 184/184, all four `rm_synthesis`
+variants and the other four tools, zero skips.
+
+Beyond the regression suite (which only proves existing matching cases
+still pass), three targeted cases confirmed the new checks catch
+something the old ones did not, using real FITS files with one field
+changed via astropy: (1) two bands identical except `CTYPE1` (`RA---SIN`
+vs `RA---TAN`) -- correctly rejected, naming the band. (2) two bands
+identical except `RADESYS` (band 2 explicit `FK4`, band 1 no `RADESYS`
+with `EQUINOX=2000.0`, resolving to FK5) -- correctly rejected. (3) two
+bands expressing the *same* resolved frame differently (band 2 explicit
+`RADESYS=FK5` with no `EQUINOX`; band 1 no `RADESYS` with
+`EQUINOX=2000.0`) -- correctly accepted, confirming the default-chain
+resolution avoids a false positive rather than just comparing raw
+keyword presence. A fourth case confirmed `match_cubes`'s own
+skip-if-already-matched check is genuinely stricter now: a byte-identical
+copy of an input, compared against a `reffile=` differing only in
+`CTYPE` (a valid `RA---TAN`/`DEC--TAN` pair, not just `CTYPE1` alone --
+an internally inconsistent `CTYPE1`/`CTYPE2` pairing correctly fails
+earlier, inside AST's own WCS load, a separate and expected failure
+mode not exercised by this ticket) -- the manifest shows `PROCESSED`,
+not `SKIPPED`.
+
+**Status: DONE.**

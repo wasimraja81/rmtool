@@ -80,6 +80,7 @@
  !
 
 use rm_synthesis_mod
+use wcs_match_mod
 use iso_c_binding, only: c_long
 implicit none
 
@@ -150,6 +151,14 @@ integer   freq_axisQb
 logical   cubeQb
 integer   iband, iqu
 character(len=272) :: bandfile
+ ! T36 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): temporary units for the
+ ! shared sky_wcs_matches_target check (src/wcs_match_mod.f90) below --
+ ! myfits_info always closes its own unit before returning, so this
+ ! check opens both files itself, on units not used elsewhere in this
+ ! program.
+integer :: wcs_chk_cand_unit, wcs_chk_ref_unit, wcs_chk_status
+character(len=272) :: wcs_chk_reffile
+logical :: wcs_chk_ok
  ! T2 ticket (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band frequency
  ! axis description (channel count + CRVAL/CRPIX/CDELT on the freq axis),
  ! captured while validating each band's header in the geometry loop
@@ -914,6 +923,45 @@ else
    zinc_im = zinc_imQ
 endif
 
+! T36 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the Q/U check above
+! (naxis/CRVAL/CRPIX/CDELT-equivalent) does not cover CTYPE, PC/CD
+! rotation, or RADESYS/EQUINOX/LONPOLE/LATPOLE -- runs unconditionally
+! (single-band and multi-band both), since this is the reference band's
+! own Q vs U, not a cross-band comparison. cfg%infileQ/cfg%infileU
+! already carry cfg%path (mutated in place above) -- opened directly,
+! no further prepending.
+wcs_chk_cand_unit = 91
+wcs_chk_ref_unit = 92
+wcs_chk_status = 0
+call FTOPEN(wcs_chk_cand_unit,cfg%infileQ(1:nchar(cfg%infileQ)),0,&
+&blocksize,wcs_chk_status)
+if (wcs_chk_status.ne.0)then
+   write(*,*)'ERROR: failed to reopen the Q-cube for the WCS-convention check'
+   write(*,*)'file: ',cfg%infileQ(1:nchar(cfg%infileQ))
+   write(*,*)'Quitting now...'
+   stop
+endif
+wcs_chk_status = 0
+call FTOPEN(wcs_chk_ref_unit,cfg%infileU(1:nchar(cfg%infileU)),0,&
+&blocksize,wcs_chk_status)
+if (wcs_chk_status.ne.0)then
+   write(*,*)'ERROR: failed to reopen the U-cube for the WCS-convention check'
+   write(*,*)'file: ',cfg%infileU(1:nchar(cfg%infileU))
+   write(*,*)'Quitting now...'
+   stop
+endif
+wcs_chk_ok = sky_wcs_matches_target(wcs_chk_cand_unit,1,2,&
+&naxesQ(1),naxesQ(2),wcs_chk_ref_unit,1,2,0.0d0,0.0d0,&
+&naxesQ(1),naxesQ(2))
+call FTCLOS(wcs_chk_cand_unit,wcs_chk_status)
+call FTCLOS(wcs_chk_ref_unit,wcs_chk_status)
+if (.not.wcs_chk_ok)then
+   write(*,*)'ERROR: Q-cube and U-cube do not share the same WCS convention'
+   write(*,*)'(CTYPE, pixel-grid rotation, RADESYS, EQUINOX, LONPOLE,',&
+   &' or LATPOLE differs)'
+   write(*,*)'Quitting now...'
+   stop
+endif
 
 naxis = naxisQ
 do i = 1,naxis
@@ -1082,6 +1130,62 @@ if (n_bands_t2.gt.1)then
             &cyval_im,cypix_im,yinc_im
             write(*,*)'Band ',iband,' CRVAL2/CRPIX2/CDELT2 = ',&
             &cyval_imQb,cypix_imQb,yinc_imQb
+            write(*,*)'Quitting now...'
+            stop
+         endif
+         ! T36 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): the checks above
+         ! (NAXIS/CRVAL/CRPIX/CDELT) do not cover CTYPE, PC/CD rotation,
+         ! or RADESYS/EQUINOX/LONPOLE/LATPOLE -- two files can pass all
+         ! of them and still not represent the same sky (different
+         ! projection, a rotated pixel grid, or a different celestial
+         ! reference frame). sky_wcs_matches_target (src/
+         ! wcs_match_mod.f90, shared with match_cubes/reproject_cubes'
+         ! own already-matched-file checks) covers those too. Both files
+         ! opened fresh here -- myfits_info above already closed its own
+         ! unit before returning.
+         wcs_chk_cand_unit = 91
+         wcs_chk_ref_unit = 92
+         wcs_chk_status = 0
+         call FTOPEN(wcs_chk_cand_unit,bandfile(1:nchar(bandfile)),0,&
+         &blocksize,wcs_chk_status)
+         if (wcs_chk_status.ne.0)then
+            write(*,*)'ERROR: failed to reopen band ',iband,&
+            &' for the WCS-convention check'
+            write(*,*)'file: ',bandfile(1:nchar(bandfile))
+            write(*,*)'Quitting now...'
+            stop
+         endif
+         ! cfg%infileQ/cfg%infileU already carry cfg%path (mutated in
+         ! place at line 625, well before this loop runs) -- unlike
+         ! cfg%band(iband)%infileQ/infileU, which do not and need
+         ! bandfile's own prepending above.
+         if (iqu.eq.1)then
+            wcs_chk_reffile = cfg%infileQ(1:nchar(cfg%infileQ))
+         else
+            wcs_chk_reffile = cfg%infileU(1:nchar(cfg%infileU))
+         endif
+         wcs_chk_status = 0
+         call FTOPEN(wcs_chk_ref_unit,wcs_chk_reffile(1:nchar(wcs_chk_reffile)),&
+         &0,blocksize,wcs_chk_status)
+         if (wcs_chk_status.ne.0)then
+            write(*,*)'ERROR: failed to reopen the reference band for the',&
+            &' WCS-convention check'
+            write(*,*)'file: ',wcs_chk_reffile(1:nchar(wcs_chk_reffile))
+            write(*,*)'Quitting now...'
+            stop
+         endif
+         wcs_chk_ok = sky_wcs_matches_target(wcs_chk_cand_unit,1,2,&
+         &naxesQb(1),naxesQb(2),wcs_chk_ref_unit,1,2,0.0d0,0.0d0,&
+         &naxes(1),naxes(2))
+         call FTCLOS(wcs_chk_cand_unit,wcs_chk_status)
+         call FTCLOS(wcs_chk_ref_unit,wcs_chk_status)
+         if (.not.wcs_chk_ok)then
+            write(*,*)'ERROR: band ',iband,' does not match the reference',&
+            &' band''s WCS convention'
+            write(*,*)'(CTYPE, pixel-grid rotation, RADESYS, EQUINOX,',&
+            &' LONPOLE, or LATPOLE differs)'
+            write(*,*)'Run convolve_cubes/match_cubes/reproject_cubes to',&
+            &' align all bands onto one common grid first.'
             write(*,*)'Quitting now...'
             stop
          endif

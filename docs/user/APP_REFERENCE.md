@@ -67,17 +67,17 @@ unparsable values are all hard errors). See
 | `reference_band` | `1` | Which band (1-indexed) is treated as the primary band in multi-band mode — see callout below. |
 | `outfile` | — | Output basename; cube-type suffixes are appended automatically. |
 
-> **`reference_band`:** rm_synthesis was originally single-band; a few
-> internal values are still tracked as a single value rather than a
-> per-band list, and `reference_band` picks which configured band
-> supplies that value. Two effects are visible in the output: if bands'
-> beams differ, the output header's BMAJ/BMIN/BPA are the reference
-> band's (a WARNING prints when this happens); and every other band's
-> sky-pixel geometry is checked against the reference band's (a
-> mismatch is a hard error). `infileQ`/`infileU`/`infileI`,
-> `badchan_file`, and the channel-window limits already use each band's
-> own value regardless of `reference_band` — this setting doesn't
-> affect those.
+> **`reference_band`:** picks which configured band's values are used
+> in two places: if bands' beams differ, the output header's
+> BMAJ/BMIN/BPA are the reference band's (a WARNING prints when this
+> happens); and every other band's sky-axis WCS is checked against the
+> reference band's (a mismatch is a hard error) -- pixel scale and
+> reference position, but also CTYPE, pixel-grid rotation, and the
+> celestial reference frame (RADESYS/EQUINOX/LONPOLE/LATPOLE). The same
+> check also runs, unconditionally, between each band's own Q and U
+> cubes. `infileQ`/`infileU`/`infileI`, `badchan_file`, and the
+> channel-window limits use each band's own value regardless of
+> `reference_band`.
 
 **Bad-channel handling (optional):**
 

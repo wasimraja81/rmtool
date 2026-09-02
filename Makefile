@@ -115,7 +115,7 @@ MAINSRC := $(SRCDIR)/rm_synthesis.f90
 # a rebuild of rm_synthesis.o.
 INCSRC := $(SRCDIR)/myfits_info.f90 $(SRCDIR)/printerror.f90
 
-OBJFILES := $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/rm_synthesis.o
+OBJFILES := $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/wcs_match_mod.o $(BUILDDIR)/rm_synthesis.o
 
 # Target executable (mode-specific plus default convenience path)
 EXECUTABLE_MODE := $(BINDIR)/rm_synthesis_$(BUILD_TAG)
@@ -149,8 +149,14 @@ $(BINDIR):
 $(BUILDDIR)/rm_synthesis_mod.o: $(MODSRC) | $(BUILDDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
 
+# wcs_match_mod: shared with match_cubes/reproject_cubes (T36, docs/dev/
+# MULTI_BAND_TOMOGRAPHY_PLAN.md) -- the first module rm_synthesis's own
+# build has ever shared with the other tools' own build graphs.
+$(BUILDDIR)/wcs_match_mod.o: $(SRCDIR)/wcs_match_mod.f90 | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
+
 # Main program compilation
-$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(INCSRC) $(BUILDDIR)/rm_synthesis_mod.o | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(INCSRC) $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/wcs_match_mod.o | $(BUILDDIR) $(CHECK_GPU_COMPILER)
 	$(FC) $(FFLAGS) -I$(MODDIR) -J$(MODDIR) -c $< -o $@
 
 # Linking
@@ -210,7 +216,10 @@ $(REPROJECT_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(REPROJECT_BUI
 $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(REPROJECT_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
 
-$(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o | $(REPROJECT_BUILDDIR)
+$(REPROJECT_BUILDDIR)/wcs_match_mod.o: $(SRCDIR)/wcs_match_mod.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/wcs_match_mod.o | $(REPROJECT_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(REPROJECT_BUILDDIR) -J$(REPROJECT_BUILDDIR) -c $< -o $@
 
 # ast_grf_stub.c: no-op AST GRF (graphics-primitive) callbacks -- the AST
@@ -220,8 +229,8 @@ $(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 $(REPROJE
 $(REPROJECT_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(REPROJECT_BUILDDIR)
 	$(CC) -O2 -c $< -o $@
 
-$(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
+$(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/wcs_match_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/wcs_match_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
 	@echo "✓ Executable created: $@"
 
 # convolve_cubes: standalone common-resolution convolution tool (the
@@ -312,14 +321,17 @@ $(MATCH_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(MATCH_BUILDDIR)
 $(MATCH_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(MATCH_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
 
-$(MATCH_BUILDDIR)/match_cubes.o: $(SRCDIR)/match_cubes.f90 $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o | $(MATCH_BUILDDIR)
+$(MATCH_BUILDDIR)/wcs_match_mod.o: $(SRCDIR)/wcs_match_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/match_cubes.o: $(SRCDIR)/match_cubes.f90 $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/wcs_match_mod.o | $(MATCH_BUILDDIR)
 	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(MATCH_BUILDDIR) -J$(MATCH_BUILDDIR) -c $< -o $@
 
 $(MATCH_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(MATCH_BUILDDIR)
 	$(CC) -O2 -c $< -o $@
 
-$(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o | $(BINDIR)
-	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
+$(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/wcs_match_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/wcs_match_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
 	@echo "✓ Executable created: $@"
 
 # rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
