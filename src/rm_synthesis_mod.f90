@@ -1792,7 +1792,7 @@ contains
     integer(int32) :: unit_cfg, ios, line_no, io_stat
     logical :: has_kv
     logical :: seen_path, seen_infileQ, seen_infileU, seen_outfile
-    logical :: seen_remove_badchan, seen_badchan_file
+    logical :: seen_badchan_file
     logical :: seen_subim, seen_subim_parfile
     logical :: seen_subim_ra_blc, seen_subim_ra_trc, seen_subim_ra_inc
     logical :: seen_subim_dec_blc, seen_subim_dec_trc, seen_subim_dec_inc
@@ -1851,7 +1851,6 @@ contains
     seen_infileQ = .false.
     seen_infileU = .false.
     seen_outfile = .false.
-    seen_remove_badchan = .false.
     seen_badchan_file = .false.
     seen_subim = .false.
     seen_subim_parfile = .false.
@@ -2047,15 +2046,6 @@ contains
         end if
         seen_outfile = .true.
         cfg%outfile = trim(val)
-      case ('remove_badchan')
-        if (seen_remove_badchan) then
-          write(*,*) 'Duplicate key in cfg at line ', line_no, ': remove_badchan'
-          status = -104
-          close(unit_cfg)
-          return
-        end if
-        seen_remove_badchan = .true.
-        cfg%remove_badchan = flag_from_value(val)
       case ('badchan_file', 'global_badchan_file')
         if (seen_badchan_file) then
           write(*,*) 'Duplicate key in cfg at line ', line_no, ': global_badchan_file'
@@ -2764,12 +2754,6 @@ contains
     else if (.not. seen_outfile) then
       write(*,*) 'Missing required cfg key: outfile'
       status = -136
-    else if (.not. seen_remove_badchan) then
-      write(*,*) 'Missing required cfg key: remove_badchan'
-      status = -137
-    else if (.not. seen_badchan_file) then
-      write(*,*) 'Missing required cfg key: global_badchan_file'
-      status = -138
     else if (.not. seen_subim) then
       write(*,*) 'Missing required cfg key: subim'
       status = -139
@@ -2898,10 +2882,11 @@ contains
       & n_bands_local, ' vs ', csv_count(raw_infileU)
       status = -201
     end if
-    ! T7: badchan_file/global_badchan_file is always required (like
-    ! infileQ/infileU), regardless of remove_badchan -- same behaviour as
-    ! the pre-T7 legacy scalar, just band-count-validated for nbands>1.
-    if (status == 0 .and. csv_count(raw_badchan_file) /= n_bands_local) then
+    ! T35 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): badchan_file/
+    ! global_badchan_file is optional. When given, it must list exactly
+    ! n_bands_local entries, same as infileQ/infileU.
+    if (status == 0 .and. len_trim(raw_badchan_file) > 0 .and. &
+    & csv_count(raw_badchan_file) /= n_bands_local) then
       write(*,*) 'infileQ/badchan_file band-count mismatch: ', &
       & n_bands_local, ' vs ', csv_count(raw_badchan_file)
       status = -238
@@ -3072,32 +3057,35 @@ contains
           cfg%band(ib)%chan_inc = 1
         end if
 
-        ! T7: per-band bad-channel file, always required.
-        call csv_get_item(raw_badchan_file, ib, cfg%band(ib)%badchan_file)
+        ! T35 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): badchan_file is
+        ! optional. When raw_badchan_file is blank, every band's
+        ! badchan_file stays at its default (blank), meaning no removal.
+        if (len_trim(raw_badchan_file) > 0) then
+          call csv_get_item(raw_badchan_file, ib, cfg%band(ib)%badchan_file)
+        end if
       end do
     end if
 
-    ! T33 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): reject a blank
-    ! badchan_file/global_badchan_file entry outright when remove_badchan=y,
-    ! for every band (n_bands_local==1 covers plain single-band runs too,
-    ! since this loop is the only badchan_file parse path there is). Blank
-    ! only ever reaches rm_synthesis.f90's own open() calls when
-    ! remove_badchan=y, where it previously produced two different, both
-    ! dangerous-or-confusing outcomes depending on which band hit it: a
-    ! silent, run-wide disable of bad-channel removal if it was the
-    ! reference band's entry (rm_synthesis.f90's own ios_mem error path
-    ! sets cfg%remove_badchan=.false. globally), or a hard crash with a
-    ! generic "failed to open" message for any other band. Rejecting it
-    ! here, before any file is opened, replaces both with one clear error
-    ! naming the exact band and the fix (use 'none' explicitly).
+    ! T35 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): remove_badchan is not
+    ! a separate cfg key. cfg%remove_badchan is set here from whether
+    ! badchan_file/global_badchan_file was given at all -- the same
+    ! convention convolve_cubes/match_cubes already use for their own
+    ! badchan_file.
+    cfg%remove_badchan = (len_trim(raw_badchan_file) > 0)
+    ! T33 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): once badchan_file is
+    ! given, every band needs a real file path or the literal value
+    ! 'none'. A blank entry is rejected instead of treated as "nothing to
+    ! list" -- blank previously reached rm_synthesis.f90's own open()
+    ! calls, disabling removal for every band if it hit the reference
+    ! band, or stopping with a generic error if it hit any other band.
     if (status == 0 .and. cfg%remove_badchan) then
       do ib = 1, n_bands_local
         if (len_trim(cfg%band(ib)%badchan_file) == 0) then
           write(*,*) 'Error: badchan_file/global_badchan_file is blank for band ', ib
-          write(*,*) '  remove_badchan=y requires either a real file path or the'
-          write(*,*) '  literal value ''none'' for every band -- blank is not'
+          write(*,*) '  a value was given for this key, so every band needs a real'
+          write(*,*) '  file path or the literal value ''none'' -- blank is not'
           write(*,*) '  accepted.'
-          status = -238
+          status = -239
           exit
         end if
       end do

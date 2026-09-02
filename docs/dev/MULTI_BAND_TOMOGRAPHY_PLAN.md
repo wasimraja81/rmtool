@@ -4120,3 +4120,70 @@ error + no output, convolve_cubes omitted-key unaffected, match_cubes
 blank-position error + no output). Full suite: 183/183 (180 prior + 3).
 
 **Status: DONE.**
+
+### T35 -- `remove_badchan` Removed from `rm_synthesis`; `badchan_file` Is the Sole Switch
+
+**Motivation:** `remove_badchan` gated whether `badchan_file`'s
+content was read, but `badchan_file` was already required regardless
+of `remove_badchan`'s value (T7/T31/T33), so the two settings had to
+agree by hand: `remove_badchan=n` plus a real `badchan_file` value
+meant the value was accepted at parse time and never read; a blank
+`badchan_file` value was still rejected under `remove_badchan=n`
+because the key was required either way. `convolve_cubes`/`match_cubes`
+never had this second setting -- an infile's own entry (`none` or a
+real path) already determines removal for that infile. `remove_badchan`
+is dropped so `rm_synthesis` follows the same convention.
+
+**Design:** `badchan_file`/`global_badchan_file` becomes optional.
+Omitted entirely: no removal for any band. Given: same per-band rules
+as before (T31/T33) -- a real path or `none` for every band, a blank
+entry is a parse-time error naming the band. `remove_badchan` is
+removed from the parser; a cfg that still sets it now fails with
+`Unknown key in cfg`. Internally, `cfg%remove_badchan` stays as a
+field (`rm_synthesis.f90`'s existing gates and the `masksrc_key` logic
+are unchanged) but is now set from `len_trim(raw_badchan_file) > 0`
+instead of parsed from its own key.
+
+**Files touched:** `src/rm_synthesis_mod.f90` (`case('remove_badchan')`
+removed; the two "Missing required cfg key" checks for
+`remove_badchan`/`badchan_file` removed; the band-count-mismatch check
+and the per-band `csv_get_item` call for `badchan_file` made
+conditional on the key being given; `cfg%remove_badchan` derivation
+added). `docs/user/APP_REFERENCE.md` (`remove_badchan` row removed;
+`badchan_file` row rewritten). `tests/run_tests.sh` (section 58's and
+59's own cfg heredocs; the 9 heredocs using `/dev/null,/dev/null`;
+`make_thesis_cfg`'s generated badchan list; the two `badchan7_*` cases;
+section 59 rewritten with a fourth case checking `remove_badchan` is
+rejected). `tests/rmsynth-test.cfg.template` and
+`tests/rmsynth-timing.cfg.template` (both had their own
+`remove_badchan=n`/`global_badchan_file=/dev/null` pair, used by most
+of the suite's basic tests via `make_cfg`/`make_timing_cfg` --
+`/dev/null` read as zero bad channels either way, so this changes
+notation, not behavior). `docs/user/TUTORIAL.md` (same pair in its own
+example cfg). 14 `cfg/*.cfg` templates and `cfg/run_rm-synthesis.sbatch`
+(`remove_badchan` line dropped in each; the pair with `remove_badchan=y`
+kept their `badchan_file` value unchanged; the five with
+`remove_badchan=n` and a placeholder path or `/dev/null`
+(`cfg/benchmark.cfg`, `cfg/rmsynth.cfg`, `cfg/rmsynth-sim-fullim.cfg`,
+`cfg/rmsynth-subim.cfg`, `cfg/rmsynth-e2e-smalltest.cfg`) had that value
+changed to `none`, since it would now actually be opened).
+
+**Verification:** built the serial and OMP variants
+(`make GPU=0 OMP=0`, `make OMP=1 GPU=0`). Checked directly, on the
+serial binary, before trusting the suite: `remove_badchan=...` in a cfg
+now fails with `Unknown key in cfg`; `badchan_file` omitted runs with
+no removal; a real path runs with removal (channel count printed
+matches the file); a blank value with nothing after the `=` is
+indistinguishable from omitting the key (same parser behavior as
+before) and now runs with no removal instead of failing, since the key
+is no longer required; `none` still gives zero removal; a blank
+position inside an otherwise-given multi-band list is still a named,
+parse-time error; both band positions checked. Full suite failed on
+first run (`tests/rmsynth-test.cfg.template`/
+`tests/rmsynth-timing.cfg.template` still had `remove_badchan=n` with
+`global_badchan_file=/dev/null`, used by most of the suite's own basic
+tests) -- fixed both templates, full suite then passed: 184/184, all
+four `rm_synthesis` variants (serial/OMP/GPU/GPU+HostOMP) and the other
+four tools included, zero skips.
+
+**Status: DONE.**

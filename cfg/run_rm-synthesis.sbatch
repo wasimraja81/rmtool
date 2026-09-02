@@ -42,7 +42,6 @@ infileQ=image.restored.q.EMU_1615-64.SB80775.contcube.conv.fits
 infileU=image.restored.u.EMU_1615-64.SB80775.contcube.conv.fits
 outfile=${outDir}/JENNIFER_TOO_FULLIM_CONV
 
-remove_badchan=y
 global_badchan_file=/scratch/ja3/raj030/for_Jennifer/rm-synthesis/cfg/askap_nan_channels.burdies
 
 # Optional mask controls:

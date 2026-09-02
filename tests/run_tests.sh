@@ -883,8 +883,7 @@ path                = ${DATA_DIR}/
 infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
 infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
 outfile             = ${OUT_DIR}/mb_match
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -973,16 +972,15 @@ if [[ -x "$BIN_SERIAL" ]]; then
     make_thesis_cfg() {
         local tag="$1" infileQ="$2" infileU="$3" resi_list="$4"
         local cfg="$OUT_DIR/${tag}.cfg"
-        # T7: badchan_file is a required per-band list, same cardinality as
-        # resi_list -- reuse its comma count rather than hard-coding it.
+        # badchan_file is a per-band list, same cardinality as resi_list --
+        # reuse its comma count rather than hard-coding it.
         local badchan_list
-        badchan_list=$(echo "$resi_list" | sed 's/[^,]*/\/dev\/null/g')
+        badchan_list=$(echo "$resi_list" | sed 's/[^,]*/none/g')
         cat > "$cfg" <<CFGEOF
 path                = ${DATA_DIR}/
 infileQ             = ${infileQ}
 infileU             = ${infileU}
 outfile             = ${OUT_DIR}/${tag}
-remove_badchan      = n
 global_badchan_file = ${badchan_list}
 subim               = n
 rem_mean            = 0
@@ -1096,8 +1094,7 @@ path                = ${DATA_DIR}/
 infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
 infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
 outfile             = ${OUT_DIR}/split_identity
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -1164,8 +1161,7 @@ path                = ${DATA_DIR}/
 infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST.Q.FITSCUBE
 infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST.U.FITSCUBE
 outfile             = ${OUT_DIR}/split_identity_chan
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = y
 subim_chan_blc      = 0,101
 subim_chan_trc      = 0,200
@@ -1242,7 +1238,6 @@ path                = ${DATA_DIR}/
 infileQ             = TEST.Q.FITSCUBE
 infileU             = TEST.U.FITSCUBE
 outfile             = ${OUT_DIR}/badchan7_ref
-remove_badchan      = y
 global_badchan_file = ${badchan7_ref_list}
 subim               = n
 rem_mean            = 0
@@ -1272,7 +1267,6 @@ path                = ${DATA_DIR}/
 infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
 infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
 outfile             = ${OUT_DIR}/badchan7_split
-remove_badchan      = y
 global_badchan_file = ${badchan7_none_list},${badchan7_band2_list}
 subim               = n
 rem_mean            = 0
@@ -1355,8 +1349,7 @@ path                = ${DATA_DIR}/
 infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
 infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
 outfile             = ${OUT_DIR}/mb_gpu
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -1458,8 +1451,7 @@ path                = ${DATA_DIR}/
 infileQ             = TEST_SPLIT_LO.Q.FITSCUBE,TEST_SPLIT_HI.Q.FITSCUBE
 infileU             = TEST_SPLIT_LO.U.FITSCUBE,TEST_SPLIT_HI.U.FITSCUBE
 outfile             = ${OUT_DIR}/mb_io_overlap
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -2738,8 +2730,7 @@ path                = ${OUT_DIR}/
 infileQ             = $(basename "$mbpp_grid_band1q"),$(basename "$mbpp_grid_band2q_reproj")
 infileU             = $(basename "$mbpp_grid_band1u"),$(basename "$mbpp_grid_band2u")
 outfile             = ${OUT_DIR}/mbpp_grid_out
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -2813,8 +2804,7 @@ path                = ${OUT_DIR}/
 infileQ             = $(basename "$mbpp_res_band1q_conv"),$(basename "$mbpp_res_band2q_conv")
 infileU             = $(basename "$mbpp_res_band1u_conv"),$(basename "$mbpp_res_band2u_conv")
 outfile             = ${OUT_DIR}/mbpp_res_out
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -2889,8 +2879,7 @@ path                = ${OUT_DIR}/
 infileQ             = $(basename "$mbpp_both_band1q_matched"),$(basename "$mbpp_both_band2q_matched")
 infileU             = $(basename "$mbpp_both_band1u_matched"),$(basename "$mbpp_both_band2u_matched")
 outfile             = ${OUT_DIR}/mbpp_both_out
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -3526,8 +3515,7 @@ path                = ${OUT_DIR}/
 infileQ             = $(basename "$mbpp_nan_band1q_conv"),$(basename "$mbpp_nan_band2q_conv")
 infileU             = $(basename "$mbpp_nan_band1u_conv"),$(basename "$mbpp_nan_band2u_conv")
 outfile             = ${OUT_DIR}/mbpp_nan_out
-remove_badchan      = n
-global_badchan_file = /dev/null,/dev/null
+global_badchan_file = none,none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -4182,7 +4170,6 @@ infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
 infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
 outfile             = $3
 
-remove_badchan      = y
 global_badchan_file = $2
 subim               = n
 rem_mean            = 0
@@ -4253,34 +4240,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 59. rm_synthesis: a blank badchan_file/global_badchan_file entry is a hard
-#     parse-time error when remove_badchan=y (T33, docs/dev/
-#     MULTI_BAND_TOMOGRAPHY_PLAN.md) -- before this ticket, a blank entry
-#     reached rm_synthesis.f90's own open() calls: silently disabling
-#     bad-channel removal for EVERY band if it was the reference band's
-#     entry, or crashing with a generic message if it was any other band's.
-#     Both are now replaced by one clear error naming the exact band,
-#     raised before any file is opened. Checks both band positions, and
-#     confirms remove_badchan=n with blank entries is still completely
-#     unaffected (badchan_file's content only matters when
-#     remove_badchan=y).
+# 59. rm_synthesis: badchan_file/global_badchan_file is the sole switch for
+#     bad-channel removal (T33/T35, docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md).
+#     There is no remove_badchan cfg key. Once badchan_file is given at
+#     all, every band needs a real file path or the literal value 'none'
+#     -- a blank entry is a parse-time error naming the band, raised
+#     before any file is opened. Omitting badchan_file entirely means no
+#     removal for any band. Checks both band positions for the blank
+#     case, and confirms omitting the key is unaffected.
 # ---------------------------------------------------------------------------
-section "59. rm_synthesis: blank badchan_file is a hard error when remove_badchan=y (T33)"
+section "59. rm_synthesis: badchan_file is the sole switch for bad-channel removal (T33/T35)"
 
 if [[ -x "$BIN_SERIAL" ]]; then
-    t33_run() {
-        # $1=label $2=remove_badchan $3=global_badchan_file value $4=outfile
-        local t33_cfg="$OUT_DIR/t33_$1.cfg"
-        local t33_log="$OUT_DIR/t33_$1.log"
-        rm -f "${4}".*.FITS
-        cat > "$t33_cfg" <<CFGEOF
+    t35_badchan_run() {
+        # $1=label $2=global_badchan_file value (empty = key omitted) $3=outfile
+        local t35_cfg="$OUT_DIR/t35_$1.cfg"
+        local t35_log="$OUT_DIR/t35_$1.log"
+        rm -f "${3}".*.FITS
+        {
+            cat <<CFGEOF
 path                = $DATA_DIR/
 infileQ             = TEST.Q.FITSCUBE,TEST_BAND2.Q.FITSCUBE
 infileU             = TEST.U.FITSCUBE,TEST_BAND2.U.FITSCUBE
-outfile             = $4
+outfile             = $3
 
-remove_badchan      = $2
-global_badchan_file = $3
+CFGEOF
+            if [[ -n "$2" ]]; then
+                echo "global_badchan_file = $2"
+            fi
+            cat <<CFGEOF
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
@@ -4300,47 +4288,80 @@ write_mask_output   = y
 write_nvalid_output = y
 use_gpu             = n
 CFGEOF
-        "$BIN_SERIAL" "$t33_cfg" > "$t33_log" 2>&1
+        } > "$t35_cfg"
+        "$BIN_SERIAL" "$t35_cfg" > "$t35_log" 2>&1
     }
 
-    # Case A: reference band (1) blank, band 2 'none'. Pre-T33 this
-    # silently disabled bad-channel removal for BOTH bands (exit 0, no
-    # error at all) -- must now be a clear, named error instead.
-    t33_out_a="$OUT_DIR/t33_case_a_out"
-    t33_run "case_a" "y" ",none" "$t33_out_a"
-    t33_log_a="$OUT_DIR/t33_case_a.log"
-    if grep -qE "badchan_file/global_badchan_file is blank for band[[:space:]]+1" "$t33_log_a" \
-            && [[ ! -f "${t33_out_a}.MASK.CUBE.FITS" ]]; then
+    # Case A: reference band (1) blank, band 2 'none'.
+    t35_out_a="$OUT_DIR/t35_case_a_out"
+    t35_badchan_run "case_a" ",none" "$t35_out_a"
+    t35_log_a="$OUT_DIR/t35_case_a.log"
+    if grep -qE "badchan_file/global_badchan_file is blank for band[[:space:]]+1" "$t35_log_a" \
+            && [[ ! -f "${t35_out_a}.MASK.CUBE.FITS" ]]; then
         pass "rm_synthesis: blank badchan_file for the reference band is a clear named error (band 1), no output written (T33 case A)"
     else
-        fail "rm_synthesis: T33 case A did not error as expected (see $t33_log_a)"
+        fail "rm_synthesis: T33 case A did not error as expected (see $t35_log_a)"
     fi
 
-    # Case B: reference band (1) 'none', band 2 blank. Pre-T33 this
-    # crashed with a generic 'failed to open' message.
-    t33_out_b="$OUT_DIR/t33_case_b_out"
-    t33_run "case_b" "y" "none," "$t33_out_b"
-    t33_log_b="$OUT_DIR/t33_case_b.log"
-    if grep -qE "badchan_file/global_badchan_file is blank for band[[:space:]]+2" "$t33_log_b" \
-            && [[ ! -f "${t33_out_b}.MASK.CUBE.FITS" ]]; then
+    # Case B: reference band (1) 'none', band 2 blank.
+    t35_out_b="$OUT_DIR/t35_case_b_out"
+    t35_badchan_run "case_b" "none," "$t35_out_b"
+    t35_log_b="$OUT_DIR/t35_case_b.log"
+    if grep -qE "badchan_file/global_badchan_file is blank for band[[:space:]]+2" "$t35_log_b" \
+            && [[ ! -f "${t35_out_b}.MASK.CUBE.FITS" ]]; then
         pass "rm_synthesis: blank badchan_file for a non-reference band is a clear named error (band 2), no output written (T33 case B)"
     else
-        fail "rm_synthesis: T33 case B did not error as expected (see $t33_log_b)"
+        fail "rm_synthesis: T33 case B did not error as expected (see $t35_log_b)"
     fi
 
-    # Case C: remove_badchan=n with BOTH bands blank -- must still run to
-    # completion exactly as before (badchan_file's content is irrelevant
-    # when remove_badchan=n).
-    t33_out_c="$OUT_DIR/t33_case_c_out"
-    t33_run "case_c" "n" "," "$t33_out_c"
-    t33_log_c="$OUT_DIR/t33_case_c.log"
-    if [[ -f "${t33_out_c}.MASK.CUBE.FITS" ]]; then
-        pass "rm_synthesis: remove_badchan=n with blank badchan_file entries is unaffected (T33 case C)"
+    # Case C: global_badchan_file omitted entirely -- must run to
+    # completion, no removal for either band.
+    t35_out_c="$OUT_DIR/t35_case_c_out"
+    t35_badchan_run "case_c" "" "$t35_out_c"
+    t35_log_c="$OUT_DIR/t35_case_c.log"
+    if [[ -f "${t35_out_c}.MASK.CUBE.FITS" ]]; then
+        pass "rm_synthesis: omitting global_badchan_file entirely is unaffected (T35 case C)"
     else
-        fail "rm_synthesis: T33 case C (remove_badchan=n, blank entries) unexpectedly failed to produce output (see $t33_log_c)"
+        fail "rm_synthesis: T35 case C (global_badchan_file omitted) unexpectedly failed to produce output (see $t35_log_c)"
+    fi
+
+    # Case D: remove_badchan is not a recognized key.
+    t35_out_d="$OUT_DIR/t35_case_d_out"
+    t35_cfg_d="$OUT_DIR/t35_case_d.cfg"
+    t35_log_d="$OUT_DIR/t35_case_d.log"
+    cat > "$t35_cfg_d" <<CFGEOF
+path                = $DATA_DIR/
+infileQ             = TEST.Q.FITSCUBE
+infileU             = TEST.U.FITSCUBE
+outfile             = $t35_out_d
+remove_badchan      = n
+subim               = n
+rem_mean            = 0
+remove_qu_bias      = n
+resiQ               = 0.0
+slopeQ              = 0.0
+resiU               = 0.0
+slopeU              = 0.0
+ofac                = 1
+fac                 = 3.14159265358979
+use_auto_rm_range   = 0
+beg_rm              = -50.0
+end_rm              = 50.0
+nrm                 = 101
+output_mode         = ap
+ap_angle_mode       = phase
+write_mask_output   = y
+write_nvalid_output = y
+use_gpu             = n
+CFGEOF
+    "$BIN_SERIAL" "$t35_cfg_d" > "$t35_log_d" 2>&1
+    if grep -q "Unknown key in cfg" "$t35_log_d" && grep -q "remove_badchan" "$t35_log_d"; then
+        pass "rm_synthesis: remove_badchan is rejected as an unknown cfg key (T35)"
+    else
+        fail "rm_synthesis: remove_badchan was not rejected as expected (see $t35_log_d)"
     fi
 else
-    skip "bin/rm_synthesis_release_cpu_serial not built; skipping blank badchan_file hard-error test"
+    skip "bin/rm_synthesis_release_cpu_serial not built; skipping badchan_file switch tests"
 fi
 
 # ---------------------------------------------------------------------------

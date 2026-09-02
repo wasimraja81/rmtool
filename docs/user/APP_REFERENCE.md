@@ -79,12 +79,11 @@ unparsable values are all hard errors). See
 > own value regardless of `reference_band` — this setting doesn't
 > affect those.
 
-**Bad-channel handling (required):**
+**Bad-channel handling (optional):**
 
 | Key | Default | Meaning |
 |---|---|---|
-| `remove_badchan` | — | `y`/`n`: drop channels listed in `badchan_file`. |
-| `badchan_file` (alias `global_badchan_file`) | — | One channel index per line. Must be present even when `remove_badchan=n` (the file need not exist in that case). Comma-separated per-band list for multi-band — every band needs its own entry: a real path, or the literal value `none` for a band with nothing to list. A blank entry is a hard parse-time error when `remove_badchan=y` — it is not the same as `none` and is rejected, not silently accepted. |
+| `badchan_file` (alias `global_badchan_file`) | omitted (no removal) | One channel index per line. Omit this key entirely for no bad-channel removal. When given, comma-separated per-band list for multi-band — every band needs its own entry: a real file path, or the literal value `none`. A blank entry is a hard parse-time error once this key is given at all. |
 
 **Subimage extraction (`subim` required; the rest optional, default = full cube):**
 

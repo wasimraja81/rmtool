@@ -51,8 +51,7 @@ infileQ             = TEST.Q.FITSCUBE
 infileU             = TEST.U.FITSCUBE
 outfile             = tutorial_out
 
-remove_badchan      = n
-global_badchan_file = /dev/null
+global_badchan_file = none
 subim               = n
 rem_mean            = 0
 remove_qu_bias      = n
