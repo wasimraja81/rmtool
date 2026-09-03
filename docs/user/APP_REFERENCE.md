@@ -217,7 +217,7 @@ true; anything else (including blank) is false.
 `CASAMBM`/`BEAMS` table, if the reference band's own Q cube has one
 (see `reference_band` above for what that table does and doesn't cover
 in multi-band mode). MASK/NVALID always carry just the plain scalar,
-regardless.
+regardless. The usefulness of this from a science perspective is only when the beams across the spectral axis match. If they do not match, the code does not forbid the rm-synthesis hoping these may be useful for certain debugging. 
 
 ### Example
 
@@ -268,7 +268,7 @@ No positional arguments — every value is `key=value` (no spaces around
 | `mode` | — | yes | `intersection`: output grid shrinks to the overlap of all inputs with the reference. `union`: output grid grows to cover all inputs and the reference. `reference`: output grid is the reference file's own extent. Zero overlap between any input and the running grid is always a hard failure regardless of mode. |
 | `reffile` | — | yes | Reference FITS cube whose WCS anchors the output grid. |
 | `infiles` | — | yes | Comma-separated list of 1–50 input FITS cube paths. |
-| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/resample/write block of planes (see [Shared Parameters](#shared-parameters) above). Threads parallelize only *within* one block, never across blocks — too small a value both increases CFITSIO call count and discards most of the OpenMP speedup (a WARNING is printed if this looks likely). |
+| `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/resample/write block of planes (see [Shared Parameters](#shared-parameters) above). Parallelism is scoped to a single block — blocks run strictly sequentially, never overlapped — so on a machine where available memory is tight enough to shrink a block below your thread count, you silently lose most of your OpenMP speedup too, not just I/O efficiency. A WARNING prints if this looks likely. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+resample. Only one background write is ever in flight. |
 | `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
 | `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `block_convolve`/`reproject_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/process/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
