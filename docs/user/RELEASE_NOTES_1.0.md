@@ -58,6 +58,10 @@ resolution:
 - `match_cubes` chains both through memory when a band needs both
   fixes — no intermediate FITS file written to disk, which matters at
   real multi-hundred-GB cube sizes.
+- Before merging bands, `rm_synthesis` checks that every band
+  represents the same sky — not just pixel grid and resolution, but
+  projection, orientation, and celestial reference frame too — and
+  refuses to run rather than risk silently combining misaligned data.
 - Beam metadata (`BMAJ`/`BMIN`/`BPA`) is carried faithfully through the
   whole chain, not silently dropped at any stage.
 - Both the resolution-matching step (convolution) and the grid-matching
