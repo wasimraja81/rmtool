@@ -76,15 +76,17 @@ unparsable values are all hard errors). See
 > frame (RADESYS/EQUINOX/LONPOLE/LATPOLE) are checked. Matching resolution across
 > frequency channels -- within a band, and across bands -- is the
 > user's own responsibility. `rm_synthesis` only warns on a mismatch
-> triggered when `CASAMBM=T` within a band (see "Beam metadata" under Output files), or when BMAJ/BMIN/BPA across bands disagrees. 
+> triggered when `CASAMBM=T` within a band (see "Beam metadata" under Output files), or when BMAJ/BMIN/BPA across bands disagrees.
 > `reference_band` picks whose beam values get written to the output
-> headers regardless of whether that check passed. 
-> Note: If the beams don't match, that propagated metadata is 
-> correspondingly less useful as a description of the run -- and more so in the 
-> multi-band mode, where only the reference band's own 
+> headers regardless of whether that check passed.
+>
+> **Note:** *If the beams don't match, that propagated metadata is
+> correspondingly less useful as a description of the run -- and more
+> so in multi-band mode, where only the reference band's own
 > per-channel beam data is ever captured in the output at all; a
 > mismatching non-reference band's own beams are never recorded
-> anywhere in the output, only flagged in the run log.
+> anywhere in the output, only flagged in the run log.*
+>
 > `infileQ`/`infileU`/`infileI`, `badchan_file`, and the channel-window
 > limits use each band's own value regardless of `reference_band`.
 
@@ -210,21 +212,12 @@ true; anything else (including blank) is false.
 - Always (unless disabled): `<outfile>.MASK.CUBE.FITS`, `<outfile>.NVALID.MAP.FITS`
 - If `cubestat=y`: `<outfile>.PEAK.MAP.FITS`, `<outfile>.RM_PEAK.MAP.FITS`, `<outfile>.ANG_PEAK.MAP.FITS`, `<outfile>.SNR.MAP.FITS`
 
-**Beam metadata:** if the reference band's own Q cube has `CASAMBM=T`
-(a per-channel CASA multi-beam cube, e.g. not yet run through
-`convolve_cubes`), the AMP/PHA cubes and PEAK/RMPEAK/ANGPEAK/SNR maps
-get that same `CASAMBM=T` plus the reference band's per-channel
-`BEAMS` table — this is the one to trust; ignore the single
-`BMAJ`/`BMIN`/`BPA` these outputs also carry, since with a varying
-beam it's just the reference band's nominal value, not a common
-resolution. Only the reference band's own table is ever attached this
-way — a non-reference band's own channel-to-channel variation is only
-flagged in the run log, never captured in the output `BEAMS` table. Otherwise (no `CASAMBM`), those same outputs simply
-carry the input's single `BMAJ`/`BMIN`/`BPA` unchanged. (MASK/NVALID
-are validity bookkeeping, not flux data, and always just get the plain
-scalar.) A mismatch between bands' own beam metadata is a runtime
-warning, not a hard error — RM synthesis itself doesn't depend on beam
-metadata for correctness.
+**Beam metadata:** AMP/PHA, and the PEAK/RMPEAK/ANGPEAK/SNR maps when
+`cubestat=y`, carry the reference band's `BMAJ`/`BMIN`/`BPA` — plus its
+`CASAMBM`/`BEAMS` table, if the reference band's own Q cube has one
+(see `reference_band` above for what that table does and doesn't cover
+in multi-band mode). MASK/NVALID always carry just the plain scalar,
+regardless.
 
 ### Example
 
