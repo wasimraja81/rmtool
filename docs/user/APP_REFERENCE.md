@@ -30,6 +30,15 @@ from the running binary) and please report the doc as stale.
 **`mem_frac_ram`** (all 5 tools): a fraction of the machine's **total**
 system RAM.
 
+**`badchan_file`** (`rm_synthesis`, `convolve_cubes`, `match_cubes`): one
+manually-specified bad channel index per line, 1-indexed — these
+channels are rejected the same way in all three tools. A multi-input
+list is comma-separated, one entry per input (band, for `rm_synthesis`;
+file, for `convolve_cubes`/`match_cubes`) — give an input with nothing
+to list the literal value `none`; a blank entry is a hard parse-time
+error once the key is given at all. Omitting the key entirely means no
+manual bad-channel removal for anything.
+
 ---
 
 ## 1. `rm_synthesis`
@@ -94,7 +103,7 @@ unparsable values are all hard errors). See
 
 | Key | Default | Meaning |
 |---|---|---|
-| `badchan_file` (alias `global_badchan_file`) | omitted (no removal) | One channel index per line. Omit this key entirely for no bad-channel removal. When given, comma-separated per-band list for multi-band — every band needs its own entry: a real file path, or the literal value `none`. A blank entry is a hard parse-time error once this key is given at all. |
+| `badchan_file` | omitted (no removal) | See [Shared Parameters](#shared-parameters) above. |
 
 **Subimage extraction (`subim` required; the rest optional, default = full cube):**
 
@@ -296,7 +305,16 @@ resolution — needed whenever channels don't already share one
 resolution, whether that's because of combining bands observed at
 different resolutions, or because a single band's own native beam
 varies channel-to-channel with frequency (the normal case for any cube
-with channel-wise varying beams). Reads
+with channel-wise varying beams). Unless an explicit target is given
+(`target_bmaj`/`target_bmin`/`target_bpa`), that common beam is derived
+automatically: each channel's own elliptical beam is sampled around its
+edge, pooled across every channel, and fit to the smallest ellipse
+containing all of them (see `npts`/`khachiyan_tol` below). Each channel
+is then brought to that beam in one FFT step — multiply by (target
+beam's Fourier transform ÷ that channel's own beam's Fourier
+transform), inverse-transform — which removes the original PSF and
+applies the target one together, rather than as two separate
+real-space passes. Reads
 per-channel beams from a CASA-style `BEAMS` binary table
 (`beamfiles=auto`) or a portable ASCII/CSV beam log (see
 `cfg/example_beamLog.txt`/`.csv`). A channel missing
@@ -328,12 +346,12 @@ Same `key=value`-only, no-positional-args convention as `reproject_cubes`.
 | `infiles` | — | yes | 1–50 comma-separated FITS cube paths. |
 | `outsuffix` | `_CONV.FITS` | no | Appended to each infile's own path (trailing `.fits`/`.FITS` stripped first). |
 | `beamfiles` | `auto` for every input | no | Comma list, one entry per infile, in order. Each entry is either the literal word `auto` (read that infile's own CASA BEAMS table) or a path to an ASCII/CSV beam-log file (`channel bmaj_arcsec bmin_arcsec bpa_deg`, 1-indexed, `#`-comments allowed). If given, must list exactly as many entries as `infiles`. |
-| `badchan_file` | none | no | One entry per `infiles` entry, same order, comma-separated — the list must have exactly as many entries as `infiles`, including a position for every file with nothing to list: give that position the literal value `none` — do not leave it out or leave it blank. E.g. with `infiles=a.fits,b.fits`, `badchan_file=none,file2.txt` gives `a.fits` no manual list and `b.fits` the second position (`file2.txt`); `badchan_file=,file2.txt` (blank first position) is a hard error once `badchan_file=` is given at all. Omitting `badchan_file=` entirely is unaffected — still valid, still means no list for any infile. Each file is one channel index per line, 1-indexed — same convention as `rm_synthesis`'s `global_badchan_file`. Independent of, and in addition to, automatic bad-channel detection from each infile's own CASA BEAMS table (a degenerate near-zero beam entry) — use this for channels known bad for reasons a beam table alone wouldn't capture (e.g. RFI). Either way, a bad channel is written as an all-NaN plane, not convolved. |
+| `badchan_file` | none | no | See [Shared Parameters](#shared-parameters) above. `convolve_cubes` additionally detects bad channels automatically from each input's own CASA BEAMS table (a degenerate near-zero beam entry) — `badchan_file` is not the only source of rejected channels here. |
 | `target_bmaj` / `target_bmin` / `target_bpa` | none (auto-derive) | no | Explicit target beam (arcsec/arcsec/deg) — give all three together to skip automatic common-beam derivation entirely. |
 | `max_common_bmaj` | none | no | If the AUTO-derived common beam's BMAJ exceeds this (arcsec), refuse to proceed. Ignored when an explicit target is given. |
 | `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of system RAM budgeted for one read/convolve/write block of planes (see [Shared Parameters](#shared-parameters) above). |
-| `npts` | `2000` | no | Boundary points sampled per beam (≥12), passed to `commonbeam_mod`'s `find_common_beam`. |
-| `khachiyan_tol` | `1.0e-5` | no | Khachiyan-algorithm convergence tolerance for the common-beam fit. |
+| `npts` | `2000` | no | How finely each channel's own beam ellipse is sampled (points around its edge) before fitting the smallest common beam that contains all of them — higher is a more faithful approximation of each beam's true shape; the default is already generous and this rarely needs changing. Below 12 is a hard parse-time error. |
+| `khachiyan_tol` | `1.0e-5` | no | Stopping tolerance for the iterative fit (`npts` above) that derives the common target beam — it keeps refining until its error drops below this; smaller means a tighter fit at more iterations. The default rarely needs changing. |
 | `io_overlap` | `n` | no | `y`: write each block on a background thread, overlapped with the *next* block's read+convolve. |
 | `nwriters` | `1` | no | `>1`: split each block's own write across this many disjoint writer threads (clamped to `[1, OMP_NUM_THREADS]`) instead of one. Only useful alongside `io_overlap=y` on a disk that benefits from concurrent writes (e.g. NVMe) — see `dry_run` below for a per-machine suggestion. |
 | `log_level` | `info` | no | `error\|warn\|info\|debug`. At `info` and above, a per-file stage-timing summary (seconds and % of that file's own total, per stage — e.g. `block_read`, `convolve_compute`, `block_write`) is always printed after each file finishes, regardless of `timing_enabled`. `debug` additionally logs one `tile_thread` line per block per worker thread (read/convolve/write start and end times) — fine-grained enough to drive `scripts/plot_tile_async_swimlane.py`'s per-thread timing plot, useful for seeing exactly where threads stall or serialize. |
@@ -397,7 +415,7 @@ Same `key=value`-only convention as the other two.
 | `footprint_mode` | — | if `stages` includes `reproject` | `intersection \| union \| reference` — same semantics as `reproject_cubes`'s `mode`. |
 | `reffile` | — | if `stages` includes `reproject` | Reference cube path. |
 | `beamfiles` | `auto` per input | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
-| `badchan_file` | none | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
+| `badchan_file` | none | no | Used when `stages` includes `convolve` — see [Shared Parameters](#shared-parameters) above; same semantics as `convolve_cubes`. |
 | `target_bmaj` / `target_bmin` / `target_bpa` | none | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
 | `max_common_bmaj` | none | no | Used when `stages` includes `convolve` — same semantics as `convolve_cubes`. |
 | `mem_frac_ram` | `0.25` | no | Fraction (0,0.95] of RAM budgeted for one read/process/write block (see [Shared Parameters](#shared-parameters) above). |
