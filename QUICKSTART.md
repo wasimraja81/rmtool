@@ -209,20 +209,31 @@ python3 scripts/casda_fetch.py --ra 323.56667 --dec -53.61528 --radius 8 --usern
 Prints how many observations exist, at how many frequency bands, with
 the exact product tomography needs, and states directly whether
 multi-band synthesis is possible for that position or only single-band.
-Add `--fetch` to actually download — each band's Q/U cube pair lands in
-its own `<outdir>/SB<n>/` subdirectory. `--target
-msh15-56|kes27|cena|dancingghosts` are a handful of objects already
-checked against this project during its own development, saved as
-internal shortcuts — `--target` checks those first, then falls back to
-resolving whatever string you gave it the same way `Centaurus A` above
-was resolved. `--ra`/`--dec` work for anything not resolvable by name.
-Full detail: `python3 scripts/casda_fetch.py --help`.
+A band only counts as usable when both Q and U are present as `.conv`
+(beam-wise matched across ASKAP's 36 PAF beams) — a band missing that
+is reported but excluded, since combining beam-mismatched data would
+silently corrupt the result. Add `--fetch` to download — each usable
+band's I/Q/U/V cubes (I to visually confirm signal, V as a noise-floor
+check) land in their own `<outdir>/SB<n>/` subdirectory; an observation
+that doesn't qualify is reported `SKIPPED`, not silently dropped.
+`--target msh15-56|kes27|cena|dancingghosts` are a handful of objects
+already checked against this project during its own development, saved
+as internal shortcuts — `--target` checks those first, then falls back
+to resolving whatever string you gave it the same way `Centaurus A`
+above was resolved. `--ra`/`--dec` work for anything not resolvable by
+name. Full detail: `python3 scripts/casda_fetch.py --help`.
 
 **Before running `rm_synthesis` on fetched data:** these are raw
 archival cubes, not yet resolution-matched — run `convolve_cubes`
-across all of them (every band, both Q and U) first. Skipping this
-won't fail the run outright (resolution matching is a warning, not a
-hard requirement — see
+across the Q and U cubes together (every band) first; I/V don't need
+it. If an `SB<n>/` directory contains its own `beamlog_target.txt`,
+that band's cubes didn't carry per-channel beam info of their own (some
+SBIDs' headers have it, older ones may not) — `--fetch` already pulled
+and curated it from the observatory's own diagnostics data, so pass it
+straight through as `beamfiles=<path to it>` for that band's Q/U pair;
+otherwise `convolve_cubes`' default (`beamfiles=auto`) already reads
+the beam from the FITS file. Skipping this won't fail the run outright
+(resolution matching is a warning, not a hard requirement — see
 [docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md)'s
 `reference_band` callout) but will silently weaken the result. See
 [§8](#8-preprocessing-reproject_cubes-convolve_cubes-match_cubes) below

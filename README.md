@@ -97,6 +97,19 @@ and RM-CLEAN, inspect the output — see
 [docs/user/TUTORIAL.md](docs/user/TUTORIAL.md). For every build variant
 and the validation test suite, see [QUICKSTART.md](QUICKSTART.md).
 
+**No Q/U data of your own yet?** `scripts/casda_fetch.py` fetches
+calibrated POSSUM Stokes Q/U cutouts from the CSIRO ASKAP Science Data
+Archive (CASDA) around a sky position, and curates the per-channel beam
+info `convolve_cubes` needs whenever a cube doesn't already carry its
+own (no manual archive digging required):
+
+```bash
+python3 scripts/casda_fetch.py --target "Centaurus A" --username you@example.org --fetch
+```
+
+See [QUICKSTART.md §4a](QUICKSTART.md#4a-getting-a-test-object) for the
+free-account setup and full detail.
+
 ## Configuration
 
 Every tool reads a plain-text `KEY=VALUE` config file (`cfg/`), one key
