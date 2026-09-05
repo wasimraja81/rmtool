@@ -78,12 +78,37 @@ exactly this risk, not a hypothetical.
    and force-pushes over this commit again -- the tag is what keeps
    this exact snapshot reachable/inspectable afterward:
    ```
-   git tag v1.0
-   git push origin v1.0
+   git tag R1.0
+   git push origin R1.0
    ```
-5. For the *next* release (v1.1, v2.0, ...): repeat steps 2-4 exactly,
-   always re-orphaning off `develop`'s then-current tip, always
-   tagging before it can be overwritten again.
+   Version numbers are R-based (`R1.0`, `R1.1`, `R2.0`, ...), not
+   `v`-prefixed and not bare numeric -- matches the `release-R1.0-prep`
+   branch name itself. Note this is a deliberate convention change:
+   every existing tag in this repo (`1.0` through `5.0-rc.2`) is bare
+   numeric with no prefix at all; `R1.0` is the first tag to use the
+   new scheme.
+5. For the *next* release (`R1.1`, `R2.0`, ...): repeat steps 2-4
+   exactly, always re-orphaning off `develop`'s then-current tip,
+   always tagging before it can be overwritten again.
+
+## Rehearsed (2026-09-05, no state changed on `main`/`origin`)
+
+Ran step 2 on a disposable local branch
+(`_rehearse_release_orphan`, never pushed, deleted immediately after),
+to confirm the mechanism before ever touching `main`:
+
+- `git checkout --orphan _rehearse_release_orphan develop` staged all
+  397 of `develop`'s tracked files as new -- matches
+  `git ls-tree -r develop --name-only | wc -l` exactly.
+- The resulting commit has `parents=[]` (`git log --format="%P"`) --
+  confirmed an orphan root with zero parents, not just a branch that
+  looks disconnected at a glance.
+- `git diff develop _rehearse_release_orphan` produced zero output --
+  the orphan's tree is byte-identical to `develop`'s, confirming the
+  snapshot step doesn't lose or alter anything.
+- No tag was created, `main`/`origin` were never touched, and the
+  rehearsal branch was deleted immediately after (`git branch -D`) --
+  confirmed no trace left in local branches, remote branches, or tags.
 
 ## Explicitly out of scope for this decision
 
