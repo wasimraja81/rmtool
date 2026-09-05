@@ -189,55 +189,80 @@ bash scratch/run_rmsynthesis_test.sh  <config>  [num_threads]  [backend]
 
 No Q/U data of your own yet? `scripts/casda_fetch.py` checks the
 CSIRO ASKAP Science Data Archive (CASDA) for calibrated POSSUM Stokes
-Q/U cubes around a sky position and fetches a small cutout — enough to
+Q/U cubes around a sky position, fetches a small cutout, and generates
+a ready-to-run pipeline config from whatever it fetched — enough to
 try single/multi-band tomography without downloading a full survey
-field.
+field or hand-assembling a cfg yourself.
 
 Needs a free CASDA/OPAL account (self-register at `opal.atnf.csiro.au`)
 and `astroquery` (`~/venv/rmtool/bin/pip install astroquery`, or your
 own venv's pip). The first run prompts for your password once and
 remembers it via your OS keyring; every later run is silent.
 
-Give it any object by a resolvable name (SIMBAD/NED-style alias) or
-explicit coordinates:
-
+**Step 1 — check what's there** (the default mode, `--run-mode=dry`;
+downloads nothing, safe to run any time):
 ```bash
-python3 scripts/casda_fetch.py --target "Centaurus A" --username you@example.org
-python3 scripts/casda_fetch.py --ra 323.56667 --dec -53.61528 --radius 8 --username you@example.org
+python3 scripts/casda_fetch.py --target dancingghosts --username you@example.org
 ```
+`--target` takes either one of this project's own presets (`msh15-56`,
+`kes27`, `cena`, `dancingghosts` — objects already investigated for
+this project, see `docs/dev/CASDA_FETCH_PLAN.md` §4 for how each was
+found) or, failing that, any other name resolvable the way SIMBAD/NED
+resolve it (e.g. `--target "Kes 27"`); use `--ra 323.56667 --dec
+-53.61528 --radius 8` instead for a position not resolvable by name at
+all. This step prints how many observations exist, at how many
+frequency bands, with a complete Stokes Q/U pair present, and states
+directly whether multi-band synthesis is possible at that position or
+only single-band. A band only counts as usable when both Q and U are
+present as `.conv` (beam-wise matched across ASKAP's 36 PAF beams) — a
+band missing that is reported but excluded, since combining
+beam-mismatched data would silently corrupt the result.
 
-Prints how many observations exist, at how many frequency bands, with
-the exact product tomography needs, and states directly whether
-multi-band synthesis is possible for that position or only single-band.
-A band only counts as usable when both Q and U are present as `.conv`
-(beam-wise matched across ASKAP's 36 PAF beams) — a band missing that
-is reported but excluded, since combining beam-mismatched data would
-silently corrupt the result. Add `--fetch` to download — each usable
-band's I/Q/U/V cubes (I to visually confirm signal, V as a noise-floor
-check) land in their own `<outdir>/SB<n>/` subdirectory; an observation
-that doesn't qualify is reported `SKIPPED`, not silently dropped.
-`--target msh15-56|kes27|cena|dancingghosts` are a handful of objects
-already checked against this project during its own development, saved
-as internal shortcuts — `--target` checks those first, then falls back
-to resolving whatever string you gave it the same way `Centaurus A`
-above was resolved. `--ra`/`--dec` work for anything not resolvable by
-name. Full detail: `python3 scripts/casda_fetch.py --help`.
+**Step 2 — fetch:**
+```bash
+python3 scripts/casda_fetch.py --target dancingghosts --username you@example.org \
+    --run-mode=auto --outdir ./dancingghosts_data
+```
+`--run-mode=auto` fetches every usable band found, the latest-observed
+SBID within each, and the latest reprocessed version of each file —
+for when you just want the most complete result CASDA currently
+supports, with no manual choices. (`--run-mode=select
+--select="1,2:51797"` fetches exactly the band/SBID/version
+combination you name instead, using band numbers from step 1's own
+report — see `--help` for the full syntax.) Each usable band's I/Q/U/V
+cubes (I to visually confirm signal, V as a noise-floor check) land in
+their own `<outdir>/SB<n>/` subdirectory; a band that doesn't qualify
+is reported `SKIPPED`, not silently dropped. If a fetched cube doesn't
+already carry a per-channel BEAMS table of its own, fetching also
+pulls and curates the observatory's own beamlog for it automatically —
+no manual beam bookkeeping needed either way.
 
-**Before running `rm_synthesis` on fetched data:** these are raw
-archival cubes, not yet resolution-matched — run `convolve_cubes`
-across the Q and U cubes together (every band) first; I/V don't need
-it. If an `SB<n>/` directory contains its own `beamlog_target.txt`,
-that band's cubes didn't carry per-channel beam info of their own (some
-SBIDs' headers have it, older ones may not) — `--fetch` already pulled
-and curated it from the observatory's own diagnostics data, so pass it
-straight through as `beamfiles=<path to it>` for that band's Q/U pair;
-otherwise `convolve_cubes`' default (`beamfiles=auto`) already reads
-the beam from the FITS file. Skipping this won't fail the run outright
-(resolution matching is a warning, not a hard requirement — see
-[docs/user/APP_REFERENCE.md](docs/user/APP_REFERENCE.md)'s
-`reference_band` callout) but will silently weaken the result. See
-[§8](#8-preprocessing-reproject_cubes-convolve_cubes-match_cubes) below
-for `convolve_cubes` usage.
+**Step 3 — run it:** step 2 also generates a ready-to-run pipeline cfg
+chaining `match_cubes` into `rm_synthesis` (`beamfiles=` already filled
+in either way, per the previous paragraph), printed at the end of its
+own output along with the exact command to run it:
+```bash
+./scripts/run_pipeline.sh ./dancingghosts_data/dancingghosts_pipeline.cfg
+```
+See [TUTORIAL.md §6](docs/user/TUTORIAL.md#6-running-the-full-pipeline-in-one-command)
+for what that script does. A starter `rmclean_cubes` cfg is generated
+alongside it too, but left out of the pipeline cfg's own `stages=` by
+default — CLEAN's stopping criteria are a choice to make after looking
+at the dirty cube, not a safe default (pass `--chain-rmclean` at fetch
+time in step 2 to opt in anyway; it prints an explicit caveat about
+what wasn't checked before doing so). See
+[EXAMPLES.md §3](docs/user/EXAMPLES.md#3-choosing-rm-clean-stopping-criteria)
+for how to choose those criteria once you're ready.
+
+**Re-running against the same `--outdir`:** `--if-exists` controls
+what happens when a previous run's output is still there — `check`
+(default) reports what's present and refuses to guess; `reuse` uses it
+as-is without re-downloading; `refetch` overwrites it; `clean` wipes
+that run's whole output (fetched cubes, generated cfgs, and anything
+`run_pipeline.sh` produced from them) before fetching fresh. Full
+detail on every flag and a longer worked explanation of the archive
+concepts above (SBIDs, reprocessing versions, `.conv` beam-matching):
+`python3 scripts/casda_fetch.py --help`.
 
 ---
 

@@ -172,8 +172,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cutout-radius", type=float, default=None,
         help="Radius in arcmin for the downloaded cutout (with "
-             "--fetch) -- independent of --radius, which only controls "
-             "the search. Defaults to --radius's value if not given.",
+             "--run-mode=auto or =select) -- independent of --radius, "
+             "which only controls the search. Defaults to --radius's "
+             "value if not given.",
     )
     parser.add_argument(
         "--run-mode", choices=("dry", "auto", "select"), default="dry",

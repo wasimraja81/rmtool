@@ -104,7 +104,7 @@ info `convolve_cubes` needs whenever a cube doesn't already carry its
 own (no manual archive digging required):
 
 ```bash
-python3 scripts/casda_fetch.py --target "Centaurus A" --username you@example.org --fetch
+python3 scripts/casda_fetch.py --target dancingghosts --username you@example.org
 ```
 
 See [QUICKSTART.md §4a](QUICKSTART.md#4a-getting-a-test-object) for the
