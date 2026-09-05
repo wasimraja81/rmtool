@@ -263,7 +263,7 @@ at those same channels). The plain/raw Q cube has neither the keyword
 nor the extension. Older/pilot-era SBIDs are expected to lack the
 `BEAMS` extension even on their `.conv.` cube (per the user's own
 domain knowledge of when ASKAPsoft started writing it) — `CASAMBM`'s
-absence on its own does not distinguish "pilot-era, genuinely no
+absence on its own does not distinguish "pilot-era, no
 per-channel beam info" from "just an unset keyword," so the extension
 itself is what's checked, not the keyword.
 
@@ -387,7 +387,7 @@ available, (b) proceed with a specific subset of bands even when more
 are available (e.g. run single-band first before committing to full
 multi-band tomography), or (c) hold off entirely. Current behaviour
 (this session) is fully automatic over whatever `usable` contains —
-correct as a mechanism (single vs multi cfg shape genuinely does need
+correct as a mechanism (single vs multi cfg shape does need
 to track the runtime fetch result, confirmed by the user), but the
 *selection* of which fetched observations feed the generator should
 become a user decision, not an automatic "use everything usable."
@@ -463,7 +463,7 @@ silently wrong, confirmed against this example, not hypothetical.
   wasn't present on both Q and U, which the user caught as wrong -- Q
   and U are recalibrated independently, e.g. a fix that only touches Q
   need not touch U, so requiring the same version number on both is not
-  a legitimate requirement the way `.conv` genuinely is). A letter
+  a legitimate requirement the way `.conv` is). A letter
   missing the requested version falls back to its own highest available
   version, no warning -- expected, not an anomaly. `.conv` presence
   remains the only cross-Stokes hard, all-or-nothing gate.
@@ -539,7 +539,7 @@ each. Three were not, and are now fixed:
    `s_region` -- a sanity check, not a precise containment test).
    `filter_target_coverage()` excludes (with a printed reason) any
    candidate that fails this, before band grouping ever sees it. Once
-   every remaining candidate genuinely reaches the target, "latest
+   every remaining candidate reaches the target, "latest
    wins" is the right default, per the user's own reasoning.
 2. **Two legitimately different bands could overlap in frequency**, and
    separately, **the same band could be split into two by
@@ -590,8 +590,8 @@ Two issues surfaced from the first live `--run-mode=auto` run against
 
 1. **A starter `rmclean_cubes` cfg is now generated alongside the other
    two, even though it isn't chained into `stages=` by default** --
-   `write_rmclean_template()`, matching `cfg/rmclean-jennifer.e2e.cfg`'s
-   structure (single-band; deliberately omits `min_valid_chan_frac`,
+   `write_rmclean_template()`, using a single-band structure (deliberately
+   omits `min_valid_chan_frac`,
    which only matters for a multi-band merge's spatially-varying
    combined-band coverage, per `cfg/rmclean-multiband-wallaby-emu.cfg`)
    with two user-chosen values: `abs_flux_floor=20uJy`, `nwriters=2` --
@@ -657,3 +657,120 @@ Two issues surfaced from the first live `--run-mode=auto` run against
    the instruction: remove `${link}` (`run_pipeline.sh`'s own, gets
    recreated automatically), never `${f}` (the input data). Not a
    `casda_fetch.py` file, but the same live-run session surfaced it.
+
+### T1f — two more `run_pipeline.sh`/rm_synthesis fixes from continued live runs (2026-09-05)
+
+1. **`cubestat` in the generated rmsynth template changed from `n` to
+   `y`.** The user asked why their run produced no PEAK/RM_PEAK/
+   ANG_PEAK/SNR maps -- confirmed against source
+   (`src/rm_synthesis_mod.f90:1564-1679`, gated only by `cfg%cubestat`,
+   `src/rm_synthesis.f90:4834`) that `cubestat=n` was the sole cause,
+   and that this was the generator's own unprompted default, never
+   confirmed with the user the way the RM-range/rmclean values were.
+   Peak/SNR maps are exactly the kind of first-look diagnostic this
+   tool's own users want, so the default flips to `y`.
+2. **`run_pipeline.sh` now clears only symlinks (not regular files) from
+   `match_input_symlinks/` at the start of its own match stage**, so a
+   symlink left over from an earlier, separate invocation (confirmed
+   case: one built from a relative `match_input_path` canonicalizes
+   to a stale, dangling target once a later run supplies an absolute
+   one, tripping the "stale symlink" guard even though nothing is
+   wrong) no longer blocks a clean retry. Deliberately scoped
+   to symlinks only (`find ... -type l -delete`, verified empirically
+   to leave regular files untouched) -- NOT a blanket `rm -rf` of that
+   directory, since `convolve_cubes`/`match_cubes` write their own
+   output (`<symlink_name><outsuffix>`) alongside these same symlinks,
+   and that output is computed data, not ephemeral infrastructure.
+   User's own explicit call: auto-clean the symlinks, but leave the
+   output-already-exists case exactly as it was (an informative error,
+   manual removal) -- "we have provided enough info on what to do to
+   the user."
+
+### T1g — `--if-exists=clean`: a fresh start, opt-in (2026-09-05)
+
+The user's own request: a way to fetch-and-run completely from scratch,
+overwriting existing links/outputs, without hunting through several
+directories by hand each time (fetch output, `pipeline_staging/`, the 3
+generated cfgs, and everything `scripts/run_pipeline.sh` itself would
+have produced against those cfgs). Added as a 4th `--if-exists` choice
+rather than a separate flag, since it's the same underlying question
+("what to do about existing state") just answered more aggressively.
+
+`clean_pipeline_artifacts(outdir, run_name)` removes, by exact/
+predictable name only -- never a blanket wipe of `outdir` itself:
+`pipeline_staging/`, `match_input_symlinks/` (here, unlike
+`run_pipeline.sh`'s own default per-run symlink-only cleanup above,
+the *whole* directory including any `_CONV.FITS` leftover -- this is
+an explicit, opt-in "start over" request, not `run_pipeline.sh`'s own
+quiet default behaviour, so full thoroughness is the right call here
+and doesn't contradict that earlier, more conservative decision), the
+3 generated `*_pipeline.cfg`/`*_rmsynth.cfg`/`*_rmclean.cfg` files, and
+a glob on `<run_name>.*` (catches rm_synthesis' own AMP/PHA/MASK/
+NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR outputs and `run_pipeline.sh`'s own
+`<run_name>.provenance/` directory in one pattern, since all of them
+share that one dot-prefixed naming convention -- confirmed directly
+from `run_pipeline.sh`'s own `RMSYNTH_OUTFILE="${OUTDIR}/${RUN_NAME}"`
+and its printed `"[pipeline] Provenance: <run_name>.provenance"` line
+-- rather than hardcoding every exact suffix, so this stays correct
+regardless of `output_mode`/`cubestat`/etc.). Each selected
+observation's own `<outdir>/SB<n>/` directory is removed separately,
+per observation, inside the fetch loop itself (not this function's
+job), since only `clean_pipeline_artifacts` needs `run_name` and only
+the fetch loop knows which specific SBIDs are about to be re-fetched.
+
+Verified against a fixture mirroring a full run's own artifact set
+(all of the above, plus an unrelated file and a `dancingghosts2_*`
+cfg sharing a name prefix): removed exactly the 10 expected items,
+left the unrelated file and the prefix-sharing-but-distinct cfg
+untouched, confirming the glob doesn't over-match.
+
+### T1h — `--chain-rmclean`: opt-in, with an explicit caveat (2026-09-05)
+
+The user's own request, after discussing the WALLABY+EMU/single-band
+rmclean cfgs' shared three-way stopping strategy (`auto_nsigma=1.0`
+per-pixel adaptive threshold, plus `abs_flux_floor` as a fixed backstop
+for pixels where that estimate is biased, plus `niter` as a hard cap --
+see T1d above): "I think we should allow --chain-rmclean for a user to
+specify. We should print out what the lacunaes are of that chaining
+without looking at dirty cubes, and that the numbers are based on
+typical EMU fields." The "EMU fields" framing is confirmed accurate:
+the user separately confirmed that single-band dataset (the source of
+the `abs_flux_floor=20uJy`/`niter=500`/`gain=0.1` values baked into
+`write_rmclean_template`) is EMU-only band, even though that isn't
+documented anywhere in its own cfg files (checked its own `.fullim`/
+`.e2e` cfgs directly -- see this project's own memory notes for this
+fact's provenance).
+
+`generate_pipeline_cfg()` takes a new `chain_rmclean: bool` parameter
+(default `False`, so every existing call site keeps today's behaviour
+unless it opts in). When set: `stages = match,rmsynth,rmclean` and
+`rmclean_cfg_template = <path>` are emitted instead of the default
+`stages = match,rmsynth` with no rmclean wiring; the generated pipeline
+cfg's own header comment is replaced (not appended to) with a caveat
+enumerating exactly what hasn't been checked before CLEAN runs:
+
+- this run's own dirty cube (`<run_name>.PEAK.MAP.FITS`/
+  `.SNR.MAP.FITS`) has not been inspected to judge whether the
+  criteria in the generated rmclean cfg suit it, since CLEAN starts
+  immediately after rmsynth in the same invocation;
+- `abs_flux_floor`/`niter`/`gain` are carried over from another
+  EMU-band field's own measured dirty-cube noise properties, not this
+  run's own data;
+- `auto_nsigma=1.0`'s per-pixel estimate is confirmed biased for some
+  pixels (per that same cfg's own validation notes), so how well the
+  fixed floor suits this field matters most exactly where the
+  per-pixel estimate is least dependable.
+
+`main()`'s own terminal summary at the end of a successful fetch prints
+the same caveat when `--chain-rmclean` was given, and points to
+`--chain-rmclean` itself in the closing suggestion when it wasn't.
+
+Verified with a synthetic two-branch test (`chain_rmclean=False`/
+`True` against the same fixture records): confirmed the default branch
+has no active (non-comment) `rmclean_cfg_template` line and keeps
+`stages = match,rmsynth`, and the chained branch emits exactly
+`stages = match,rmsynth,rmclean` plus the correct
+`rmclean_cfg_template=` path, both by checking active (non-`#`) lines
+specifically -- the default branch's own header comment mentions
+`rmclean_cfg_template =` as instructional text, so a plain substring
+check would have been a false negative for the "not wired in" case.

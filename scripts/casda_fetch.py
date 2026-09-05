@@ -93,9 +93,11 @@ match_cubes into rm_synthesis) is generated from whatever was fetched.
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
 import re
+import shutil
 import tarfile
 from dataclasses import dataclass, field
 from typing import Optional
@@ -194,17 +196,38 @@ def parse_args() -> argparse.Namespace:
              "--run-mode=auto or =select)",
     )
     parser.add_argument(
-        "--if-exists", choices=("check", "refetch", "reuse"), default="check",
+        "--if-exists", choices=("check", "refetch", "reuse", "clean"),
+        default="check",
         help="What to do when an observation's expected output files are "
              "already present in its <outdir>/SB<n>/ directory. check "
              "(default): report what's there and abort rather than "
-             "guess -- pass refetch or reuse explicitly to proceed. "
-             "refetch: download and overwrite regardless. reuse: skip "
-             "the download for that observation and use the files "
-             "already on disk as-is (presence only, not checked for "
-             "correctness/version -- see stage_symlink and the module "
-             "docstring's note on why a version can't be verified this "
-             "way after the fact).",
+             "guess -- pass refetch, reuse, or clean explicitly to "
+             "proceed. refetch: download and overwrite regardless. "
+             "reuse: skip the download for that observation and use the "
+             "files already on disk as-is (presence only, not checked "
+             "for correctness/version -- see stage_symlink and the "
+             "module docstring's note on why a version can't be "
+             "verified this way after the fact). clean: remove each "
+             "selected observation's whole <outdir>/SB<n>/ directory "
+             "plus every generated pipeline artifact for this run_name "
+             "(pipeline_staging/, match_input_symlinks/, the 3 "
+             "generated cfgs, and any <run_name>.* output/provenance "
+             "scripts/run_pipeline.sh would have produced) before "
+             "fetching fresh -- for when you want a clean "
+             "start rather than layering a retry on top of leftover "
+             "state from earlier attempts.",
+    )
+    parser.add_argument(
+        "--chain-rmclean", action="store_true",
+        help="Add 'rmclean' to the generated pipeline cfg's own stages= "
+             "(with rmclean_cfg_template= pointing at the generated "
+             "rmclean cfg), so one ./scripts/run_pipeline.sh invocation "
+             "runs match, rmsynth, AND rmclean together. Off by default: "
+             "this means CLEAN runs immediately after rmsynth, before "
+             "you've looked at the dirty cube to judge whether the "
+             "generated stopping criteria fit it -- printed as "
+             "an explicit caveat when this flag is used, not silently "
+             "assumed safe.",
     )
     args = parser.parse_args()
     if args.ra is not None and args.dec is None:
@@ -857,7 +880,7 @@ def resolve_selection(bands: list, run_mode: str, select_str: Optional[str]) -> 
 def check_band_overlaps(selection: list) -> bool:
     """True if no two observations about to be fetched together
     overlap in frequency -- catches both a spectral overlap
-    between two truly distinct bands and the same band mistakenly
+    between two distinct bands and the same band mistakenly
     split into two by floating-point noise in em_min/em_max between
     SBIDs (near-duplicate ranges trivially overlap almost entirely
     either way, so one check covers both causes). Prints the
@@ -905,6 +928,44 @@ def sanitize_run_name(s: str) -> str:
     a single underscore."""
     s = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
     return s or "rmtool_fetch"
+
+
+def clean_pipeline_artifacts(outdir: str, run_name: str) -> None:
+    """Removes every generated pipeline artifact for this run_name
+    under outdir, by exact/predictable name only -- never a blanket
+    wipe of outdir itself, so anything the user placed there
+    independently is left alone. Covers both this tool's own output
+    (pipeline_staging/, the 3 generated *_pipeline.cfg/*_rmsynth.cfg/
+    *_rmclean.cfg files) and scripts/run_pipeline.sh's own downstream
+    artifacts from a prior run against those same generated cfgs
+    (match_input_symlinks/, and <run_name>.* -- rm_synthesis' own
+    AMP/PHA/MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR outputs plus
+    run_pipeline.sh's own <run_name>.provenance/ directory all share
+    this one dot-prefixed naming convention, confirmed directly from
+    run_pipeline.sh's own RMSYNTH_OUTFILE="${OUTDIR}/${RUN_NAME}" and
+    its own printed "[pipeline] Provenance: <run_name>.provenance"
+    line -- a glob on this prefix is used rather than hardcoding every
+    exact suffix, so this stays correct regardless of output_mode/
+    cubestat/etc. rather than silently missing one if those change).
+    Per-observation <outdir>/SB<n>/ directories are NOT this
+    function's job -- see the --if-exists=clean handling in main(),
+    which removes exactly the ones about to be re-fetched, not every
+    SB<n>/ directory that happens to exist under outdir."""
+    def remove(path: str) -> None:
+        if os.path.isdir(path) and not os.path.islink(path):
+            print(f"  Removing {path}")
+            shutil.rmtree(path)
+        elif os.path.exists(path) or os.path.islink(path):
+            print(f"  Removing {path}")
+            os.remove(path)
+
+    remove(os.path.join(outdir, "pipeline_staging"))
+    remove(os.path.join(outdir, "match_input_symlinks"))
+    remove(os.path.join(outdir, f"{run_name}_pipeline.cfg"))
+    remove(os.path.join(outdir, f"{run_name}_rmsynth.cfg"))
+    remove(os.path.join(outdir, f"{run_name}_rmclean.cfg"))
+    for path in sorted(glob.glob(os.path.join(outdir, f"{run_name}.*"))):
+        remove(path)
 
 
 def stage_symlink(real_path: str, staging_dir: str, link_name: str) -> str:
@@ -1043,7 +1104,7 @@ ap_angle_mode = phase
 
 write_mask_output = y
 write_nvalid_output = y
-cubestat = n
+cubestat = y
 use_gpu = n
 mem_frac_ram = 0.25
 log_level = info
@@ -1058,16 +1119,16 @@ def write_rmclean_template(path: str) -> None:
     default (generate_pipeline_cfg's own docstring explains why) -- so
     extending to CLEAN means editing this file and adding it to the
     pipeline cfg's own stages=/rmclean_cfg_template=, not hunting
-    through cfg/ for a template to copy from scratch. Structured like
-    cfg/rmclean-jennifer.e2e.cfg (single-band; no min_valid_chan_frac,
-    which only does anything for a multi-band merge's spatially-varying
-    combined-band coverage -- see cfg/rmclean-multiband-wallaby-emu.cfg
-    for why THAT cfg needs it and this one shouldn't copy it
-    unexamined), with two values the user chose explicitly rather than
-    carrying over from either existing project cfg: abs_flux_floor=20uJy
-    and nwriters=2 -- see this file's own header comment for why even
-    those should still be re-checked against this run's own data before
-    being trusted for a CLEAN pass."""
+    through cfg/ for a template to copy from scratch. Single-band
+    structure (no min_valid_chan_frac, which only does anything for a
+    multi-band merge's spatially-varying combined-band coverage -- see
+    cfg/rmclean-multiband-wallaby-emu.cfg for why THAT cfg needs it and
+    this one shouldn't copy it unexamined), with two values the user
+    chose explicitly rather than carrying over from an existing project
+    cfg: abs_flux_floor=20uJy and nwriters=2 -- see this file's own
+    header comment for why even those should still be re-checked
+    against this run's own data before being trusted for a CLEAN
+    pass."""
     body = """\
 # rmclean_cubes config auto-generated by scripts/casda_fetch.py -- NOT
 # chained into the pipeline cfg's own stages= by default (CLEAN
@@ -1084,9 +1145,10 @@ outfile   = placeholder
 
 # 20uJy is a starting value, not a measurement of this run's own data --
 # re-measure it against this run's own dirty AMP.RMCUBE.FITS once you
-# have it (see cfg/rmclean-jennifer.e2e.cfg and
-# cfg/rmclean-multiband-wallaby-emu.cfg for how each of those two was
-# independently measured from its own cube, not copied from the other).
+# have it. See docs/user/EXAMPLES.md's "Choosing RM-CLEAN stopping
+# criteria" section for the method, and
+# cfg/rmclean-multiband-wallaby-emu.cfg for a value independently
+# measured this way from another field's own dirty cube.
 abs_flux_floor = 20uJy
 auto_nsigma = 1.0
 
@@ -1105,7 +1167,8 @@ timing_enabled = y
         f.write(body)
 
 
-def generate_pipeline_cfg(outdir: str, run_name: str, records: list) -> Optional[str]:
+def generate_pipeline_cfg(outdir: str, run_name: str, records: list,
+                           chain_rmclean: bool = False) -> Optional[str]:
     """records: one (sbid_dir, q_path, u_path, beamfile_or_None) tuple
     per fetched observation -- already resolved to exactly one SBID per
     band by resolve_selection before this is called, never "everything
@@ -1121,14 +1184,16 @@ def generate_pipeline_cfg(outdir: str, run_name: str, records: list) -> Optional
     observation's own Q/U already share one native grid); two or more
     use stages=both (separate SBIDs/bands may not share a grid).
 
-    rmclean is deliberately left out of the generated stages= -- its
-    CLEAN stopping criteria are a choice for the user to make (see
-    docs/user/EXAMPLES.md's own dedicated section on this), not
-    something to default silently. A ready-to-edit rmclean cfg
-    (write_rmclean_template) is still generated alongside the other two
-    either way, so extending to CLEAN later means editing that file and
-    this pipeline cfg's own stages=/rmclean_cfg_template=, not hunting
-    through cfg/ for a template to start from.
+    rmclean is left out of the generated stages= UNLESS chain_rmclean is
+    set -- its CLEAN stopping criteria are a choice for the user to make
+    (see docs/user/EXAMPLES.md's own dedicated section on this), not
+    something to default silently: running it in the same invocation as
+    rmsynth means CLEAN starts before the dirty cube has been inspected
+    to judge whether the generated criteria suit it. A ready-to-edit
+    rmclean cfg (write_rmclean_template) is generated alongside the
+    other two either way; with chain_rmclean, the pipeline cfg's own
+    header comment prints exactly what hasn't been checked instead of
+    the default "add this yourself" note.
 
     Returns the pipeline cfg's path, or None if `records` is empty
     (nothing fetched to build a pipeline around)."""
@@ -1169,8 +1234,35 @@ def generate_pipeline_cfg(outdir: str, run_name: str, records: list) -> Optional
     write_rmclean_template(rmclean_template_path)
 
     pipeline_cfg_path = os.path.join(outdir, f"{run_name}_pipeline.cfg")
-    with open(pipeline_cfg_path, "w") as f:
-        f.write(
+    if chain_rmclean:
+        header = (
+            f"# Pipeline config auto-generated by scripts/casda_fetch.py -- run with:\n"
+            f"#   ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
+            f"# rmclean IS included below (--chain-rmclean was given) -- stages=\n"
+            f"# runs match, rmsynth, AND rmclean in this one invocation, using\n"
+            f"#   {rmclean_template_path}\n"
+            f"# as its cfg. What that cfg's stopping criteria have not been\n"
+            f"# checked against, since CLEAN starts right after rmsynth finishes:\n"
+            f"#   - this run's own dirty cube (once rmsynth finishes, look at\n"
+            f"#     {run_name}.PEAK.MAP.FITS / {run_name}.SNR.MAP.FITS) has not\n"
+            f"#     been inspected to judge whether the criteria below suit it\n"
+            f"#   - abs_flux_floor=20uJy and niter=500/gain=0.1 in that cfg are\n"
+            f"#     carried over from another EMU-band field's own measured\n"
+            f"#     dirty-cube noise properties -- not measured from this run's\n"
+            f"#     own data (see docs/user/EXAMPLES.md's \"Choosing RM-CLEAN\n"
+            f"#     stopping criteria\" section for the method)\n"
+            f"#   - auto_nsigma=1.0's per-pixel noise estimate is biased for\n"
+            f"#     some pixels (see that same cfg's own validation notes) --\n"
+            f"#     abs_flux_floor is the backstop for exactly those pixels, so\n"
+            f"#     how well 20uJy suits this field matters most where the\n"
+            f"#     per-pixel estimate is least reliable\n"
+            f"# Edit {rmclean_template_path} first if you want to check these\n"
+            f"# against this run's own output before CLEAN runs on it.\n"
+        )
+        stages_line = f"stages = match,rmsynth,rmclean\n"
+        rmclean_cfg_line = f"rmclean_cfg_template = {rmclean_template_path}\n"
+    else:
+        header = (
             f"# Pipeline config auto-generated by scripts/casda_fetch.py -- run with:\n"
             f"#   ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
             f"# rmclean is not included by default -- its CLEAN stopping criteria are\n"
@@ -1180,7 +1272,14 @@ def generate_pipeline_cfg(outdir: str, run_name: str, records: list) -> Optional
             f"# look at the rmsynth output below first, edit that file's\n"
             f"# abs_flux_floor/niter/etc. to fit it, then add 'rmclean' to stages=\n"
             f"# and rmclean_cfg_template = {rmclean_template_path}\n"
-            f"stages = match,rmsynth\n"
+        )
+        stages_line = f"stages = match,rmsynth\n"
+        rmclean_cfg_line = ""
+
+    with open(pipeline_cfg_path, "w") as f:
+        f.write(
+            header +
+            stages_line +
             f"outdir = {outdir}\n"
             f"run_name = {run_name}\n"
             f"\n"
@@ -1192,6 +1291,7 @@ def generate_pipeline_cfg(outdir: str, run_name: str, records: list) -> Optional
             f"rmsynth_cfg_template = {rmsynth_template_path}\n"
             f"rmsynth_backend = auto\n"
             f"rmsynth_omp_threads = 6\n"
+            + (f"\n{rmclean_cfg_line}" if rmclean_cfg_line else "")
         )
     return pipeline_cfg_path
 
@@ -1210,6 +1310,12 @@ def main() -> None:
     # does (that one already used an absolute target).
     args.outdir = os.path.abspath(args.outdir)
     coord = resolve_target(args)
+    # Computed early (needs only args.target/coord, nothing fetch-
+    # related) so --if-exists=clean can use it to identify this run's
+    # own generated artifacts before the fetch loop starts, not just at
+    # generate_pipeline_cfg() time.
+    run_name = sanitize_run_name(
+        args.target if args.target else f"ra{coord.ra.deg:.3f}_dec{coord.dec.deg:.3f}")
     print(
         f"Target position: {coord.to_string('hmsdms')} "
         f"({coord.ra.deg:.5f}, {coord.dec.deg:.5f} deg)"
@@ -1263,6 +1369,13 @@ def main() -> None:
     if not check_band_overlaps(selection):
         return
 
+    if args.if_exists == "clean":
+        print(f"\n--if-exists=clean: removing this run's own generated "
+              f"pipeline artifacts under {args.outdir} before fetching "
+              f"fresh (each selected observation's own SB<n>/ directory "
+              f"is removed further below, per observation):")
+        clean_pipeline_artifacts(args.outdir, run_name)
+
     print(f"\nFetching {len(selection)} observation(s) into "
           f"{args.outdir}/<SBID>/, cutout radius={cutout_radius} arcmin...")
 
@@ -1307,6 +1420,9 @@ def main() -> None:
         rows = rows[mask_pol]
 
         obs_dir = os.path.join(args.outdir, sbid_dirname(obs.obs_id))
+        if args.if_exists == "clean" and os.path.exists(obs_dir):
+            print(f"  Removing {obs_dir} (--if-exists=clean)")
+            shutil.rmtree(obs_dir)
         os.makedirs(obs_dir, exist_ok=True)
         freq_str = f"{obs.freq[0]:.1f}-{obs.freq[1]:.1f} MHz" if obs.freq else "unknown freq"
         print(f"\n{obs.obs_id} ({freq_str}) -> {obs_dir}/")
@@ -1449,24 +1565,51 @@ def main() -> None:
         )
         return
 
-    run_name = sanitize_run_name(
-        args.target if args.target else f"ra{coord.ra.deg:.3f}_dec{coord.dec.deg:.3f}")
-    pipeline_cfg_path = generate_pipeline_cfg(args.outdir, run_name, pipeline_records)
+    pipeline_cfg_path = generate_pipeline_cfg(
+        args.outdir, run_name, pipeline_records, chain_rmclean=args.chain_rmclean)
     rmclean_template_path = os.path.join(args.outdir, f"{run_name}_rmclean.cfg")
-    print(
-        f"\nPipeline config generated from all {len(pipeline_records)} "
-        f"requested observation(s): {pipeline_cfg_path}\n"
-        f"Run it with: ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
-        f"This chains match_cubes (resolution/grid matching -- "
-        f"beamfiles= already set per band, curated or auto as printed "
-        f"above) into rm_synthesis. It does NOT include rmclean_cubes "
-        f"or use the I/V cubes (source-verification/noise-floor only, "
-        f"not part of tomography) by default -- a starter rmclean cfg "
-        f"is already waiting at {rmclean_template_path} if you want to "
-        f"add it: look at the rmsynth output, edit that file's stopping "
-        f"criteria to fit it, then add 'rmclean' to the pipeline cfg's "
-        f"stages= and rmclean_cfg_template=."
-    )
+    if args.chain_rmclean:
+        print(
+            f"\nPipeline config generated from all {len(pipeline_records)} "
+            f"requested observation(s): {pipeline_cfg_path}\n"
+            f"Run it with: ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
+            f"This chains match_cubes -> rm_synthesis -> rmclean_cubes in one "
+            f"invocation (--chain-rmclean was given), using "
+            f"{rmclean_template_path} for the CLEAN stage. Not checked before "
+            f"CLEAN runs, since it starts right after rmsynth finishes in the "
+            f"same invocation:\n"
+            f"  - this run's own dirty cube -- CLEAN's stopping criteria are "
+            f"not being judged against {run_name}.PEAK.MAP.FITS / "
+            f"{run_name}.SNR.MAP.FITS before they're used\n"
+            f"  - abs_flux_floor=20uJy and niter=500/gain=0.1 are carried "
+            f"over from another EMU-band field's own measured dirty-cube "
+            f"noise properties, not this run's own data (see "
+            f"docs/user/EXAMPLES.md's \"Choosing RM-CLEAN stopping "
+            f"criteria\" section for the method)\n"
+            f"  - auto_nsigma=1.0's per-pixel noise estimate is confirmed "
+            f"biased for some pixels -- abs_flux_floor backstops exactly "
+            f"those pixels, so how well 20uJy suits this field matters "
+            f"most where the per-pixel estimate is least reliable\n"
+            f"Edit {rmclean_template_path} first if you want to check these "
+            f"against this run's own rmsynth output before running the "
+            f"pipeline cfg above."
+        )
+    else:
+        print(
+            f"\nPipeline config generated from all {len(pipeline_records)} "
+            f"requested observation(s): {pipeline_cfg_path}\n"
+            f"Run it with: ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
+            f"This chains match_cubes (resolution/grid matching -- "
+            f"beamfiles= already set per band, curated or auto as printed "
+            f"above) into rm_synthesis. It does NOT include rmclean_cubes "
+            f"or use the I/V cubes (source-verification/noise-floor only, "
+            f"not part of tomography) by default -- a starter rmclean cfg "
+            f"is already waiting at {rmclean_template_path} if you want to "
+            f"add it: look at the rmsynth output, edit that file's stopping "
+            f"criteria to fit it, then add 'rmclean' to the pipeline cfg's "
+            f"stages= and rmclean_cfg_template=. Or re-run casda_fetch.py "
+            f"with --chain-rmclean to have this done automatically next time."
+        )
 
 
 if __name__ == "__main__":
