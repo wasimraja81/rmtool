@@ -582,3 +582,78 @@ The two accepted-as-is items from this same review: no validation that
 a fetched cutout has usable signal (Stokes I is exactly why it gets
 fetched -- the user inspects it themselves), and `rmclean_cubes` still
 not wired into `--run-mode` (tracked above, unchanged by this pass).
+
+### T1d — live-run fixes (2026-09-05): a starter rmclean cfg, and absolute paths
+
+Two issues surfaced from the first live `--run-mode=auto` run against
+`dancingghosts` (SBID 74876, single band), both fixed:
+
+1. **A starter `rmclean_cubes` cfg is now generated alongside the other
+   two, even though it isn't chained into `stages=` by default** --
+   `write_rmclean_template()`, matching `cfg/rmclean-jennifer.e2e.cfg`'s
+   structure (single-band; deliberately omits `min_valid_chan_frac`,
+   which only matters for a multi-band merge's spatially-varying
+   combined-band coverage, per `cfg/rmclean-multiband-wallaby-emu.cfg`)
+   with two user-chosen values: `abs_flux_floor=20uJy`, `nwriters=2` --
+   both flagged in the generated file's own comment as starting points
+   to re-check against this run's own dirty cube, not copied
+   measurements from either existing project cfg. The pipeline cfg's
+   own header comment and `casda_fetch.py`'s final terminal message
+   both now name this file's exact path directly, so extending to
+   CLEAN means editing that file and adding two lines to the pipeline
+   cfg, not finding a template to copy from `cfg/` first.
+2. **A relative `--outdir` broke `scripts/run_pipeline.sh`'s own
+   match-stage symlinking.** That script builds its own second symlink
+   layer (`match_input_symlinks/`) via `ln -s "${f}" "${link}"`, where
+   `${f}` comes from this tool's own `match_input_path=`. A relative
+   `${f}` makes `ln -s` write a relative target, which POSIX resolves
+   against the *new* symlink's own directory (`match_input_symlinks/`),
+   not any directory `casda_fetch.py` or the user had in mind --
+   producing `ERROR: cannot open FITS file` once `match_cubes` tried to
+   read through it, confirmed directly against the user's own live run
+   output. Independent of `stage_symlink()`'s own symlinks, which
+   already used an absolute target. Fixed at the source: `args.outdir`
+   is absolutized (`os.path.abspath`) once, immediately after
+   `parse_args()`, so every path derived from it downstream (`obs_dir`,
+   `pipeline_staging/`, and all three generated cfgs' own path-valued
+   keys) is absolute regardless of which directory `casda_fetch.py` is
+   invoked from.
+
+### T1e — re-fetch avoidance and UX fixes from a second live run (2026-09-05)
+
+1. **`--if-exists=check|refetch|reuse` (default `check`)** -- the fetch
+   loop previously had no way to know a re-run's expected output files
+   (predicted from `conv_by_letter`, already known pre-fetch -- the
+   only checkable signal, since CASDA's cutout service renames every
+   download and a version tag isn't recoverable from a downloaded file
+   either, see `version_number_from_filename`) already existed on disk,
+   so re-running after fixing the path bug above would have
+   unconditionally resubmitted a CASDA cutout job and re-downloaded
+   everything. Presence-only, not correctness -- deliberately not
+   checked against version (per the user's own framing: "we do not
+   technically need to check for correctness"). `check` (default)
+   reports what's already there and aborts rather than silently guess
+   either way; `reuse` skips the download and treats the existing files
+   as this run's own output; `refetch` is today's unconditional
+   behaviour, unchanged.
+2. **A "stale symlink" error surfaced from `run_pipeline.sh` itself**
+   on the corrected second attempt -- not a new bug: `match_input_symlinks/`
+   is a directory `run_pipeline.sh` owns and manages entirely on its
+   own (unrelated to this tool's own `pipeline_staging/`), and it still
+   had a symlink left over from the FIRST (pre-fix) attempt, whose
+   target canonicalizes to a dangling path under the old relative-path
+   scheme. `run_pipeline.sh`'s own guard against silently repointing an
+   existing symlink is doing exactly what it's supposed to; the fix is
+   just removing that stale, fully-regeneratable directory before
+   re-running -- not a `casda_fetch.py` change.
+3. **A progress message added before the `casda.cutout()` call**, which
+   stages the request server-side and polls until the job completes --
+   previously silent for however long that takes (confirmed: upwards of
+   a minute per observation), which could read as a hang.
+4. **`scripts/run_pipeline.sh`'s own stale-symlink error message was
+   ambiguous about which of its two paths to delete** ("stale symlink
+   at X does not point at Y -- remove it first" -- "it" reads as
+   referring to either). Reworded to name both paths explicitly next to
+   the instruction: remove `${link}` (`run_pipeline.sh`'s own, gets
+   recreated automatically), never `${f}` (the input data). Not a
+   `casda_fetch.py` file, but the same live-run session surfaced it.

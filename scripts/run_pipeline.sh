@@ -313,7 +313,7 @@ if [[ "${DO_MATCH}" -eq 1 ]]; then
     link="${MATCH_SYMLINK_DIR}/${b}"
     if [[ -e "${link}" || -L "${link}" ]]; then
       [[ "$(readlink -f "${link}")" == "$(readlink -f "${f}")" ]] || \
-        die "stale symlink at ${link} does not point at ${f} -- remove it first"
+        die "stale symlink ${link} does not resolve to this run's expected input, ${f} -- remove the symlink ${link} (it will be recreated automatically on the next run; do not remove ${f}, that's your input data)"
     else
       ln -s "${f}" "${link}"
     fi
