@@ -265,6 +265,19 @@ log "Stages: ${STAGES_RAW}"
 log "Output: ${OUTDIR}/${RUN_NAME}.*"
 log "Provenance: ${PROVDIR}"
 
+# This host has SMT (hyperthreading): logical CPU N and N+8 are the two
+# siblings of the same physical core, so an unconstrained OpenMP run
+# grabs both siblings of every core instead of one thread per physical
+# core. Set once here so match_cubes/rm_synthesis/rmclean_cubes all
+# inherit it -- rm_synthesis' own runner script (scratch/
+# run_rmsynthesis_test.sh) already sets the same values itself, so this
+# is redundant but harmless for that stage; match_cubes/rmclean_cubes
+# had no such guard at all until now and were confirmed to spread
+# across both SMT siblings of every core.
+export OMP_NUM_THREADS=6
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+
 RMSYNTH_INFILEQ=""
 RMSYNTH_INFILEU=""
 
@@ -305,6 +318,21 @@ if [[ "${DO_MATCH}" -eq 1 ]]; then
   # silently repointed.
   MATCH_SYMLINK_DIR="${OUTDIR}/match_input_symlinks"
   mkdir -p "${MATCH_SYMLINK_DIR}"
+
+  # Clear only SYMLINKS left over from an earlier, separate invocation
+  # -- pure indirection with no data of their own, safely regenerated
+  # fresh in the loop below regardless of what they used to point at
+  # (fixes a confirmed case: an earlier run's symlink built from a relative
+  # match_input_path canonicalizes to a different, now-stale target
+  # than this run's own absolute one, tripping the "stale symlink"
+  # guard below on every subsequent run even though nothing is wrong).
+  # Deliberately NOT a blanket rm -rf of this whole directory:
+  # match_cubes writes its own output (<symlink_name><outsuffix>)
+  # alongside these same symlinks (see this block's own comment above),
+  # and that output is computed data -- left alone here on
+  # purpose, so its own abort-if-exists guard still requires deleting
+  # it explicitly rather than silently regenerating it every run.
+  find "${MATCH_SYMLINK_DIR}" -maxdepth 1 -type l -delete
 
   ALL_INFILES=""
   for b in "${Q_BANDS[@]}" "${U_BANDS[@]}"; do
