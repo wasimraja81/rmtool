@@ -3006,8 +3006,8 @@ contains
       ! image these are ~160MB (real(dp)) or ~80MB (real) EACH, and as
       ! automatic arrays private to each OMP thread they were silently
       ! stack-allocated, guaranteed to overflow a worker thread's default
-      ! stack on real production-scale data (found via the real ~46GB
-      ! Jennifer end-to-end verification run; invisible on this project's
+      ! stack on real production-scale data (found via a ~46GB
+      ! end-to-end verification run; invisible on this project's
       ! own tiny 32x32 test fixtures). Allocated on first use per thread
       ! below (nx_in/ny_in/nx_out/ny_out are fixed for this whole call, so
       ! one allocation per thread suffices).

@@ -483,8 +483,8 @@ resolved, plus one follow-up decision (0) reached after the rest:
    comparisons). **This is an explicit, narrower scope than the
    encapsulation-refactor effort accepted for itself**: that project's T3b
    needed a real production-scale Setonix run to validate beyond what
-   synthetic in-suite tests could show (see project memory
-   `project_jennifer_t3b_validation`); no equivalent real-data validation
+   synthetic in-suite tests could show (see project memory for that
+   validation run); no equivalent real-data validation
    step is planned here. A real multi-band production run remains something
    the user can do separately once this lands, but it is not a gate any
    ticket in this plan depends on passing.

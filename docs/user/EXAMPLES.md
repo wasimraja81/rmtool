@@ -203,9 +203,8 @@ actually know about your data:
 | Production runs on real data (recommended default) | **Both together** | Whichever fires first wins per pixel. `auto_nsigma` handles the typical case; `abs_flux_floor` is a safety net for the pixels where the per-pixel sigma estimate itself is untrustworthy (it can be biased for individual pixels even though it's accurate on average). |
 | You're debugging, or want to see the FULL iteration history regardless of convergence | Neither — `niter` alone | CLEAN runs every pixel for the full `niter` budget; combine with `trace_ix`/`trace_iy`/`log_every` to inspect one pixel's own per-iteration trend. |
 
-**A worked example**, anchored to this dataset's own measured noise
-floor (`cfg/rmclean-jennifer.e2e.cfg`'s actual reasoning, not an
-invented number):
+**A worked example**, anchored to one dataset's own measured noise
+floor, not an invented number:
 
 ```cfg
 # abs_flux_floor anchored to this dataset's own independently-measured

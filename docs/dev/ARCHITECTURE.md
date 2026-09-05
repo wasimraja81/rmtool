@@ -552,7 +552,7 @@ Even with `io_read_threads`/`nwriters` tuned, the tile loop is
 still fully serial *between* tiles: `write(N)` finishes before `read(N+1)`
 even starts, though the two touch entirely different files (output
 AMP/PHA vs. input Q/U) with no data dependency between them. Real Setonix
-timing (`JENNIFER_TOO_FULLIM.run.cpu.setonix.log`, 27 tiles) showed read
+timing (the full-image CPU run's own timing log, 27 tiles) showed read
 (~124s/tile) and write (~95-110s/tile) together at 84% of wall time —
 overlapping them was the largest single lever available.
 

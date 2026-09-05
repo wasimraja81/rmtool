@@ -1743,8 +1743,8 @@ contains
       ! this whole file moved to FTGIOU-based allocation) happened to run
       ! without visibly failing on the tiny 32x32 test fixture but
       ! corrupted CFITSIO's internal unit table on a real cube,
-      ! SIGSEGVing deep inside libcfitsio -- found via the real ~46GB
-      ! Jennifer end-to-end run.
+      ! SIGSEGVing deep inside libcfitsio -- found via a ~46GB
+      ! end-to-end run.
       call safe_ftopen(unit, trim(filename), 0, blocksize, fitsstat)
       if (fitsstat.ne.0) then
          call free_fits_unit(unit)

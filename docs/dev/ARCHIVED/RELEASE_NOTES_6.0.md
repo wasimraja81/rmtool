@@ -208,8 +208,9 @@ instead of running out of memory.
 - `src/rmclean_io_mod.f90` — mask-cube I/O extracted into its own
   module (`read_mask_tile`/`read_mask_chunk`), both for independent
   testability and as the vehicle for the T10a/T10b fixes.
-- `cfg/rmclean-example.cfg`, `cfg/rmclean-jennifer.e2e.cfg`,
-  `cfg/rmclean-e2e-smalltest.cfg` — annotated, current example configs.
+- `cfg/rmclean-example.cfg`, `cfg/rmclean-e2e-smalltest.cfg` — annotated,
+  current example configs, plus a full-scale e2e validation cfg for this
+  project's own dataset.
 - `tests/data/rmclean_pixel65_65/` — a small, permanent, fast-running
   regression fixture built directly from the real dataset that exposed
   the mask-read bug.

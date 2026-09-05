@@ -242,7 +242,7 @@ program reproject_cubes
    ! io_overlap (default n): background-thread block write, overlapped
    ! with the NEXT block's read+resample -- same scheme/key name as rm_
    ! synthesis/rmclean_cubes/convolve_cubes' own io_overlap (planning-doc
-   ! ticket, added after the real ~46GB Jennifer end-to-end run measured
+   ! ticket, added after a ~46GB end-to-end run measured
    ! this class of block write as fully serial with compute on real
    ! storage). Same CLI-then-cfg-then-override merge pattern as
    ! mem_frac_ram just above.

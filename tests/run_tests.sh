@@ -2443,7 +2443,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 32. gaussft_mod: FFT-friendly padding (found via the real Jennifer e2e
+# 32. gaussft_mod: FFT-friendly padding (found via an e2e validation
 #     run -- 4501x4501 = 7 x 643, 643 prime, made convolve_cubes/
 #     match_cubes' own convolution step ~2x slower than necessary; see
 #     next_fast_fft_size's own comment in src/gaussft.f90).
@@ -2476,8 +2476,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # 33. convolve_cubes: io_overlap bit-identical to io_overlap=n (planning-
-#     doc ticket, added alongside the FFT padding fix -- same real
-#     Jennifer e2e run found convolve's own block write fully serial
+#     doc ticket, added alongside the FFT padding fix -- the same e2e
+#     validation run found convolve's own block write fully serial
 #     with compute, ~44s/block dead time on real storage).
 # ---------------------------------------------------------------------------
 section "33. convolve_cubes: io_overlap bit-identical to io_overlap=n"
@@ -4077,7 +4077,7 @@ section "56. rmclean_cubes: swim-lane plot generation (reminder check, non-block
 # Found worth having (2026-08-09) after a real multi-hour WALLABY+EMU
 # rmclean run finished with no swim-lane plot ever generated for it --
 # the capability existed (scripts/plot_tile_async_swimlane.py, already
-# used for the earlier Jennifer e2e run) but nothing prompted using it.
+# used for an earlier e2e validation run) but nothing prompted using it.
 # Deliberately uses warn(), not fail(): this is a diagnostics/visibility
 # tool, not a correctness property of rmclean_cubes' own output -- it
 # should never be why the suite (or anything gating on it) goes red, but

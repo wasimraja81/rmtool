@@ -17,7 +17,7 @@ with corresponding documentation and interpretation updates for swim-lane diagno
   - Prevents staging-only terms from over-shrinking CPU/non-staging RAM tiles.
 
 - Benchmark observations used during release qualification:
-  - CPU full-image Jennifer run improved after planner split.
+  - CPU full-image run improved after planner split.
   - GPU path remained correct with active offload, but showed a small runtime regression on the tested environment.
 
 - Documentation improvements:

@@ -812,7 +812,7 @@ write-throughput gain (see Validation below). See
   - Host RAM tile budget now uses `bytes_per_tile_pixel_ram`.
   - GPU VRAM sub-block budget now uses `bytes_per_vram_pixel`.
 - Updated docs to reflect planner behaviour and measured outcomes:
-  - CPU full-image Jennifer benchmark improved after planner split.
+  - CPU full-image benchmark improved after planner split.
   - GPU path remained correct but showed a slight regression on the tested environment.
 - Extended swim-lane interpretation notes for CPU thread-detail view:
   - Clarified that single-RM-chunk runs (`nrm_out <= nrm_block_size`) show only odd/non-hatched `cpu_extract` traces.

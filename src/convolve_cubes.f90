@@ -12,8 +12,9 @@
 ! self-contained). Route 1: a CASA-style BEAMS binary table extension
 ! (CASAMBM=T in the primary header, EXTNAME='BEAMS', columns BMAJ/BMIN/BPA
 ! in arcsec/arcsec/deg, CHAN 0-indexed) -- confirmed against a real ASKAP
-! cube (/data1/tmp/cutout-stokesQ.fits, used by cfg/rmsynth-jennifer.fullim
-! .cfg): CASAMBM=T, 288-row BEAMS table, one row per FREQ channel. Route 2:
+! cube (/data1/tmp/cutout-stokesQ.fits, used by that dataset's own
+! full-image rmsynth cfg): CASAMBM=T, 288-row BEAMS table, one row per FREQ
+! channel. Route 2:
 ! a plain ASCII text file, one line per channel: "channel bmaj_arcsec
 ! bmin_arcsec bpa_deg" (1-indexed channel, matching this project's existing
 ! bad-channel-file convention), '#'-prefixed or blank lines skipped -- for
@@ -118,7 +119,7 @@ program convolve_cubes
    ! than 2^31-1 elements would silently wrap/misbehave on a real
    ! full-size image with a generous mem_frac_ram. 2e9 leaves comfortable
    ! headroom under 2,147,483,647 for ANY nx/ny, not just today's real
-   ! 4501x4501 Jennifer cube -- this clamp activates (shrinks
+   ! 4501x4501 validation cube -- this clamp activates (shrinks
    ! block_planes below what mem_frac_ram alone would allow) only for
    ! genuinely huge images/generous mem_frac_ram combinations; ordinary
    ! runs never notice it.
@@ -198,7 +199,7 @@ program convolve_cubes
    ! io_overlap (default n): background-thread block write, overlapped
    ! with the NEXT block's read+convolve -- same scheme/key name as rm_
    ! synthesis/rmclean_cubes' own io_overlap (planning-doc ticket, added
-   ! after the real ~46GB Jennifer end-to-end run measured convolve's own
+   ! after a ~46GB end-to-end run measured convolve's own
    ! write I/O -- a real disk, 150MB/s measured -- as fully serial with
    ! compute, ~44s/block of dead time). See write_convolved_file's own
    ! comment for why this is a single-writer-at-a-time design (block_out
@@ -1481,8 +1482,8 @@ contains
       ! thread's own stack, which is typically only a few MB (OMP_STACKSIZE
       ! default) -- a guaranteed stack-overflow SIGSEGV, invisible on this
       ! project's own tiny (32x32) test fixtures but fatal on real
-      ! production-scale data (found via the real ~46GB Jennifer
-      ! end-to-end verification run). Needed only because gaussft_mod's
+      ! production-scale data (found via a ~46GB end-to-end
+      ! verification run). Needed only because gaussft_mod's
       ! convolve_to_beam works in real(dp), while block_in/block_out
       ! (this file's own I/O buffers) are single precision, matching every
       ! other block-I/O buffer in this project (reproject_cubes.f90's own
@@ -1665,7 +1666,7 @@ contains
       ! it. This still captures the real win: write(N) overlaps
       ! read+compute(N+1), which is where the actual dead time was
       ! (measured directly: ~44s/block write, fully serial with compute,
-      ! on the real Jennifer cube's own storage).
+      ! on that dataset's own storage).
       cur_slot = 0
       write_pending = .false.
       write_failed = .false.

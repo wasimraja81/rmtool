@@ -51,7 +51,7 @@ was introduced, in favour of the simpler full-spectrum estimator
 default (must opt in explicitly); `auto_nsigma`'s own default value is
 `1.0` (not `5.0` -- justified now that the sigma estimate itself is
 trustworthy); `abs_flux_floor` values are always given with an explicit
-unit suffix; `cfg/rmclean-jennifer.e2e.cfg` sets a REAL, active
+unit suffix; that dataset's own e2e cfg sets a REAL, active
 `abs_flux_floor=20uJy` (anchored to this dataset's own independently-
 measured ~25.5 uJy/beam floor) alongside `auto_nsigma=1.0` as a genuine
 safety net, not a placeholder. See T9's own Evidence section (including
@@ -62,13 +62,13 @@ corruption bug found while investigating why a real full-cube CLEAN run
 diverged from small-subimage test behaviour: `read_mask_cube`'s use of
 the plain `FTGPVB` CFITSIO entry point overflowed its 32-bit
 `firstelem`/`nelem` arguments for any mask cube exceeding 2^31 total
-elements (this project's own Jennifer ASKAP mask cube, 4501x4501x288,
+elements (this project's own ASKAP mask cube, 4501x4501x288,
 is 2.7x over that limit), silently truncating the valid-channel mask
 read at ~76 of 288 channels for EVERY pixel in the image. Fixed by
 switching to `FTGPVBLL`, CFITSIO's own genuinely-64-bit entry point for
 the exact same underlying C call -- verified directly against this
 project's own bundled cfitsio-4.3.1 source, not assumed. A full-cube
-confirmation run (`jennifer_e2e_v5_cleaned`) proved this single bug was
+confirmation run (the v5 CLEAN run) proved this single bug was
 the root cause of three things investigated this session as apparently
 separate mysteries: niter-cap hit rate 99.05% -> 0.00% across all
 20,259,001 real pixels, mean iterations 496.72 -> 55.29, ~2.7x faster
@@ -82,7 +82,7 @@ deleted `read_mask_cube`; `mask_tile` is now tiled exactly like AMP/PHA;
 the mask-pattern cache builds incrementally, once per tile, with no
 locks needed (the tile loop's own strict sequencing already guarantees
 insertion never races a lookup). A full real-data confirmation run
-(`jennifer_e2e_v6_cleaned`) is BYTE-FOR-BYTE IDENTICAL to T10a's own
+(the v6 CLEAN run) is BYTE-FOR-BYTE IDENTICAL to T10a's own
 `v5` run across all 6 output cubes, with an exactly-matching aggregate
 stop-reason summary -- proving T10b is a pure architectural
 improvement with zero behavioural change. T11 (CLEAN divergence /
@@ -969,7 +969,7 @@ argued from theory alone:
 
 **UPDATE (2026-07-31) — the "once `comp_rm_refined`/`derotate_to_lsq_ref`
 are used correctly" precondition above was NOT actually satisfied in
-`rmclean_cubes.f90`, found live in the Jennifer v2 verification run.**
+`rmclean_cubes.f90`, found live in the v2 validation run.**
 `clean_complex` computes `comp_rm_refined_p` (a required output) and
 `rmclean_cubes.f90` received it into a local variable — but never read
 it again. The program's own three `derotate_to_lsq_ref` calls (compute
@@ -985,7 +985,7 @@ mattered) -- it went live the moment this session switched the default
 to `mid` (decision 8's own UPDATE above), since `mid` deliberately picks
 a nonzero `lsq_ref_compute`.
 
-Found while investigating a user question about the Jennifer v2 run's
+Found while investigating a user question about the v2 validation run's
 own flux normalization (comparing CLEAN/RESTORED amplitude against the
 dirty cube): attempting to numerically verify the exact `dirty =
 [comp(*)RMSF_dirty] + resid` identity (provable by induction on
@@ -1022,10 +1022,10 @@ bins), `CLEAN.AMP` is bit-identical to float32 epsilon (`5.96e-8` --
 confirms a pure phase correction, no amplitude side effect), and
 `RESTORED.PHA` is EXACTLY unchanged (`0.0` -- confirms the fix is
 correctly scoped to `comp_re_p`/`comp_im_p` only, as intended). Not yet
-re-run against the full Jennifer dataset (multi-hour real-data job) --
+re-run against the full validation dataset (multi-hour real-data job) --
 the fix's correctness is established at the mechanism level (matching
 the already-validated library-level test pattern) and confirmed to have
-a real, correctly-scoped, nonzero effect; a full Jennifer re-run would
+a real, correctly-scoped, nonzero effect; a full re-run would
 only add production-scale confirmation, not new evidence of
 correctness.
 
@@ -1746,7 +1746,7 @@ document once the user pointed out it's a continuation of this same
 integration effort, not a distinct initiative.
 
 **Motivation, measured not assumed.** A moderately-large-scale
-verification run (`cfg/rmclean-jennifer.e2e.cfg`, 4501x4501x101, ~20.26M
+verification run (that dataset's own e2e cfg, 4501x4501x101, ~20.26M
 pixels) measured `tile_compute` at 97.7-98.2% of `rmclean_cubes`'s own
 total wall time across two runs (13023s of 13328s total stage time; the
 earlier pre-`lsq_ref_compute=mid` run showed 16739s of 17046s).
@@ -1757,7 +1757,7 @@ filter`'s fast path calls `rmsf_point_direct` (`src/rmclean.f90:491-512`)
 up to 3 times per CLEAN iteration for its own closed-form amplitude fit,
 and up to `m_search` (tens to hundreds) more times on escalation. Each
 call is a direct `O(nchan)` sum of `cos`/`sin` over every good channel
-(~286 for the Jennifer band) — transcendental-heavy, not simple
+(~286 for this dataset's own band) — transcendental-heavy, not simple
 arithmetic. With `niter` up to 500 and ~20M independent pixels, this is
 both embarrassingly parallel across pixels and individually
 transcendental-heavy within one — a shape GPUs are architecturally
@@ -1947,7 +1947,7 @@ itself is designed to be dataset-agnostic).
 **Status:** planning capture only, per the user's own explicit request --
 "I will start that work in a new session." No code written.
 
-**Motivation.** Verifying the Jennifer v2 run's correctness (the
+**Motivation.** Verifying the v2 validation run's correctness (the
 `comp_rm_refined`/derotation fix above) relied on ad hoc, one-off Python
 (astropy + numpy, reading FITS slices directly) to measure things like
 "RMS of AMP in the RM tail (-500 to -360 rad/m^2) across a handful of
@@ -1958,7 +1958,7 @@ The user wants this promoted to a real, permanent tool.
 
 **Concrete motivating check (the one that triggered this ticket):**
 tail-region (RM far from any real emission) dirty/restored/resid AMP
-RMS for 8 random Jennifer v2 sightlines came out ~13-30 uJy/beam
+RMS for 8 random sightlines from the v2 validation run came out ~13-30 uJy/beam
 (mean ~22-26 uJy/beam across the three cubes), independently confirmed
 by the user to be close to the band-averaged Q/U noise level -- a good
 end-to-end sanity check. The user's own follow-up, not yet checked:
@@ -2010,7 +2010,7 @@ together since the second depends on the first: (1) make it possible to
 answer "is CLEAN converging, and why did it stop" from the log alone,
 for both a single traced sightline and the whole run; (2) get real,
 data-driven evidence for choosing `niter`/`gain`/`threshold_snr` on the
-actual Jennifer dataset, without paying for a full 4501x4501 run per
+validation dataset, without paying for a full 4501x4501 run per
 trial.
 
 **Scope/what was built.**
@@ -2050,8 +2050,8 @@ trial.
   manually deriving block count from the tile-plan geometry.
 - Subimage-based fast-iteration workflow: no new cutout tool needed --
   reused `rm_synthesis`'s own pre-existing `subim=y` CFITSIO-subsection
-  read directly against the already-convolved Jennifer Q/U cubes
-  (`cfg/rmsynth-jennifer.subim128.cfg`, 128x128 px centred on the
+  read directly against the already-convolved Q/U cubes
+  (that dataset's own 128px-subimage rmsynth cfg, 128x128 px centred on the
   4501x4501 image, RA/Dec 2187-2314, full 286-channel band, otherwise
   identical RM settings to the production e2e cfg). Runs in ~7s
   (vs. hours for the full cube); confirmed the centre-of-image crop
@@ -2095,7 +2095,7 @@ OMP_PLACES=cores per this host's own standing thread-count convention):
 Tail RMS on the matching DIRTY cube (no CLEAN at all): median 25.46
 uJy/beam, mean 25.62 uJy/beam -- consistent with the ~22-26 uJy/beam
 band-averaged Q/U noise floor already established on the full
-`jennifer_e2e` cube (T6's own motivating check), confirming this
+dataset's own cube (T6's own motivating check), confirming this
 subimage's noise properties are representative, not an artefact of the
 crop.
 
@@ -2112,7 +2112,7 @@ gain increases, and at `gain=0.7` the peak/tail ratio drops BELOW 1.0
 (0.862) -- the region right at a real source ends up QUIETER than blank
 sky, a clear over-subtraction signature (removing genuine noise/
 structure as if it were flux), not a healthy convergence result.
-`gain=0.1` (current production default, used in the v1/v2/v3 Jennifer
+`gain=0.1` (current production default, used in the v1/v2/v3 validation
 runs) has the peak/tail ratio closest to the theoretically-expected
 value (slightly ABOVE 1 -- real structure at the peak leaving marginally
 more residual than pure tail noise, the correct qualitative sign) of
@@ -2238,7 +2238,7 @@ suite: 121/121 pass (all pre-existing plus the rewritten section 31 --
 runs with no seed at all now needed since per-pixel tail-sigma has zero
 randomness, valid-combined and valid-neither-given cases replacing the
 old mutually-exclusive/required-one checks -- and section 37's own 3
-new cases). `cfg/rmclean-e2e-smalltest.cfg`, `cfg/rmclean-jennifer.e2e.cfg`,
+new cases). `cfg/rmclean-e2e-smalltest.cfg`, that dataset's own e2e cfg,
 `cfg/rmclean-example.cfg` updated for the renamed keys.
 
 **Evidence -- the fix actually fixes T7's finding, not just the logging.**
@@ -2291,7 +2291,7 @@ pre-scan used, applied per-pixel here instead). `fwhm_rm`/
 entirely (no longer needed -- one fewer required argument, one fewer
 concept). cfg key renamed `tail_exclude_nfwhm=` -> `noise_percentile=`
 throughout (`rmclean_cubes.f90`, `cfg/rmclean-example.cfg`,
-`cfg/rmclean-jennifer.e2e.cfg`, 3 direct test callers, `tests/
+that dataset's own e2e cfg, 3 direct test callers, `tests/
 test_rmclean_stop_reason.f90`'s own Case C).
 
 **The image-plane test and what it found.** Ran the T7 subimage's
@@ -2463,7 +2463,7 @@ copied from the old design:**
   any nonzero number here would be arbitrary for genuinely unknown
   data; `auto_nsigma=1.0` (uncommented, active) carries the real
   default, since it needs no prior knowledge of the target data.
-- `cfg/rmclean-jennifer.e2e.cfg` (real, specific dataset):
+- That dataset's own e2e cfg (real, specific dataset):
   `abs_flux_floor=20uJy` -- a GENUINE, ACTIVE second criterion, not a
   placeholder, anchored to this dataset's own independently-and-
   repeatedly-measured ~25.5 uJy/beam noise floor (T7/T9's own tail-RMS
@@ -2478,7 +2478,7 @@ copied from the old design:**
   both criteria are doing real work, not one dominating.
 
 **T9 UPDATE 2 (same day) -- unrelated pair of bugs found running the
-real full Jennifer cube with the curated cfg:**
+full validation cube with the curated cfg:**
 1. Per-thread `dur_ms` log field (`F10.3`) overflows to `**********`
    once a single tile block's own compute stage runs longer than
    ~16.7 min (only 6 integer digits fit) -- found live, a block
@@ -2509,7 +2509,7 @@ real full Jennifer cube with the curated cfg:**
 ### T10 -- mask-cube read overflow (found via a real full-cube run diverging from small-subimage tests) + RAM-aware mask handling (T10a AND T10b both done -- heading corrected 2026-08-07, was stale: said "T10b not started" while the body below already said "T10b is done"; T11 below was blocked on this and is now unblocked, just still not started)
 
 **Background:** after T9 landed, the user ran a full 4501x4501
-Jennifer CLEAN with the curated cfg (`jennifer_e2e_v4_cleaned`, isolated
+CLEAN with the curated cfg (the v4 CLEAN run, isolated
 in a systemd scope). The run's own aggregate summary was starkly
 different from every small-subimage test this session: 99.05% of all
 20,259,001 pixels hit the `niter=500` cap (mean `n_iter_used=496.72`),
@@ -2572,7 +2572,7 @@ step below was directly verified, not assumed):**
 4. Root cause, confirmed not guessed: `read_mask_cube`
    (`src/rmclean_cubes.f90`) read the ENTIRE mask cube in one call:
    `call FTGPVB(unit, 1, 1, nx_in*ny_in*nchan_in, 0_1, mask_out, ...)`.
-   For the real Jennifer MASK.CUBE.FITS, `nx_in*ny_in*nchan_in` =
+   For that dataset's own MASK.CUBE.FITS, `nx_in*ny_in*nchan_in` =
    4501*4501*288 = 5,834,592,288 -- computed in ordinary 32-bit integer
    arithmetic, overflowing the signed 32-bit limit (2,147,483,647) by
    more than 2.7x. Wrapped mod 2^32, the value passed to CFITSIO as
@@ -2600,7 +2600,7 @@ tiled, since `build_mask_pattern_cache`'s one-time global pre-scan needs
 to see every pixel before any tile is CLEANed. Every piece of prior
 testing (T7/T8/T9's own subimage-based evidence-gathering, the full
 121-test regression suite) used cube sizes far below the 2^31-element
-threshold; this session's full 4501x4501x288 Jennifer run was the FIRST
+threshold; this session's full 4501x4501x288 validation run was the FIRST
 time this exact code path was exercised against a real dataset large
 enough to trigger it.
 
@@ -2633,7 +2633,7 @@ count) individually. `FTGPVB` is used in exactly one place in the whole
 codebase (`read_mask_cube`); nowhere else needed touching. Fixed by
 switching to `FTGPVBLL` with `firstelem`/`nelem` computed as
 `integer(kind=8)` (`int(nx_in,8)*int(ny_in,8)*int(nchan_in,8)`) --
-correct at any dataset size, not bounded by today's Jennifer cube
+correct at any dataset size, not bounded by today's validation cube
 specifically. **Verified:** full suite 121/121 after the fix; re-ran the
 exact forced-small-tile pixel-(65,65) cross-check against the real full
 file -- `iter=1` through `iter=500` now BIT-IDENTICAL to the cutout's own
@@ -2673,7 +2673,7 @@ restoration) and the full suite is 122/122 again. Runs in ~3s wall time
 -- `tests/output/` is gitignored and the fixture is deleted at the end
 of every run regardless of pass/fail.
 
-**T10a full-cube confirmation (`jennifer_e2e_v5_cleaned`, isolated
+**T10a full-cube confirmation (the v5 CLEAN run, isolated
 systemd scope, 6 threads, MemoryMax=40G, same curated cfg as the flawed
 v4 run):** a complete real 4501x4501 run with the fix, replacing v4
 (deleted). Result is a complete reversal of every symptom this ticket
@@ -2813,8 +2813,8 @@ against the loop's real structure.
    forced-small-tile-vs-default-tile numerical consistency check (a real
    end-to-end exercise of tile-boundary mask addressing).
 3. **Full real-data confirmation, the strongest test available:** a
-   complete fresh 4501x4501 Jennifer CLEAN with the T10b binary
-   (`jennifer_e2e_v6_cleaned`, same curated cfg, same isolation/thread
+   complete fresh 4501x4501 CLEAN with the T10b binary
+   (the v6 CLEAN run, same curated cfg, same isolation/thread
    conventions as T10a's own `v5` confirmation run). Aggregate
    stop-reason summary EXACTLY matches `v5` in every figure: niter-cap
    hits 0 (0.00%), `abs_flux_floor` 5,291,908 (26.12%), `auto_nsigma`
@@ -2921,8 +2921,8 @@ window between one tile's `!$omp end parallel` and the next tile's
 first `!$omp parallel`, while the next tile's single-threaded read/
 mask/prep runs), so real contention with compute is far lower in
 practice than a naive "N writers + N compute threads on an 8-core
-box" count would suggest. This project's own real Jennifer T3b
-validation run (see [[project_jennifer_t3b_validation]]) used
+box" count would suggest. This project's own T3b
+validation run (see project memory for that run) used
 `io_write_threads=2` alongside `OMP_NUM_THREADS=6` on this same
 8-core machine -- 6+2=8, saturating physical cores without exceeding
 them -- consistent with, though not an explicit test of, this reasoning.
@@ -4172,5 +4172,54 @@ check that all 6 outputs' own `LSQREF` reads `0.0` (the run's real
 before this fix, the pre-existing behavior would have copied the
 nonzero value through unchanged. Full suite: pending confirmation this
 session.
+
+**Status: DONE.**
+
+### T23 -- `run_pipeline.sh` let `match_cubes`/`rmclean_cubes` spread across both SMT siblings of every core
+
+**Motivation:** the user observed hyperthreading during a `rmclean_cubes`
+run launched via `run_pipeline.sh` (the run finished correctly, but
+should not have been using SMT siblings at all -- see this project's
+own standing convention: `wasim-desktop` is an 8-physical/16-logical
+SMT host, and no rmtool job should default to using more than 6
+threads, or use SMT siblings, without being told to).
+
+**Root cause, confirmed against source:** both `match_cubes.f90` and
+`rmclean_cubes.f90` size their internal thread pools from
+`omp_get_max_threads()` with no cfg-level override of their own --
+they inherit whatever `OMP_NUM_THREADS`/`OMP_PROC_BIND`/`OMP_PLACES`
+the process environment provides at startup, same mechanism
+`rm_synthesis` uses. `run_pipeline.sh` invoked both directly
+(`"${MATCH_EXE}" ...`, `"${RMCLEAN_EXE}" --config ...` via
+`run_logged`) with no such environment set at either call site --
+despite this script's own header comment already claiming it drives
+execution "with the right CPU thread pinning." `rm_synthesis` was the
+only one of the three protected, and only incidentally: it runs
+through a separate wrapper, `scratch/run_rmsynthesis_test.sh`, which
+sets `OMP_NUM_THREADS`/`OMP_PROC_BIND=close`/`OMP_PLACES=cores` itself
+(from its own second positional argument, `rmsynth_omp_threads` in the
+pipeline cfg, defaulting to 6) -- nothing in `run_pipeline.sh` itself
+did this.
+
+**Fix:** `OMP_NUM_THREADS=6`/`OMP_PROC_BIND=close`/`OMP_PLACES=cores`
+are now exported once, near the top of `run_pipeline.sh` (right after
+the provenance-directory/log setup, before any stage runs), so
+`match_cubes`, the `rm_synthesis` runner, and `rmclean_cubes` all
+inherit them uniformly. No new pipeline-cfg keys were added --
+considered per-stage keys mirroring `rmsynth_omp_threads`
+(`match_omp_threads`/`rmclean_omp_threads`) first, but the user
+corrected this directly: the ask was to stop hyperthreading, not to
+add per-stage configurability that was never requested. The global
+export is redundant with the runner script's own internal `export` for
+the `rmsynth` stage specifically (same effective values, harmless), and
+is the only guard at all for `match`/`rmclean`. `rmsynth_omp_threads`
+itself is untouched and still overrides the global default for that
+one stage via the runner script's own argument, so existing per-run
+configurability for `rmsynth` is preserved.
+
+**Verified:** `bash -n` syntax check; a standalone check that a child
+process invoked through the same `run_logged() { "$@" | tee ...; }`
+wrapper pattern used for all three stages inherits the exported vars
+(confirmed via `env` as the invoked command).
 
 **Status: DONE.**

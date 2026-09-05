@@ -59,7 +59,7 @@ Conclusion: easiest wins are in IO overlap/scheduling, not in RM math kernels.
 - Objective: capture baseline timing and correctness on `optimise-io`.
 - Scope: measurement only.
 - Evidence captured:
-  - Jennifer full-image run on Setonix used as baseline reference.
+  - Full-image run on Setonix used as baseline reference.
   - Stage timings in `tile_read`/`tile_write` CSV and log confirmed IO-dominant profile.
 
 ### T1 - IO Isolation Layer
@@ -412,7 +412,7 @@ all 8 output products on a 7-tile dev-machine run (`tests/run_tests.sh`
 Pending validation:
 - Benchmark `io_overlap=y` on Setonix itself (not just the dev machine)
   against the serial-read baseline log
-  (`JENNIFER_TOO_FULLIM.run.cpu.setonix.log`: read ~124s/tile,
+  (the full-image CPU run's own timing log: read ~124s/tile,
   write ~95-110s/tile) to confirm the wall-time reduction predicted from
   that data (~34% at serial read, scaling down as `io_read_threads`
   increases — see swim-lane analysis).
