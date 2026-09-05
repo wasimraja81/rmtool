@@ -1,7 +1,8 @@
 # Fetching calibrated Q/U multiband cubes from public archives — Plan
 
-**Status: T0 (discovery, fetch, beam curation) working end-to-end against
-CASDA data. T1 (pipeline wiring) not started.**
+**Status: T0 (discovery, fetch, beam curation), T1 (pipeline-cfg
+generation), T1a (band/SBID/version selection), and T1b (RM-range
+policy) implemented, not yet committed.**
 
 ## 1. Motivation
 
@@ -337,5 +338,247 @@ format — 1-indexed `channel bmaj_arcsec bmin_arcsec bpa_deg`
 was considered further once the ASCII curation path was confirmed
 sufficient for `convolve_cubes`' own `beamfiles=` mechanism.
 
-**T1 (wiring `--fetch` output into `scripts/run_pipeline.sh` as a
-`fetch` stage) not yet started.**
+### T1 — generating a ready-to-run pipeline cfg from `--fetch` output
+
+**In progress, not yet reviewed/committed.** Rather than a `fetch` stage
+built into `scripts/run_pipeline.sh` itself, `--fetch` now also calls
+`generate_pipeline_cfg()`, which writes a flattened `pipeline_staging/`
+symlink directory (needed because `run_pipeline.sh`'s own
+`match_infileQ=`/`match_infileU=` are bare filenames under one shared
+`match_input_path=`, and its symlink step doesn't create intermediate
+directories — a per-SBID subdirectory in the filename, matching this
+tool's own `<outdir>/SB<n>/` layout, isn't an option), an `rm_synthesis`
+cfg template, and a top-level `run_pipeline.sh`-compatible pipeline cfg
+chaining `match->rmsynth` — so `./scripts/run_pipeline.sh
+<generated>.cfg` runs end to end with no manual editing. `rmclean` is
+deliberately excluded from the generated `stages=`: its CLEAN stopping
+criteria are a choice for the user to make (see
+`docs/user/EXAMPLES.md`'s own dedicated section on this), not something
+to default silently.
+
+**Correction (2026-09-05): the template's `use_auto_rm_range=1` default
+was wrong, not just a stylistic choice to revisit.** `use_auto_rm_range=1`
+is hard-rejected by `rm_synthesis` itself for any multi-band run
+(`src/rm_synthesis.f90:1002-1008`, `'ERROR: use_auto_rm_range=1 is not
+supported for multi-band runs'`) — a generated multi-band cfg using it
+would fail outright, not just produce a suboptimal range. The reason is
+load-bearing, not just conservative: the auto-range heuristic
+(`src/rm_synthesis_mod.f90:774-799`) infers the dataset's min/max
+frequency from a merged λ² array's own endpoints, which only holds for
+one internally-monotonic band — concatenating bands in any order but
+frequency order would silently corrupt it. See "RM range and `nrm`"
+below for the corrected default.
+
+`match_args`' own `stages=` is chosen from how many observations were
+fetched: a single observation uses `stages=convolve` (nothing
+to reproject — one observation's own Q/U already share one native
+grid); two or more use `stages=both` with `footprint_mode=intersection`
+(separate SBIDs are separate scheduling blocks and may not share a grid
+even at the same frequency band, not just across distinct bands).
+
+**Open, scoped but not yet implemented (user note, 2026-09-05):**
+CASDA's public holdings for a given position can change over time —
+multi-band data may simply not exist yet even when the position is
+otherwise usable. The generator should not just silently build whatever
+`stages=`/band combination happens to fall out of one fetch run's
+result. Needed: let the user choose, after seeing what was
+fetched, whether to (a) proceed single-band if multi-band isn't
+available, (b) proceed with a specific subset of bands even when more
+are available (e.g. run single-band first before committing to full
+multi-band tomography), or (c) hold off entirely. Current behaviour
+(this session) is fully automatic over whatever `usable` contains —
+correct as a mechanism (single vs multi cfg shape genuinely does need
+to track the runtime fetch result, confirmed by the user), but the
+*selection* of which fetched observations feed the generator should
+become a user decision, not an automatic "use everything usable."
+`generate_pipeline_cfg(outdir, run_name, records)`'s `records` parameter
+is already a plain, explicit list (not derived internally from global
+state), so filtering it by user choice before the call is the natural
+extension point — no rework of the generator itself anticipated.
+
+**This turned out to need its own analysis pass, confirmed via a live
+CASDA query, not just a design opinion** — see below.
+
+### T1a — SBID and version selection (confirmed via a live CASDA query)
+
+**The "more than one SBID per band" case is not an edge case — it's the
+normal case for a target with observation history.** Querying
+PKS 2130-538 live (`cont.restored.3d`, all 12 distinct `obs_id`s CASDA
+currently has for this position) shows the 799.5-1087.5 MHz band alone
+has **three** separate, fully Q/U-`.conv`-complete SBIDs: `ASKAP-45811`
+(t_min MJD 59907.26), `ASKAP-51797` (MJD 60157.55), `ASKAP-74876`
+(MJD 60874.58) — three re-observations/reprocessings of what tomography
+needs to treat as ONE band, not three independent ones.
+`generate_pipeline_cfg()` as committed today would treat all three as
+separate "observations" and feed all three into
+`match_cubes`/`rm_synthesis` as if they were three distinct bands —
+silently wrong, confirmed against this example, not hypothetical.
+
+**Two independent selection problems, both confirmed:**
+
+1. **Which SBID, when 2+ share a band.** `t_min`/`t_max` (MJD) are
+   standard ObsCore columns, confirmed present and populated for every
+   row queried above — available from the discovery query alone, no
+   download needed, so a "latest observation" choice is fully knowable
+   in dry-run mode. User's proposed default: pick the SBID with the
+   latest `t_min` per band.
+2. **Which file version, when the SAME SBID has more than one cube.**
+   Confirmed (not hypothetical): `SB10083` (same field) has both
+   `image.restored.i.SB10083.contcube.fits` and
+   `image.restored.i.SB10083.contcube.v2.fits` alongside it — a `.vN.`
+   reprocessing tag. Notably, the tag is NOT applied uniformly across
+   that SBID's whole file set in this example (`v2` exists for the
+   plain Stokes-I file but not for its `.conv` counterpart, nor for
+   Stokes V at all) — so version selection has to be resolved per
+   (SBID, Stokes letter, conv-status) file group, not once per SBID.
+   User's proposed default: highest `vN` wins per file group; an
+   unversioned filename is the implicit baseline (`v1`).
+
+**Implemented (2026-09-05), confirmed with the user before building:**
+`--fetch` is retired in favor of `--run-mode` (`dry` default, `auto`,
+`select`):
+
+- `group_into_bands()` groups usable observations by exact frequency
+  match, numbered 1..N ascending, each band's own SBIDs sorted
+  latest-`t_min`-first (index 0 = the `auto` pick). `print_band_report()`
+  (the `--run-mode=dry` output, always printed regardless of mode) lists
+  every band, every candidate SBID with its observation date, and any
+  (Stokes letter, conv-status) file group with more than one `.vN.`
+  version present, flagging the default in both cases.
+- `--run-mode=auto`: every band, each one's latest-`t_min` SBID, every
+  file's latest version -- "fix ALL cfg params to auto" per the user's
+  own framing.
+- `--run-mode=select --select="<list>"`: `<list>` is a comma-separated
+  `band[:sbid[:version]]` list (band numbers from a prior dry run);
+  omitting `sbid`/`version` defaults that axis to latest. Resolved by
+  `resolve_selection()`, validated against band/SBID numbers derived
+  fresh from THIS run's own query, never a cached mapping (dry-run band
+  numbers can drift between runs if CASDA's holdings change in between
+  -- not otherwise guarded against beyond showing the frequency range
+  next to every number so a mismatch is visible).
+- Version selection threads into `select_iquv_mask(rows, version=...)`,
+  resolved **independently per Stokes letter, never shared between Q
+  and U the way `.conv` is** (correction, 2026-09-05: an earlier version
+  of this hard-aborted the whole observation if a requested version
+  wasn't present on both Q and U, which the user caught as wrong -- Q
+  and U are recalibrated independently, e.g. a fix that only touches Q
+  need not touch U, so requiring the same version number on both is not
+  a legitimate requirement the way `.conv` genuinely is). A letter
+  missing the requested version falls back to its own highest available
+  version, no warning -- expected, not an anomaly. `.conv` presence
+  remains the only cross-Stokes hard, all-or-nothing gate.
+- This is scoped to *which observation feeds the pipeline cfg*, not the
+  raw per-observation fetch mechanics, which are otherwise unchanged.
+
+### T1b — RM range and `nrm`: implemented (2026-09-05)
+
+Per the correction above, `use_auto_rm_range=1` cannot be the generated
+default for multi-band. Implemented, checked against this codebase's own
+existing (informational-only) multi-band diagnostic rather than derived
+from a textbook formula in isolation (`src/rm_synthesis.f90:2264-2278`),
+confirmed with the user before building:
+
+- `beg_rm = -1000.0`, `end_rm = 1000.0` (a Galactic-scale range, fixed
+  rather than data-derived) -- applied **uniformly, including
+  single-band fetches**, one consistent generated-cfg policy regardless
+  of band count (the user's own reasoning: not wanting to spend time
+  processing RM values outside the range of interest either way, even
+  though `use_auto_rm_range=1` is only *hard-rejected* for `nbands>1`).
+- `nrm` computed by `compute_rm_range()` from the **combined δRM** (RMSF
+  FWHM) the fetched bands' own λ² coverage dictates, reading each
+  record's own downloaded FITS header (`band_lambda_sq_span()`: FREQ
+  axis `CRVAL`/`CDELT`/`CRPIX`/`NAXIS`, confirmed Hz-scale directly
+  against a downloaded cube's header) -- not an ObsCore column, which
+  only carries the total span, not the per-channel resolution needed
+  here. Uses the SAME formula the existing multi-band diagnostic already
+  prints as informational output (not a new derivation): per band,
+  `dlam2_band = lam2_lo_edge - lam2_hi_edge` (half-channel-edge-extended
+  λ² span); combined `delta_RM = cfg.fac / sum(dlam2_band over all
+  bands)` (`src/rm_synthesis.f90:2264-2278`, `cfg.fac` = π by default).
+  `nrm = ceil((end_rm - beg_rm) / combined_delta_RM)` -- matches this
+  project's own multi-band cfg
+  (`cfg/rmsynth-multiband-wallaby-emu.cfg`: `nrm=29` for a ±500 range
+  with δRM=35.70 rad/m², and 1000/35.70≈28.0, consistent with one nrm
+  sample per resolution element before oversampling). `ofac` stays at
+  its existing default (`4`) as the oversampling step on top of `nrm`
+  (`nrm_out = nrm * ofac`, already how every cfg in this repo uses it)
+  -- confirmed with the user that "oversample δRM by some factor" reads
+  as `ofac`'s existing role, not a second independent factor.
+- Sanity-checked against a downloaded SB74876 Q cube (288 channels,
+  1 MHz/chan, ~800-1088 MHz): δRM≈48.6 rad/m² -> `nrm=42` for the
+  ±1000 range -- larger (coarser) than the 2-band WALLABY+EMU example's
+  35.70 rad/m², consistent with a single, narrower band having less
+  total λ² coverage than a combined multi-band span.
+
+**Still open:** `rmclean_cubes` isn't wired into `--run-mode=auto`/
+`select` at all yet (deliberately -- see the `generate_pipeline_cfg()`
+docstring); the user's SBID-selection framework ("quit and let user
+specify... latest processing could be the default") should extend to it
+the same way once it's added, rather than being designed separately.
+
+### T1c — three corner cases found by direct review, implemented (2026-09-05)
+
+Asked to precisely enumerate corner cases in fetching a small cutout
+set for tomography and say whether the implementation was immune to
+each. Three were not, and are now fixed:
+
+1. **Two SBIDs sharing a band could be different sky fields (adjacent/
+   overlapping mosaic tiles), not reprocessings of the same field** --
+   `Observation`/`Band` never captured or compared field identity, only
+   frequency + observation time. Resolved by checking target
+   encompassment directly rather than field identity: CASDA's
+   `query_region` cone search only guarantees a field is *near* the
+   search circle, not that the target position is within its
+   coverage -- confirmed live (SB74876/EMU_2132-51 has `s_fov=54.7 deg`,
+   a wide mosaic, with the target 2.5 deg off its own field centre --
+   comfortably covered here, but a field that only clips the search
+   radius at its edge would not be). `observation_covers_target()`
+   checks `separation(target, field_centre) + cutout_radius < s_fov/2`
+   using ObsCore's own `s_ra`/`s_dec`/`s_fov` (a circular approximation
+   of the field's possibly-irregular polygon footprint in
+   `s_region` -- a sanity check, not a precise containment test).
+   `filter_target_coverage()` excludes (with a printed reason) any
+   candidate that fails this, before band grouping ever sees it. Once
+   every remaining candidate genuinely reaches the target, "latest
+   wins" is the right default, per the user's own reasoning.
+2. **Two legitimately different bands could overlap in frequency**, and
+   separately, **the same band could be split into two by
+   floating-point noise** in `em_min`/`em_max` between SBIDs (`Band`
+   grouping keys on exact tuple equality). Both would silently
+   double-count the shared frequency range in a combined multi-band
+   run, biasing the RMSF/sensitivity. One check handles both (a
+   near-duplicate range trivially overlaps almost entirely too):
+   `check_band_overlaps()` runs on the final resolved selection, right
+   before fetching, and quits with a message naming the overlapping
+   pair and by how much if any two selected observations overlap.
+   Resolving it (picking only one) is left to the user.
+3. **A partial multi-band fetch (one requested observation fails or
+   its beamlog can't be curated) used to still generate a pipeline cfg
+   for whatever succeeded**, silently downgrading a stated multi-band
+   intent (e.g. from `--select "1,2"`) to single-band. Fixed:
+   `main()`'s fetch loop now tracks `all_succeeded` across every
+   requested observation (a `SKIPPED`/`FAILED`/`PARTIAL` cutout status,
+   or a beamlog curation failure when one was needed, each
+   set it `False`) and, after attempting every requested observation
+   (not stopping at the first failure -- confirmed with the user:
+   complete diagnostics in one pass are worth the extra time on a run
+   that's going to be rejected anyway), refuses to generate a pipeline
+   cfg at all if anything short of full success occurred, printing
+   which observation(s) didn't make it and why instead. This also
+   closes an independently-existing bug: a failed beamlog
+   curation used to silently fall back to `beamfiles=auto` in the
+   generated cfg even when a `BEAMS` table was already confirmed
+   absent -- guaranteed to fail at `match_cubes` runtime rather than
+   inform the user immediately.
+
+**One implementation-level fix along the way**: `observation_covers_target()`
+originally returned `numpy.bool_` (from `SkyCoord.separation()`), not
+Python's native `bool`, despite its own declared `-> bool` signature --
+harmless under a plain `if`, but wrong under a strict `is True`/`is
+False` check, which is how the mismatch was caught. Wrapped the return
+in `bool(...)`.
+
+The two accepted-as-is items from this same review: no validation that
+a fetched cutout has usable signal (Stokes I is exactly why it gets
+fetched -- the user inspects it themselves), and `rmclean_cubes` still
+not wired into `--run-mode` (tracked above, unchanged by this pass).
