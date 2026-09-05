@@ -1506,7 +1506,7 @@ def main() -> None:
                     tag = f"{letter}_conv" if conv_by_letter.get(letter) else letter
                     new_fits = os.path.join(obs_dir, f"{tag}.fits")
                     os.replace(path, new_fits)
-                    print(f"  wrote {new_fits}")
+                    print(f"  wrote {os.path.basename(new_fits)}")
                     checksum_src = path + ".checksum"
                     if os.path.exists(checksum_src):
                         os.replace(checksum_src, new_fits + ".checksum")
@@ -1568,16 +1568,18 @@ def main() -> None:
     pipeline_cfg_path = generate_pipeline_cfg(
         args.outdir, run_name, pipeline_records, chain_rmclean=args.chain_rmclean)
     rmclean_template_path = os.path.join(args.outdir, f"{run_name}_rmclean.cfg")
+    pipeline_cfg_name = os.path.basename(pipeline_cfg_path)
+    rmclean_template_name = os.path.basename(rmclean_template_path)
     if args.chain_rmclean:
         print(
             f"\nPipeline config generated from all {len(pipeline_records)} "
-            f"requested observation(s): {pipeline_cfg_path}\n"
-            f"Run it with: ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
+            f"requested observation(s), in {args.outdir}/:\n"
+            f"  {pipeline_cfg_name}  (run: ./scripts/run_pipeline.sh {pipeline_cfg_path})\n"
+            f"  {rmclean_template_name}  (CLEAN-stage cfg, chained via --chain-rmclean)\n"
+            f"\n"
             f"This chains match_cubes -> rm_synthesis -> rmclean_cubes in one "
-            f"invocation (--chain-rmclean was given), using "
-            f"{rmclean_template_path} for the CLEAN stage. Not checked before "
-            f"CLEAN runs, since it starts right after rmsynth finishes in the "
-            f"same invocation:\n"
+            f"invocation. Not checked before CLEAN runs, since it starts "
+            f"right after rmsynth finishes in the same invocation:\n"
             f"  - this run's own dirty cube -- CLEAN's stopping criteria are "
             f"not being judged against {run_name}.PEAK.MAP.FITS / "
             f"{run_name}.SNR.MAP.FITS before they're used\n"
@@ -1590,25 +1592,27 @@ def main() -> None:
             f"biased for some pixels -- abs_flux_floor backstops exactly "
             f"those pixels, so how well 20uJy suits this field matters "
             f"most where the per-pixel estimate is least reliable\n"
-            f"Edit {rmclean_template_path} first if you want to check these "
+            f"Edit {rmclean_template_name} first if you want to check these "
             f"against this run's own rmsynth output before running the "
             f"pipeline cfg above."
         )
     else:
         print(
             f"\nPipeline config generated from all {len(pipeline_records)} "
-            f"requested observation(s): {pipeline_cfg_path}\n"
-            f"Run it with: ./scripts/run_pipeline.sh {pipeline_cfg_path}\n"
-            f"This chains match_cubes (resolution/grid matching -- "
-            f"beamfiles= already set per band, curated or auto as printed "
-            f"above) into rm_synthesis. It does NOT include rmclean_cubes "
-            f"or use the I/V cubes (source-verification/noise-floor only, "
-            f"not part of tomography) by default -- a starter rmclean cfg "
-            f"is already waiting at {rmclean_template_path} if you want to "
-            f"add it: look at the rmsynth output, edit that file's stopping "
-            f"criteria to fit it, then add 'rmclean' to the pipeline cfg's "
-            f"stages= and rmclean_cfg_template=. Or re-run casda_fetch.py "
-            f"with --chain-rmclean to have this done automatically next time."
+            f"requested observation(s), in {args.outdir}/:\n"
+            f"  {pipeline_cfg_name}  (run: ./scripts/run_pipeline.sh {pipeline_cfg_path})\n"
+            f"  {rmclean_template_name}  (starter CLEAN cfg, not yet chained)\n"
+            f"\n"
+            f"The pipeline cfg chains match_cubes (resolution/grid matching "
+            f"-- beamfiles= already set per band, curated or auto as "
+            f"printed above) into rm_synthesis. It does NOT include "
+            f"rmclean_cubes or use the I/V cubes (source-verification/"
+            f"noise-floor only, not part of tomography) by default -- look "
+            f"at the rmsynth output, edit {rmclean_template_name}'s "
+            f"stopping criteria to fit it, then add 'rmclean' to the "
+            f"pipeline cfg's stages= and rmclean_cfg_template=. Or re-run "
+            f"casda_fetch.py with --chain-rmclean to have this done "
+            f"automatically next time."
         )
 
 
