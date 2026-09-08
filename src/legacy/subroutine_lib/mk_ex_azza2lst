@@ -1,0 +1,2 @@
+g77 -Wall -o ex_azza2lst ex_azza2lst.f -L/usr/local/pgplot -lpgplot -L/usr/X11R6/lib -lX11 -lm 
+#-mcmodel=medium

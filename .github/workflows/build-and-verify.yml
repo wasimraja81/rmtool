@@ -1,0 +1,68 @@
+name: Build and verify Docker image
+
+# Reusable workflow (workflow_call only -- no other trigger surface,
+# so this cannot execute on its own even if this file ends up present
+# in a repo other than rmtool-dev, e.g. via the orphan snapshot that
+# eventually reaches rmtool's main). Holds the Docker-build +
+# verification steps shared by cut-release.yml's own orchestrated
+# pipeline, kept as one copy so there is never a second copy of this
+# logic to drift out of sync with it.
+#
+# ref is required and must be passed explicitly by every caller --
+# without it, actions/checkout would default to whatever ref triggered
+# the *calling* workflow's own run, not necessarily the commit this
+# check is meant to verify (this bit a first draft of
+# cut-release.yml during design: a manually-triggered run defaults
+# checkout to the branch selected at trigger time, not the
+# release-candidate branch built moments earlier in the same run).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out and verify'
+        required: true
+        type: string
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Build Docker image
+        run: docker build -f docker/dockerfile -t rmtool-verify:${{ github.sha }} .
+
+      - name: Verify casda_fetch.py runs by bare name via the container's own python3
+        run: docker run --rm rmtool-verify:${{ github.sha }} casda_fetch.py -h
+
+      - name: Verify astroquery/pyvo/requests import correctly
+        run: docker run --rm rmtool-verify:${{ github.sha }} python3 -c "import astroquery, pyvo, requests"
+
+      - name: Verify run_pipeline.sh and every compiled binary are on PATH
+        run: |
+          docker run --rm rmtool-verify:${{ github.sha }} bash -c "
+            which run_pipeline.sh casda_fetch.py &&
+            which rm_synthesis match_cubes rmclean_cubes convolve_cubes reproject_cubes
+          "
+
+      # tests/output and tests/data are bind-mounted (not left as the
+      # image's own COPY'd copies) so dry_run=y's disk-type check
+      # (io_overlap/nwriters advisory) resolves against this runner's
+      # own block device via df, the same as it would for any user's
+      # own bind-mounted output directory -- a path inside the
+      # container's own unmounted overlay filesystem has no matching
+      # device for df to find, which is a correctly-handled case (see
+      # src/convolve_cubes.f90's own run_dry_run_check) but not the one
+      # this check exists to exercise.
+      - name: Run full regression suite (tests/run_tests.sh) inside the image
+        run: |
+          mkdir -p tests/output tests/data
+          docker run --rm \
+            -v "$PWD/tests/output:/app/rmtool/tests/output" \
+            -v "$PWD/tests/data:/app/rmtool/tests/data" \
+            rmtool-verify:${{ github.sha }} \
+            bash tests/run_tests.sh

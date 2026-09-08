@@ -1,0 +1,701 @@
+       program subimage
+      !------------------------------------------------------
+      ! This program picks up and writes out a given 
+      ! section from a FITS image provided it is supplied 
+      ! as inputs the centre (x,y) pixels as well as the
+      ! number of pixels along the x and the y-axes around 
+      ! the centre for which the subimage is required. 
+      !
+      !          -- wasim raja, 16 July, 2009
+      !------------------------------------------------------
+
+      implicit none
+
+      integer*4 maxdim,maxkeys, max_inbuff
+      parameter(maxdim = 100, maxkeys=500, max_inbuff=8192)
+      ! max_inbuff is the buffer size for the arrays meant 
+      ! for reading the image/cubes. For images with a large 
+      ! number of pixels, one may run out of memory if one 
+      ! attempts to read the entire image into a single 
+      ! array. We thus read and analyse the image/cube part 
+      ! by part, taking care to prevent "out of memory" 
+      ! situations by proper choice of max_inbuff parameter.
+      integer*4 nchar
+      character*172 infile
+      integer*4 rwmode
+      integer*4 status
+      integer*4 blocksize
+      ! FOR FTGHPR:
+      integer*4 bitpix, naxis, naxes(maxdim)
+      integer*4 i, j
+      character*16 tmpstr
+      character*12 keyname(maxkeys)
+      character*18 keyword
+      !character*1 yorn
+
+      ! Definitions related to reading IMAGE:
+      integer group
+      real buff_array(max_inbuff),nullval
+      real subim(max_inbuff,max_inbuff)
+      logical anyflg
+
+      integer*4 ypix_beg, ypix_end, nypix, cypix
+      integer*4 xpix_beg, xpix_end, nxpix, cxpix
+      integer*4 iy, ix, kx, ky
+      integer*4 nx_totpix, ny_totpix, nz_totpix 
+      integer*4 nbuffer, firstpix, npixels
+
+
+      real*4 cxval_im, xinc_im, cyval_im, yinc_im
+      integer*4 cxpix_im, cypix_im
+      integer*4 nx_1st, nx_2nd, ny_1st, ny_2nd
+      integer*4 nxc, nyc
+    
+      real*4 xval(max_inbuff), yval(max_inbuff) 
+      real*4 x1, xn, y1, yn
+
+      character*72 comment
+      logical cube
+      integer*4 data_precision
+      cube = .false. ! by default, we assume that the file 
+                     ! contains an image and NOT a cube...
+                     ! We will automatically upgrade the 
+                     ! status of cube later, after reading 
+                     ! the file...
+
+      ! IT IS IMPORTANT TO INITIALISE "STATUS" TO 
+      ! ZERO, FOR ONE TO MAKE SUBROUTINE CALLS 
+      ! SUCCESSFUL... IF PASSED WITH A POSITIVE  
+      ! VALUE, THE SUBROUTINE WILL EXIT IMMEDIATELY. 
+      ! FITSIO ALTERS THE STATUS's VALUE IF IT 
+      ! ENCOUNTERS SOME SERIOUS ERRORS DURING THE 
+      ! RUN OF THE PROGRAM, SO THAT ANY SUBSEQUENT 
+      ! CALLS TO SUBROUTINES ARE NOT EXECUTED...
+      ! THUS "STATUS" CAN BE USED TO MONITOR ERRORS
+      ! AND MESSAGES RELATED TO THEM...
+      status = 0
+
+!-------------------------------------------------------------------
+      ! Get the file containing the Image/Cube:
+      !
+
+
+      rwmode = 1 ! read only mode
+      if(iargc().eq.5)then
+              call getarg(1,infile)
+              call getarg(2,tmpstr)
+              read(tmpstr(1:),*)cxpix
+              call getarg(3,tmpstr)
+              read(tmpstr(1:),*)cypix
+              call getarg(4,tmpstr)
+              read(tmpstr(1:),*)nxpix
+              call getarg(5,tmpstr)
+              read(tmpstr(1:),*)nypix
+      else
+          write(*,*)'--------------------------------------------------'
+          write(*,*)' You can have a blind run command as...'
+          write(*,*)' subimage <infile> <xpix-centre> <ypix-centre> <nxp
+     -ix> <nypix>'
+          write(*,*)'  '
+          write(*,*)'infile [NO DEFAULT]: '
+          write(*,*)' FITS IMAGE File (without PATH) '
+          write(*,*)' This file is expected by default '
+          write(*,*)' to be in the DATA/ directory '
+          write(*,*)'  '
+          write(*,*)'xpix-centre [NO DEFAULT]: '
+          write(*,*)' Centre X-pixel of the subimage '
+          write(*,*)'  '
+          write(*,*)'ypix-centre [NO DEFAULT]: '
+          write(*,*)' Centre Y-pixel of the subimage '
+          write(*,*)'  '
+          write(*,*)'nxpix [NO DEFAULT]: '
+          write(*,*)' Total number of X-pixels in subimage '
+          write(*,*)'  '
+          write(*,*)'nypix [NO DEFAULT]: '
+          write(*,*)' Total number of Y-pixels in subimage '
+          write(*,*)'  '
+          write(*,*)'--------------------------------------------------'
+          write(*,*)'  '
+          write(*,*)'Input Image/Cube Fits File:'
+          write(*,*)' '
+          read(*,'(a)')infile
+          write(*,*)"centre X-pixel: " 
+          read(*,*)cxpix  
+          write(*,*)"centre Y-pixel: " 
+          read(*,*)cypix  
+          write(*,*)"nx pixels in output image: " 
+          read(*,*)nxpix  
+          write(*,*)"ny pixels in output image: " 
+          read(*,*)nypix  
+      end if
+
+      blocksize = 1
+
+      infile = '../DATA/'//infile(1:nchar(infile))
+      ! Open the Image/Cube Fits file:
+      call FTOPEN(21,infile,rwmode,blocksize,status)
+      write(*,*)"infile:",infile(1:nchar(infile))
+
+      ! Determine the data-type of the image (BITPIX value):
+      ! Possible returned values are: 
+      !   8 : unsigned byte, 
+      !  16 : signed 2-byte integer, 
+      !  32 : signed 4-byte integer, 
+      !  64 : signed 8-byte integer, 
+      ! -32 : real, and 
+      ! -64 : double. 
+
+      call FTGIDT(21,bitpix,status)
+      !call FTGIET(21,bitpix,status)
+      write(*,*)"---------------------------"
+      write(*,*)" Data-type of image: ",bitpix
+      write(*,*)" "
+      write(*,*)"Interpret the values as: "
+      write(*,*)"!   8(B) : unsigned byte," 
+      write(*,*)"!  16(I) : signed 2-byte integer," 
+      write(*,*)"!  32(J) : signed 4-byte integer," 
+      write(*,*)"!  64(K) : signed 8-byte integer," 
+      write(*,*)"! -32(E) : real, and" 
+      write(*,*)"! -64(D) : double." 
+      write(*,*)" "
+      write(*,*)"---------------------------"
+
+      ! Determine the dimension(NUMBER of AXES) in 
+      ! the image:
+      call FTGIDM(21,naxis,status)
+      write(*,*)" Total number of axes :",naxis
+      write(*,*)" "
+      write(*,*)"---------------------------"
+
+      if(naxis.gt.99)then
+              write(*,*)"------------- WARNING --------------"
+              write(*,*)" "
+              write(*,*)"Either the input file has not properly "
+              write(*,*)"been read, or "
+              write(*,*)"NAXIS is > 99"
+              write(*,*)"Currently this code expects that the "
+              write(*,*)"image dimensions does not exceed 99"
+              write(*,*)" "
+              write(*,*)"However if you are sure that your im-"
+              write(*,*)"age has NAXIS > 99, then modify the "
+              write(*,*)"source code and RECOMPILE it..."
+              write(*,*)" "
+              write(*,*)"To modify the code: "
+              write(*,*)"Open the code in your favourite text-"
+              write(*,*)"editor, and search for the section: "
+              write(*,*)"        'ERROR_NAXIS99' "
+              write(*,*)"The section will describe to you the "
+              write(*,*)"necessary modifications that needs to"
+              write(*,*)"be made..."
+              write(*,*)" "
+              write(*,*)"-----------------------------------"
+              stop
+      endif
+      ! Determine the KEYWORD character "values":
+      ! In this case, we wish to know the "names" 
+      ! of the axes...
+      tmpstr(1:) = '              '
+      do i = 1,naxis
+      !
+! ERROR_NAXIS99:
+      ! The following if-section takes care of upto 
+      ! 99 naxis. I do not think any FITS file will have 
+      ! naxis > 99 ever.
+      ! If at all such an apparently crazy need arises, 
+      ! append appropriate number of "else if" sections 
+      ! and corresponding "formats" defined as in label 
+      ! number 499 and 599.
+         if (i.lt.10)then
+                 write(tmpstr(1:),fmt=499)i
+                 keyword = 'ctype'//tmpstr(1:nchar(tmpstr))
+         else if(i.ge.10.and.i.lt.100)then
+                 write(tmpstr(1:),fmt=599)i
+                 keyword = 'ctype'//tmpstr(1:nchar(tmpstr))
+         endif
+         call FTGKEY(21,keyword, keyname(i),comment,status)
+         write(*,*)keyword(1:nchar(keyword)),": ",
+     -keyname(i)(1:nchar(keyname(i)))
+      enddo
+499   format (i1)
+599   format (i2)
+
+      ! Determine the SIZE along each dimension of the image:
+      call FTGISZ(21,maxdim,naxes,status)
+
+      write(*,*)"---------------------------------------"
+      write(*,*)"AXIS NUM     AXIS NAME      AXIS SIZE"
+      do i = 1,naxis
+         write(*,*)"     ",i,")     ",keyname(i),"    ",naxes(i)
+      enddo
+      write(*,*)" "
+      if (naxes(1).gt.1.and.naxes(2).gt.1.and.naxes(3).gt.1)then
+              npixels = naxes(1)*naxes(2)*naxes(3)
+              nx_totpix = naxes(1)
+              ny_totpix = naxes(2)
+              nz_totpix = naxes(3)
+              write(*,*)"You are dealing with a CUBE..."
+              write(*,*)"NPIXELS = ",npixels
+              cube = .true.
+              write(*,*)"This code is meant to deal only"
+              write(*,*)"with 2-D images as of now and " 
+              write(*,*)"not cubes! We will quit now..."
+              goto 9999
+      else if (naxes(1).gt.1.and.naxes(2).gt.1.and.naxes(3).eq.1)then
+              npixels = naxes(1)*naxes(2)
+              nx_totpix = naxes(1)
+              ny_totpix = naxes(2)
+              write(*,*)"You are dealing with a 2D IMAGE..."
+              write(*,*)"NPIXELS = ",npixels
+              cube = .false.
+      endif
+      !------------------------------------------------------------
+      ! Let's read an image now...
+      ! Depending on the BITPIX value of the image as determined 
+      ! above, we will need to call one of the following routines:
+      ! FTG2DB(unit,group,nullval,dim1,nx,ny,array,anyflg,status)
+      ! FTG2DI(unit,group,nullval,dim1,nx,ny,array,anyflg,status)
+      ! FTG2DK(unit,group,nullval,dim1,nx,ny,array,anyflg,status)
+      ! FTG2DE(unit,group,nullval,dim1,nx,ny,array,anyflg,status)
+      ! FTG2DD(unit,group,nullval,dim1,nx,ny,array,anyflg,status)
+      !
+      ! FTG2DE reads a 2-d image of real values from the primary 
+      ! array.
+      !
+      ! Data conversion and scaling will be performed if necessary
+      ! (e.g, if the datatype of the FITS array is not the same
+      ! as the array being read).
+      
+      ! unit    i  Fortran output unit number
+      ! group   i  number of the data group, if any
+      !            [each group of the primary array is a 
+      !             row in the table, where the first 
+      !             column contains the group parameters
+      !             and the second column contains the 
+      !             image itself]
+      !             Perhaps it will be helpful to imagine the primary 
+      !             array as an array of dimension: (ngroups x 2), 
+      !             where each element of the array is also 
+      !             an array -- element(j,1) = [group params]
+      !                      -- element(j,2) = [image], and
+      !                         j = 1:ngroups
+
+      ! nullval r  undefined pixels will be set to this value (unless = 0)
+      ! dim1    i  actual first dimension of ARRAY
+      ! nx      i  size of the image in the x direction
+      ! ny      i  size of the image in the y direction
+      ! array   r  the array of values to be read
+      ! anyflg  l  set to true if any of the image pixels were undefined
+      ! status  i  returned error stataus
+      !
+      !-------------------------------------------------------------
+      ! However for a large image, it may not be a good idea 
+      ! to try to read the entire image into a single large array
+      ! Hence we read the image only part-by-part, with the aid of 
+      ! the max_inbuff parameter defined already. The routine used 
+      ! here is one of : FTGPV[BIJKED]
+      !-------------------------------------------------------------
+      !
+
+      !-------------------------------------------------------------
+      ! Sometimes it may be profitable to write out a binary 
+      ! image... The following section writes a binary 2D image 
+      ! from the FITS image file. Each record consists of the 
+      ! data along the NAXIS1 axis.
+      if(.not.cube)then
+               if(bitpix.eq.8)data_precision = 1
+               if(bitpix.eq.16)data_precision = 2
+               if(bitpix.eq.32)data_precision = 4
+               if(bitpix.eq.64)data_precision = 8
+               if(bitpix.eq.-32)data_precision = 4
+               if(bitpix.eq.-64)data_precision = 8
+
+              group = 1
+              firstpix = 1
+              nullval = -999.0
+              nbuffer = naxes(1)
+              write(*,*)"nbuffer derived from naxes(1) = ",nbuffer
+
+
+      ! Now generate the axis values:
+
+      ! Please be careful with the units of cxval_im, xinc_im etc. 
+      ! Here it is assumed that these are in degrees.
+      !
+      ! Get the RA's first:
+        call FTGKYE(21,"crval1",cxval_im,comment,status) ! central "value" of 
+                                                         ! axis(1) or RA-centre
+        call FTGKYJ(21,"crpix1",cxpix_im,comment,status) ! central "pixel" of 
+                                                         ! axis(1) or RA-centre
+        call FTGKYE(21,"cdelt1",xinc_im,comment,status)  ! increment in between 
+                                                         ! pixels of axis(1)
+        ! Now get the Dec's :
+        call FTGKYE(21,"crval2",cyval_im,comment,status) ! central "value" of 
+                                                         ! axis(2) or Dec-centre
+        call FTGKYJ(21,"crpix2",cypix_im,comment,status) ! central "pixel" of 
+                                                         ! axis(2) or Dec-centre
+        call FTGKYE(21,"cdelt2",yinc_im,comment,status)  ! increment in between 
+                                                         ! pixels of axis(2)
+  
+        ! Check if the central pixel is indeed at the centre of the 
+        ! image array and also find out the number of points leading 
+        ! and lagging the central pixel:
+  
+        ! If total number of pixel is EVEN, centre must lie at n_totpix/2 
+        ! or n_totpix/2 + 1
+        if(mod(nx_totpix,2) .eq. 0)then   
+                nxc = nx_totpix/2
+                if(cxpix_im .eq. nxc)then
+                        nx_1st = nxc - 1
+                        nx_2nd = nxc 
+                else if(cxpix_im .eq. nxc + 1)then
+                        nx_1st = nxc
+                        nx_2nd = nxc - 1
+                else
+                        write(*,*)"------------------------------"
+                        write(*,*)"           WARNING            "
+                        write(*,*)"centre x-pixel is offset from "
+                        write(*,*)"actual centre of the image... "
+                        write(*,*)" "
+                        write(*,*)"Total x-pixels in image: ",nx_totpix
+                        write(*,*)"Expected x-centre : ",nxc,"or",nxc+1
+                        write(*,*)"Found x-centre at : ",cxpix_im
+                        write(*,*)" "
+                        write(*,*)"Quitting now... "
+                        goto 9999
+                endif
+        ! If total number of pixel is ODD, centre must lie at (n_totpix + 1)/2
+        elseif(mod(nx_totpix,2) .eq. 1)then
+                nxc = (nx_totpix+1)/2
+                if(cxpix_im .eq. nxc)then
+                        nx_1st = nxc - 1
+                        nx_2nd = nxc - 1
+                else
+                        write(*,*)"------------------------------"
+                        write(*,*)"           WARNING            "
+                        write(*,*)"centre x-pixel is offset from "
+                        write(*,*)"actual centre of the image... "
+                        write(*,*)" "
+                        write(*,*)"Total x-pixels in image: ",nx_totpix
+                        write(*,*)"Expected x-centre : ",nxc
+                        write(*,*)"Found x-centre at : ",cxpix_im
+                        write(*,*)" "
+                        write(*,*)"Quitting now... "
+                        goto 9999
+                endif
+        endif
+  
+  
+        ! If total number of pixel is EVEN, centre must lie at n_totpix/2 
+        ! or n_totpix/2 + 1
+        if(mod(ny_totpix,2) .eq. 0)then   
+                nyc = ny_totpix/2
+                if(cypix_im .eq. nyc)then
+                        ny_1st = nyc - 1
+                        ny_2nd = nyc 
+                else if(cypix_im .eq. nyc + 1)then
+                        ny_1st = nyc
+                        ny_2nd = nyc - 1
+                else
+                        write(*,*)"------------------------------"
+                        write(*,*)"           WARNING            "
+                        write(*,*)"centre y-pixel is offset from "
+                        write(*,*)"actual centre of the image... "
+                        write(*,*)" "
+                        write(*,*)"Total y-pixels in image: ",ny_totpix
+                        write(*,*)"Expected y-centre : ",nyc,"or",nyc+1
+                        write(*,*)"Found y-centre at : ",cypix_im
+                        write(*,*)" "
+                        write(*,*)"Quitting now... "
+                        goto 9999
+                endif
+        ! If total number of pixel is ODD, centre must lie at (n_totpix + 1)/2
+        elseif(mod(ny_totpix,2) .eq. 1)then
+                nyc = (ny_totpix+1)/2
+                if(cypix_im .eq. nyc)then
+                        ny_1st = nyc - 1
+                        ny_2nd = nyc - 1
+                else
+                        write(*,*)"------------------------------"
+                        write(*,*)"           WARNING            "
+                        write(*,*)"centre y-pixel is offset from "
+                        write(*,*)"actual centre of the image... "
+                        write(*,*)" "
+                        write(*,*)"Total y-pixels in image: ",ny_totpix
+                        write(*,*)"Expected y-centre : ",nyc
+                        write(*,*)"Found y-centre at : ",cypix_im
+                        write(*,*)" "
+                        write(*,*)"Quitting now... "
+                        goto 9999
+                endif
+        endif
+  
+        !Refreshing Standard IX Arithmetic-Series concepts: 
+        !val_1 = val_c - n_1st*delta_val
+        !val_ntot = val_1 + (ntot - 1)*delta_val
+  
+        ! generating the x-axis values...
+        x1 = cxval_im - nx_1st*xinc_im
+        xn = x1 + (nx_totpix - 1)*xinc_im
+        call linspace(x1,xn,nx_totpix,xval)
+  
+        ! generating the y-axis values...
+        y1 = cyval_im - ny_1st*yinc_im
+        yn = y1 + (ny_totpix - 1)*yinc_im
+        call linspace(y1,yn,ny_totpix,yval)
+
+       
+      ! We will now define the subimage of (nxpix x nypix) 
+      ! pixels centered around the pixel: (cxpix,cypix)
+
+
+         if(mod(nxpix,2) .ne. 0)then
+                 write(*,*)"nxpix expected even, found odd!"
+                 nxpix = nxpix - 1
+                 write(*,*)"nxpix further re-adjusted to: ",nxpix
+         endif
+   
+         if(mod(nypix,2) .ne. 0)then
+                 write(*,*)"nypix expected even, found odd!"
+                 nypix = nypix - 1 
+                 write(*,*)"nypix further re-adjusted to: ",nypix
+         endif
+   
+         if(nxpix .gt. nx_totpix)then
+                 write(*,*)"nxpix = ",nxpix
+                 write(*,*)"Image out of range!"
+                 nxpix = int(nx_totpix/8) 
+                 write(*,*)"nxpix re-adjusted to: ",nxpix
+                 if(mod(nxpix,2) .ne. 0)then
+                        write(*,*)"nxpix expected even, found odd!"
+                        nxpix = nxpix - 1 
+                        write(*,*)"nxpix further re-adjusted to: ",nxpix
+                 endif
+         else if(cxpix .lt. nxpix/2 + 1)then
+              write(*,*)"cxpix,nxpix = ",cxpix,nxpix
+              write(*,*)"Image out of range!"
+              cxpix = nxpix/2 + 1 
+              write(*,*)"cxpix re-adjusted to: ",cxpix
+         else if(cxpix .gt. nx_totpix + 1 - nxpix/2)then
+              write(*,*)"cxpix,nxpix = ",cxpix,nxpix
+              write(*,*)"Image out of range!"
+              cxpix = nx_totpix + 1 - nxpix/2 
+              write(*,*)"cxpix re-adjusted to: ",cxpix
+         endif
+
+         if(nypix .gt. ny_totpix)then
+              write(*,*)"nypix = ",nypix
+              write(*,*)"Image out of range!"
+              nypix = int(ny_totpix/8) 
+              write(*,*)"nypix re-adjusted to: ",nypix
+              if(mod(nypix,2) .ne. 0)then
+                      write(*,*)"nypix expected even, found odd!"
+                      nypix = nypix - 1 
+                      write(*,*)"nypix further re-adjusted to: ",nypix
+              endif
+         else if(cypix .lt. nypix/2 + 1)then
+              write(*,*)"cypix,nypix = ",cypix,nypix
+              write(*,*)"Image out of range!"
+              cypix = nypix/2 + 1 
+              write(*,*)"cypix re-adjusted to: ",cypix
+         else if(cypix .gt. ny_totpix + 1 - nypix/2)then
+              write(*,*)"cypix,nypix = ",cypix,nypix
+              write(*,*)"Image out of range!"
+              cypix = ny_totpix + 1 - nypix/2 
+              write(*,*)"cypix re-adjusted to: ",cypix
+         endif
+
+              ypix_beg = cypix-nypix/2 
+              ypix_end = cypix + nypix/2 - 1
+
+              xpix_beg = cxpix-nxpix/2
+              xpix_end = cxpix + nxpix/2 - 1
+
+
+              open(31,file='image.bin',status='unknown',
+     -        form='unformatted',access='direct',
+     -        recl=nxpix*data_precision)
+
+
+              if(bitpix.eq.8)then
+                 ky = 0
+                 firstpix = ypix_beg*nbuffer 
+                 do iy = ypix_beg,ypix_end
+                    call FTGPVB(21,group,firstpix,nbuffer,nullval,
+     -                           buff_array,anyflg,status)
+                    ky = ky + 1
+                    kx = 0
+                    do ix = xpix_beg,xpix_end
+                       kx = kx + 1
+                       subim(ky,kx) = buff_array(ix) ! row --> ky
+                                                     ! col --> kx
+                    enddo
+                    write(31,rec=ky)(buff_array(j),j=xpix_beg,xpix_end)
+                    firstpix = firstpix + nbuffer
+                 enddo
+                 close(31)
+              else if(bitpix.eq.16)then
+                 ky = 0
+                 firstpix = ypix_beg*nbuffer 
+                 do iy = ypix_beg,ypix_end
+                    call FTGPVI(21,group,firstpix,nbuffer,nullval,
+     -                           buff_array,anyflg,status)
+                    ky = ky + 1
+                    kx = 0
+                    do ix = xpix_beg,xpix_end
+                       kx = kx + 1
+                       subim(ky,kx) = buff_array(ix) ! row --> iy
+                                                     ! col --> ix
+                    enddo
+                    write(31,rec=ky)(buff_array(j),j=xpix_beg,xpix_end)
+                    firstpix = firstpix + nbuffer
+                 enddo
+                 close(31)
+              else if(bitpix.eq.32)then
+                 ky = 0
+                 firstpix = ypix_beg*nbuffer 
+                 do iy = ypix_beg,ypix_end
+                    call FTGPVJ(21,group,firstpix,nbuffer,nullval,
+     -                           buff_array,anyflg,status)
+                    ky = ky + 1
+                    kx = 0
+                    do ix = xpix_beg,xpix_end
+                       kx = kx + 1
+                       subim(ky,kx) = buff_array(ix) ! row --> iy
+                                                     ! col --> ix
+                    enddo
+                    write(31,rec=ky)(buff_array(j),j=xpix_beg,xpix_end)
+                    firstpix = firstpix + nbuffer
+                 enddo
+                 close(31)
+              else if(bitpix.eq.64)then
+                 ky = 0
+                 firstpix = ypix_beg*nbuffer 
+                 do iy = ypix_beg,ypix_end
+                    call FTGPVK(21,group,firstpix,nbuffer,nullval,
+     -                           buff_array,anyflg,status)
+                    ky = ky + 1
+                    kx = 0
+                    do ix = xpix_beg,xpix_end
+                       kx = kx + 1
+                       subim(ky,kx) = buff_array(ix) ! row --> iy
+                                                     ! col --> ix
+                    enddo
+                    write(31,rec=ky)(buff_array(j),j=xpix_beg,xpix_end)
+                    firstpix = firstpix + nbuffer
+                 enddo
+                 close(31)
+              else if(bitpix.eq.-32)then
+                 ky = 0
+                 firstpix = ypix_beg*nbuffer 
+                 do iy = ypix_beg,ypix_end
+                    call FTGPVE(21,group,firstpix,nbuffer,nullval,
+     -                           buff_array,anyflg,status)
+                    ky = ky + 1
+                    kx = 0
+                    do ix = xpix_beg,xpix_end
+                       kx = kx + 1
+                       subim(ky,kx) = buff_array(ix) ! row --> iy
+                                                     ! col --> ix
+                    enddo
+                    write(31,rec=ky)(buff_array(j),j=xpix_beg,xpix_end)
+                    firstpix = firstpix + nbuffer
+                 enddo
+                 close(31)
+              else if(bitpix.eq.-64)then
+                 ky = 0
+                 firstpix = ypix_beg*nbuffer 
+                 do iy = ypix_beg,ypix_end
+                    call FTGPVD(21,group,firstpix,nbuffer,nullval,
+     -                           buff_array,anyflg,status)
+                    ky = ky + 1
+                    kx = 0
+                    do ix = xpix_beg,xpix_end
+                       kx = kx + 1
+                       subim(ky,kx) = buff_array(ix) ! row --> iy
+                                                     ! col --> ix
+                    enddo
+                    write(31,rec=ky)(buff_array(j),j=xpix_beg,xpix_end)
+                    firstpix = firstpix + nbuffer
+                 enddo
+                 close(31)
+              endif
+              open(41,file='image.dat',status='unknown')
+
+              do i = 1,kx
+                 do j = 1,ky
+                    write(41,*)subim(i,j) 
+                 enddo
+              enddo
+
+              close(41)
+      !
+      ! Finished writing image file
+
+      ! Now write the axes values to the axis files: 
+
+              open(51,file='xaxis.txt',status='unknown')
+              open(61,file='yaxis.txt',status='unknown')
+
+              do j = xpix_beg,xpix_end
+                 write(51,*)xval(j)
+                 write(61,*)yval(j)
+              enddo
+
+              close(51)
+              close(61)
+      ! CLOSE THE FITS FILE:
+              call FTCLOS(21,status)
+              write(*,*)"---------------------------"
+              write(*,*)"Current subroutine: FTCLOS "
+              write(*,*)"STATUS = ",status
+              write(*,*)" "
+              if (status .gt. 0)call printerror(status)
+
+              write(*,*)"---------------------------"
+      ! -----------------------------------------------------------------
+      endif
+
+
+
+9999  continue      
+      end
+
+
+C *************************************************************************
+      subroutine printerror(status)
+
+C  This subroutine prints out the descriptive text corresponding to the
+C  error status value and prints out the contents of the internal
+C  error message stack generated by FITSIO whenever an error occurs.
+
+      integer status
+      character errtext*30,errmessage*80
+
+C  Check if status is OK (no error); if so, simply return
+      if (status .le. 0)return
+
+C  The FTGERR subroutine returns a descriptive 30-character text string that
+C  corresponds to the integer error status number.  A complete list of all
+C  the error numbers can be found in the back of the FITSIO User's Guide.
+      call ftgerr(status,errtext)
+      print *,'FITSIO Error Status =',status,': ',errtext
+
+C  FITSIO usually generates an internal stack of error messages whenever
+C  an error occurs.  These messages provide much more information on the
+C  cause of the problem than can be provided by the single integer error
+C  status value.  The FTGMSG subroutine retrieves the oldest message from
+C  the stack and shifts any remaining messages on the stack down one
+C  position.  FTGMSG is called repeatedly until a blank message is
+C  returned, which indicates that the stack is empty.  Each error message
+C  may be up to 80 characters in length.  Another subroutine, called
+C  FTCMSG, is available to simply clear the whole error message stack in
+C  cases where one is not interested in the contents.
+      call ftgmsg(errmessage)
+      do while (errmessage .ne. ' ')
+          print *,errmessage
+          call ftgmsg(errmessage)
+      end do
+      end
+C *************************************************************************
+      include 'nchar.f'
+      include '/home/wasim/subroutine_lib/fort_lib.f'

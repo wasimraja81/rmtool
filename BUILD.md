@@ -1,0 +1,318 @@
+# RM-Synthesis Build System
+
+## Quick Start
+
+### Release Tagging Policy
+
+- Public release tags use `R<major>.<minor>` format (for example: `R1.0`,
+  `R1.1`, `R2.0`), each carrying a short alias (e.g. `R1.0` is
+  "Confluent Brahmaputra") — see
+  [RELEASE_NOTES.md](RELEASE_NOTES.md) for
+  the current release.
+- `R1.0-beta` is the package's first release: a beta shared for
+  feedback ahead of the first full public release, `R1.0` itself.
+  Earlier `1.0`–`6.0` version numbers were this project's own internal
+  development progression, never tagged as a public release — that
+  history is kept for the record in [docs/dev/ARCHIVED/](docs/dev/ARCHIVED/)
+  but is not part of the public release line.
+
+### Building with Make
+
+```bash
+# Build
+make
+
+# Build with debug symbols
+make MODE=debug
+
+# Clean build artifacts
+make clean
+
+# Install to system
+sudo make install
+
+# Show help
+make help
+```
+
+**Advantages:**
+- No dependencies (just Make)
+- Fast incremental builds
+- Direct control over compilation
+
+### Build Variants and Binary Names
+
+Build commands are unchanged (`make OMP=... GPU=...`), but binary names use
+clear capability labels:
+
+| Build command | Binary produced | Semantics |
+|---|---|---|
+| `make OMP=0 GPU=0` | `bin/rm_synthesis_release_cpu_serial` | Pure serial CPU, no parallelism |
+| `make OMP=1 GPU=0` | `bin/rm_synthesis_release_cpu_omp` | CPU with OpenMP parallelization |
+| `make OMP=0 GPU=1` | `bin/rm_synthesis_release_gpu_offload` | GPU offload, serial host prep |
+| `make OMP=1 GPU=1` | `bin/rm_synthesis_release_gpu_offload_hostomp` | GPU offload + host OpenMP |
+
+#### HOST_OMP Policy
+
+Each variant is compiled with a compile-time `HOST_OMP` macro that controls
+whether host-side preprocessing loops use OpenMP parallelization:
+
+- **HOST_OMP=0** (`cpu_serial`, `gpu_offload`): Host loops remain serial
+- **HOST_OMP=1** (`cpu_omp`, `gpu_offload_hostomp`): Host loops parallelized via `!$omp parallel do`
+
+The `HOST_OMP` macro gates preprocessor directives in the main program 
+(`src/rm_synthesis.f90`) and runtime variable checks in free-form Fortran 
+(`src/rm_synthesis_mod.f90`), ensuring correct semantic behaviour for each variant.
+
+#### Use Cases
+
+- **cpu_serial**: Baseline reference for benchmarking
+- **cpu_omp**: Measure CPU parallelism efficiency vs. serial
+- **gpu_offload**: GPU kernel speedup with minimal host overhead
+- **gpu_offload_hostomp**: Maximum parallelization (GPU kernel + host prep)
+
+### Quick Build Script
+
+```bash
+./build.sh
+```
+
+Checks dependencies (gfortran, CFITSIO, Starlink AST, FFTW3) with clear
+install instructions if anything's missing, then builds everything
+[scripts/run_pipeline.sh](scripts/run_pipeline.sh) needs in one go:
+`match_cubes`, `reproject_cubes`, `convolve_cubes`, `rmclean_cubes`,
+and `rm_synthesis`'s CPU/OpenMP variant. Also attempts `rm_synthesis`'s
+GPU variant, best-effort (not required -- reported and skipped if no
+working GPU compiler is found). For debug builds or any other
+OMP=/GPU= combination, use `make` directly (see below).
+
+## Requirements
+
+### Fortran Compiler
+```bash
+# Debian/Ubuntu
+sudo apt-get install gfortran
+
+# macOS
+brew install gcc
+
+# Or any Fortran 2008+ compiler (ifort, pgfortran, etc.)
+```
+
+### CFITSIO Library
+```bash
+# Debian/Ubuntu
+sudo apt-get install libcfitsio-dev
+
+# macOS
+brew install cfitsio
+
+# From source: https://heasarc.gsfc.nasa.gov/fitsio/
+```
+
+### Starlink AST and FFTW3 (only needed for `reproject_cubes`/`convolve_cubes`/`match_cubes`/`rmclean_cubes`)
+The main `rm_synthesis` build needs only gfortran + CFITSIO above.
+`reproject_cubes`, `convolve_cubes`, `match_cubes` (which consolidates
+the other two, with an option to chain them through memory with no
+intermediate FITS file), and `rmclean_cubes` (standalone RM-CLEAN,
+driving `rmclean_mod` against real dirty AMP/PHA cubes `rm_synthesis`
+itself wrote) are independent standalone tools (own binaries, own build
+targets, not linked into `rm_synthesis`) with their own extra
+dependencies:
+```bash
+# Debian/Ubuntu
+sudo apt-get install libstarlink-ast-dev libstarlink-ast-err9 \
+    libstarlink-ast-grf3d9 libstarlink-pal-dev libfftw3-dev
+```
+`rmclean_cubes` needs only FFTW3 + CFITSIO from the above (no Starlink
+AST dependency -- it never resamples anything). Both packaged into
+`docker/dockerfile` already, if building via the container is easier
+than installing these directly.
+
+## Build Targets
+
+| Target | Purpose |
+|--------|---------|
+| `make` | Build release executable |
+| `make MODE=debug` | Build with debugging info |
+| `make reproject_cubes` | Build the cross-band sky-grid alignment tool (`bin/reproject_cubes`) |
+| `make convolve_cubes` | Build the angular-resolution-matching tool, within a band or across bands (`bin/convolve_cubes`) |
+| `make match_cubes` | Build the consolidated reproject+convolve tool, chainable through memory (`bin/match_cubes`) |
+| `make rmclean_cubes` | Build the standalone RM-CLEAN tool (`bin/rmclean_cubes`) |
+| `make clean` | Remove build artifacts |
+| `make install` | Install to /usr/local/bin |
+| `make uninstall` | Remove installation |
+| `make help` | Show help message |
+
+## Directory Structure
+
+```
+rmtool/
+├── src/
+│   ├── rm_synthesis_mod.f90      # Modern Fortran module
+│   ├── rm_synthesis.f90          # Main program; `include`s myfits_info.f90/
+│   │                             # printerror.f90 below at compile time
+│   ├── myfits_info.f90           # FITS utilities
+│   ├── printerror.f90            # Error handling
+│   ├── reproject_cubes.f90       # Standalone: cross-band sky-grid alignment
+│   ├── gaussft.f90               # gaussft_mod: beam-matching convolution (pure)
+│   ├── commonbeam.f90            # commonbeam_mod: smallest common beam
+│   ├── convolve_cubes.f90        # Standalone: angular-resolution matching,
+│   │                              # within a band or across bands
+│   ├── match_cubes.f90           # Standalone: reproject_cubes + convolve_cubes
+│   │                              # consolidated, chainable through memory
+│   ├── rmclean.f90               # rmclean_mod: RM-CLEAN core (pure computation)
+│   └── rmclean_cubes.f90         # Standalone: RM-CLEAN driven against real
+│                                  # dirty AMP/PHA cubes rm_synthesis wrote
+├── build/                        # Build artifacts (Makefile)
+│   ├── modules/                  # Compiled .mod files
+│   ├── reproject_cubes/          # reproject_cubes' own build artifacts
+│   ├── convolve_cubes/           # convolve_cubes' own build artifacts
+│   ├── match_cubes/              # match_cubes' own build artifacts
+│   ├── rmclean_cubes/            # rmclean_cubes' own build artifacts
+│   └── *.o                       # Object files
+├── bin/                          # Final executables (rm_synthesis, reproject_cubes,
+│                                  # convolve_cubes, match_cubes, rmclean_cubes)
+├── Makefile                      # Simple build
+├── build.sh                      # Quick build script
+└── cfg/                          # Configuration files, incl. example_beamLog.txt/.csv
+```
+
+## Compiler Options
+
+### GFortran (Default)
+
+```bash
+# Release (optimised)
+make MODE=release
+
+# Debug (with bounds checking)
+make MODE=debug
+```
+
+### Intel Fortran
+
+Modify `Makefile` to use `ifort`:
+
+```bash
+FC=ifort make
+```
+
+## Troubleshooting
+
+### CFITSIO Not Found
+
+```bash
+# Check if installed
+pkg-config --modversion cfitsio
+
+# Or manually specify location
+CFITSIO_LIB="-L/usr/local/lib -lcfitsio" make
+```
+
+### Compilation Errors
+
+**Error:** `Symbol 'sp' has no type`
+- Solution: Ensure `rm_synthesis_mod.f90` compiles first (it defines `sp` kind)
+
+**Error:** `undefined reference to 'ftopen'`
+- Solution: Install CFITSIO development package
+
+### AST Link Errors (`reproject_cubes`/`match_cubes` only)
+
+**Error:** `undefined reference to 'astG...'` (e.g. `astGAttr`,
+`astGLine`, `astGText`)
+
+`reproject_cubes` and `match_cubes` compile a small hand-written stub,
+`src/ast_grf_stub.c`, providing no-op implementations of AST's "GRF"
+graphics-callback interface (AST's `Plot` class expects these to exist
+at link time, even though this project never creates a `Plot` object,
+so they're never actually called at runtime). `convolve_cubes` and
+`rmclean_cubes` don't link AST at all and are unaffected.
+
+The stub's function signatures were transcribed from one system's own
+`/usr/include/grf.h`, not from a version-independent contract -- AST's
+GRF interface has genuinely changed across major versions (v1.0 vs.
+v2.0), so a sufficiently different AST installation could need a
+different stub.
+
+**What's actually verified:** build success *and* real functional
+correctness (`reproject_cubes`/`match_cubes` exercised through
+`tests/run_tests.sh`, including known-source recovery through actual
+reprojection, not just a link check) on **Ubuntu 24.04** specifically
+-- both this project's own development and its CI/Docker verification
+(`docker/dockerfile: FROM ubuntu:24.04`) use that same OS version and
+the same package:
+
+```bash
+sudo apt-get install libstarlink-ast-dev libstarlink-ast-err9 \
+    libstarlink-ast-grf3d9 libstarlink-pal-dev
+```
+
+Containers for other base systems are in progress. If you hit this
+error on a different OS/AST version in the meantime: compare your
+system's own `/usr/include/grf.h` against `src/ast_grf_stub.c` and
+adjust the stub's signatures/function set to match, or use the Ubuntu
+24.04 Docker image as the known-working path.
+
+## Performance
+
+For production use:
+
+```bash
+# Optimize for your CPU
+make MODE=release
+
+# Or with aggressive optimisation
+FFLAGS="-O3 -march=native -ffast-math" make
+```
+
+## Timing And Benchmark Logging
+
+All build variants support runtime timing diagnostics through config keys.
+
+Add to your cfg:
+
+```cfg
+timing_enabled = y
+timing_tile_enabled = y
+timing_io_enabled = y
+log_output_file =
+timing_csv_file = ./timing.csv
+```
+
+`log_output_file`:
+- empty value writes timing to stdout
+- non-empty value appends timing logs to that file
+
+`timing_csv_file`:
+- appends one CSV row per run
+- useful for scripted benchmark sweeps across `cpu_serial`, `cpu_omp`,
+  `gpu_offload`, and `gpu_offload_hostomp`
+
+Example benchmark commands:
+
+```bash
+make OMP=0 GPU=0
+bin/rm_synthesis_release_cpu_serial cfg/rmsynth.cfg
+
+make OMP=1 GPU=0
+bin/rm_synthesis_release_cpu_omp cfg/rmsynth.cfg
+
+make OMP=0 GPU=1
+bin/rm_synthesis_release_gpu_offload cfg/rmsynth.cfg
+```
+
+## Distribution
+
+For distributing the package:
+
+1. Create source tarball: `tar czf rm_synthesis-4.1.tar.gz .` (match the current release tag)
+2. Users build with: `make && sudo make install`
+
+## Support
+
+See individual file comments:
+- `src/rm_synthesis_mod.f90` - Module documentation
+- `src/rm_synthesis.f90` - Main program documentation
+- `src/myfits_info.f90` - FITS interface

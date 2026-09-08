@@ -1,0 +1,1647 @@
+#!/usr/bin/env python3
+"""Generate a clean 3-lane swim-lane plot from RM-synthesis debug logs.
+
+Style:
+- Lanes: GPU, CPU, I/O
+- Colors: GPU compute, CPU prep, CPU scatter, I/O read/write
+- X-axis: seconds since selected run start
+
+Example:
+  /home/wasim/venv/rmtool/bin/python scripts/plot_tile_async_swimlane.py \
+      --log MY_CASA_RMSYNTH_FULLIM_TEST.run.log \
+      --out scratch/tile_async_swimlane_clean_latest.png \
+      --run latest
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import textwrap
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}).*"
+    r"\[(?P<cat>[^\]]+)\]\s+\[tid=(?P<tid>\d+)\]\s+(?P<msg>.*)$"
+)
+
+ASYNC_RE = re.compile(
+    r"async\s+(?P<kind>enqueue|start|done)\s+"
+    r"(?P<stage>compute|scatter)\s+slot=(?P<slot>\d+)\s+sub=(?P<sub>\d+)"
+)
+
+SUBBLOCK_RE = re.compile(
+    r"(?P<label>prep|send|start|done)\s+(?P<sub>\d+)/(?P<tot>\d+)\s+y:\[(?P<yb>\d+),(?P<ye>\d+)\]"
+)
+
+STAGE_BOUNDS_RE = re.compile(r"\b(?P<ev>start|done)\b.*x:\[")
+
+GPU_SYNC_RE = re.compile(r"^gpu (send|recv)$")
+
+BYTES_RE = re.compile(r"bytes=(?P<bytes>\d+)")
+
+THREAD_CPU_RE = re.compile(
+    r"thread_timing\s+stage=(?P<stage>\w+)\s+event=(?P<event>start|done)\s+"
+    r"tid=(?P<tid>\d+)\s+"
+    r"(?:rm_block=(?P<rm_block>\d+)\s+nrm_now=(?P<nrm_now>\d+)"
+    r"|block=(?P<block>\d+)\s+unit_count=(?P<unit_count>\d+)"
+    r"|block=(?P<block_pl>\d+)\s+plane=(?P<plane>\d+)\s+nthreads=(?P<nthreads>\d+))"
+    # \s* (not requiring but allowing whitespace) right after 'dur_ms='
+    # -- Fortran's F10.3 right-justifies into a fixed field, so smaller
+    # values (e.g. a single plane's ~8s) print with leading spaces
+    # ('dur_ms=  8212.996') where larger ones (e.g. a whole block's
+    # cumulative time) happen not to need any -- confirmed directly:
+    # requiring digits immediately after '=' silently dropped dur_ms
+    # for every smaller value, a real pre-existing gap this project's
+    # own larger-value test cases never happened to expose.
+    r"(?:\s+dur_ms=\s*(?P<dur_ms>[0-9]+\.[0-9]+))?"
+)
+# Three field-name spellings feed the same downstream (tid, sub, slot,
+# stage) interval key (build_cpu_thread_intervals):
+# - rm_synthesis_mod.f90's own 'rm_block=...nrm_now=...' (paired start/
+#   done lines -- sub=rm_block, slot=nrm_now).
+# - convolve_cubes.f90/reproject_cubes.f90/rmclean_cubes.f90's own
+#   'block=...unit_count=...' (also paired start/done -- sub=block,
+#   slot=unit_count).
+# - convolve_cubes.f90/match_cubes.f90's own per-PLANE 'block=...
+#   plane=...nthreads=...' (sub=block, slot=plane) -- 2026-08-09,
+#   T30 item 7 follow-up. This third shape is DONE-ONLY, no matching
+#   start line exists for it at all (confirmed directly: it produced
+#   zero plotted intervals before this fix, a real pre-existing gap,
+#   not a hypothetical one) -- build_cpu_thread_intervals derives the
+#   interval directly from this event's own dur_ms instead of pairing
+#   it with a start event. match_cubes.f90's reproject stage uses this
+#   same shape too (T30 item 3/7's spatial-tile redesign): since every
+#   thread in the team works the SAME plane together (row-split, not
+#   plane-split), each thread still logs its OWN done line with its
+#   real tid, all sharing the identical team-elapsed dur_ms for that
+#   plane -- keeps the swim-lane honest (N simultaneous lanes for a
+#   team-parallel plane, not 1), see docs/dev/MULTI_BAND_TOMOGRAPHY_
+#   PLAN.md T30 item 7 for the full reasoning.
+
+
+@dataclass(frozen=True)
+class Event:
+    ts: datetime
+    category: str
+    tid: int
+    message: str
+    label: Optional[str] = None
+    sub: Optional[int] = None
+    kind: Optional[str] = None
+    stage: Optional[str] = None
+    slot: Optional[int] = None
+    nbytes: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ThreadInterval:
+    tid: int
+    rm_block: int
+    nrm_now: int
+    start: datetime
+    end: datetime
+    stage: str = "cpu_extract"
+    dur_ms: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class Interval:
+    lane: str
+    kind: str
+    label: str
+    start: datetime
+    end: datetime
+    sub: Optional[int] = None
+    slot: Optional[int] = None
+    nbytes: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RunWindow:
+    start: datetime
+    end: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class PhaseRow:
+    sub: int
+    h2d_proxy_s: float
+    kernel_s: float
+    d2h_proxy_s: float
+
+
+def parse_events(log_path: Path) -> Tuple[List[Event], List[datetime]]:
+    events: List[Event] = []
+    run_starts: List[datetime] = []
+
+    with log_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = LINE_RE.search(line)
+            if not m:
+                continue
+
+            ts = datetime.strptime(m.group("ts"), "%Y-%m-%dT%H:%M:%S.%f")
+            cat = m.group("cat")
+            tid = int(m.group("tid"))
+            msg = m.group("msg")
+
+            if cat == "startup":
+                if "run started" in msg:
+                    run_starts.append(ts)
+                events.append(
+                    Event(
+                        ts=ts,
+                        category=cat,
+                        tid=tid,
+                        message=msg,
+                    )
+                )
+                continue
+
+            if cat == "tile_async":
+                ma = ASYNC_RE.search(msg)
+                if ma:
+                    events.append(
+                        Event(
+                            ts=ts,
+                            category=cat,
+                            tid=tid,
+                            message=msg,
+                            kind=ma.group("kind"),
+                            stage=ma.group("stage"),
+                            slot=int(ma.group("slot")),
+                            sub=int(ma.group("sub")),
+                        )
+                    )
+                continue
+
+            if cat in {"tile_prep", "tile_compute", "tile_scatter"}:
+                ms = SUBBLOCK_RE.search(msg)
+                if ms:
+                    events.append(
+                        Event(
+                            ts=ts,
+                            category=cat,
+                            tid=tid,
+                            message=msg,
+                            label=ms.group("label"),
+                            sub=int(ms.group("sub")),
+                        )
+                    )
+                    continue
+
+            if cat == "tile_compute":
+                mgs = GPU_SYNC_RE.match(msg.strip())
+                if mgs:
+                    # Non-staged, non-async GPU compute (single-shot: whole
+                    # tile fits in one VRAM sub-block) logs plain 'gpu send'/
+                    # 'gpu recv' notes -- no sub-block index, unlike the
+                    # staged/async path's 'async enqueue/start/done ...
+                    # slot=/sub=' markers. This is the only signal available
+                    # to bound that interval, so it's captured here rather
+                    # than falling through unmatched.
+                    events.append(
+                        Event(
+                            ts=ts,
+                            category=cat,
+                            tid=tid,
+                            message=msg,
+                            label="gpu_" + mgs.group(1),
+                        )
+                    )
+                    continue
+
+            if cat in {
+                "tile_read",
+                "tile_write",
+                "tile_mask",
+                "tile_prep",
+                "tile_compute",
+                "tile_cubestat",
+            }:
+                mb = STAGE_BOUNDS_RE.search(msg)
+                if mb:
+                    mbytes = BYTES_RE.search(msg)
+                    events.append(
+                        Event(
+                            ts=ts,
+                            category=cat,
+                            tid=tid,
+                            message=msg,
+                            label=mb.group("ev"),
+                            nbytes=int(mbytes.group("bytes")) if mbytes else None,
+                        )
+                    )
+
+            if cat == "tile_thread":
+                mt = THREAD_CPU_RE.search(msg)
+                if mt:
+                    sub = mt.group("rm_block") or mt.group("block") or mt.group("block_pl")
+                    slot = mt.group("nrm_now") or mt.group("unit_count") or mt.group("plane")
+                    events.append(
+                        Event(
+                            ts=ts,
+                            category=cat,
+                            tid=tid,
+                            message=msg,
+                            label=mt.group("event"),
+                            sub=int(sub),
+                            kind=mt.group("stage"),
+                            slot=int(slot),
+                        )
+                    )
+
+    events.sort(key=lambda e: e.ts)
+    run_starts.sort()
+    return events, run_starts
+
+
+def build_cpu_thread_intervals(
+    events: List[Event], stage_filter: Optional[str] = None
+) -> List[ThreadInterval]:
+    """Pairs thread_timing start/done events into per-thread intervals.
+
+    stage_filter restricts to one named stage (e.g. "convolve", "resample",
+    "clean", or rm_synthesis's own "cpu_extract") -- needed because a
+    single log can contain more than one stage's thread_timing lines
+    (e.g. match_cubes stages=both emits both "convolve" and "resample"),
+    and mixing them would pair a "convolve" start with a "resample" done
+    if they happened to share the same (tid, sub, slot) by coincidence.
+    stage is included in the pairing key regardless, so this is a belt-
+    and-suspenders filter -- pass None to keep every stage present (the
+    original single-stage rm_synthesis behaviour).
+
+    Two shapes handled, not one: most stages log a paired start+done
+    (interval = the gap between the two real timestamps). convolve's own
+    per-plane lines, and match_cubes' reproject per-plane lines (T30 item
+    7, 2026-08-09), log DONE ONLY, with the duration already computed and
+    attached as dur_ms -- there is no start line to pair with (confirmed
+    directly: before this fix, these produced zero intervals, silently,
+    not an edge case that never occurs). For those, the interval is
+    derived directly (start = done_ts - dur_ms) instead of paired.
+    """
+    starts: Dict[Tuple[int, int, int, str], List[datetime]] = {}
+    intervals: List[ThreadInterval] = []
+
+    for ev in events:
+        if ev.category != "tile_thread":
+            continue
+        if stage_filter is not None and ev.kind != stage_filter:
+            continue
+        if ev.sub is None or ev.slot is None:
+            continue
+
+        m = THREAD_CPU_RE.search(ev.message)
+        dur_ms = float(m.group("dur_ms")) if (m and m.group("dur_ms")) else None
+        key = (ev.tid, ev.sub, ev.slot, ev.kind)
+
+        if ev.label == "start":
+            starts.setdefault(key, []).append(ev.ts)
+        elif ev.label == "done":
+            bucket = starts.get(key)
+            if bucket:
+                st = bucket.pop(0)
+                if ev.ts > st:
+                    intervals.append(
+                        ThreadInterval(
+                            tid=ev.tid,
+                            rm_block=ev.sub,
+                            nrm_now=ev.slot,
+                            start=st,
+                            end=ev.ts,
+                            stage=ev.kind or "cpu_extract",
+                            dur_ms=dur_ms,
+                        )
+                    )
+            elif dur_ms is not None:
+                # No paired start line for this event -- self-contained
+                # done-only shape (convolve/reproject per-plane lines).
+                # Derive the interval directly from its own dur_ms.
+                st = ev.ts - timedelta(milliseconds=dur_ms)
+                intervals.append(
+                    ThreadInterval(
+                        tid=ev.tid,
+                        rm_block=ev.sub,
+                        nrm_now=ev.slot,
+                        start=st,
+                        end=ev.ts,
+                        stage=ev.kind or "cpu_extract",
+                        dur_ms=dur_ms,
+                    )
+                )
+
+    intervals.sort(key=lambda x: (x.start, x.tid, x.rm_block))
+    return intervals
+
+
+# Stage label/color table shared by the swim-lane and the stage-totals bar
+# chart, so the two panels stay visually consistent. Covers both views'
+# Interval.kind vocabularies: CPU-thread-detail uses cpu_stage_*, the
+# pipeline/GPU view uses cpu_prep/cpu_scatter/gpu_compute_*.
+_STAGE_TOTAL_STYLE: List[Tuple[str, str, str]] = [
+    # (interval kind, display label, color)
+    ("io_read", "I/O read", "#2a78d6"),
+    ("io_write", "I/O write", "#1f4f99"),
+    ("cpu_stage_mask", "CPU mask", "#85b86f"),
+    ("cpu_stage_prep", "CPU prep", "#b8b36a"),
+    ("cpu_stage_compute", "CPU compute", "#8a8a8a"),
+    ("cpu_stage_cubestat", "CPU cubestat", "#5aa3a5"),
+    ("cpu_prep", "CPU prep", "#eda100"),
+    ("cpu_scatter", "CPU scatter", "#e34948"),
+    ("gpu_compute_slot1", "GPU compute (slot 1)", "#4a3aa7"),
+    ("gpu_compute_slot2", "GPU compute (slot 2)", "#7d6fd1"),
+    ("gpu_compute_sync", "GPU compute (sync)", "#5b4bc0"),
+]
+
+
+def compute_stage_totals(*interval_lists: List[Interval]) -> List[Tuple[str, float, str]]:
+    """Total wall-clock seconds per pipeline stage, sorted descending.
+
+    Accepts one or more interval lists (e.g. io_intervals, cpu_stage_intervals)
+    and sums durations by Interval.kind across all of them. Uses the
+    tile-level start/done intervals (not per-thread bursts), so a stage
+    that runs on 16 parallel threads for 30s each still counts as 30s, not
+    480s -- this reflects wall time, matching the binary's own
+    'Timing summary (seconds)' block.
+    """
+    by_kind: Dict[str, float] = {}
+    for intervals in interval_lists:
+        for iv in intervals:
+            by_kind[iv.kind] = by_kind.get(iv.kind, 0.0) + (iv.end - iv.start).total_seconds()
+
+    totals = [
+        (label, by_kind[kind], color)
+        for kind, label, color in _STAGE_TOTAL_STYLE
+        if by_kind.get(kind, 0.0) > 0.0
+    ]
+    totals.sort(key=lambda t: t[1], reverse=True)
+    return totals
+
+
+def draw_stage_totals_bar(
+    ax, totals: List[Tuple[str, float, str]], wall_time_s: Optional[float] = None
+) -> None:
+    """Horizontal bar chart of total stage time, largest on top.
+
+    A bar chart rather than a pie: stage totals in real runs are often
+    extremely skewed (e.g. one write stage at >90% of wall time with
+    everything else in single digits), which a pie renders as one slice
+    and a sliver soup. A sorted bar with value labels stays readable at
+    any skew and lets exact seconds be read off directly.
+
+    Percentages are of `wall_time_s` (the run's actual elapsed time) when
+    given, matching the binary's own 'Timing summary (seconds)' block --
+    NOT percent-of-summed-stages, which would quietly overstate things
+    whenever stages overlap in real time (e.g. io_overlap=y write running
+    concurrently with the next tile's read/compute: the two durations
+    both count in full, so they'd sum to more than the wall clock ever
+    elapsed). Falls back to percent-of-summed-stages only if wall_time_s
+    isn't available.
+    """
+    if not totals:
+        ax.axis("off")
+        return
+
+    labels = [t[0] for t in totals]
+    values = [t[1] for t in totals]
+    colors = [t[2] for t in totals]
+    y_pos = list(range(len(totals)))[::-1]  # largest at top
+
+    ax.barh(y_pos, values, color=colors, edgecolor="black", linewidth=0.5, height=0.65)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("total wall-clock seconds")
+    subtitle = " (% of run wall time)" if wall_time_s else " (% of summed stage time)"
+    ax.set_title(f"Stage time totals{subtitle}", fontsize=10)
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+
+    denom = wall_time_s if wall_time_s else (sum(values) or 1.0)
+    xmax = max(values) if values else 1.0
+    for y, v in zip(y_pos, values):
+        pct = 100.0 * v / denom
+        ax.text(
+            v + xmax * 0.015,
+            y,
+            f"{v:.1f}s ({pct:.0f}%)",
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+    ax.set_xlim(0, xmax * 1.22)
+
+
+def draw_io_throughput_panel(
+    ax,
+    io_intervals: List[Interval],
+    t0: datetime,
+    time_axis: str,
+) -> None:
+    """Read/write throughput (MB/s), one flat horizontal segment per I/O
+    interval spanning its actual [start, end] window at that interval's
+    average MB/s (nbytes / duration) -- a per-operation average, not a
+    continuously sampled signal, so segments are flat for their duration
+    with gaps in between where nothing was in flight. Stacked directly
+    below the swim lane / thread panel on the SAME time x-axis (unlike
+    the stage-totals bar, which is categorical) so a dip or spike here
+    lines up visually with the Gantt bar above it.
+    """
+    import matplotlib.dates as mdates
+
+    colors = {"io_read": "#2a78d6", "io_write": "#1f4f99"}
+    seen_labels = set()
+    for iv in io_intervals:
+        if iv.kind not in colors or iv.nbytes is None:
+            continue
+        # MB/s uses the TRUE duration (scientifically accurate); the drawn
+        # width uses the same 0.02s minimum-visibility floor the Gantt bars
+        # above use for their `width = max(0.02, ...)`. Without matching
+        # that floor here, a very short interval (e.g. the last, smaller
+        # remainder tile's write) would draw narrower in this panel than
+        # its own bar directly above, making the two panels look
+        # misaligned even though both start at the same true timestamp.
+        dur_s = max(1e-6, (iv.end - iv.start).total_seconds())
+        disp_dur_s = max(0.02, dur_s)
+        mbps = (iv.nbytes / 1.0e6) / dur_s
+        if time_axis == "absolute":
+            x0 = mdates.date2num(iv.start)
+            x1 = x0 + disp_dur_s / 86400.0
+        else:
+            x0 = (iv.start - t0).total_seconds()
+            x1 = x0 + disp_dur_s
+        label = "I/O read" if iv.kind == "io_read" else "I/O write"
+        ax.hlines(
+            mbps, x0, x1,
+            color=colors[iv.kind], linewidth=2.6, capstyle="butt",
+            label=None if label in seen_labels else label,
+        )
+        ax.vlines(x0, 0.0, mbps, color=colors[iv.kind], linewidth=0.6, alpha=0.35)
+        seen_labels.add(label)
+
+    ax.set_ylabel("MB/s")
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="both", linestyle="--", alpha=0.3)
+    if seen_labels:
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+
+
+def _build_stacked_axes(
+    base_height: float,
+    has_throughput: bool,
+    stage_totals: Optional[List[Tuple[str, float, str]]],
+):
+    """Builds a 1-3 row stacked figure and returns (fig, ax, ax_thr, ax2).
+
+    ax: the swim-lane/thread panel (always present, height base_height).
+    ax_thr: I/O throughput panel, if has_throughput -- shares the same
+      time x-axis as ax, so it's stacked directly beneath it.
+    ax2: stage-totals bar panel, if stage_totals -- a different, non-time
+      x-axis (stage name vs seconds/percent), so it never shares limits
+      with ax/ax_thr regardless of row order.
+    Either or both of ax_thr/ax2 are None when not requested.
+    """
+    import matplotlib.pyplot as plt
+
+    height_ratios = [base_height]
+    if has_throughput:
+        height_ratios.append(1.7)
+    if stage_totals:
+        height_ratios.append(1.0 + 0.32 * len(stage_totals))
+
+    if len(height_ratios) == 1:
+        fig, ax = plt.subplots(figsize=(14, height_ratios[0]))
+        return fig, ax, None, None
+
+    fig, axes = plt.subplots(
+        len(height_ratios), 1, figsize=(14, sum(height_ratios)),
+        gridspec_kw={"height_ratios": height_ratios},
+    )
+    axes = list(axes)
+    ax = axes[0]
+    idx = 1
+    ax_thr = None
+    if has_throughput:
+        ax_thr = axes[idx]
+        idx += 1
+    ax2 = None
+    if stage_totals:
+        ax2 = axes[idx]
+        idx += 1
+    return fig, ax, ax_thr, ax2
+
+
+def plot_cpu_thread_timeline(
+    thread_intervals: List[ThreadInterval],
+    io_intervals: List[Interval],
+    cpu_stage_intervals: List[Interval],
+    out_path: Path,
+    title: str,
+    time_axis: str,
+    right_info_lines: Optional[List[str]] = None,
+    stage_totals: Optional[List[Tuple[str, float, str]]] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    if not thread_intervals:
+        raise ValueError("No CPU thread intervals available to plot")
+
+    stages_present = sorted(set(iv.stage for iv in thread_intervals))
+    stage_label = "+".join(stages_present)
+
+    all_start = [iv.start for iv in thread_intervals] + [iv.start for iv in io_intervals] + [iv.start for iv in cpu_stage_intervals]
+    all_end = [iv.end for iv in thread_intervals] + [iv.end for iv in io_intervals] + [iv.end for iv in cpu_stage_intervals]
+    t0 = min(all_start)
+    t1 = max(all_end)
+    wall = max(0.001, (t1 - t0).total_seconds())
+
+    tids = sorted(set(iv.tid for iv in thread_intervals))
+    lane_labels = [f"T{tid}" for tid in tids]
+    if cpu_stage_intervals:
+        lane_labels = ["CPU stage"] + lane_labels
+    if io_intervals:
+        lane_labels = ["I/O read", "I/O write"] + lane_labels
+    y_map = {lane: idx for idx, lane in enumerate(lane_labels)}
+
+    fig_h = 3.2 + 0.22 * len(tids)
+    has_throughput = any(iv.nbytes is not None for iv in io_intervals)
+    fig, ax, ax_thr, ax2 = _build_stacked_axes(fig_h, has_throughput, stage_totals)
+
+    for iv in thread_intervals:
+        lane = f"T{iv.tid}"
+        y = y_map[lane]
+        if time_axis == "absolute":
+            left = mdates.date2num(iv.start)
+            width = max(0.02, (iv.end - iv.start).total_seconds()) / 86400.0
+        else:
+            left = (iv.start - t0).total_seconds()
+            width = max(0.02, (iv.end - iv.start).total_seconds())
+
+        color = "#e97827" if (iv.rm_block % 2 == 1) else "#f0be64"
+        hatch = "//" if (iv.rm_block % 2 == 0) else None
+        ax.barh(
+            y=y,
+            left=left,
+            width=width,
+            height=0.72,
+            color=color,
+            edgecolor="black",
+            linewidth=0.45,
+            alpha=0.95,
+            hatch=hatch,
+        )
+
+    for iv in io_intervals:
+        y = y_map["I/O read"] if iv.kind == "io_read" else y_map["I/O write"]
+        if time_axis == "absolute":
+            left = mdates.date2num(iv.start)
+            width = max(0.02, (iv.end - iv.start).total_seconds()) / 86400.0
+        else:
+            left = (iv.start - t0).total_seconds()
+            width = max(0.02, (iv.end - iv.start).total_seconds())
+
+        color = "#2a78d6" if iv.kind == "io_read" else "#1f4f99"
+        ax.barh(
+            y=y,
+            left=left,
+            width=width,
+            height=0.55,
+            color=color,
+            edgecolor="black",
+            linewidth=0.45,
+            alpha=0.9,
+        )
+
+    stage_colors = {
+        "cpu_stage_mask": "#85b86f",
+        "cpu_stage_prep": "#b8b36a",
+        "cpu_stage_compute": "#8a8a8a",
+        "cpu_stage_cubestat": "#5aa3a5",
+    }
+    for iv in cpu_stage_intervals:
+        y = y_map["CPU stage"]
+        if time_axis == "absolute":
+            left = mdates.date2num(iv.start)
+            width = max(0.02, (iv.end - iv.start).total_seconds()) / 86400.0
+        else:
+            left = (iv.start - t0).total_seconds()
+            width = max(0.02, (iv.end - iv.start).total_seconds())
+
+        ax.barh(
+            y=y,
+            left=left,
+            width=width,
+            height=0.55,
+            color=stage_colors.get(iv.kind, "#7f7f7f"),
+            edgecolor="black",
+            linewidth=0.45,
+            alpha=0.9,
+        )
+
+    ax.set_yticks([y_map[k] for k in lane_labels])
+    ax.set_yticklabels(lane_labels)
+    ax.set_ylim(-0.8, len(lane_labels) - 0.2)
+    # The throughput panel (if present) shares this time axis and sits
+    # directly below, so it -- not this panel -- gets the x tick labels.
+    time_ax = ax_thr if ax_thr is not None else ax
+    if time_axis == "absolute":
+        time_ax.set_xlabel("absolute time")
+        ax.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
+        if ax_thr is not None:
+            ax_thr.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
+        time_ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+    else:
+        time_ax.set_xlabel("seconds since run start")
+        ax.set_xlim(0.0, wall)
+        if ax_thr is not None:
+            ax_thr.set_xlim(0.0, wall)
+    ax.set_ylabel("CPU thread")
+    ax.set_title(title)
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+    if ax_thr is not None:
+        ax.tick_params(labelbottom=False)
+        draw_io_throughput_panel(ax_thr, io_intervals, t0, time_axis)
+    for tick in time_ax.get_xticklabels():
+        tick.set_rotation(30)
+        tick.set_ha("right")
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color="#e97827", ec="black", lw=0.45),
+        plt.Rectangle((0, 0), 1, 1, color="#f0be64", ec="black", lw=0.45, hatch="////"),
+    ]
+    labels = [f"{stage_label} block odd", f"{stage_label} block even"]
+    if io_intervals:
+        handles.extend(
+            [
+                plt.Rectangle((0, 0), 1, 1, color="#2a78d6", ec="black", lw=0.45),
+                plt.Rectangle((0, 0), 1, 1, color="#1f4f99", ec="black", lw=0.45),
+            ]
+        )
+        labels.extend(["I/O read", "I/O write"])
+    if cpu_stage_intervals:
+        handles.extend(
+            [
+                plt.Rectangle((0, 0), 1, 1, color="#85b86f", ec="black", lw=0.45),
+                plt.Rectangle((0, 0), 1, 1, color="#b8b36a", ec="black", lw=0.45),
+                plt.Rectangle((0, 0), 1, 1, color="#8a8a8a", ec="black", lw=0.45),
+                plt.Rectangle((0, 0), 1, 1, color="#5aa3a5", ec="black", lw=0.45),
+            ]
+        )
+        labels.extend(["CPU mask", "CPU prep", "CPU compute", "CPU cubestat"])
+    if ax2 is not None:
+        draw_stage_totals_bar(ax2, stage_totals, wall_time_s=wall)
+    fig.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
+    _layout_right_panel(fig, ax, handles, labels, right_info_lines)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=170, bbox_inches="tight", pad_inches=0.12)
+    plt.close(fig)
+
+
+def split_runs(
+    events: List[Event], run_starts: List[datetime], gap_seconds: float
+) -> List[List[Event]]:
+    if not events:
+        return []
+
+    if run_starts:
+        windows: List[RunWindow] = []
+        for i, st in enumerate(run_starts):
+            en = run_starts[i + 1] if i + 1 < len(run_starts) else None
+            windows.append(RunWindow(st, en))
+
+        by_window: List[List[Event]] = []
+        for w in windows:
+            run_events = [
+                ev for ev in events if ev.ts >= w.start and (w.end is None or ev.ts < w.end)
+            ]
+            if run_events:
+                by_window.append(run_events)
+        if by_window:
+            return by_window
+
+    runs: List[List[Event]] = [[events[0]]]
+    for ev in events[1:]:
+        dt = (ev.ts - runs[-1][-1].ts).total_seconds()
+        if dt > gap_seconds:
+            runs.append([ev])
+        else:
+            runs[-1].append(ev)
+    return runs
+
+
+def select_run(runs: List[List[Event]], run_selector: str) -> List[Event]:
+    if not runs:
+        return []
+    if run_selector == "latest":
+        return runs[-1]
+    if run_selector == "first":
+        return runs[0]
+
+    idx = int(run_selector)
+    if idx < 0:
+        idx = len(runs) + idx
+    if idx < 0 or idx >= len(runs):
+        raise IndexError(f"Run index {run_selector} out of range (0..{len(runs)-1})")
+    return runs[idx]
+
+
+def _pair_intervals(starts: List[datetime], ends: List[datetime]) -> List[Tuple[datetime, datetime]]:
+    pairs: List[Tuple[datetime, datetime]] = []
+    n = min(len(starts), len(ends))
+    for i in range(n):
+        if ends[i] > starts[i]:
+            pairs.append((starts[i], ends[i]))
+    return pairs
+
+
+def _pair_intervals_bytes(
+    starts: List[Tuple[datetime, Optional[int]]],
+    ends: List[Tuple[datetime, Optional[int]]],
+) -> List[Tuple[datetime, datetime, Optional[int]]]:
+    """Like _pair_intervals, but also carries each interval's byte count
+    through (from whichever of its start/done event logged one -- both
+    do today, but only one is required)."""
+    pairs: List[Tuple[datetime, datetime, Optional[int]]] = []
+    n = min(len(starts), len(ends))
+    for i in range(n):
+        s_ts, s_bytes = starts[i]
+        e_ts, e_bytes = ends[i]
+        if e_ts > s_ts:
+            pairs.append((s_ts, e_ts, s_bytes if s_bytes is not None else e_bytes))
+    return pairs
+
+
+def build_intervals(events: List[Event]) -> List[Interval]:
+    if not events:
+        return []
+
+    prep_open_ts: Dict[int, Optional[datetime]] = {}
+    scatter_start_ts: Dict[int, List[datetime]] = {}
+    scatter_done_ts: Dict[int, List[datetime]] = {}
+    gpu_compute_start_ts: Dict[Tuple[int, int], List[datetime]] = {}
+    gpu_compute_done_ts: Dict[Tuple[int, int], List[datetime]] = {}
+
+    io_read_start: List[Tuple[datetime, Optional[int]]] = []
+    io_read_done: List[Tuple[datetime, Optional[int]]] = []
+    io_write_start: List[Tuple[datetime, Optional[int]]] = []
+    io_write_done: List[Tuple[datetime, Optional[int]]] = []
+
+    intervals: List[Interval] = []
+
+    for ev in events:
+        if ev.category == "tile_prep" and ev.label == "prep" and ev.sub is not None:
+            if prep_open_ts.get(ev.sub) is None:
+                prep_open_ts[ev.sub] = ev.ts
+        elif ev.category == "tile_compute" and ev.label == "send" and ev.sub is not None:
+            prep_start = prep_open_ts.get(ev.sub)
+            if prep_start is not None and ev.ts > prep_start:
+                intervals.append(
+                    Interval(
+                        "CPU", "cpu_prep", f"prep {ev.sub}", prep_start, ev.ts, sub=ev.sub
+                    )
+                )
+            prep_open_ts[ev.sub] = None
+        elif ev.category == "tile_scatter" and ev.label == "start" and ev.sub is not None:
+            scatter_start_ts.setdefault(ev.sub, []).append(ev.ts)
+        elif ev.category == "tile_scatter" and ev.label == "done" and ev.sub is not None:
+            scatter_done_ts.setdefault(ev.sub, []).append(ev.ts)
+        elif (
+            ev.category == "tile_async"
+            and ev.stage == "compute"
+            and ev.sub is not None
+            and ev.slot is not None
+            and ev.kind is not None
+        ):
+            key = (ev.sub, ev.slot)
+            if ev.kind == "start":
+                gpu_compute_start_ts.setdefault(key, []).append(ev.ts)
+            elif ev.kind == "done":
+                gpu_compute_done_ts.setdefault(key, []).append(ev.ts)
+        elif ev.category == "tile_read" and ev.label in {"start", "done"}:
+            if ev.label == "start":
+                io_read_start.append((ev.ts, ev.nbytes))
+            else:
+                io_read_done.append((ev.ts, ev.nbytes))
+        elif ev.category == "tile_write" and ev.label in {"start", "done"}:
+            if ev.label == "start":
+                io_write_start.append((ev.ts, ev.nbytes))
+            else:
+                io_write_done.append((ev.ts, ev.nbytes))
+
+    for s, e, nb in _pair_intervals_bytes(io_read_start, io_read_done):
+        intervals.append(Interval("I/O read", "io_read", "read", s, e, sub=None, nbytes=nb))
+    for s, e, nb in _pair_intervals_bytes(io_write_start, io_write_done):
+        intervals.append(Interval("I/O write", "io_write", "write", s, e, sub=None, nbytes=nb))
+
+    for sub in sorted(scatter_start_ts.keys()):
+        starts = sorted(scatter_start_ts.get(sub, []))
+        ends = sorted(scatter_done_ts.get(sub, []))
+        n = min(len(starts), len(ends))
+        for i in range(n):
+            if ends[i] > starts[i]:
+                intervals.append(
+                    Interval(
+                        "CPU",
+                        "cpu_scatter",
+                        f"scatter {sub}",
+                        starts[i],
+                        ends[i],
+                        sub=sub,
+                    )
+                )
+
+    for key in sorted(gpu_compute_start_ts.keys()):
+        sub, slot = key
+        starts = sorted(gpu_compute_start_ts.get(key, []))
+        ends = sorted(gpu_compute_done_ts.get(key, []))
+        n = min(len(starts), len(ends))
+        for i in range(n):
+            if ends[i] > starts[i]:
+                intervals.append(
+                    Interval(
+                        "GPU",
+                        f"gpu_compute_slot{slot}",
+                        f"compute {sub} (slot {slot})",
+                        starts[i],
+                        ends[i],
+                        sub=sub,
+                        slot=slot,
+                    )
+                )
+
+    intervals.sort(key=lambda x: (x.start, x.lane, x.kind))
+    return intervals
+
+
+def build_gpu_sync_intervals(events: List[Event]) -> List[Interval]:
+    """Synchronous (non-staged, non-async) GPU compute intervals, from the
+    'gpu send'/'gpu recv' notes logged when a tile fits in one VRAM
+    sub-block (use_async_pipeline=.false. in the Fortran source, so none of
+    the async enqueue/start/done slot=/sub= markers tile_async parsing looks
+    for are ever emitted). These notes carry no sub-block index of their
+    own, so pairing is chronological -- correct here because this code path
+    only ever runs one compute call at a time on the main thread, exactly
+    like the io_read/io_write pairing below it in build_intervals."""
+    send_ts: List[datetime] = []
+    recv_ts: List[datetime] = []
+    intervals: List[Interval] = []
+
+    for ev in events:
+        if ev.category != "tile_compute":
+            continue
+        if ev.label == "gpu_send":
+            send_ts.append(ev.ts)
+        elif ev.label == "gpu_recv":
+            recv_ts.append(ev.ts)
+
+    for i, (s, e) in enumerate(_pair_intervals(sorted(send_ts), sorted(recv_ts))):
+        intervals.append(
+            Interval(
+                "GPU",
+                "gpu_compute_sync",
+                f"compute {i + 1} (sync)",
+                s,
+                e,
+                sub=i + 1,
+                slot=None,
+            )
+        )
+
+    intervals.sort(key=lambda x: (x.start, x.lane, x.kind))
+    return intervals
+
+
+def build_cpu_stage_intervals(events: List[Event]) -> List[Interval]:
+    starts: Dict[str, List[datetime]] = {
+        "tile_mask": [],
+        "tile_prep": [],
+        "tile_compute": [],
+        "tile_cubestat": [],
+    }
+    ends: Dict[str, List[datetime]] = {
+        "tile_mask": [],
+        "tile_prep": [],
+        "tile_compute": [],
+        "tile_cubestat": [],
+    }
+
+    for ev in events:
+        if ev.category not in starts or ev.label not in {"start", "done"}:
+            continue
+        if ev.label == "start":
+            starts[ev.category].append(ev.ts)
+        else:
+            ends[ev.category].append(ev.ts)
+
+    kind_map = {
+        "tile_mask": "cpu_stage_mask",
+        "tile_prep": "cpu_stage_prep",
+        "tile_compute": "cpu_stage_compute",
+        "tile_cubestat": "cpu_stage_cubestat",
+    }
+    label_map = {
+        "tile_mask": "mask",
+        "tile_prep": "prep",
+        "tile_compute": "compute",
+        "tile_cubestat": "cubestat",
+    }
+
+    intervals: List[Interval] = []
+    for cat in starts:
+        pairs = _pair_intervals(sorted(starts[cat]), sorted(ends[cat]))
+        for s, e in pairs:
+            intervals.append(
+                Interval(
+                    lane="CPU",
+                    kind=kind_map[cat],
+                    label=label_map[cat],
+                    start=s,
+                    end=e,
+                )
+            )
+
+    intervals.sort(key=lambda x: (x.start, x.lane, x.kind))
+    return intervals
+
+
+def build_phase_rows(events: List[Event]) -> List[PhaseRow]:
+    send_ts: Dict[int, datetime] = {}
+    compute_start_ts: Dict[int, datetime] = {}
+    compute_done_ts: Dict[int, datetime] = {}
+    scatter_start_ts: Dict[int, datetime] = {}
+    scatter_done_ts: Dict[int, datetime] = {}
+
+    for ev in events:
+        if ev.category == "tile_compute" and ev.label == "send" and ev.sub is not None:
+            send_ts[ev.sub] = ev.ts
+        elif (
+            ev.category == "tile_async"
+            and ev.stage == "compute"
+            and ev.sub is not None
+            and ev.kind is not None
+        ):
+            if ev.kind == "start":
+                compute_start_ts[ev.sub] = ev.ts
+            elif ev.kind == "done":
+                compute_done_ts[ev.sub] = ev.ts
+        elif (
+            ev.category == "tile_async"
+            and ev.stage == "scatter"
+            and ev.sub is not None
+            and ev.kind is not None
+        ):
+            if ev.kind == "start":
+                scatter_start_ts[ev.sub] = ev.ts
+            elif ev.kind == "done":
+                scatter_done_ts[ev.sub] = ev.ts
+
+    rows: List[PhaseRow] = []
+    all_subs = sorted(
+        set(send_ts.keys())
+        | set(compute_start_ts.keys())
+        | set(compute_done_ts.keys())
+        | set(scatter_start_ts.keys())
+        | set(scatter_done_ts.keys())
+    )
+
+    for sub in all_subs:
+        h2d_proxy = 0.0
+        kernel = 0.0
+        d2h_proxy = 0.0
+
+        if sub in send_ts and sub in compute_start_ts:
+            h2d_proxy = max(0.0, (compute_start_ts[sub] - send_ts[sub]).total_seconds())
+        if sub in compute_start_ts and sub in compute_done_ts:
+            kernel = max(0.0, (compute_done_ts[sub] - compute_start_ts[sub]).total_seconds())
+        if sub in scatter_start_ts and sub in scatter_done_ts:
+            d2h_proxy = max(0.0, (scatter_done_ts[sub] - scatter_start_ts[sub]).total_seconds())
+
+        rows.append(
+            PhaseRow(
+                sub=sub,
+                h2d_proxy_s=h2d_proxy,
+                kernel_s=kernel,
+                d2h_proxy_s=d2h_proxy,
+            )
+        )
+
+    return rows
+
+
+def _self_overlap_seconds(intervals: List[Tuple[float, float]]) -> float:
+    points: List[Tuple[float, int]] = []
+    for s, e in intervals:
+        points.append((s, 1))
+        points.append((e, -1))
+    points.sort(key=lambda x: (x[0], -x[1]))
+
+    total = 0.0
+    active = 0
+    prev_t: Optional[float] = None
+    for t, delta in points:
+        if prev_t is not None and active >= 2 and t > prev_t:
+            total += t - prev_t
+        active += delta
+        prev_t = t
+    return total
+
+
+def _cross_overlap_seconds(
+    a_intervals: List[Tuple[float, float]], b_intervals: List[Tuple[float, float]]
+) -> float:
+    points: List[Tuple[float, str, int]] = []
+    for s, e in a_intervals:
+        points.append((s, "a", 1))
+        points.append((e, "a", -1))
+    for s, e in b_intervals:
+        points.append((s, "b", 1))
+        points.append((e, "b", -1))
+    points.sort(key=lambda x: (x[0], -x[2]))
+
+    total = 0.0
+    active_a = 0
+    active_b = 0
+    prev_t: Optional[float] = None
+    for t, tag, delta in points:
+        if prev_t is not None and active_a > 0 and active_b > 0 and t > prev_t:
+            total += t - prev_t
+        if tag == "a":
+            active_a += delta
+        else:
+            active_b += delta
+        prev_t = t
+    return total
+
+
+def _artist_window_extent(artist, renderer):
+    """Window extent of an artist's *rendered footprint*.
+
+    Text.get_window_extent() returns only the text glyphs' extent and
+    ignores the bbox= patch drawn around it (the rounded box with padding
+    the info panel uses) -- that patch reliably extends several points
+    beyond the text on every side, so using the raw text extent for
+    overlap/overflow checks systematically under-reports how much space
+    the artist actually occupies, letting it visually collide with its
+    neighbour even when the check says "no overlap". Prefer the bbox
+    patch's own extent when one is attached (Legend has no such patch
+    method and its own get_window_extent() already matches its frame).
+    """
+    get_patch = getattr(artist, "get_bbox_patch", None)
+    if get_patch is not None:
+        patch = get_patch()
+        if patch is not None:
+            return patch.get_window_extent(renderer=renderer)
+    return artist.get_window_extent(renderer=renderer)
+
+
+def _bbox_overlap_area_axes(a, b) -> float:
+    if a is None or b is None:
+        return 0.0
+    w = max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
+    h = max(0.0, min(a.y1, b.y1) - max(a.y0, b.y0))
+    return w * h
+
+
+def _format_info_block(
+    rows: List[Tuple[Optional[str], Optional[str]]],
+    key_width: int = 22,
+    value_wrap: int = 52,
+) -> List[str]:
+    lines: List[str] = []
+    cont_indent = " " * (key_width + 3)
+
+    for key, value in rows:
+        if key is None:
+            lines.append(value or "")
+            continue
+
+        vtxt = "" if value is None else str(value)
+        wrapped = textwrap.wrap(vtxt, width=value_wrap) or [""]
+        lines.append(f"{key:<{key_width}} : {wrapped[0]}")
+        for part in wrapped[1:]:
+            lines.append(f"{cont_indent}{part}")
+
+    return lines
+
+
+def _layout_right_panel(
+    fig,
+    ax,
+    handles,
+    labels,
+    right_info_lines: Optional[List[str]],
+):
+    """Lay out the legend/info panel as two fixed, non-overlapping regions.
+
+    The right panel spans exactly the same y-range as the left (swim-lane)
+    panel, y_bottom to y_top in ax.transAxes -- so its total height always
+    matches the left panel's by construction. Within that span: the legend
+    owns a bottom region (bounded to at most max_legend_frac of the total,
+    so a many-item legend can't crowd out the info block), and the info
+    box owns whatever's left above it. Because the two regions are fixed
+    and stacked rather than independently placed and only checked for
+    overlap afterward, they cannot collide -- there is no "did it fit"
+    search over their joint placement, only a per-region font-size choice
+    to make each one's own content fit its own budget.
+    """
+    x_anchor = 1.05
+    y_bottom = 0.02
+    y_top = 0.98
+    gap = 0.02
+    available_h = y_top - y_bottom
+    max_legend_frac = 0.45
+
+    if not handles and not right_info_lines:
+        return
+
+    def measure(artist):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        return _artist_window_extent(artist, renderer).transformed(ax.transAxes.inverted())
+
+    # Legend: a fixed, modest column count (kept narrow -- this is a side
+    # panel, not a place for a 6-column legend that dwarfs the info box
+    # next to it) and the largest font, in descending order, whose
+    # rendered height stays within max_legend_frac of the total.
+    legend_ncol = 1 if len(labels) <= 2 else (2 if len(labels) <= 5 else 3)
+    legend_artist = None
+    legend_bbox = None
+    legend_fs_used = None
+    if handles:
+        for legend_fs in (8, 7, 6, 5, 4):
+            if legend_artist is not None:
+                legend_artist.remove()
+            legend_artist = ax.legend(
+                handles,
+                labels,
+                loc="lower left",
+                bbox_to_anchor=(x_anchor, y_bottom),
+                ncol=legend_ncol,
+                fontsize=legend_fs,
+                handlelength=2.0,
+                handleheight=1.1,
+                columnspacing=1.0,
+                borderaxespad=0.0,
+                framealpha=0.9,
+            )
+            legend_bbox = measure(legend_artist)
+            legend_fs_used = legend_fs
+            if legend_bbox.height <= max_legend_frac * available_h:
+                break
+
+    legend_h = legend_bbox.height if legend_bbox is not None else 0.0
+    info_budget_h = available_h - legend_h - (gap if legend_artist is not None and right_info_lines else 0.0)
+
+    def build_info(fs):
+        return ax.text(
+            x_anchor,
+            y_top,
+            "\n".join(right_info_lines),
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=fs,
+            fontfamily="DejaVu Sans Mono",
+            linespacing=1.05,
+            clip_on=False,
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "#666666",
+                "alpha": 0.9,
+                "boxstyle": "round,pad=0.5",
+            },
+        )
+
+    def info_height_at(fs):
+        probe = build_info(fs)
+        h = measure(probe).height
+        probe.remove()
+        return h
+
+    # Info box: continuous (not integer-stepped) font size, binary-searched
+    # to the largest that fills info_budget_h -- whatever the legend left
+    # behind. Fixed integer candidates (9, 8, 7, ...) routinely overshoot
+    # the budget at one size and undershoot it at the next, leaving a
+    # visibly wasted gap between the boxes instead of the info panel
+    # actually using the space it was given.
+    info_artist = None
+    info_bbox = None
+    info_fs_used = None
+    if right_info_lines:
+        lo_fs, hi_fs = 3.5, 9.5
+        if info_height_at(hi_fs) <= info_budget_h:
+            best_fs = hi_fs
+        else:
+            best_fs = lo_fs
+            for _ in range(10):
+                mid_fs = (lo_fs + hi_fs) / 2.0
+                if info_height_at(mid_fs) <= info_budget_h:
+                    best_fs = mid_fs
+                    lo_fs = mid_fs
+                else:
+                    hi_fs = mid_fs
+        info_artist = build_info(best_fs)
+        info_bbox = measure(info_artist)
+        info_fs_used = best_fs
+
+    overlap_area = _bbox_overlap_area_axes(legend_bbox, info_bbox)
+    if legend_bbox is not None:
+        print(
+            "layout_legend_bbox_axes: "
+            f"x0={legend_bbox.x0:.3f} y0={legend_bbox.y0:.3f} "
+            f"x1={legend_bbox.x1:.3f} y1={legend_bbox.y1:.3f} "
+            f"ncol={legend_ncol} fs={legend_fs_used}"
+        )
+    if info_bbox is not None:
+        print(
+            "layout_info_bbox_axes: "
+            f"x0={info_bbox.x0:.3f} y0={info_bbox.y0:.3f} "
+            f"x1={info_bbox.x1:.3f} y1={info_bbox.y1:.3f} fs={info_fs_used}"
+        )
+    print(f"layout_overlap_axes_area: {overlap_area:.6f}")
+
+
+def plot_clean_swimlane(
+    intervals: List[Interval],
+    out_path: Path,
+    title: str,
+    time_axis: str,
+    right_info_lines: Optional[List[str]] = None,
+    stage_totals: Optional[List[Tuple[str, float, str]]] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Liberation Sans", "DejaVu Sans", "Noto Sans"],
+            "text.antialiased": True,
+            "axes.titlesize": 12,
+            "axes.labelsize": 10,
+            "xtick.labelsize": 9,
+            "ytick.labelsize": 9,
+            "legend.fontsize": 9,
+        }
+    )
+
+    if not intervals:
+        raise ValueError("No intervals available to plot")
+
+    lane_order = [
+        lane
+        for lane in ["GPU", "CPU", "I/O read", "I/O write"]
+        if any(iv.lane == lane for iv in intervals)
+    ]
+    if not lane_order:
+        raise ValueError("No active lanes available to plot")
+    y_map = {lane: idx for idx, lane in enumerate(lane_order)}
+
+    colors = {
+        "gpu_compute_slot1": "#4a3aa7",
+        "gpu_compute_slot2": "#7d6fd1",
+        "gpu_compute_sync": "#5b4bc0",
+        "cpu_prep_odd": "#eda100",
+        "cpu_prep_even": "#f4c65a",
+        "cpu_scatter": "#e34948",
+        "io_read": "#2a78d6",
+        "io_write": "#1f4f99",
+    }
+
+    t0 = min(iv.start for iv in intervals)
+    t1 = max(iv.end for iv in intervals)
+    wall = max(0.001, (t1 - t0).total_seconds())
+
+    has_throughput = any(
+        iv.kind in {"io_read", "io_write"} and iv.nbytes is not None for iv in intervals
+    )
+    fig, ax, ax_thr, ax2 = _build_stacked_axes(3.8, has_throughput, stage_totals)
+
+    for iv in intervals:
+        if time_axis == "absolute":
+            left = mdates.date2num(iv.start)
+            width = max(0.02, (iv.end - iv.start).total_seconds()) / 86400.0
+            width_s = (iv.end - iv.start).total_seconds()
+        else:
+            left = (iv.start - t0).total_seconds()
+            width = max(0.02, (iv.end - iv.start).total_seconds())
+            width_s = width
+
+        # Keep 3 primary lanes but add slight vertical offsets so overlapping
+        # sub-block intervals remain visible and individually labelable.
+        y_base = y_map[iv.lane]
+        y_off = 0.0
+        if iv.sub is not None and iv.lane == "CPU":
+            parity_center = -0.14 if (iv.sub % 2 == 1) else 0.14
+            if iv.kind == "cpu_prep":
+                y_off = parity_center - 0.08
+            elif iv.kind == "cpu_scatter":
+                y_off = parity_center + 0.08
+            else:
+                y_off = parity_center
+        elif iv.sub is not None and iv.lane == "GPU":
+            y_off = -0.14 if (iv.sub % 2 == 1) else 0.14
+        y = y_base + y_off
+
+        bar_color = colors.get(iv.kind, "#777777")
+        bar_hatch = None
+        if iv.kind == "cpu_prep" and iv.sub is not None:
+            bar_color = colors["cpu_prep_odd"] if (iv.sub % 2 == 1) else colors["cpu_prep_even"]
+            if iv.sub % 2 == 0:
+                bar_hatch = "//"
+        if iv.kind == "gpu_compute_slot2":
+            bar_hatch = "//"
+
+        ax.barh(
+            y=y,
+            left=left,
+            width=width,
+            height=0.34,
+            color=bar_color,
+            edgecolor="black",
+            linewidth=0.5,
+            alpha=0.95,
+            hatch=bar_hatch,
+        )
+
+    ax.set_yticks([y_map[k] for k in lane_order])
+    ax.set_yticklabels(lane_order)
+    # Add extra bottom margin so GPU lane does not crowd the x-axis labels.
+    ax.set_ylim(-0.8, len(lane_order) - 0.2)
+    # The throughput panel (if present) shares this time axis and sits
+    # directly below, so it -- not this panel -- gets the x tick labels.
+    time_ax = ax_thr if ax_thr is not None else ax
+    if time_axis == "absolute":
+        time_ax.set_xlabel("absolute time")
+        ax.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
+        if ax_thr is not None:
+            ax_thr.set_xlim(mdates.date2num(t0), mdates.date2num(t1))
+        time_ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+    else:
+        time_ax.set_xlabel("seconds since band start")
+        ax.set_xlim(0.0, wall)
+        if ax_thr is not None:
+            ax_thr.set_xlim(0.0, wall)
+    ax.set_ylabel("lane")
+    ax.set_title(title)
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+    if ax_thr is not None:
+        ax.tick_params(labelbottom=False)
+        draw_io_throughput_panel(
+            ax_thr, [iv for iv in intervals if iv.kind in {"io_read", "io_write"}], t0, time_axis
+        )
+    for tick in time_ax.get_xticklabels():
+        tick.set_rotation(30)
+        tick.set_ha("right")
+
+    kinds_present = {iv.kind for iv in intervals}
+    legend_items: List[Tuple[str, str, Optional[str]]] = []
+    if "io_read" in kinds_present:
+        legend_items.append(("I/O read", "#2a78d6", None))
+    if "io_write" in kinds_present:
+        legend_items.append(("I/O write", "#1f4f99", None))
+    if "cpu_prep" in kinds_present:
+        legend_items.append(("CPU prep (odd blocks)", "#eda100", None))
+        legend_items.append(("CPU prep (even blocks)", "#f4c65a", "////"))
+    if "cpu_scatter" in kinds_present:
+        legend_items.append(("CPU scatter", "#e34948", None))
+    if "gpu_compute_slot1" in kinds_present:
+        legend_items.append(("GPU compute async slot 1", "#4a3aa7", None))
+    if "gpu_compute_slot2" in kinds_present:
+        legend_items.append(("GPU compute async slot 2", "#7d6fd1", "//"))
+    if "gpu_compute_sync" in kinds_present:
+        legend_items.append(("GPU compute (synchronous fallback)", "#5b4bc0", None))
+
+    handles = []
+    for name, color, hatch in legend_items:
+        handles.append(plt.Rectangle((0, 0), 1, 1, color=color, ec="black", lw=0.5, hatch=hatch))
+    labels = [n for n, _, _ in legend_items]
+    if ax2 is not None:
+        draw_stage_totals_bar(ax2, stage_totals, wall_time_s=wall)
+    # Keep room on the right for the out-of-axes legend.
+    fig.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
+    _layout_right_panel(fig, ax, handles, labels, right_info_lines)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=170, bbox_inches="tight", pad_inches=0.12)
+    plt.close(fig)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Clean 3-lane timing swim-lane")
+    parser.add_argument("--log", required=True, help="Path to run log file")
+    parser.add_argument("--out", required=True, help="Output PNG path")
+    parser.add_argument(
+        "--run",
+        default="latest",
+        help="Run selector: latest, first, or numeric index (supports negative)",
+    )
+    parser.add_argument(
+        "--gap-sec",
+        type=float,
+        default=300.0,
+        help="Gap threshold in seconds when startup markers are unavailable",
+    )
+    parser.add_argument(
+        "--time-axis",
+        choices=["absolute", "relative"],
+        default="absolute",
+        help="X-axis mode: absolute wall-clock or relative seconds since run start",
+    )
+    parser.add_argument(
+        "--thread-stage",
+        default=None,
+        help=(
+            "Restrict per-thread timing (thread_timing stage=...) to one "
+            "named stage -- e.g. convolve, resample, clean (convolve_cubes/"
+            "match_cubes/reproject_cubes/rmclean_cubes), or cpu_extract "
+            "(rm_synthesis). Needed when a single log mixes more than one "
+            "stage's thread_timing lines (e.g. match_cubes stages=both logs "
+            "both convolve and resample) -- generate one plot per stage by "
+            "invoking this script once per --thread-stage value. Omit to "
+            "include every stage present (fine when only one is)."
+        ),
+    )
+    args = parser.parse_args()
+
+    log_path = Path(args.log)
+    out_path = Path(args.out)
+
+    events, run_starts = parse_events(log_path)
+    if not events:
+        raise SystemExit(f"No supported timing events found in {log_path}")
+
+    runs = split_runs(events, run_starts, gap_seconds=args.gap_sec)
+    run_events = select_run(runs, args.run)
+    intervals = build_intervals(run_events)
+    cpu_stage_intervals = build_cpu_stage_intervals(run_events)
+    thread_intervals = build_cpu_thread_intervals(run_events, stage_filter=args.thread_stage)
+    phase_rows = build_phase_rows(run_events)
+
+    gpu_enabled_hint = any(
+        ev.category == "startup" and "GPU requested and enabled" in ev.message
+        for ev in run_events
+    )
+
+    has_async_gpu_compute = any(iv.kind.startswith("gpu_compute_slot") for iv in intervals)
+    if gpu_enabled_hint and not has_async_gpu_compute:
+        intervals.extend(build_gpu_sync_intervals(run_events))
+        intervals.sort(key=lambda x: (x.start, x.lane, x.kind))
+
+    if not intervals and not thread_intervals:
+        raise SystemExit("No intervals produced for selected run")
+
+    all_start = [iv.start for iv in intervals] + [iv.start for iv in thread_intervals]
+    all_end = [iv.end for iv in intervals] + [iv.end for iv in thread_intervals]
+    t_start = min(all_start)
+    t_end = max(all_end)
+    plot_window_s = (t_end - t_start).total_seconds()
+    total_wall_s = (
+        (run_events[-1].ts - run_events[0].ts).total_seconds()
+        if len(run_events) > 1
+        else 0.0
+    )
+
+    gpu_intervals = [
+        ((iv.start - t_start).total_seconds(), (iv.end - t_start).total_seconds())
+        for iv in intervals
+        if iv.kind.startswith("gpu_compute_slot")
+    ]
+    cpu_intervals = [
+        ((iv.start - t_start).total_seconds(), (iv.end - t_start).total_seconds())
+        for iv in intervals
+        if iv.kind in {"cpu_prep", "cpu_scatter"}
+    ]
+
+    gpu_gpu_overlap = _self_overlap_seconds(gpu_intervals) if gpu_intervals else 0.0
+    cpu_gpu_overlap = (
+        _cross_overlap_seconds(cpu_intervals, gpu_intervals)
+        if cpu_intervals and gpu_intervals
+        else 0.0
+    )
+
+    title = "Process timeline"
+    gpu_slot1_count = sum(1 for iv in intervals if iv.kind == "gpu_compute_slot1")
+    gpu_slot2_count = sum(1 for iv in intervals if iv.kind == "gpu_compute_slot2")
+    gpu_sync_count = sum(1 for iv in intervals if iv.kind == "gpu_compute_sync")
+    cpu_prep_count = sum(1 for iv in intervals if iv.kind == "cpu_prep")
+    cpu_scatter_count = sum(1 for iv in intervals if iv.kind == "cpu_scatter")
+    io_read_count = sum(1 for iv in intervals if iv.kind == "io_read")
+    io_write_count = sum(1 for iv in intervals if iv.kind == "io_write")
+
+    execution_context = "GPU run inferred" if gpu_enabled_hint else "CPU only run inferred"
+    gpu_marker_status = "found" if gpu_enabled_hint else "not found"
+    plot_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cpu_only_thread_mode = (
+        bool(thread_intervals)
+        and gpu_slot1_count == 0
+        and gpu_slot2_count == 0
+        and gpu_sync_count == 0
+    )
+    view_mode = "CPU thread detail" if cpu_only_thread_mode else "Pipeline timeline"
+
+    info_rows: List[Tuple[Optional[str], Optional[str]]] = [
+        (None, "Run metadata"),
+        ("Run log file", log_path.name),
+        ("Run selector", args.run),
+        ("Plot date", plot_date),
+        ("Total wall time (s)", f"{total_wall_s:.3f}"),
+        ("Execution context", execution_context),
+        ("GPU startup marker", gpu_marker_status),
+        ("View", view_mode),
+        (None, ""),
+        (None, "Event inventory"),
+        ("Pipeline intervals", str(len(intervals))),
+        ("CPU thread intervals", str(len(thread_intervals))),
+        ("CPU stage intervals", str(len(cpu_stage_intervals))),
+        (None, ""),
+        (None, "Overlap metrics"),
+        ("GPU-GPU overlap (s)", f"{gpu_gpu_overlap:.3f}"),
+        ("CPU-GPU overlap (s)", f"{cpu_gpu_overlap:.3f}"),
+        (None, ""),
+        (None, "Category counts"),
+        ("I/O read / write", f"{io_read_count} / {io_write_count}"),
+        ("CPU prep / scatter", f"{cpu_prep_count} / {cpu_scatter_count}"),
+        (
+            "GPU async s1/s2/sync-fb",
+            f"{gpu_slot1_count} / {gpu_slot2_count} / {gpu_sync_count}",
+        ),
+    ]
+
+    if cpu_only_thread_mode:
+        io_only = [iv for iv in intervals if iv.kind in {"io_read", "io_write"}]
+        thread_tids = sorted(set(iv.tid for iv in thread_intervals))
+        info_rows.extend(
+            [
+                (None, ""),
+                (None, "Thread layout"),
+                ("Threads active", str(len(thread_tids))),
+            ]
+        )
+        right_info_lines = _format_info_block(info_rows)
+        stage_totals = compute_stage_totals(io_only, cpu_stage_intervals)
+        # cpu_stage_intervals includes cpu_stage_compute (the tile-level
+        # compute makespan, same data behind the "CPU compute" stage total)
+        # so the "CPU stage" row is a complete mask->prep->compute->cubestat
+        # sequence, matching the legend and summing to the tile's non-I/O
+        # time -- not redundant with the per-thread T<tid> lanes above it,
+        # which show *how* compute was parallelised, not *when* the stage
+        # ran as a whole.
+        plot_cpu_thread_timeline(
+            thread_intervals,
+            io_only,
+            cpu_stage_intervals,
+            out_path,
+            title=title,
+            time_axis=args.time_axis,
+            right_info_lines=right_info_lines,
+            stage_totals=stage_totals,
+        )
+    else:
+        right_info_lines = _format_info_block(info_rows)
+        stage_totals = compute_stage_totals(intervals)
+        plot_clean_swimlane(
+            intervals,
+            out_path,
+            title,
+            time_axis=args.time_axis,
+            right_info_lines=right_info_lines,
+            stage_totals=stage_totals,
+        )
+
+    print(f"log: {log_path}")
+    print(f"runs found: {len(runs)}")
+    print(f"selected run events: {len(run_events)}")
+    print(f"intervals plotted: {len(intervals)}")
+    print(f"cpu_thread_intervals: {len(thread_intervals)}")
+    print(f"cpu_only_thread_mode: {cpu_only_thread_mode}")
+    print(f"view_mode: {view_mode}")
+    print(f"execution_context: {execution_context}")
+    print(f"total_wall_s: {total_wall_s:.3f}")
+    print(f"plot_window_s: {plot_window_s:.3f}")
+    print(f"gpu_gpu_overlap_s: {gpu_gpu_overlap:.3f}")
+    print(f"cpu_gpu_overlap_s: {cpu_gpu_overlap:.3f}")
+    if phase_rows:
+        total_h2d = sum(r.h2d_proxy_s for r in phase_rows)
+        total_kernel = sum(r.kernel_s for r in phase_rows)
+        total_d2h = sum(r.d2h_proxy_s for r in phase_rows)
+        print("phase_breakdown_proxy_seconds:")
+        for r in phase_rows:
+            print(
+                f"  sub={r.sub} h2d_proxy={r.h2d_proxy_s:.3f} "
+                f"kernel={r.kernel_s:.3f} d2h_proxy={r.d2h_proxy_s:.3f}"
+            )
+        print(
+            f"phase_totals_proxy_s: h2d_proxy={total_h2d:.3f} "
+            f"kernel={total_kernel:.3f} d2h_proxy={total_d2h:.3f}"
+        )
+    print(f"wrote: {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
