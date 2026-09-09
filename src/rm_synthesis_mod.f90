@@ -1,0 +1,4115 @@
+module rm_synthesis_mod
+  !! Modern Fortran module for RM-synthesis extraction routines
+  !! Wraps legacy fixed-form subroutines with explicit interfaces
+  !! Author: Wasim Raja (modernized 2026)
+  
+  use iso_fortran_env, only: sp => real32, dp => real64, int8, int16, int32, int64
+  use iso_c_binding, only: c_int, c_long, c_ptr, c_funptr, c_null_ptr, &
+       c_loc, c_f_pointer, c_funloc
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  use omp_lib, only: omp_get_wtime, omp_get_thread_num, omp_in_parallel
+#endif
+  implicit none
+
+  private
+  public :: extract_general_setup, extract_general, extract_general_ri
+  public :: compute_lsq_ref
+  public :: extract_general_w, extract_general_ri_w
+  public :: prepare_gpu_data, prepare_cpu_data, tile_extract_gpu_rm_blocked
+  public :: cubestat_tail_quantile_maps
+  public :: linspace, nchar
+  public :: read_cfg_keyval, rmsynth_config_t, band_cfg_t
+  public :: plan_tile, tile_plan_t
+  public :: compute_tile_read_bytes, split_channels_across_threads
+  public :: write_runtime_estimate
+  public :: init_logging, log_message, log_tile_bounds, log_tile_note, log_subblock_progress
+  public :: timer_reset, timer_start, timer_stop, timer_add
+  public :: timer_report_summary, timer_get_stage_seconds
+  public :: write_timing_csv_line
+  public :: wall_time_seconds
+  public :: STAGE_TOTAL, STAGE_CFG_PARSE, STAGE_IO_INIT, STAGE_HEADER
+  public :: STAGE_TILE_TOTAL, STAGE_TILE_READ, STAGE_TILE_MASK
+  public :: STAGE_TILE_PREP, STAGE_TILE_COMPUTE, STAGE_TILE_CUBESTAT
+  public :: STAGE_TILE_SCATTER, STAGE_TILE_WRITE, STAGE_FINALIZE
+  public :: STAGE_IO_READ_INIT, STAGE_IO_WRITE_INIT
+  public :: sp, dp, int32, int64
+  public :: tile_write_job_t, tile_write_dispatch_async, tile_write_join
+  public :: populate_write_job
+  public :: do_tile_write
+  public :: host_is_big_endian, write_rm_chunk_raw
+  
+  ! Include file parameters for RM-synthesis
+  integer, parameter :: max_axis = 100
+  integer, parameter :: max_ra = 1024
+  integer, parameter :: max_dec = 1024
+  integer, parameter :: maxchan = 256
+  integer, parameter :: max_pix = 134217728  ! 512 MB in real32
+  integer, parameter :: maxofac = 16
+  integer, parameter :: maxnt = maxchan * maxofac
+  
+  ! Physical constants
+  ! Speed of light in units of 10^6 m/s (for freq[MHz] <-> lambda[m] conversion)
+  real(sp), parameter :: c_velocity = 299.792458_sp
+
+  integer, parameter :: LOG_ERROR = 0
+  integer, parameter :: LOG_WARN  = 1
+  integer, parameter :: LOG_INFO  = 2
+  integer, parameter :: LOG_DEBUG = 3
+
+  integer, parameter :: STAGE_TOTAL         = 1
+  integer, parameter :: STAGE_CFG_PARSE     = 2
+  integer, parameter :: STAGE_IO_INIT       = 3
+  integer, parameter :: STAGE_HEADER        = 4
+  integer, parameter :: STAGE_TILE_TOTAL    = 5
+  integer, parameter :: STAGE_TILE_READ     = 6
+  integer, parameter :: STAGE_TILE_MASK     = 7
+  integer, parameter :: STAGE_TILE_PREP     = 8
+  integer, parameter :: STAGE_TILE_COMPUTE  = 9
+  integer, parameter :: STAGE_TILE_SCATTER  = 10
+  integer, parameter :: STAGE_TILE_CUBESTAT = 11
+  integer, parameter :: STAGE_TILE_WRITE    = 12
+  integer, parameter :: STAGE_FINALIZE      = 13
+  integer, parameter :: STAGE_IO_READ_INIT  = 14
+  integer, parameter :: STAGE_IO_WRITE_INIT = 15
+  integer, parameter :: MAX_STAGES          = 32
+
+  logical, save :: logger_initialized = .false.
+  logical, save :: logger_owns_unit = .false.
+  logical, save :: timing_enabled_glob = .false.
+  logical, save :: timing_tile_enabled_glob = .false.
+  logical, save :: timing_io_enabled_glob = .false.
+  integer, save :: logger_unit = 6
+  integer, save :: logger_level = LOG_INFO
+  real(dp), save :: stage_totals(MAX_STAGES) = 0.0_dp
+  character(len=24), save :: stage_names(MAX_STAGES)
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  logical, parameter :: host_omp_enabled = .true.
+#else
+  logical, parameter :: host_omp_enabled = .false.
+#endif
+  
+  public :: max_axis, max_ra, max_dec, maxchan, max_pix, maxofac, maxnt
+  public :: c_velocity
+
+  !===========================================================================
+  ! Config bundle (T1 encapsulation ticket, planning/ENCAPSULATION_REFACTOR_PLAN.md).
+  !===========================================================================
+  ! One field per read_cfg_keyval argument (cfgfile/status excluded --
+  ! cfgfile is the input path, status is a plain error-code out-arg, both
+  ! stay as direct subroutine arguments). Field grouping mirrors the
+  ! sectioning in cfg/rmsynth.cfg's annotated template and the cfg
+  ! parser's own case-statement clusters, purely for readability -- it
+  ! carries no behavioural meaning. Character lengths match the caller's
+  ! existing declared lengths in rm_synthesis.f90 exactly (172/16/272),
+  ! not chosen fresh, so nothing about how config values are stored
+  ! changes for this ticket.
+  !===========================================================================
+  ! Per-band config bundle (multi-band-tomography plan, T1 ticket,
+  ! planning/MULTI_BAND_TOMOGRAPHY_PLAN.md).
+  !===========================================================================
+  ! One element per band, populated from comma-separated per-band cfg keys
+  ! (see rmsynth_config_t%band below). A single-value (comma-free) cfg
+  ! produces a length-1 array here -- there is no separate "legacy" parsing
+  ! path (plan Sec 5, "one unified pipeline, comma-separated lists").
+  type :: band_cfg_t
+    character(len=272) :: infileQ = ' ', infileU = ' '
+    real(sp) :: resiQ = 0.0_sp, slopeQ = 0.0_sp, resiU = 0.0_sp, slopeU = 0.0_sp
+    character(len=272) :: path_I = ' ', infileI = ' '
+    ! T6 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band channel
+    ! sub-range selection, same semantics/defaults as the legacy scalar
+    ! subim_chan_blc/trc/inc (0/0/1 = "full band"), applied only when
+    ! cfg%subim=.true. (that switch itself stays global, not per-band).
+    integer(int32) :: chan_blc = 0, chan_trc = 0, chan_inc = 1
+    ! T7 (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md): per-band bad-channel
+    ! file, same format/semantics as the legacy scalar badchan_file --
+    ! list entries are raw pixel indices into this band's own file.
+    character(len=172) :: badchan_file = ' '
+  end type band_cfg_t
+
+  type :: rmsynth_config_t
+    ! Input / output paths
+    character(len=172) :: path = ' '
+    character(len=272) :: infileQ = ' ', infileU = ' ', outfile = ' '
+    ! Multi-band tomography (plan Sec 5): band(:) holds the per-band
+    ! infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I values
+    ! parsed from their comma-separated cfg keys; reference_band selects
+    ! which entry's geometry every other band is validated against, and
+    ! whose values populate the legacy scalar fields above/below (infileQ,
+    ! infileU, resiQ, slopeQ, resiU, slopeU, infileI, path_I) so that every
+    ! existing single-band code path in rm_synthesis.f90 keeps reading
+    ! those scalars completely unchanged, for any band count.
+    integer(int32) :: reference_band = 1
+    type(band_cfg_t), allocatable :: band(:)
+    ! Bad-channel handling
+    logical :: remove_badchan = .false.
+    character(len=172) :: badchan_file = ' '
+    ! Subimage extraction
+    logical :: subim = .false.
+    character(len=272) :: subim_parfile = ' '
+    integer(int32) :: subim_ra_blc = 1, subim_ra_trc = 0, subim_ra_inc = 1
+    integer(int32) :: subim_dec_blc = 1, subim_dec_trc = 0, subim_dec_inc = 1
+    integer(int32) :: subim_chan_blc = 0, subim_chan_trc = 0, subim_chan_inc = 1
+    ! Tile memory planning
+    integer(int32) :: tile_ra = 0, tile_dec = 0
+    real(sp) :: mem_frac_ram = 0.25_sp, mem_frac_vram = 0.70_sp
+    integer(int32) :: gpu_vram_mib = 0
+    logical :: tile_auto = .true.
+    ! Q/U processing & bias correction
+    integer(int32) :: rem_mean = 0
+    logical :: remove_qu_bias = .false.
+    real(sp) :: resiQ = 0.0_sp, slopeQ = 0.0_sp, resiU = 0.0_sp, slopeU = 0.0_sp
+    character(len=272) :: path_I = ' ', infileI = ' '
+    ! RM synthesis sampling
+    integer(int32) :: ofac = 4
+    real(sp) :: fac = 3.14159265358979_sp, beg_rm = -50.0_sp, end_rm = 50.0_sp
+    integer(int32) :: nrm_out_par = 100, use_auto_rm_range = 1
+    ! Output format
+    integer(int32) :: output_mode = 0, ap_angle_mode = 0
+    ! Phase reference lambda^2 for the dirty AMP/PHA cube's own phase
+    ! convention -- mode+fixed_value, mirroring rmclean_mod's own
+    ! get_lsq_ref_compute strategy (src/rmclean.f90; duplicated here, not
+    ! `use`d, matching this project's standalone-module convention: see
+    ! compute_lsq_ref below). Default 'zero' preserves this project's
+    ! historical thesis-matching convention (lsq_ref=0, no subtraction)
+    ! exactly -- every existing cfg file is unaffected by this option's
+    ! addition. See planning/RMCLEAN_INTEGRATION_PLAN.md for why a
+    ! caller might prefer 'mid' instead: it lets RM-CLEAN's own Gate 0
+    ! validate against a MUCH coarser CDELT3 for the same oversample,
+    ! since get_drm's bound is set by max_k|l_sq(k)-lsq_ref|, minimized
+    ! by centring lsq_ref between the data's own extremes.
+    character(len=16) :: lsq_ref_mode = 'zero'
+    real(sp) :: lsq_ref_fixed_value = 0.0_sp
+    ! Masking & optional outputs
+    character(len=272) :: mask_cube_file = ' ', mask_input_cube_file = ' '
+    character(len=272) :: mask_trust_mode = 'safe'
+    logical :: write_mask_output = .true., write_nvalid_output = .true.
+    ! Cubestat / peak maps
+    logical :: cubestat = .false.
+    ! GPU
+    logical :: use_gpu = .false.
+    ! I/O parallelism
+    logical :: io_overlap = .false.
+    integer(int32) :: io_read_threads = 1, nwriters = 1
+    ! Logging & timing
+    character(len=16) :: log_level = 'info'
+    logical :: timing_enabled = .false., timing_tile_enabled = .false.
+    logical :: timing_io_enabled = .false.
+    character(len=272) :: log_output_file = ' ', timing_csv_file = ' '
+    ! Misc
+    logical :: dry_run = .false.
+  end type rmsynth_config_t
+
+  !===========================================================================
+  ! Tile / VRAM planner bundle (T2 encapsulation ticket, planning/ENCAPSULATION_REFACTOR_PLAN.md).
+  !===========================================================================
+  ! Bundles the RAM/VRAM tile-size arithmetic (previously ~150 lines of loose
+  ! locals inline in rm_synthesis.f90) into one derived type + one subroutine
+  ! (plan_tile, defined next to read_cfg_keyval below). The caller still does
+  ! the /proc/meminfo read itself (genuine file I/O) and passes the resolved
+  ! value in as mem_avail_kb; plan_tile itself is the pure-arithmetic part of
+  ! the planner, moved verbatim, just addressed as plan%field instead of a
+  ! bare local. tile_ra_in/tile_dec_in are the cfg-supplied values (0 or
+  ! negative meaning "auto"); tile_ra/tile_dec are the resolved result,
+  ! matching how the original code read and overwrote the same local in
+  ! place.
+  type :: tile_plan_t
+    ! Inputs (set by the caller before calling plan_tile)
+    integer :: nz_out = 0, nrm_out = 0, nx_out = 0, ny_out = 0
+    integer :: rem_mean = 0
+    logical :: use_input_mask = .false., need_icube = .false.
+    logical :: cubestat = .false., io_overlap = .false.
+    logical :: use_gpu_actual = .false.
+    real(sp) :: mem_frac_ram = 0.25_sp, mem_frac_vram = 0.70_sp
+    integer :: gpu_vram_mib = 0
+    integer :: tile_ra_in = 0, tile_dec_in = 0
+    logical :: tile_auto = .true.
+    integer(kind=int64) :: mem_avail_kb = 0_int64
+    ! Outputs (set by plan_tile)
+    integer(kind=int64) :: bytes_per_tile_pixel_ram = 0_int64
+    integer(kind=int64) :: bytes_per_tile_pixel_ram_out = 0_int64
+    integer(kind=int64) :: bytes_per_vram_pixel = 0_int64
+    integer(kind=int64) :: mem_safe_bytes = 0_int64
+    integer(kind=int64) :: tile_pixels_max = 0_int64
+    integer(kind=int64) :: image_pixels_total = 0_int64
+    integer(kind=int64) :: tile_bytes_est = 0_int64
+    integer(kind=int64) :: template_bytes = 0_int64
+    integer :: tile_ra = 0, tile_dec = 0
+    integer :: gpu_vram_mib_eff = 0
+    integer :: ny_sub = 0
+    integer :: inflight_slots_planned = 1
+    logical :: use_staging = .false.
+    real(dp) :: mem_frac_vram_per_slot = 0.0_dp
+  end type tile_plan_t
+
+  !===========================================================================
+  ! Asynchronous tile-write support (io_overlap).
+  !===========================================================================
+  ! Runs the tile-write step (AMP/PHA RM-chunked writes plus optional
+  ! MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR writes) on a POSIX thread that is
+  ! independent of the OpenMP runtime, so it can genuinely run concurrently
+  ! with the *next* tile's OpenMP-parallel read/mask/prep/compute. An
+  ! `!$omp task` cannot be used for this: a task can never outlive its
+  ! enclosing parallel region (the region's exit is always a barrier), and
+  ! keeping that region open across the next tile's own `!$omp parallel do`
+  ! calls would make them nested regions, which libgomp silently collapses
+  ! to one thread by default -- this codebase never sets OMP_NESTED /
+  ! omp_set_max_active_levels, so io_read_threads and the compute kernel's
+  ! thread count would silently stop being parallel the moment io_overlap
+  ! was enabled. A raw pthread has no such lifetime coupling to OpenMP's
+  ! team model, so read/mask/prep/compute keep using their existing
+  ! parallel regions completely undisturbed.
+  !
+  ! Platform note: pthread_t is assumed representable as a C long (true for
+  ! glibc/x86_64 Linux -- the only supported build target for this tool).
+  type :: tile_write_job_t
+    ! AMP/PHA: written either through this single CFITSIO handle (ftpsse,
+    ! n_write_threads==1, the always-safe default) or, when
+    ! n_write_threads>1, via raw stream writes straight to path_amp/
+    ! path_pha, bypassing CFITSIO entirely for the pixel data -- see
+    ! write_rm_chunk_raw and use_raw_write below.
+    integer :: unit_amp = 0, unit_pha = 0
+    character(len=272) :: path_amp = ' ', path_pha = ' '
+    ! 0-based byte offset of this HDU's pixel data, from CFITSIO's FTGHAD,
+    ! fetched once by the caller before any tile writes begin. Only
+    ! meaningful (and only used) when use_raw_write is .true.
+    integer(kind=int64) :: datastart_amp = 0_int64, datastart_pha = 0_int64
+    integer :: n_write_threads = 1
+    logical :: use_raw_write = .false.
+    ! Single-handle outputs.
+    integer :: unit_mask = 0, unit_nvalid = 0
+    integer :: unit_peak = 0, unit_rmpeak = 0, unit_angpeak = 0, unit_snr = 0
+    logical :: out_mask_open = .false., out_nvalid_open = .false.
+    logical :: out_peak_open = .false., out_rmpeak_open = .false.
+    logical :: out_angpeak_open = .false., out_snr_open = .false.
+    logical :: cubestat_on = .false.
+    ! Geometry.
+    integer :: group = 1
+    integer :: naxes_out(3) = 0, naxes_mask(3) = 0
+    integer :: naxes_nvalid(2) = 0, naxes_stat(2) = 0
+    integer :: ix_out_beg = 0, ix_out_end = 0
+    integer :: iy_out_beg = 0, iy_out_end = 0
+    integer :: nrm_out = 0, nx_tile = 0, ny_tile = 0, nz_out = 0
+    integer :: ix_tile_beg = 0, ix_tile_end = 0
+    integer :: iy_tile_beg = 0, iy_tile_end = 0
+    ! Data: points at the tile-output buffer slot this job owns. Must stay
+    ! untouched by the producer (next tile's mask/prep/compute) until
+    ! tile_write_join() returns for this job.
+    real(sp), pointer :: p_tile_arr(:) => null()
+    real(sp), pointer :: phi_tile_arr(:) => null()
+    integer(int8), pointer :: mask_tile_arr(:) => null()
+    integer(int16), pointer :: nvalid_tile_arr(:) => null()
+    real(sp), pointer :: peak_tile_arr(:) => null()
+    real(sp), pointer :: rm_peak_tile_arr(:) => null()
+    real(sp), pointer :: ang_peak_tile_arr(:) => null()
+    real(sp), pointer :: snr_tile_arr(:) => null()
+  end type tile_write_job_t
+
+  interface
+    function c_pthread_create(thread, attr, start_routine, arg) &
+         bind(C, name="pthread_create") result(rc)
+      import :: c_int, c_long, c_ptr, c_funptr
+      integer(c_long) :: thread
+      type(c_ptr), value :: attr
+      type(c_funptr), value :: start_routine
+      type(c_ptr), value :: arg
+      integer(c_int) :: rc
+    end function c_pthread_create
+
+    function c_pthread_join(thread, retval) &
+         bind(C, name="pthread_join") result(rc)
+      import :: c_int, c_long, c_ptr
+      integer(c_long), value :: thread
+      type(c_ptr), value :: retval
+      integer(c_int) :: rc
+    end function c_pthread_join
+  end interface
+
+contains
+
+  subroutine init_stage_names()
+    implicit none
+    stage_names = ' '
+    stage_names(STAGE_TOTAL) = 'total'
+    stage_names(STAGE_CFG_PARSE) = 'cfg_parse'
+    stage_names(STAGE_IO_INIT) = 'io_init'
+    stage_names(STAGE_HEADER) = 'header_write'
+    stage_names(STAGE_TILE_TOTAL) = 'tile_total'
+    stage_names(STAGE_TILE_READ) = 'tile_read'
+    stage_names(STAGE_TILE_MASK) = 'tile_mask'
+    stage_names(STAGE_TILE_PREP) = 'tile_prep'
+    stage_names(STAGE_TILE_COMPUTE) = 'tile_compute'
+    stage_names(STAGE_TILE_SCATTER) = 'tile_scatter'
+    stage_names(STAGE_TILE_CUBESTAT) = 'tile_cubestat'
+    stage_names(STAGE_TILE_WRITE) = 'tile_write'
+    stage_names(STAGE_FINALIZE) = 'finalize'
+    stage_names(STAGE_IO_READ_INIT) = 'io_read_init'
+    stage_names(STAGE_IO_WRITE_INIT) = 'io_write_init'
+  end subroutine init_stage_names
+
+  real(dp) function wall_time_seconds()
+    implicit none
+    integer(int64) :: clk_count, clk_rate
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    wall_time_seconds = omp_get_wtime()
+#else
+    call system_clock(clk_count, clk_rate)
+    if (clk_rate > 0_int64) then
+      wall_time_seconds = real(clk_count, dp) / real(clk_rate, dp)
+    else
+      wall_time_seconds = 0.0_dp
+    end if
+#endif
+  end function wall_time_seconds
+
+  integer function level_from_name(level_name)
+    implicit none
+    character(len=*), intent(in) :: level_name
+    character(len=16) :: tmp
+    tmp = trim(lower_ascii(level_name))
+    select case (tmp)
+    case ('error')
+      level_from_name = LOG_ERROR
+    case ('warn', 'warning')
+      level_from_name = LOG_WARN
+    case ('debug')
+      level_from_name = LOG_DEBUG
+    case default
+      level_from_name = LOG_INFO
+    end select
+  end function level_from_name
+
+  character(len=32) function iso_timestamp_local()
+    implicit none
+    integer :: vals(8)
+    call date_and_time(values=vals)
+    write(iso_timestamp_local, &
+      '(I4.4,"-",I2.2,"-",I2.2,"T",I2.2,":",I2.2,":",I2.2,".",I3.3)') &
+      vals(1), vals(2), vals(3), vals(5), vals(6), vals(7), vals(8)
+  end function iso_timestamp_local
+
+  integer function current_thread_id()
+    implicit none
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    current_thread_id = omp_get_thread_num()
+#else
+    current_thread_id = 0
+#endif
+  end function current_thread_id
+
+  subroutine init_logging(log_level_name, timing_enabled, timing_tile_enabled, &
+                          timing_io_enabled, log_output_file, status)
+    implicit none
+    character(len=*), intent(in) :: log_level_name
+    logical, intent(in) :: timing_enabled, timing_tile_enabled
+    logical, intent(in) :: timing_io_enabled
+    character(len=*), intent(in) :: log_output_file
+    integer(int32), intent(out) :: status
+    integer :: ios_local
+
+    status = 0
+    call init_stage_names()
+
+    logger_level = level_from_name(log_level_name)
+    timing_enabled_glob = timing_enabled
+    timing_tile_enabled_glob = timing_tile_enabled
+    timing_io_enabled_glob = timing_io_enabled
+
+    if (logger_owns_unit) then
+      close(logger_unit)
+      logger_owns_unit = .false.
+      logger_unit = 6
+    end if
+
+    if (nchar(log_output_file) > 0) then
+      logger_unit = 99
+      open(logger_unit, file=trim(log_output_file), status='unknown', &
+           position='append', action='write', iostat=ios_local)
+      if (ios_local /= 0) then
+        status = ios_local
+        logger_unit = 6
+        return
+      end if
+      logger_owns_unit = .true.
+    end if
+
+    logger_initialized = .true.
+  end subroutine init_logging
+
+  subroutine log_message(level_name, stage_name, message)
+    implicit none
+    character(len=*), intent(in) :: level_name, stage_name, message
+    integer :: msg_level, tid
+    character(len=32) :: ts
+
+    if (.not. logger_initialized) return
+
+    msg_level = level_from_name(level_name)
+    if (msg_level > logger_level) return
+
+    ts = iso_timestamp_local()
+    tid = current_thread_id()
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp critical (logger_write_lock)
+#endif
+    write(logger_unit, '(A," [",A,"] [",A,"] [tid=",I0,"] ",A)') &
+      trim(ts), trim(level_name), trim(stage_name), tid, trim(message)
+    flush(logger_unit)
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp end critical (logger_write_lock)
+#endif
+  end subroutine log_message
+
+  subroutine log_tile_bounds(stage_name, event, x_beg, x_end, y_beg, y_end, nbytes)
+    !! nbytes is optional and only passed by tile_read/tile_write callers,
+    !! which know the payload size for this interval; other stages (mask/
+    !! prep/compute) have no comparable byte count and omit it, so the
+    !! swim-lane plotter's throughput panel only ever sees I/O intervals.
+    implicit none
+    character(len=*), intent(in) :: stage_name, event
+    integer(int32), intent(in) :: x_beg, x_end, y_beg, y_end
+    integer(int64), intent(in), optional :: nbytes
+    character(len=160) :: message
+
+    if(present(nbytes))then
+      write(message, '(A,1X,"x:[",I0,",",I0,"] y:[",I0,",",I0,"] bytes=",I0)') &
+        trim(event), x_beg, x_end, y_beg, y_end, nbytes
+    else
+      write(message, '(A,1X,"x:[",I0,",",I0,"] y:[",I0,",",I0,"]")') &
+        trim(event), x_beg, x_end, y_beg, y_end
+    endif
+    call log_message('debug', stage_name, trim(message))
+  end subroutine log_tile_bounds
+
+  subroutine log_tile_note(stage_name, note)
+    implicit none
+    character(len=*), intent(in) :: stage_name, note
+    call log_message('debug', stage_name, trim(note))
+  end subroutine log_tile_note
+
+  subroutine log_subblock_progress(stage_name, label, sub_idx, sub_total, y_beg, y_end)
+    implicit none
+    character(len=*), intent(in) :: stage_name, label
+    integer(int32), intent(in) :: sub_idx, sub_total, y_beg, y_end
+    character(len=128) :: message
+
+    write(message, '(A,1X,I0,"/",I0,1X,"y:[",I0,",",I0,"]")') &
+      trim(label), sub_idx, sub_total, y_beg, y_end
+    call log_message('debug', stage_name, trim(message))
+  end subroutine log_subblock_progress
+
+  subroutine timer_reset()
+    implicit none
+    call init_stage_names()
+    stage_totals = 0.0_dp
+  end subroutine timer_reset
+
+  subroutine timer_start(t0)
+    implicit none
+    real(dp), intent(out) :: t0
+    t0 = wall_time_seconds()
+  end subroutine timer_start
+
+  subroutine timer_add(stage_id, dt)
+    implicit none
+    integer(int32), intent(in) :: stage_id
+    real(dp), intent(in) :: dt
+
+    if (.not. timing_enabled_glob) return
+    if (stage_id == STAGE_TILE_TOTAL .or. stage_id == STAGE_TILE_READ .or. &
+        stage_id == STAGE_TILE_MASK .or. stage_id == STAGE_TILE_PREP .or. &
+      stage_id == STAGE_TILE_COMPUTE .or. stage_id == STAGE_TILE_SCATTER .or. &
+      stage_id == STAGE_TILE_CUBESTAT .or. &
+        stage_id == STAGE_TILE_WRITE) then
+      if (.not. timing_tile_enabled_glob) return
+    end if
+    if ((stage_id == STAGE_IO_INIT .or. stage_id == STAGE_TILE_READ .or. &
+         stage_id == STAGE_TILE_WRITE) .and. (.not. timing_io_enabled_glob)) return
+
+    if (stage_id >= 1 .and. stage_id <= MAX_STAGES) then
+      stage_totals(stage_id) = stage_totals(stage_id) + max(0.0_dp, dt)
+    end if
+  end subroutine timer_add
+
+  subroutine timer_stop(stage_id, t0)
+    implicit none
+    integer(int32), intent(in) :: stage_id
+    real(dp), intent(in) :: t0
+    real(dp) :: dt
+    dt = wall_time_seconds() - t0
+    call timer_add(stage_id, dt)
+  end subroutine timer_stop
+
+  subroutine timer_report_summary()
+    implicit none
+    integer :: i
+    real(dp) :: total_t, pct
+    real(dp) :: io_read_t, io_write_t, compute_rm_t
+    real(dp) :: compute_stat_t, other_t, macro_sum
+    character(len=160) :: line
+
+    if (.not. timing_enabled_glob) return
+
+    total_t = stage_totals(STAGE_TOTAL)
+    if (total_t <= 0.0_dp) then
+      total_t = 0.0_dp
+      do i = 1, MAX_STAGES
+        if (i /= STAGE_TOTAL) total_t = total_t + stage_totals(i)
+      end do
+    end if
+
+    call log_timing_line('Timing summary (seconds):')
+    call log_timing_line('stage                     sec         pct')
+    do i = 1, MAX_STAGES
+      if (len_trim(stage_names(i)) > 0 .and. stage_totals(i) > 0.0_dp) then
+        pct = 0.0_dp
+        if (total_t > 0.0_dp) pct = 100.0_dp * stage_totals(i) / total_t
+        write(line, '(A24,1X,F12.3,1X,F8.2)') trim(stage_names(i)), &
+          stage_totals(i), pct
+        call log_timing_line(trim(line))
+      end if
+    end do
+
+    ! Phase-5 macro breakdown requested for performance attribution.
+    io_read_t = stage_totals(STAGE_TILE_READ) + stage_totals(STAGE_IO_READ_INIT)
+    io_write_t = stage_totals(STAGE_TILE_WRITE) + stage_totals(STAGE_IO_WRITE_INIT)
+    compute_rm_t = stage_totals(STAGE_TILE_COMPUTE)
+    compute_stat_t = stage_totals(STAGE_TILE_CUBESTAT)
+    macro_sum = io_read_t + io_write_t + compute_rm_t + compute_stat_t
+    other_t = max(0.0_dp, total_t - macro_sum)
+
+    call log_timing_line('Macro timing breakdown:')
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'read I/O', io_read_t, &
+      merge(100.0_dp*io_read_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'compute RM', compute_rm_t, &
+      merge(100.0_dp*compute_rm_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'compute cubestat', compute_stat_t, &
+      merge(100.0_dp*compute_stat_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'output write I/O', io_write_t, &
+      merge(100.0_dp*io_write_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    call log_timing_line(trim(line))
+    write(line, '(A24,1X,F12.3,1X,F8.2)') 'other overhead', other_t, &
+      merge(100.0_dp*other_t/total_t, 0.0_dp, total_t > 0.0_dp)
+    call log_timing_line(trim(line))
+  end subroutine timer_report_summary
+
+  subroutine log_timing_line(message)
+    implicit none
+    character(len=*), intent(in) :: message
+    character(len=32) :: ts
+    integer :: tid
+
+    ts = iso_timestamp_local()
+    tid = current_thread_id()
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp critical (logger_write_lock)
+#endif
+    write(logger_unit, '(A," [info] [timing] [tid=",I0,"] ",A)') &
+      trim(ts), tid, trim(message)
+    flush(logger_unit)
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+!$omp end critical (logger_write_lock)
+#endif
+  end subroutine log_timing_line
+
+  real(dp) function timer_get_stage_seconds(stage_id)
+    implicit none
+    integer(int32), intent(in) :: stage_id
+
+    timer_get_stage_seconds = 0.0_dp
+    if (stage_id >= 1 .and. stage_id <= MAX_STAGES) then
+      timer_get_stage_seconds = stage_totals(stage_id)
+    end if
+  end function timer_get_stage_seconds
+
+  subroutine write_timing_csv_line(csv_file, run_id, mode, cube_nx, cube_ny, &
+                                   cube_nchan, cube_nrm, tile_ra, tile_dec, &
+                                   io_read_bytes, io_write_bytes, &
+                                   io_read_syscalls, io_write_syscalls, status)
+    implicit none
+    character(len=*), intent(in) :: csv_file, run_id, mode
+    integer(int32), intent(in) :: cube_nx, cube_ny, cube_nchan, cube_nrm
+    integer(int32), intent(in) :: tile_ra, tile_dec
+    integer(int64), intent(in) :: io_read_bytes, io_write_bytes
+    integer(int64), intent(in) :: io_read_syscalls, io_write_syscalls
+    integer(int32), intent(out) :: status
+
+    integer(int32) :: csv_unit
+    integer(int64) :: csv_size
+    real(dp) :: total_t
+
+    status = 0
+    if (nchar(csv_file) <= 0) return
+
+    total_t = timer_get_stage_seconds(STAGE_TOTAL)
+    if (total_t <= 0.0_dp) then
+      total_t = timer_get_stage_seconds(STAGE_CFG_PARSE) + &
+                timer_get_stage_seconds(STAGE_IO_INIT) + &
+                timer_get_stage_seconds(STAGE_HEADER) + &
+                timer_get_stage_seconds(STAGE_TILE_TOTAL) + &
+                timer_get_stage_seconds(STAGE_FINALIZE)
+    end if
+
+    csv_unit = 97
+    open(csv_unit, file=trim(csv_file), status='unknown', position='append', &
+         action='write', iostat=status)
+    if (status /= 0) return
+
+    csv_size = 0_int64
+    inquire(unit=csv_unit, size=csv_size)
+    if (csv_size == 0_int64) then
+      write(csv_unit, '(A)') &
+        'run_id,mode,cube_nx,cube_ny,cube_nchan,cube_nrm,tile_ra,tile_dec,' // &
+        'stage_total_sec,cfg_parse_sec,io_init_sec,header_sec,tile_total_sec,' // &
+        'tile_read_sec,tile_mask_sec,tile_prep_sec,tile_compute_sec,' // &
+        'tile_scatter_sec,tile_cubestat_sec,tile_write_sec,finalize_sec,' // &
+        'io_read_bytes,io_write_bytes,io_read_syscalls,io_write_syscalls,' // &
+        'io_read_init_sec,io_write_init_sec'
+    end if
+
+    write(csv_unit, '(A,",",A,",",I0,",",I0,",",I0,",",I0,",",I0,",",I0,",",' // &
+                    'F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",' // &
+                    'F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",F0.6,",",' // &
+                    'F0.6,",",I0,",",I0,",",I0,",",I0,",",F0.6,",",F0.6)') &
+      trim(run_id), trim(mode), cube_nx, cube_ny, cube_nchan, cube_nrm, tile_ra, tile_dec, &
+      total_t, timer_get_stage_seconds(STAGE_CFG_PARSE), timer_get_stage_seconds(STAGE_IO_INIT), &
+      timer_get_stage_seconds(STAGE_HEADER), timer_get_stage_seconds(STAGE_TILE_TOTAL), &
+      timer_get_stage_seconds(STAGE_TILE_READ), timer_get_stage_seconds(STAGE_TILE_MASK), &
+      timer_get_stage_seconds(STAGE_TILE_PREP), timer_get_stage_seconds(STAGE_TILE_COMPUTE), &
+      timer_get_stage_seconds(STAGE_TILE_SCATTER), timer_get_stage_seconds(STAGE_TILE_CUBESTAT), &
+      timer_get_stage_seconds(STAGE_TILE_WRITE), timer_get_stage_seconds(STAGE_FINALIZE), &
+      io_read_bytes, io_write_bytes, io_read_syscalls, io_write_syscalls, &
+      timer_get_stage_seconds(STAGE_IO_READ_INIT), timer_get_stage_seconds(STAGE_IO_WRITE_INIT)
+
+    close(csv_unit)
+  end subroutine write_timing_csv_line
+
+  function compute_lsq_ref(l_sq, n, mode, fixed_value) result(lsq_ref)
+    !! The phase-reference lambda^2 used to build extract_general_setup's
+    !! own cos_arr/sin_arr templates -- mode+fixed_value, mirroring
+    !! rmclean_mod's own get_lsq_ref_compute (src/rmclean.f90) exactly:
+    !! duplicated here rather than `use rmclean_mod`, since this module is
+    !! the older, heavily production-tested core and rmclean_mod is a
+    !! newer, algorithm-specific add-on -- adding a hard dependency in
+    !! this direction would be backwards (this project's own convention
+    !! elsewhere is that small standalone tools/modules duplicate rather
+    !! than couple, e.g. gaussft_mod/commonbeam_mod/rmclean_mod each avoid
+    !! cross-module coupling for exactly this reason).
+    !! 'zero' (default): lsq_ref=0, this project's historical
+    !! thesis-matching convention, no subtraction at all.
+    !! 'mid': (min(l_sq)+max(l_sq))/2 -- minimizes RM-CLEAN's own get_drm
+    !! bound (see that routine's own doc comment for the Chebyshev-centre
+    !! derivation); recommended if the dirty cube will be RM-CLEANed
+    !! afterward and a coarser CDELT3/faster CLEAN is wanted.
+    !! 'centroid': channel-count-weighted mean.
+    !! 'min'/'max': the data's own extremes.
+    !! 'fixed': fixed_value, required (and validated at cfg-parse time --
+    !! see read_cfg_keyval's own lsq_ref_mode='fixed' check) whenever this
+    !! mode is selected.
+    integer(int32), intent(in) :: n
+    real(sp), intent(in) :: l_sq(n)
+    character(len=*), intent(in) :: mode
+    real(sp), intent(in) :: fixed_value
+    real(sp) :: lsq_ref
+
+    select case (trim(mode))
+    case ('zero')
+      lsq_ref = 0.0_sp
+    case ('mid')
+      lsq_ref = 0.5_sp*(minval(l_sq) + maxval(l_sq))
+    case ('centroid')
+      lsq_ref = sum(l_sq)/real(n, sp)
+    case ('min')
+      lsq_ref = minval(l_sq)
+    case ('max')
+      lsq_ref = maxval(l_sq)
+    case ('fixed')
+      lsq_ref = fixed_value
+    case default
+      write(*,*) 'FATAL: compute_lsq_ref: unrecognized mode: ', trim(mode)
+      stop 1
+    end select
+  end function compute_lsq_ref
+
+  subroutine extract_general_setup(t, npts, fac, beg_rm, end_rm, nout, nu, cos_arr, sin_arr, maxout, maxpts, use_auto_rm_range, ofac, lsq_ref)
+    !! Pre-compute sine and cosine templates for RM-extraction
+    !! This avoids redundant trig calculations across multiple pixels
+    !! use_auto_rm_range: 1=derive beg/end/nrm from data, 0=use user beg/end
+    !! nout is final output depth and should be nrm * ofac
+    !! See: extract_general_setup.f for original implementation
+    !! lsq_ref: phase-reference lambda^2, from compute_lsq_ref above --
+    !! baked into the template here (phi_tmp uses t(kk)-lsq_ref, not raw
+    !! t(kk)), so every downstream caller (extract_general's own dot
+    !! products against cos_arr/sin_arr) automatically inherits whichever
+    !! reference was chosen with no further code changes needed.
+
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, use_auto_rm_range
+    integer(int32), intent(in) :: ofac
+    real(sp), intent(in) :: t(*), fac, beg_rm, end_rm, lsq_ref
+    real(sp), intent(out) :: nu(*)
+    real(sp), intent(out) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+    
+    real(sp) :: freq_MHz(npts), f1, f2, Lsq1, Lsq2, dfreq
+    real(sp) :: t_span, d_nu, nu_span, omega, h_tmp, phi_tmp, beg_eff, end_eff
+    real(sp) :: neg_span, pos_span, span_ratio
+    integer(int32) :: i, j, kk, nneg, npos, zero_idx
+    real(sp), parameter :: pi = 3.14159265358979, twopi = 6.28318530717959
+    
+    ! Generate temporal frequencies from L_sq data
+    ! t is lambda_squared (wavelength in meters squared)
+    ! freq_MHz is frequency in MHz
+    ! Using c = 299.792458 × 10^6 m/s (speed of light)
+    j = npts + 1
+    do kk = 1, npts
+      j = j - 1
+      freq_MHz(j) = c_velocity / sqrt(t(kk))
+    end do
+    
+    ! Calculate edge L_sq
+    !
+    ! NOTE (multi-band-tomography plan, planning/MULTI_BAND_TOMOGRAPHY_PLAN.md,
+    ! Sec 7 decision 5): dfreq below is a MEAN spacing computed purely from
+    ! the two array endpoints, (freq_MHz(npts)-freq_MHz(1))/(npts-1) -- this
+    ! implicitly assumes t(1:npts) (the L_sq/lambda^2 array passed in as
+    ! `t`) is ONE globally monotonic, uniformly-spaced sequence, so that
+    ! freq_MHz(1)/freq_MHz(npts) are genuinely the dataset's true min/max
+    ! frequency. That holds for a single band (today's only caller with
+    ! use_auto_rm_range=1), but would NOT hold in general for a *merged*
+    ! multi-band L_sq array built by concatenating each band's own channel
+    ! list (planning/MULTI_BAND_TOMOGRAPHY_PLAN.md Sec 4/Sec 9 T2): each
+    ! band's own sub-range is internally monotonic, but the endpoints of
+    ! the FULL concatenated array are just whichever band happens to be
+    ! listed last, not the true global min/max across all bands -- e.g. a
+    ! higher-frequency band listed before a lower-frequency one would make
+    ! this dfreq/d_nu/nu_span calculation silently wrong. This is exactly
+    ! why use_auto_rm_range=1 is rejected outright for nbands>1 in
+    ! rm_synthesis.f90's multi-band validation block (T1/T2) -- that
+    ! restriction is load-bearing for this reason, not just cautious. It
+    ! does NOT affect the actual DFT template build below (the cos_arr/
+    ! sin_arr loop indexes t(kk) by position only, order-independent) or
+    ! the use_auto_rm_range=0 path (beg_eff/end_eff come from cfg%beg_rm/
+    ! end_rm directly, this heuristic's output is unused). A proper
+    ! multi-band generalization of this heuristic (per-band spans summed,
+    ! true global min/max tracked explicitly rather than inferred from
+    ! array endpoints) is phase 3's job (the delta_RM/max-RM-scale
+    ! diagnostic), not implemented here.
+    dfreq = (freq_MHz(npts) - freq_MHz(1)) / dble(npts - 1)
+    f1 = freq_MHz(1) - 0.5_sp * dfreq
+    f2 = freq_MHz(npts) + 0.5_sp * dfreq
+    Lsq2 = (c_velocity / f1)**2
+    Lsq1 = (c_velocity / f2)**2
+
+    ! Relation between RM and wavelength-squared domains
+    t_span = Lsq2 - Lsq1
+    d_nu = fac / t_span
+    nu_span = dble(npts) * d_nu
+
+    ! Build RM limits for the final nout samples. use_auto_rm_range=1 is
+    ! rejected outright for multi-band runs (nbands>1) before this
+    ! subroutine is ever called with a merged L_sq array -- see the note
+    ! above on why the d_nu heuristic below is unsafe for that case.
+    if (use_auto_rm_range == 1) then
+      beg_eff = -0.5_sp * real(npts - 1) * d_nu
+      end_eff =  0.5_sp * real(npts - 1) * d_nu
+    else
+      beg_eff = beg_rm
+      end_eff = end_rm
+    end if
+
+    if (nout <= 1) then
+      nu(1) = beg_eff
+    else if (nout >= 3 .and. beg_eff < 0.0_sp .and. end_eff > 0.0_sp) then
+      neg_span = abs(beg_eff)
+      pos_span = abs(end_eff)
+      span_ratio = neg_span / (neg_span + pos_span)
+
+      nneg = nint(real(nout - 1, kind=sp) * span_ratio)
+      nneg = max(1_int32, min(nout - 2, nneg))
+      npos = (nout - 1) - nneg
+
+      h_tmp = min(neg_span / real(nneg, kind=sp), &
+                  pos_span / real(npos, kind=sp))
+      zero_idx = nneg + 1
+
+      do i = 1, nout
+        nu(i) = real(i - zero_idx, kind=sp) * h_tmp
+      end do
+    else
+      h_tmp = (end_eff - beg_eff) / real(nout - 1)
+      do i = 1, nout
+        nu(i) = beg_eff + real(i - 1) * h_tmp
+      end do
+    end if
+    
+    ! Pre-compute cos and sin templates
+    do i = 1, nout
+      omega = 2.0_sp * nu(i)
+      do kk = 1, npts
+        phi_tmp = omega * (t(kk) - lsq_ref)
+        cos_arr(kk, i) = cos(phi_tmp)
+        sin_arr(kk, i) = -sin(phi_tmp)
+      end do
+    end do
+    
+  end subroutine extract_general_setup
+
+  subroutine extract_general(ryt_in, iyt_in, npts, nout, p_ex, phi_ex, &
+                             cos_arr, sin_arr, maxout, maxpts, mean_rem)
+    !! Extract RM power using pre-computed templates
+    !! Uses only dot products (no trig recomputation)
+    !! See: extract_general_v4.f for original implementation
+    
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
+    real(sp), intent(in) :: ryt_in(*), iyt_in(*)
+    real(sp), intent(out) :: p_ex(*), phi_ex(*)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+    
+    real(sp) :: ryt(npts), iyt(npts)
+    real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
+    integer(int32) :: i, kk
+    
+    ! Remove mean from Q and U if requested
+    if (mean_rem > 0) then
+      call compute_mean(ryt_in, npts, ryw_tmp)
+      call compute_mean(iyt_in, npts, iyw_tmp)
+      do i = 1, npts
+        ryt(i) = ryt_in(i) - ryw_tmp
+        iyt(i) = iyt_in(i) - iyw_tmp
+      end do
+    else
+      do i = 1, npts
+        ryt(i) = ryt_in(i)
+        iyt(i) = iyt_in(i)
+      end do
+    end if
+    
+    ! Extract using pre-computed templates.
+    ! One fused loop reduces memory traffic versus copying template vectors
+    ! and calling 4 separate dot products per RM bin.
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp shared(nout,npts,ryt,iyt,cos_arr,sin_arr,p_ex,phi_ex)
+    do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
+      !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
+      do kk = 1, npts
+        rc_cor = rc_cor + ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + iyt(kk) * sin_arr(kk, i)
+      end do
+      
+      rc_cor = rc_cor / dble(npts)
+      rs_cor = rs_cor / dble(npts)
+      ic_cor = ic_cor / dble(npts)
+      is_cor = is_cor / dble(npts)
+      
+      ! Combine coherently to construct y(omega)
+      ryw_tmp = rc_cor - is_cor
+      iyw_tmp = rs_cor + ic_cor
+      p_ex(i) = sqrt(ryw_tmp**2 + iyw_tmp**2)
+      phi_ex(i) = atan2(iyw_tmp, ryw_tmp)
+    end do
+    !$omp end parallel do
+    
+  end subroutine extract_general
+
+  subroutine extract_general_ri(ryt_in, iyt_in, npts, nout, re_ex, im_ex, &
+                                cos_arr, sin_arr, maxout, maxpts, mean_rem)
+    !! Extract RM complex spectrum directly as REAL/IMAG outputs
+    !! Avoids amplitude/phase conversion when RI mode is requested
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
+    real(sp), intent(in) :: ryt_in(*), iyt_in(*)
+    real(sp), intent(out) :: re_ex(*), im_ex(*)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+
+    real(sp) :: ryt(npts), iyt(npts)
+    real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
+    integer(int32) :: i, kk
+
+    if (mean_rem > 0) then
+      call compute_mean(ryt_in, npts, ryw_tmp)
+      call compute_mean(iyt_in, npts, iyw_tmp)
+      do i = 1, npts
+        ryt(i) = ryt_in(i) - ryw_tmp
+        iyt(i) = iyt_in(i) - iyw_tmp
+      end do
+    else
+      do i = 1, npts
+        ryt(i) = ryt_in(i)
+        iyt(i) = iyt_in(i)
+      end do
+    end if
+
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp shared(nout,npts,ryt,iyt,cos_arr,sin_arr,re_ex,im_ex)
+    do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
+      !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
+      do kk = 1, npts
+        rc_cor = rc_cor + ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + iyt(kk) * sin_arr(kk, i)
+      end do
+
+      rc_cor = rc_cor / dble(npts)
+      rs_cor = rs_cor / dble(npts)
+      ic_cor = ic_cor / dble(npts)
+      is_cor = is_cor / dble(npts)
+
+      ryw_tmp = rc_cor - is_cor
+      iyw_tmp = rs_cor + ic_cor
+      re_ex(i) = ryw_tmp
+      im_ex(i) = iyw_tmp
+    end do
+    !$omp end parallel do
+
+  end subroutine extract_general_ri
+
+  subroutine extract_general_w(ryt_in, iyt_in, wts_in, npts, nout, p_ex, phi_ex, &
+                               cos_arr, sin_arr, maxout, maxpts, mean_rem)
+    !! Weighted RM extraction (AP mode).
+    !! Channels with zero weight are ignored via weighted sums.
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
+    real(sp), intent(in) :: ryt_in(*), iyt_in(*), wts_in(*)
+    real(sp), intent(out) :: p_ex(*), phi_ex(*)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+
+    real(sp) :: ryt(npts), iyt(npts), wts(npts)
+    real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
+    real(sp) :: wsum, mean_q, mean_u
+    integer(int32) :: i, kk
+
+    do kk = 1, npts
+      wts(kk) = max(0.0_sp, wts_in(kk))
+    end do
+
+    wsum = 0.0_sp
+    !$omp simd reduction(+:wsum)
+    do kk = 1, npts
+      wsum = wsum + wts(kk)
+    end do
+
+    if (mean_rem > 0 .and. wsum > 0.0_sp) then
+      mean_q = 0.0_sp
+      mean_u = 0.0_sp
+      !$omp simd reduction(+:mean_q,mean_u)
+      do kk = 1, npts
+        mean_q = mean_q + wts(kk) * ryt_in(kk)
+        mean_u = mean_u + wts(kk) * iyt_in(kk)
+      end do
+      mean_q = mean_q / wsum
+      mean_u = mean_u / wsum
+      do i = 1, npts
+        ryt(i) = ryt_in(i) - mean_q
+        iyt(i) = iyt_in(i) - mean_u
+      end do
+    else
+      do i = 1, npts
+        ryt(i) = ryt_in(i)
+        iyt(i) = iyt_in(i)
+      end do
+    end if
+
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,p_ex,phi_ex)
+    do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
+      !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
+      do kk = 1, npts
+        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(kk, i)
+      end do
+
+      if (wsum > 0.0_sp) then
+        rc_cor = rc_cor / wsum
+        rs_cor = rs_cor / wsum
+        ic_cor = ic_cor / wsum
+        is_cor = is_cor / wsum
+      else
+        rc_cor = 0.0_sp
+        rs_cor = 0.0_sp
+        ic_cor = 0.0_sp
+        is_cor = 0.0_sp
+      end if
+
+      ryw_tmp = rc_cor - is_cor
+      iyw_tmp = rs_cor + ic_cor
+      p_ex(i) = sqrt(ryw_tmp**2 + iyw_tmp**2)
+      phi_ex(i) = atan2(iyw_tmp, ryw_tmp)
+    end do
+    !$omp end parallel do
+
+  end subroutine extract_general_w
+
+  subroutine extract_general_ri_w(ryt_in, iyt_in, wts_in, npts, nout, re_ex, im_ex, &
+                                  cos_arr, sin_arr, maxout, maxpts, mean_rem)
+    !! Weighted RM extraction (RI mode).
+    implicit none
+    integer(int32), intent(in) :: npts, nout, maxout, maxpts, mean_rem
+    real(sp), intent(in) :: ryt_in(*), iyt_in(*), wts_in(*)
+    real(sp), intent(out) :: re_ex(*), im_ex(*)
+    real(sp), intent(in) :: cos_arr(maxpts, maxout), sin_arr(maxpts, maxout)
+
+    real(sp) :: ryt(npts), iyt(npts), wts(npts)
+    real(sp) :: rc_cor, ic_cor, rs_cor, is_cor, ryw_tmp, iyw_tmp
+    real(sp) :: wsum, mean_q, mean_u
+    integer(int32) :: i, kk
+
+    do kk = 1, npts
+      wts(kk) = max(0.0_sp, wts_in(kk))
+    end do
+
+    wsum = 0.0_sp
+    !$omp simd reduction(+:wsum)
+    do kk = 1, npts
+      wsum = wsum + wts(kk)
+    end do
+
+    if (mean_rem > 0 .and. wsum > 0.0_sp) then
+      mean_q = 0.0_sp
+      mean_u = 0.0_sp
+      !$omp simd reduction(+:mean_q,mean_u)
+      do kk = 1, npts
+        mean_q = mean_q + wts(kk) * ryt_in(kk)
+        mean_u = mean_u + wts(kk) * iyt_in(kk)
+      end do
+      mean_q = mean_q / wsum
+      mean_u = mean_u / wsum
+      do i = 1, npts
+        ryt(i) = ryt_in(i) - mean_q
+        iyt(i) = iyt_in(i) - mean_u
+      end do
+    else
+      do i = 1, npts
+        ryt(i) = ryt_in(i)
+        iyt(i) = iyt_in(i)
+      end do
+    end if
+
+    !$omp parallel do if(host_omp_enabled) default(none) private(i,kk,rc_cor,rs_cor,ic_cor,is_cor,ryw_tmp,iyw_tmp) &
+    !$omp shared(nout,npts,ryt,iyt,wts,wsum,cos_arr,sin_arr,re_ex,im_ex)
+    do i = 1, nout
+      rc_cor = 0.0_sp
+      rs_cor = 0.0_sp
+      ic_cor = 0.0_sp
+      is_cor = 0.0_sp
+      !$omp simd reduction(+:rc_cor,rs_cor,ic_cor,is_cor)
+      do kk = 1, npts
+        rc_cor = rc_cor + wts(kk) * ryt(kk) * cos_arr(kk, i)
+        rs_cor = rs_cor + wts(kk) * ryt(kk) * sin_arr(kk, i)
+        ic_cor = ic_cor + wts(kk) * iyt(kk) * cos_arr(kk, i)
+        is_cor = is_cor + wts(kk) * iyt(kk) * sin_arr(kk, i)
+      end do
+
+      if (wsum > 0.0_sp) then
+        rc_cor = rc_cor / wsum
+        rs_cor = rs_cor / wsum
+        ic_cor = ic_cor / wsum
+        is_cor = is_cor / wsum
+      else
+        rc_cor = 0.0_sp
+        rs_cor = 0.0_sp
+        ic_cor = 0.0_sp
+        is_cor = 0.0_sp
+      end if
+
+      ryw_tmp = rc_cor - is_cor
+      iyw_tmp = rs_cor + ic_cor
+      re_ex(i) = ryw_tmp
+      im_ex(i) = iyw_tmp
+    end do
+    !$omp end parallel do
+
+  end subroutine extract_general_ri_w
+
+  subroutine prepare_gpu_data(specQ_flat, specU_flat, mask_tile, &
+                              nx_tile, ny_tile, nz_out, &
+                              specQ_gpu, specU_gpu, wts_gpu, &
+                              rem_mean, mean_Q, mean_U, wsum_gpu)
+    !! ========================================================================
+    !! GPU Data Preparation: Reshape and Pack Arrays
+    !! ========================================================================
+    !!
+    !! Purpose: Transform flat FITS arrays into full-size GPU-friendly layouts
+    !! with unified masking applied.
+    !!
+    !! Input layout (from FITS):
+    !!   - specQ_flat(nx_tile*ny_tile*nz_out) — flat 1D array
+    !!   - specU_flat(nx_tile*ny_tile*nz_out) — flat 1D array
+    !!   - mask_tile(nx_tile*ny_tile*nz_out) — unified mask: 0=bad, 1=good (integer*1)
+    !!     Contains all masking: global bad channels, NaN/Inf, per-pixel mask
+    !!   - Index formula: ix + (iy-1)*nx_tile + (iz-1)*nx_tile*ny_tile
+    !!
+    !! Output layout: specQ_gpu(npix, nz_out) — GPU-optimal (pixels fastest).
+    !! Adjacent warp threads (adjacent ipix) access the same channel: stride-1
+    !! across the warp = coalesced. Use prepare_cpu_data for CPU-only runs.
+    !!
+    !! No dense packing: all nz_out channels stored, bad channels have wts=0.
+    !!
+    !! wsum_gpu(npix) — per-pixel valid-channel count, always computed.
+    !! Pixel-dependent masking (NaN/Inf, input mask) means wsum varies by pixel
+    !! but is RM-independent. Precomputing here avoids nrm_out redundant passes
+    !! inside tile_extract_gpu_rm_blocked.
+    
+    implicit none
+    integer(int32), intent(in) :: nx_tile, ny_tile, nz_out
+    integer(int32), intent(in) :: rem_mean
+    
+    real(sp), intent(in) :: specQ_flat(nx_tile*ny_tile*nz_out)
+    real(sp), intent(in) :: specU_flat(nx_tile*ny_tile*nz_out)
+    integer*1, intent(in) :: mask_tile(nx_tile*ny_tile*nz_out)
+    
+    real(sp), allocatable, intent(out) :: specQ_gpu(:,:)
+    real(sp), allocatable, intent(out) :: specU_gpu(:,:)
+    real(sp), allocatable, intent(out) :: wts_gpu(:,:)
+    real(sp), allocatable, intent(out) :: mean_Q(:), mean_U(:)
+    real(sp), allocatable, intent(out) :: wsum_gpu(:)
+    
+    integer(int32) :: iz
+    ! npix/ipix/src_idx can exceed INT32_MAX for large tiles (npix*nz_out);
+    ! must be int64 to avoid wraparound corrupting the flat-array index.
+    integer(int64) :: npix, ipix, src_idx
+    logical :: pack_loop_omp
+    real(sp) :: q_val, u_val
+    real(sp) :: wsum, q_sum, u_sum
+
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    pack_loop_omp = (.not. omp_in_parallel())
+#else
+    pack_loop_omp = .false.
+#endif
+    
+    ! GPU layout: (npix, nz_out) — pixels fastest for warp coalescing
+    allocate(specQ_gpu(npix, nz_out))
+    allocate(specU_gpu(npix, nz_out))
+    allocate(wts_gpu(npix, nz_out))
+    if (rem_mean > 0) then
+      allocate(mean_Q(npix))
+      allocate(mean_U(npix))
+      mean_Q = 0.0_sp
+      mean_U = 0.0_sp
+    end if
+    
+    ! Load all channels using unified mask
+    ! mask_tile already contains all masking info: global bad channels, NaN/Inf, per-pixel mask
+    !$omp parallel do if(host_omp_enabled .and. pack_loop_omp) collapse(2) default(none) &
+    !$omp     private(iz, ipix, src_idx, q_val, u_val) &
+    !$omp     shared(nz_out, npix, specQ_flat, specU_flat, mask_tile, specQ_gpu, specU_gpu, wts_gpu)
+    do iz = 1, nz_out
+      do ipix = 1, npix
+        src_idx = ipix + (iz - 1) * npix
+        
+        q_val = specQ_flat(src_idx)
+        u_val = specU_flat(src_idx)
+        
+        ! Use unified mask: if mask_tile==0, channel is bad; else it's good
+        ! Store all channels (bad ones have wts=0, will contribute zero to DFT)
+        specQ_gpu(ipix, iz) = q_val
+        specU_gpu(ipix, iz) = u_val
+        wts_gpu(ipix, iz) = real(mask_tile(src_idx), sp)  ! 0.0 if bad, 1.0 if good
+      end do
+    end do
+    !$omp end parallel do
+    
+    ! Always compute per-pixel weight sums.
+    ! wsum_gpu(ipix) is RM-independent but pixel-dependent when NaN/Inf or
+    ! input-mask channels vary spatially. Precomputing once here saves
+    ! nrm_out redundant accumulations per pixel in the GPU kernel.
+    allocate(wsum_gpu(npix))
+    !$omp parallel do if(host_omp_enabled) default(none) &
+    !$omp     private(ipix, iz) &
+    !$omp     shared(npix, nz_out, wts_gpu, wsum_gpu)
+    do ipix = 1, npix
+      wsum_gpu(ipix) = 0.0_sp
+      do iz = 1, nz_out
+        wsum_gpu(ipix) = wsum_gpu(ipix) + wts_gpu(ipix, iz)
+      end do
+    end do
+    !$omp end parallel do
+
+    ! Pre-compute per-pixel means if rem_mean > 0
+    if (rem_mean > 0) then
+      allocate(mean_Q(npix))
+      allocate(mean_U(npix))
+      !$omp parallel do if(host_omp_enabled) default(none) &
+      !$omp     private(ipix, iz, q_sum, u_sum) &
+      !$omp     shared(npix, nz_out, specQ_gpu, specU_gpu, wts_gpu, wsum_gpu, mean_Q, mean_U)
+      do ipix = 1, npix
+        q_sum = 0.0_sp
+        u_sum = 0.0_sp
+        do iz = 1, nz_out
+          q_sum = q_sum + wts_gpu(ipix, iz) * specQ_gpu(ipix, iz)
+          u_sum = u_sum + wts_gpu(ipix, iz) * specU_gpu(ipix, iz)
+        end do
+        if (wsum_gpu(ipix) > 0.0_sp) then
+          mean_Q(ipix) = q_sum / wsum_gpu(ipix)
+          mean_U(ipix) = u_sum / wsum_gpu(ipix)
+        end if
+      end do
+      !$omp end parallel do
+    end if
+
+  end subroutine prepare_gpu_data
+
+  subroutine prepare_cpu_data(specQ_flat, specU_flat, mask_tile, &
+                              nx_tile, ny_tile, nz_out, &
+                              specQ_cpu, specU_cpu, wts_cpu, &
+                              rem_mean, mean_Q, mean_U, wsum_cpu)
+    !! ========================================================================
+    !! CPU Data Preparation: Reshape arrays with CPU-optimal memory layout
+    !! ========================================================================
+    !!
+    !! Output layout: specQ_cpu(nz_out, npix) — channels fastest-varying.
+    !! For the inner DFT loop (do iz=1,nz_out with ipix fixed),
+    !! specQ_cpu(iz, ipix) accesses stride-1 memory. All nz_out channels
+    !! for one pixel (e.g. 288*4=1152 bytes) fit in ~19 cache lines, loaded
+    !! once and reused for all nrm_out RM bins.
+    !!
+    !! Contrast with prepare_gpu_data: (npix, nz_out) where the same loop
+    !! has stride = npix*4B >> L3 cache, causing one DRAM miss per channel.
+    
+    implicit none
+    integer(int32), intent(in) :: nx_tile, ny_tile, nz_out
+    integer(int32), intent(in) :: rem_mean
+    
+    real(sp), intent(in) :: specQ_flat(nx_tile*ny_tile*nz_out)
+    real(sp), intent(in) :: specU_flat(nx_tile*ny_tile*nz_out)
+    integer*1, intent(in) :: mask_tile(nx_tile*ny_tile*nz_out)
+    
+    real(sp), allocatable, intent(out) :: specQ_cpu(:,:)
+    real(sp), allocatable, intent(out) :: specU_cpu(:,:)
+    real(sp), allocatable, intent(out) :: wts_cpu(:,:)
+    real(sp), allocatable, intent(out) :: mean_Q(:), mean_U(:)
+    real(sp), allocatable, intent(out) :: wsum_cpu(:)
+    
+    integer(int32) :: iz
+    ! npix/ipix/src_idx can exceed INT32_MAX for large tiles (npix*nz_out);
+    ! must be int64 to avoid wraparound corrupting the flat-array index.
+    integer(int64) :: npix, ipix, src_idx
+    logical :: pack_loop_omp
+    real(sp) :: q_sum, u_sum
+
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
+
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+    pack_loop_omp = (.not. omp_in_parallel())
+#else
+    pack_loop_omp = .false.
+#endif
+    
+    ! CPU layout: (nz_out, npix) — channels fastest for stride-1 inner loop
+    allocate(specQ_cpu(nz_out, npix))
+    allocate(specU_cpu(nz_out, npix))
+    allocate(wts_cpu(nz_out, npix))
+    
+    ! Load all channels using unified mask
+    !$omp parallel do if(host_omp_enabled .and. pack_loop_omp) collapse(2) default(none) &
+    !$omp     private(iz, ipix, src_idx) &
+    !$omp     shared(nz_out, npix, specQ_flat, specU_flat, mask_tile, specQ_cpu, specU_cpu, wts_cpu)
+    do iz = 1, nz_out
+      do ipix = 1, npix
+        src_idx = ipix + (iz - 1) * npix
+        specQ_cpu(iz, ipix) = specQ_flat(src_idx)
+        specU_cpu(iz, ipix) = specU_flat(src_idx)
+        wts_cpu(iz, ipix) = real(mask_tile(src_idx), sp)
+      end do
+    end do
+    !$omp end parallel do
+    
+    ! Per-pixel weight sums (RM-independent, precomputed once)
+    allocate(wsum_cpu(npix))
+    !$omp parallel do if(host_omp_enabled) default(none) &
+    !$omp     private(ipix, iz) &
+    !$omp     shared(npix, nz_out, wts_cpu, wsum_cpu)
+    do ipix = 1, npix
+      wsum_cpu(ipix) = 0.0_sp
+      do iz = 1, nz_out
+        wsum_cpu(ipix) = wsum_cpu(ipix) + wts_cpu(iz, ipix)
+      end do
+    end do
+    !$omp end parallel do
+
+    if (rem_mean > 0) then
+      allocate(mean_Q(npix))
+      allocate(mean_U(npix))
+      !$omp parallel do if(host_omp_enabled) default(none) &
+      !$omp     private(ipix, iz, q_sum, u_sum) &
+      !$omp     shared(npix, nz_out, specQ_cpu, specU_cpu, wts_cpu, wsum_cpu, mean_Q, mean_U)
+      do ipix = 1, npix
+        q_sum = 0.0_sp
+        u_sum = 0.0_sp
+        do iz = 1, nz_out
+          q_sum = q_sum + wts_cpu(iz, ipix) * specQ_cpu(iz, ipix)
+          u_sum = u_sum + wts_cpu(iz, ipix) * specU_cpu(iz, ipix)
+        end do
+        if (wsum_cpu(ipix) > 0.0_sp) then
+          mean_Q(ipix) = q_sum / wsum_cpu(ipix)
+          mean_U(ipix) = u_sum / wsum_cpu(ipix)
+        end if
+      end do
+      !$omp end parallel do
+    end if
+
+  end subroutine prepare_cpu_data
+
+  subroutine tile_extract_gpu_rm_blocked(specQ_gpu, specU_gpu, wts_gpu, &
+                                         mean_Q, mean_U, wsum_gpu, &
+                                         cos_arr_gpu, sin_arr_gpu, &
+                                         nx_tile, ny_tile, nz_out, &
+                                         i_rm_block, nrm_block_now, nrm_out, &
+                                         use_gpu_actual, rem_mean, output_mode, ap_angle_mode, &
+                                         p_tile_arr, phi_tile_arr)
+    !! ========================================================================
+    !! GPU Kernel: RM-Block Tiled Extraction (Optimized)
+    !! ========================================================================
+    !!
+    !! Purpose: Compute P(RM, pixel) and Phi(RM, pixel) using optimized GPU kernel
+    !! with RM-block tiling strategy and full-size channel arrays.
+    !!
+    !! Data Flow:
+    !!   1. Input: Pre-packed GPU arrays from prepare_gpu_data
+    !!      - specQ_gpu(npix, nz_out) — FULL array with all channels
+    !!      - wts_gpu(npix, nz_out) — weight mask (0 for bad, 1 for good channels)
+    !!      - mean_Q(npix), mean_U(npix) — pre-computed if rem_mean > 0
+    !!      - wsum_gpu(npix) — per-pixel valid-channel count (precomputed)
+    !!      - cos_arr_gpu(nz_out, nrm_out) — FULL-SIZE templates
+    !!   2. Process: RM-block loop (CPU), GPU parallel over pixels × RM_in_block
+    !!      - Use collapse(2): parallelize (pixel, RM_in_block) pairs
+    !!      - Inner loop (sequential): full DFT over all nz_out channels
+    !!   3. Output: p_tile_arr(npix*nrm_out), phi_tile_arr(npix*nrm_out)
+    !!
+    !! Direct indexing (no channel mapping):
+    !!   - Template: cos_arr_gpu(iz, i) where iz ∈ [1..nz_out]
+    !!   - Data: specQ_gpu(ipix, iz) where iz ∈ [1..nz_out]
+    !!   - Masking: wts_gpu(ipix, iz) handles both global and per-pixel bad channels
+
+    implicit none
+    integer(int32), intent(in) :: nx_tile, ny_tile, nz_out
+    integer(int32), intent(in) :: i_rm_block, nrm_block_now, nrm_out
+    integer(int32), intent(in) :: rem_mean, output_mode, ap_angle_mode
+    logical, intent(in) :: use_gpu_actual
+    
+    real(sp), intent(in) :: specQ_gpu(:,:)
+    real(sp), intent(in) :: specU_gpu(:,:)
+    real(sp), intent(in) :: wts_gpu(:,:)
+    real(sp), intent(in), optional :: mean_Q(nx_tile*ny_tile)
+    real(sp), intent(in), optional :: mean_U(nx_tile*ny_tile)
+    real(sp), intent(in) :: wsum_gpu(nx_tile*ny_tile)
+    real(sp), intent(in) :: cos_arr_gpu(:, :)
+    real(sp), intent(in) :: sin_arr_gpu(:, :)
+    
+    real(sp), intent(inout) :: p_tile_arr(:)
+    real(sp), intent(inout) :: phi_tile_arr(:)
+    
+    integer(int32) :: i_rm_local, i_rm_global, iz
+    ! ipix/npix/p_idx can exceed INT32_MAX for large tiles (npix*nrm_out);
+    ! must be int64 to avoid wraparound writing outside p_tile_arr/phi_tile_arr.
+    integer(int64) :: ipix, npix, p_idx
+    integer(int32) :: tid_local
+    real(sp) :: rc_cor, rs_cor, ic_cor, is_cor, ryw_tmp, iyw_tmp
+    real(sp) :: q_eff, u_eff, wt, mean_q_pix, mean_u_pix
+    real(sp) :: zero_val = 0.0_sp  ! Used for runtime NaN generation (0.0/0.0)
+    real(dp) :: t_thread_start, t_thread_elapsed
+    character(len=192) :: thread_msg
+
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
+    
+#ifdef USE_GPU
+    !$omp target teams distribute parallel do collapse(2) if(use_gpu_actual) &
+    !$omp     map(to: specQ_gpu, specU_gpu, wts_gpu, &
+    !$omp             mean_Q, mean_U, wsum_gpu, &
+    !$omp             cos_arr_gpu, sin_arr_gpu, &
+    !$omp             nx_tile, ny_tile, nz_out, &
+    !$omp             i_rm_block, nrm_block_now, rem_mean, &
+    !$omp             output_mode, ap_angle_mode, npix, zero_val) &
+    !$omp     map(tofrom: p_tile_arr, phi_tile_arr) &
+    !$omp     private(i_rm_local, i_rm_global, iz, &
+    !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
+    !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
+    !$omp             mean_q_pix, mean_u_pix)
+#else
+  !$omp parallel if(host_omp_enabled) default(none) &
+  !$omp     private(ipix, i_rm_local, i_rm_global, iz, p_idx, tid_local, t_thread_start, t_thread_elapsed, thread_msg, &
+    !$omp             rc_cor, rs_cor, ic_cor, is_cor, &
+    !$omp             q_eff, u_eff, wt, ryw_tmp, iyw_tmp, &
+    !$omp             mean_q_pix, mean_u_pix) &
+    !$omp     shared(npix, nz_out, nrm_block_now, &
+    !$omp            specQ_gpu, specU_gpu, wts_gpu, &
+    !$omp            mean_Q, mean_U, wsum_gpu, &
+    !$omp            cos_arr_gpu, sin_arr_gpu, &
+    !$omp            i_rm_block, rem_mean, output_mode, ap_angle_mode, &
+    !$omp            p_tile_arr, phi_tile_arr, zero_val)
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+  tid_local = omp_get_thread_num()
+  t_thread_start = omp_get_wtime()
+  write(thread_msg,'(A,I0,A,I0,A,I0)') &
+  &'thread_timing stage=cpu_extract event=start tid=', tid_local, &
+  &' rm_block=', i_rm_block, ' nrm_now=', nrm_block_now
+  call log_message('debug','tile_thread',trim(thread_msg))
+#endif
+  !$omp do collapse(2) schedule(dynamic,64)
+#endif
+    do ipix = 1, npix
+      do i_rm_local = 1, nrm_block_now
+        i_rm_global = i_rm_block + i_rm_local - 1
+        
+        ! Initialize accumulators for this (pixel, RM) pair
+        rc_cor = 0.0_sp
+        rs_cor = 0.0_sp
+        ic_cor = 0.0_sp
+        is_cor = 0.0_sp
+        
+        ! Load per-pixel mean if needed
+        if (rem_mean > 0 .and. present(mean_Q)) then
+          mean_q_pix = mean_Q(ipix)
+          mean_u_pix = mean_U(ipix)
+        else
+          mean_q_pix = 0.0_sp
+          mean_u_pix = 0.0_sp
+        end if
+        
+        ! Full DFT: sum over all channels for this RM bin
+        ! Direct indexing: iz ∈ [1..nz_out] indexes both data and template
+        ! wts=0 automatically skips bad channels
+        do iz = 1, nz_out
+#ifdef USE_GPU
+          ! GPU layout: (npix, nz_out) — coalesced across warp
+          q_eff = specQ_gpu(ipix, iz) - mean_q_pix
+          u_eff = specU_gpu(ipix, iz) - mean_u_pix
+          wt = wts_gpu(ipix, iz)
+#else
+          ! CPU layout: (nz_out, npix) — stride-1 channel access
+          q_eff = specQ_gpu(iz, ipix) - mean_q_pix
+          u_eff = specU_gpu(iz, ipix) - mean_u_pix
+          wt = wts_gpu(iz, ipix)
+#endif
+          rc_cor = rc_cor + wt * q_eff * cos_arr_gpu(iz, i_rm_global)
+          rs_cor = rs_cor + wt * q_eff * sin_arr_gpu(iz, i_rm_global)
+          ic_cor = ic_cor + wt * u_eff * cos_arr_gpu(iz, i_rm_global)
+          is_cor = is_cor + wt * u_eff * sin_arr_gpu(iz, i_rm_global)
+        end do
+        
+        ! Normalize by precomputed per-pixel weight sum and compute output
+        if (wsum_gpu(ipix) > 0.0_sp) then
+          rc_cor = rc_cor / wsum_gpu(ipix)
+          rs_cor = rs_cor / wsum_gpu(ipix)
+          ic_cor = ic_cor / wsum_gpu(ipix)
+          is_cor = is_cor / wsum_gpu(ipix)
+          
+          ryw_tmp = rc_cor - is_cor
+          iyw_tmp = rs_cor + ic_cor
+          
+          p_idx = ipix + (i_rm_global - 1) * npix
+          
+          if (output_mode == 1) then
+            ! Output real and imaginary parts
+            p_tile_arr(p_idx) = ryw_tmp
+            phi_tile_arr(p_idx) = iyw_tmp
+          else
+            ! Output polarized intensity and angle
+            p_tile_arr(p_idx) = sqrt(ryw_tmp**2 + iyw_tmp**2)
+            phi_tile_arr(p_idx) = atan2(iyw_tmp, ryw_tmp)
+            if (ap_angle_mode == 1) then
+              phi_tile_arr(p_idx) = 0.5_sp * phi_tile_arr(p_idx)
+            end if
+          end if
+        else
+          ! No valid data for this pixel: output NaN
+          ! Using runtime 0.0/0.0 to generate IEEE NaN (portable across platforms)
+          p_idx = ipix + (i_rm_global - 1) * npix
+          p_tile_arr(p_idx) = zero_val / zero_val
+          phi_tile_arr(p_idx) = zero_val / zero_val
+        end if
+      end do
+    end do
+#ifdef USE_GPU
+    !$omp end target teams distribute parallel do
+#else
+      !$omp end do
+#if defined(HOST_OMP) && (HOST_OMP == 1)
+      t_thread_elapsed = (omp_get_wtime() - t_thread_start) * 1000.0_dp
+      tid_local = omp_get_thread_num()
+      write(thread_msg,'(A,I0,A,I0,A,I0,A,F10.3)') &
+      &'thread_timing stage=cpu_extract event=done tid=', tid_local, &
+      &' rm_block=', i_rm_block, ' nrm_now=', nrm_block_now, &
+      &' dur_ms=', t_thread_elapsed
+      call log_message('debug','tile_thread',trim(thread_msg))
+#endif
+      !$omp end parallel
+#endif
+
+  end subroutine tile_extract_gpu_rm_blocked
+
+  subroutine cubestat_tail_quantile_maps(p_tile_arr, phi_tile_arr, rm_axis, &
+                                         nx_tile, ny_tile, nrm_out, &
+                                         peak_map, rm_peak_map, &
+                                         ang_peak_map, snr_map)
+    !! Compute cubestat maps from tile RM profiles using tail-quantile sigma.
+    !! Sigma definition per pixel: sigma = (q50 - q16) / 0.67449
+    !! Fallback when q50<=q16: MAD-based robust sigma.
+    implicit none
+    integer(int32), intent(in) :: nx_tile, ny_tile, nrm_out
+    real(sp), intent(in) :: p_tile_arr(nx_tile*ny_tile*nrm_out)
+    real(sp), intent(in) :: phi_tile_arr(nx_tile*ny_tile*nrm_out)
+    real(sp), intent(in) :: rm_axis(nrm_out)
+    real(sp), intent(out) :: peak_map(nx_tile*ny_tile)
+    real(sp), intent(out) :: rm_peak_map(nx_tile*ny_tile)
+    real(sp), intent(out) :: ang_peak_map(nx_tile*ny_tile)
+    real(sp), intent(out) :: snr_map(nx_tile*ny_tile)
+
+    integer(int32) :: irm, nvalid
+    integer(int32) :: idx_peak, i16, i50, i_mad
+    ! npix/ipix/idx can exceed INT32_MAX for large tiles (npix*nrm_out);
+    ! must be int64 to avoid wraparound reading outside p_tile_arr/phi_tile_arr.
+    integer(int64) :: npix, ipix, idx
+    real(sp) :: pval, pmax, sigma_noise, q16, q50, median_val, eps_sigma
+    real(sp) :: vals(nrm_out), dev(nrm_out)
+    real(sp) :: zero_val
+
+    npix = int(nx_tile,kind=int64) * int(ny_tile,kind=int64)
+    eps_sigma = 1.0e-12_sp
+    zero_val = 0.0_sp
+
+    !$omp parallel do if(host_omp_enabled) schedule(static) default(none) &
+    !$omp   private(ipix, irm, idx, pval, nvalid, pmax, idx_peak, i16, i50, &
+    !$omp           i_mad, q16, q50, sigma_noise, median_val, vals, dev) &
+    !$omp   shared(npix, nrm_out, p_tile_arr, phi_tile_arr, rm_axis, eps_sigma, zero_val, &
+    !$omp          peak_map, rm_peak_map, ang_peak_map, snr_map)
+    do ipix = 1, npix
+      pmax = -huge(1.0_sp)
+      idx_peak = 0
+      nvalid = 0
+
+      do irm = 1, nrm_out
+        idx = ipix + (irm - 1) * npix
+        pval = p_tile_arr(idx)
+        if (pval == pval) then
+          nvalid = nvalid + 1
+          vals(nvalid) = pval
+          if (pval > pmax) then
+            pmax = pval
+            idx_peak = irm
+          end if
+        end if
+      end do
+
+      if (nvalid <= 0 .or. idx_peak <= 0) then
+        peak_map(ipix) = zero_val / zero_val
+        rm_peak_map(ipix) = zero_val / zero_val
+        ang_peak_map(ipix) = zero_val / zero_val
+        snr_map(ipix) = zero_val / zero_val
+        cycle
+      end if
+
+      call sort_real_inplace(vals, nvalid)
+
+      i16 = int(0.16_sp * real(nvalid - 1, sp)) + 1
+      if (i16 < 1) i16 = 1
+      if (i16 > nvalid) i16 = nvalid
+      i50 = (nvalid + 1) / 2
+      if (i50 < 1) i50 = 1
+      if (i50 > nvalid) i50 = nvalid
+
+      q16 = vals(i16)
+      q50 = vals(i50)
+      sigma_noise = (q50 - q16) / 0.67449_sp
+
+      if (sigma_noise <= 0.0_sp) then
+        median_val = vals(i50)
+        do irm = 1, nvalid
+          dev(irm) = abs(vals(irm) - median_val)
+        end do
+        call sort_real_inplace(dev, nvalid)
+        i_mad = (nvalid + 1) / 2
+        if (i_mad < 1) i_mad = 1
+        if (i_mad > nvalid) i_mad = nvalid
+        sigma_noise = 1.4826_sp * dev(i_mad)
+      end if
+
+      if (sigma_noise < eps_sigma) sigma_noise = eps_sigma
+
+      idx = ipix + (idx_peak - 1) * npix
+      peak_map(ipix) = pmax
+      rm_peak_map(ipix) = rm_axis(idx_peak)
+      ang_peak_map(ipix) = phi_tile_arr(idx)
+      snr_map(ipix) = pmax / sigma_noise
+    end do
+    !$omp end parallel do
+
+  contains
+
+    subroutine sort_real_inplace(arr, n)
+      real(sp), intent(inout) :: arr(n)
+      integer(int32), intent(in) :: n
+      integer(int32) :: i, j
+      real(sp) :: key
+
+      do i = 2, n
+        key = arr(i)
+        j = i - 1
+        do while (j >= 1 .and. arr(j) > key)
+          arr(j + 1) = arr(j)
+          j = j - 1
+        end do
+        arr(j + 1) = key
+      end do
+    end subroutine sort_real_inplace
+
+  end subroutine cubestat_tail_quantile_maps
+
+  subroutine compute_mean(arr, n, mean_val)
+    !! Compute mean of array
+    integer(int32), intent(in) :: n
+    real(sp), intent(in) :: arr(n)
+    real(sp), intent(out) :: mean_val
+    integer(int32) :: i
+    mean_val = 0.0_sp
+    do i = 1, n
+      mean_val = mean_val + arr(i)
+    end do
+    mean_val = mean_val / real(n, sp)
+  end subroutine compute_mean
+
+  subroutine compute_rms(arr, n, rms_val)
+    !! RMS about the mean of arr (population RMS, divide by n -- matches
+    !! the RM-CLEAN lineage this is needed for, planning/
+    !! RMCLEAN_INTEGRATION_PLAN.md T1: used as the CLEAN loop's own
+    !! residual-noise estimate for its stopping criterion, recomputed
+    !! every iteration -- a whole-array intrinsic reduction (sum) rather
+    !! than a hand-rolled accumulator loop, since gfortran vectorizes the
+    !! former at least as well and it reads as one expression instead of
+    !! a loop.
+    integer(int32), intent(in) :: n
+    real(sp), intent(in) :: arr(n)
+    real(sp), intent(out) :: rms_val
+    real(sp) :: mean_val
+    call compute_mean(arr, n, mean_val)
+    rms_val = sqrt(sum((arr - mean_val)**2) / real(n, sp))
+  end subroutine compute_rms
+
+  subroutine dot_product_custom(a, b, result, n)
+    !! Compute dot product of two vectors
+    integer(int32), intent(in) :: n
+    real(sp), intent(in) :: a(n), b(n)
+    real(sp), intent(out) :: result
+    integer(int32) :: i
+    result = 0.0_sp
+    do i = 1, n
+      result = result + a(i) * b(i)
+    end do
+  end subroutine dot_product_custom
+
+  subroutine linspace(base, limit, n, v)
+    !! Generate linearly spaced vector from base to limit
+    !! Generates n points including both endpoints
+    !! If n=1, v(1) = limit. If base=limit, all elements = limit
+    real(sp), intent(in) :: base, limit
+    integer(int32), intent(inout) :: n
+    real(sp), intent(out) :: v(*)
+    integer(int32) :: i
+    real(sp) :: h
+    
+    if (n < 1) then
+      write(*, '(A)') '----------------- WARNING -------------------'
+      write(*, '(A)') '----------- SUBROUTINE "LINSPACE"------------'
+      write(*, '(A)') '    Wrong vector length, N changed to 100'
+      write(*, '(A)') '---------------------------------------------'
+      n = 100
+    end if
+    
+    if (n == 1) then
+      v(1) = limit
+    else if (abs(base - limit) < tiny(1.0_sp)) then
+      do i = 1, n
+        v(i) = limit
+      end do
+    else
+      h = (limit - base) / real(n - 1, sp)
+      do i = 1, n
+        v(i) = base + real(i - 1, sp) * h
+      end do
+    end if
+  end subroutine linspace
+
+  function nchar(string) result(ipos)
+    !! Find length of string excluding trailing whitespace
+    !! Returns position of last non-whitespace character
+    !! Used for trimming: string(1:nchar(string))
+    character(len=*), intent(in) :: string
+    integer(int32) :: ipos
+    character :: c, blank, tab, null_char
+    integer(int32) :: i
+    
+    blank = ' '
+    tab = char(9)
+    null_char = char(0)
+    
+    ipos = 0
+    i = len(string)
+    do while (i > 0 .and. ipos == 0)
+      c = string(i:i)
+      if (c /= blank .and. c /= tab .and. c /= null_char) then
+        ipos = i
+      end if
+      i = i - 1
+    end do
+  end function nchar
+
+  subroutine read_cfg_keyval(cfgfile, cfg, status)
+    !! Read all runtime parameters from a single KEY=VALUE config file.
+    !! T1 encapsulation ticket: cfg bundles what used to be ~54 separate
+    !! intent(inout)/intent(out) arguments into one derived type (see
+    !! rmsynth_config_t above) -- the parsing logic below (the select
+    !! case body, duplicate detection, cross-key validation) is otherwise
+    !! unchanged, just addressed as cfg%field instead of a bare local.
+    implicit none
+    character(len=*), intent(in) :: cfgfile
+    type(rmsynth_config_t), intent(inout) :: cfg
+    integer(int32), intent(out) :: status
+
+    character(len=512) :: line, key, val, key_lc
+    integer(int32) :: unit_cfg, ios, line_no, io_stat
+    logical :: has_kv
+    logical :: seen_path, seen_infileQ, seen_infileU, seen_outfile
+    logical :: seen_badchan_file
+    logical :: seen_subim, seen_subim_parfile
+    logical :: seen_subim_ra_blc, seen_subim_ra_trc, seen_subim_ra_inc
+    logical :: seen_subim_dec_blc, seen_subim_dec_trc, seen_subim_dec_inc
+    logical :: seen_subim_chan_blc, seen_subim_chan_trc, seen_subim_chan_inc
+    logical :: seen_tile_ra, seen_tile_dec
+    logical :: seen_mem_frac_ram, seen_mem_frac_vram, seen_gpu_vram_mib
+    logical :: seen_tile_auto, seen_dry_run
+    logical :: seen_rem_mean, seen_remove_qu_bias
+    logical :: seen_resiQ, seen_slopeQ, seen_resiU, seen_slopeU
+    logical :: seen_path_I, seen_infileI
+    logical :: seen_reference_band
+    logical :: seen_ofac, seen_fac, seen_beg_rm, seen_end_rm, seen_nrm_out
+    ! Multi-band tomography (T1 ticket): raw comma-separated text for each
+    ! per-band key, captured verbatim during the line-parse loop below and
+    ! split into cfg%band(:) only after the whole file has been read (so
+    ! every per-band key's list length can be cross-validated first). A
+    ! comma-free value is a length-1 list -- there is no separate
+    ! "single-band" parsing branch (plan Sec 5).
+    character(len=512) :: raw_infileQ, raw_infileU
+    character(len=512) :: raw_resiQ, raw_slopeQ, raw_resiU, raw_slopeU
+    character(len=512) :: raw_infileI, raw_path_I
+    ! T6: raw comma-separated text for the per-band channel sub-range keys,
+    ! same deferred-assembly pattern as raw_resiQ etc above.
+    character(len=512) :: raw_subim_chan_blc, raw_subim_chan_trc
+    character(len=512) :: raw_subim_chan_inc
+    ! T7: raw comma-separated text for the per-band badchan_file key --
+    ! required (like raw_infileQ), not optional (like the T6 keys above),
+    ! matching the legacy scalar's own "always required" behaviour.
+    character(len=512) :: raw_badchan_file
+    character(len=512) :: csv_item
+    integer(int32) :: n_bands_local, ib
+    logical :: seen_use_auto_rm_range
+    logical :: seen_output_mode
+    logical :: seen_ap_angle_mode
+    logical :: seen_lsq_ref_mode
+    logical :: seen_lsq_ref_fixed_value
+    logical :: seen_mask_cube_file, seen_mask_input_cube_file
+    logical :: seen_mask_trust_mode
+    logical :: seen_write_mask_output, seen_write_nvalid_output
+    logical :: seen_cubestat
+    logical :: seen_use_gpu
+    logical :: seen_io_overlap
+    logical :: seen_io_read_threads
+    logical :: seen_nwriters
+    logical :: seen_log_level
+    logical :: seen_timing_enabled
+    logical :: seen_timing_tile_enabled
+    logical :: seen_timing_io_enabled
+    logical :: seen_log_output_file
+    logical :: seen_timing_csv_file
+
+    status = 0
+    line_no = 0
+
+    seen_path = .false.
+    seen_infileQ = .false.
+    seen_infileU = .false.
+    seen_outfile = .false.
+    seen_badchan_file = .false.
+    seen_subim = .false.
+    seen_subim_parfile = .false.
+    seen_subim_ra_blc = .false.
+    seen_subim_ra_trc = .false.
+    seen_subim_ra_inc = .false.
+    seen_subim_dec_blc = .false.
+    seen_subim_dec_trc = .false.
+    seen_subim_dec_inc = .false.
+    seen_subim_chan_blc = .false.
+    seen_subim_chan_trc = .false.
+    seen_subim_chan_inc = .false.
+    seen_tile_ra = .false.
+    seen_tile_dec = .false.
+    seen_mem_frac_ram = .false.
+    seen_mem_frac_vram = .false.
+    seen_gpu_vram_mib = .false.
+    seen_tile_auto = .false.
+    seen_dry_run = .false.
+    seen_rem_mean = .false.
+    seen_remove_qu_bias = .false.
+    seen_resiQ = .false.
+    seen_slopeQ = .false.
+    seen_resiU = .false.
+    seen_slopeU = .false.
+    seen_path_I = .false.
+    seen_infileI = .false.
+    seen_reference_band = .false.
+    raw_infileQ = ' '
+    raw_infileU = ' '
+    raw_resiQ = ' '
+    raw_slopeQ = ' '
+    raw_resiU = ' '
+    raw_slopeU = ' '
+    raw_infileI = ' '
+    raw_path_I = ' '
+    raw_subim_chan_blc = ' '
+    raw_subim_chan_trc = ' '
+    raw_subim_chan_inc = ' '
+    raw_badchan_file = ' '
+    seen_ofac = .false.
+    seen_fac = .false.
+    seen_beg_rm = .false.
+    seen_end_rm = .false.
+    seen_nrm_out = .false.
+    seen_use_auto_rm_range = .false.
+    seen_output_mode = .false.
+    seen_ap_angle_mode = .false.
+    seen_lsq_ref_mode = .false.
+    seen_lsq_ref_fixed_value = .false.
+    seen_mask_cube_file = .false.
+    seen_mask_input_cube_file = .false.
+    seen_mask_trust_mode = .false.
+    seen_write_mask_output = .false.
+    seen_write_nvalid_output = .false.
+    seen_cubestat = .false.
+    seen_use_gpu = .false.
+    seen_io_overlap = .false.
+    seen_io_read_threads = .false.
+    seen_nwriters = .false.
+    seen_log_level = .false.
+    seen_timing_enabled = .false.
+    seen_timing_tile_enabled = .false.
+    seen_timing_io_enabled = .false.
+    seen_log_output_file = .false.
+    seen_timing_csv_file = .false.
+
+    ! Defaults can be overridden by the config.
+    cfg%path = '../DATA/'
+    cfg%infileQ = ' '
+    cfg%infileU = ' '
+    cfg%reference_band = 1
+    cfg%outfile = 'output'
+    cfg%remove_badchan = .false.
+    cfg%badchan_file = 'bad_channels.txt'
+    cfg%subim = .false.
+    cfg%subim_parfile = 'subimage.par'
+    cfg%subim_ra_blc = 1
+    cfg%subim_ra_trc = 0
+    cfg%subim_ra_inc = 1
+    cfg%subim_dec_blc = 1
+    cfg%subim_dec_trc = 0
+    cfg%subim_dec_inc = 1
+    cfg%subim_chan_blc = 0
+    cfg%subim_chan_trc = 0
+    cfg%subim_chan_inc = 1
+    cfg%tile_ra = 0
+    cfg%tile_dec = 0
+    cfg%mem_frac_ram = 0.25_sp
+    cfg%mem_frac_vram = 0.70_sp
+    cfg%gpu_vram_mib = 0
+    cfg%tile_auto = .true.
+    cfg%dry_run = .false.
+    cfg%rem_mean = 0
+    cfg%remove_qu_bias = .false.
+    cfg%resiQ = 0.0_sp
+    cfg%slopeQ = 0.0_sp
+    cfg%resiU = 0.0_sp
+    cfg%slopeU = 0.0_sp
+    cfg%path_I = cfg%path
+    cfg%infileI = ' '
+    cfg%ofac = 4
+    cfg%fac = 3.14159265358979_sp
+    cfg%beg_rm = -50.0_sp
+    cfg%end_rm = 50.0_sp
+    cfg%nrm_out_par = 100
+    cfg%use_auto_rm_range = 1
+    cfg%output_mode = 0
+    cfg%ap_angle_mode = 0
+    cfg%mask_cube_file = ''
+    cfg%mask_input_cube_file = ''
+    cfg%mask_trust_mode = 'safe'
+    cfg%write_mask_output = .true.
+    cfg%write_nvalid_output = .true.
+    cfg%cubestat = .false.
+    cfg%use_gpu = .false.
+    cfg%io_overlap = .false.
+    cfg%io_read_threads = 1
+    cfg%nwriters = 1
+    cfg%log_level = 'info'
+    cfg%timing_enabled = .false.
+    cfg%timing_tile_enabled = .false.
+    cfg%timing_io_enabled = .false.
+    cfg%log_output_file = ''
+    cfg%timing_csv_file = ''
+
+    unit_cfg = 11
+    open(unit_cfg, file=cfgfile, status='old', iostat=ios)
+    if (ios /= 0) then
+      status = ios
+      return
+    end if
+
+    do
+      read(unit_cfg, '(A)', iostat=ios) line
+      if (ios /= 0) exit
+      line_no = line_no + 1
+
+      call split_key_value(line, key, val, has_kv)
+      if (.not. has_kv) cycle
+
+      key_lc = trim(lower_ascii(key))
+
+      select case (key_lc)
+      case ('path')
+        if (seen_path) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': path'
+          status = -100
+          close(unit_cfg)
+          return
+        end if
+        seen_path = .true.
+        cfg%path = trim(val)
+      case ('infileq')
+        if (seen_infileQ) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileQ'
+          status = -101
+          close(unit_cfg)
+          return
+        end if
+        seen_infileQ = .true.
+        raw_infileQ = val
+      case ('infileu')
+        if (seen_infileU) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileU'
+          status = -102
+          close(unit_cfg)
+          return
+        end if
+        seen_infileU = .true.
+        raw_infileU = val
+      case ('reference_band')
+        if (seen_reference_band) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': reference_band'
+          status = -230
+          close(unit_cfg)
+          return
+        end if
+        seen_reference_band = .true.
+        read(val, *, iostat=ios) cfg%reference_band
+        if (ios /= 0) then
+          write(*,*) 'Invalid integer for reference_band at cfg line ', line_no
+          status = -231
+          close(unit_cfg)
+          return
+        end if
+      case ('outfile')
+        if (seen_outfile) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': outfile'
+          status = -103
+          close(unit_cfg)
+          return
+        end if
+        seen_outfile = .true.
+        cfg%outfile = trim(val)
+      case ('badchan_file', 'global_badchan_file')
+        if (seen_badchan_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': global_badchan_file'
+          status = -105
+          close(unit_cfg)
+          return
+        end if
+        seen_badchan_file = .true.
+        raw_badchan_file = val
+      case ('subim')
+        if (seen_subim) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim'
+          status = -106
+          close(unit_cfg)
+          return
+        end if
+        seen_subim = .true.
+        cfg%subim = flag_from_value(val)
+      case ('subim_parfile')
+        if (seen_subim_parfile) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_parfile'
+          status = -107
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_parfile = .true.
+        cfg%subim_parfile = trim(val)
+      case ('subim_ra_blc')
+        if (seen_subim_ra_blc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_ra_blc'
+          status = -171
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_ra_blc = .true.
+        read(val, *, iostat=io_stat) cfg%subim_ra_blc
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading subim_ra_blc at line ', line_no
+          status = -171
+          close(unit_cfg)
+          return
+        end if
+        if (cfg%subim_ra_blc < 1) then
+          write(*,*) 'Error: subim_ra_blc must be >= 1 at line ', line_no
+          status = -171
+          close(unit_cfg)
+          return
+        end if
+      case ('subim_ra_trc')
+        if (seen_subim_ra_trc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_ra_trc'
+          status = -172
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_ra_trc = .true.
+        read(val, *, iostat=io_stat) cfg%subim_ra_trc
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading subim_ra_trc at line ', line_no
+          status = -172
+          close(unit_cfg)
+          return
+        end if
+        if (cfg%subim_ra_trc > 0 .and. cfg%subim_ra_trc < cfg%subim_ra_blc) then
+          write(*,*) 'Error: subim_ra_trc must be >= subim_ra_blc at line ', line_no
+          status = -172
+          close(unit_cfg)
+          return
+        end if
+      case ('subim_ra_inc')
+        if (seen_subim_ra_inc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_ra_inc'
+          status = -173
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_ra_inc = .true.
+        read(val, *, iostat=io_stat) cfg%subim_ra_inc
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading subim_ra_inc at line ', line_no
+          status = -173
+          close(unit_cfg)
+          return
+        end if
+        if (cfg%subim_ra_inc < 1) then
+          write(*,*) 'Error: subim_ra_inc must be >= 1 at line ', line_no
+          status = -173
+          close(unit_cfg)
+          return
+        end if
+      case ('subim_dec_blc')
+        if (seen_subim_dec_blc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_dec_blc'
+          status = -174
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_dec_blc = .true.
+        read(val, *, iostat=io_stat) cfg%subim_dec_blc
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading subim_dec_blc at line ', line_no
+          status = -174
+          close(unit_cfg)
+          return
+        end if
+        if (cfg%subim_dec_blc < 1) then
+          write(*,*) 'Error: subim_dec_blc must be >= 1 at line ', line_no
+          status = -174
+          close(unit_cfg)
+          return
+        end if
+      case ('subim_dec_trc')
+        if (seen_subim_dec_trc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_dec_trc'
+          status = -175
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_dec_trc = .true.
+        read(val, *, iostat=io_stat) cfg%subim_dec_trc
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading subim_dec_trc at line ', line_no
+          status = -175
+          close(unit_cfg)
+          return
+        end if
+        if (cfg%subim_dec_trc > 0 .and. cfg%subim_dec_trc < cfg%subim_dec_blc) then
+          write(*,*) 'Error: subim_dec_trc must be >= subim_dec_blc at line ', line_no
+          status = -175
+          close(unit_cfg)
+          return
+        end if
+      case ('subim_dec_inc')
+        if (seen_subim_dec_inc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_dec_inc'
+          status = -176
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_dec_inc = .true.
+        read(val, *, iostat=io_stat) cfg%subim_dec_inc
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading subim_dec_inc at line ', line_no
+          status = -176
+          close(unit_cfg)
+          return
+        end if
+        if (cfg%subim_dec_inc < 1) then
+          write(*,*) 'Error: subim_dec_inc must be >= 1 at line ', line_no
+          status = -176
+          close(unit_cfg)
+          return
+        end if
+      case ('subim_chan_blc')
+        if (seen_subim_chan_blc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_chan_blc'
+          status = -177
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_chan_blc = .true.
+        raw_subim_chan_blc = val
+      case ('subim_chan_trc')
+        if (seen_subim_chan_trc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_chan_trc'
+          status = -178
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_chan_trc = .true.
+        raw_subim_chan_trc = val
+      case ('subim_chan_inc')
+        if (seen_subim_chan_inc) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': subim_chan_inc'
+          status = -179
+          close(unit_cfg)
+          return
+        end if
+        seen_subim_chan_inc = .true.
+        raw_subim_chan_inc = val
+      case ('tile_ra')
+        if (seen_tile_ra) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_ra'
+          status = -180
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_ra = .true.
+        read(val, *, iostat=io_stat) cfg%tile_ra
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading tile_ra at line ', line_no
+          status = -180
+          close(unit_cfg)
+          return
+        end if
+      case ('tile_dec')
+        if (seen_tile_dec) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_dec'
+          status = -181
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_dec = .true.
+        read(val, *, iostat=io_stat) cfg%tile_dec
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading tile_dec at line ', line_no
+          status = -181
+          close(unit_cfg)
+          return
+        end if
+      case ('mem_frac_ram')
+        if (seen_mem_frac_ram) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mem_frac_ram'
+          status = -182
+          close(unit_cfg)
+          return
+        end if
+        seen_mem_frac_ram = .true.
+        read(val, *, iostat=io_stat) cfg%mem_frac_ram
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading mem_frac_ram at line ', line_no
+          status = -182
+          close(unit_cfg)
+          return
+        end if
+      case ('mem_frac_vram')
+        if (seen_mem_frac_vram) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mem_frac_vram'
+          status = -190
+          close(unit_cfg)
+          return
+        end if
+        seen_mem_frac_vram = .true.
+        read(val, *, iostat=io_stat) cfg%mem_frac_vram
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading mem_frac_vram at line ', line_no
+          status = -190
+          close(unit_cfg)
+          return
+        end if
+      case ('gpu_vram_mib')
+        if (seen_gpu_vram_mib) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': gpu_vram_mib'
+          status = -191
+          close(unit_cfg)
+          return
+        end if
+        seen_gpu_vram_mib = .true.
+        read(val, *, iostat=io_stat) cfg%gpu_vram_mib
+        if (io_stat /= 0) then
+          write(*,*) 'Error reading gpu_vram_mib at line ', line_no
+          status = -191
+          close(unit_cfg)
+          return
+        end if
+      case ('tile_auto')
+        if (seen_tile_auto) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': tile_auto'
+          status = -183
+          close(unit_cfg)
+          return
+        end if
+        seen_tile_auto = .true.
+        cfg%tile_auto = flag_from_value(val)
+      case ('dry_run')
+        if (seen_dry_run) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': dry_run'
+          status = -184
+          close(unit_cfg)
+          return
+        end if
+        seen_dry_run = .true.
+        cfg%dry_run = flag_from_value(val)
+      case ('rem_mean')
+        if (seen_rem_mean) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': rem_mean'
+          status = -108
+          close(unit_cfg)
+          return
+        end if
+        seen_rem_mean = .true.
+        read(val, *, iostat=ios) cfg%rem_mean
+        if (ios /= 0) then
+          write(*,*) 'Invalid integer for rem_mean at cfg line ', line_no
+          status = -109
+          close(unit_cfg)
+          return
+        end if
+      case ('remove_qu_bias')
+        if (seen_remove_qu_bias) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': remove_qu_bias'
+          status = -110
+          close(unit_cfg)
+          return
+        end if
+        seen_remove_qu_bias = .true.
+        cfg%remove_qu_bias = flag_from_value(val)
+      case ('resiq')
+        if (seen_resiQ) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': resiQ'
+          status = -111
+          close(unit_cfg)
+          return
+        end if
+        seen_resiQ = .true.
+        raw_resiQ = val
+      case ('slopeq')
+        if (seen_slopeQ) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': slopeQ'
+          status = -113
+          close(unit_cfg)
+          return
+        end if
+        seen_slopeQ = .true.
+        raw_slopeQ = val
+      case ('resiu')
+        if (seen_resiU) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': resiU'
+          status = -115
+          close(unit_cfg)
+          return
+        end if
+        seen_resiU = .true.
+        raw_resiU = val
+      case ('slopeu')
+        if (seen_slopeU) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': slopeU'
+          status = -117
+          close(unit_cfg)
+          return
+        end if
+        seen_slopeU = .true.
+        raw_slopeU = val
+      case ('path_i')
+        if (seen_path_I) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': path_I'
+          status = -119
+          close(unit_cfg)
+          return
+        end if
+        seen_path_I = .true.
+        raw_path_I = val
+      case ('infilei')
+        if (seen_infileI) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': infileI'
+          status = -120
+          close(unit_cfg)
+          return
+        end if
+        seen_infileI = .true.
+        raw_infileI = val
+      case ('ofac')
+        if (seen_ofac) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': ofac'
+          status = -121
+          close(unit_cfg)
+          return
+        end if
+        seen_ofac = .true.
+        read(val, *, iostat=ios) cfg%ofac
+        if (ios /= 0) then
+          write(*,*) 'Invalid integer for ofac at cfg line ', line_no
+          status = -122
+          close(unit_cfg)
+          return
+        end if
+      case ('fac')
+        if (seen_fac) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': fac'
+          status = -123
+          close(unit_cfg)
+          return
+        end if
+        seen_fac = .true.
+        read(val, *, iostat=ios) cfg%fac
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for fac at cfg line ', line_no
+          status = -124
+          close(unit_cfg)
+          return
+        end if
+      case ('beg_rm')
+        if (seen_beg_rm) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': beg_rm'
+          status = -125
+          close(unit_cfg)
+          return
+        end if
+        seen_beg_rm = .true.
+        read(val, *, iostat=ios) cfg%beg_rm
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for beg_rm at cfg line ', line_no
+          status = -126
+          close(unit_cfg)
+          return
+        end if
+      case ('end_rm', 'max_rm')
+        if (seen_end_rm) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': end_rm/max_rm'
+          status = -161
+          close(unit_cfg)
+          return
+        end if
+        seen_end_rm = .true.
+        read(val, *, iostat=ios) cfg%end_rm
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for end_rm at cfg line ', line_no
+          status = -162
+          close(unit_cfg)
+          return
+        end if
+      case ('nrm', 'nrm_out')
+        if (seen_nrm_out) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': nrm/nrm_out'
+          status = -127
+          close(unit_cfg)
+          return
+        end if
+        seen_nrm_out = .true.
+        read(val, *, iostat=ios) cfg%nrm_out_par
+        if (ios /= 0) then
+          write(*,*) 'Invalid integer for nrm at cfg line ', line_no
+          status = -128
+          close(unit_cfg)
+          return
+        end if
+      case ('use_auto_rm_range')
+        if (seen_use_auto_rm_range) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': use_auto_rm_range'
+          status = -129
+          close(unit_cfg)
+          return
+        end if
+        seen_use_auto_rm_range = .true.
+        read(val, *, iostat=ios) cfg%use_auto_rm_range
+        if (ios /= 0) then
+          write(*,*) 'Invalid integer for use_auto_rm_range at cfg line ', line_no
+          status = -130
+          close(unit_cfg)
+          return
+        end if
+      case ('output_mode')
+        if (seen_output_mode) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': output_mode'
+          status = -168
+          close(unit_cfg)
+          return
+        end if
+        seen_output_mode = .true.
+        select case (trim(lower_ascii(val)))
+        case ('ap')
+          cfg%output_mode = 0
+        case ('ri')
+          cfg%output_mode = 1
+        case default
+          write(*,*) 'Invalid output_mode at cfg line ', line_no
+          write(*,*) 'Allowed values: ap, ri'
+          status = -169
+          close(unit_cfg)
+          return
+        end select
+      case ('ap_angle_mode')
+        if (seen_ap_angle_mode) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': ap_angle_mode'
+          status = -159
+          close(unit_cfg)
+          return
+        end if
+        seen_ap_angle_mode = .true.
+        select case (trim(lower_ascii(val)))
+        case ('phase')
+          cfg%ap_angle_mode = 0
+        case ('pol')
+          cfg%ap_angle_mode = 1
+        case default
+          write(*,*) 'Invalid ap_angle_mode at cfg line ', line_no
+          write(*,*) 'Allowed values: phase, pol'
+          status = -160
+          close(unit_cfg)
+          return
+        end select
+      case ('lsq_ref_mode')
+        if (seen_lsq_ref_mode) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': lsq_ref_mode'
+          status = -239
+          close(unit_cfg)
+          return
+        end if
+        seen_lsq_ref_mode = .true.
+        select case (trim(lower_ascii(val)))
+        case ('zero', 'mid', 'centroid', 'min', 'max', 'fixed')
+          cfg%lsq_ref_mode = trim(lower_ascii(val))
+        case default
+          write(*,*) 'Invalid lsq_ref_mode at cfg line ', line_no
+          write(*,*) 'Allowed values: zero, mid, centroid, min, max, fixed'
+          status = -240
+          close(unit_cfg)
+          return
+        end select
+      case ('lsq_ref_fixed_value')
+        if (seen_lsq_ref_fixed_value) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': lsq_ref_fixed_value'
+          status = -241
+          close(unit_cfg)
+          return
+        end if
+        seen_lsq_ref_fixed_value = .true.
+        read(val, *, iostat=ios) cfg%lsq_ref_fixed_value
+        if (ios /= 0) then
+          write(*,*) 'Invalid lsq_ref_fixed_value at cfg line ', line_no
+          status = -242
+          close(unit_cfg)
+          return
+        end if
+      case ('mask_cube_file')
+        if (seen_mask_cube_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_cube_file'
+          status = -162
+          close(unit_cfg)
+          return
+        end if
+        seen_mask_cube_file = .true.
+        cfg%mask_cube_file = trim(val)
+      case ('mask_input_cube_file')
+        if (seen_mask_input_cube_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_input_cube_file'
+          status = -163
+          close(unit_cfg)
+          return
+        end if
+        seen_mask_input_cube_file = .true.
+        cfg%mask_input_cube_file = trim(val)
+      case ('mask_trust_mode')
+        if (seen_mask_trust_mode) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': mask_trust_mode'
+          status = -164
+          close(unit_cfg)
+          return
+        end if
+        seen_mask_trust_mode = .true.
+        select case (trim(lower_ascii(val)))
+        case ('safe')
+          cfg%mask_trust_mode = 'safe'
+        case ('strict')
+          cfg%mask_trust_mode = 'strict'
+        case default
+          write(*,*) 'Invalid mask_trust_mode at cfg line ', line_no
+          write(*,*) 'Allowed values: safe, strict'
+          status = -164
+          close(unit_cfg)
+          return
+        end select
+      case ('write_mask_output')
+        if (seen_write_mask_output) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': write_mask_output'
+          status = -187
+          close(unit_cfg)
+          return
+        end if
+        seen_write_mask_output = .true.
+        cfg%write_mask_output = flag_from_value(val)
+      case ('write_nvalid_output')
+        if (seen_write_nvalid_output) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': write_nvalid_output'
+          status = -188
+          close(unit_cfg)
+          return
+        end if
+        seen_write_nvalid_output = .true.
+        cfg%write_nvalid_output = flag_from_value(val)
+      case ('cubestat')
+        if (seen_cubestat) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': cubestat'
+          status = -190
+          close(unit_cfg)
+          return
+        end if
+        seen_cubestat = .true.
+        cfg%cubestat = flag_from_value(val)
+      case ('use_gpu', 'use_gpus')
+        if (seen_use_gpu) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': use_gpu/use_gpus'
+          status = -189
+          close(unit_cfg)
+          return
+        end if
+        seen_use_gpu = .true.
+        cfg%use_gpu = flag_from_value(val)
+      case ('io_overlap')
+        if (seen_io_overlap) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_overlap'
+          status = -192
+          close(unit_cfg)
+          return
+        end if
+        seen_io_overlap = .true.
+        cfg%io_overlap = flag_from_value(val)
+      case ('io_read_threads')
+        if (seen_io_read_threads) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': io_read_threads'
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+        seen_io_read_threads = .true.
+        read(val, *, iostat=io_stat) cfg%io_read_threads
+        if (io_stat /= 0 .or. cfg%io_read_threads < 1) then
+          write(*,*) 'Error reading io_read_threads at line ', line_no
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+      case ('nwriters')
+        if (seen_nwriters) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': nwriters'
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+        seen_nwriters = .true.
+        read(val, *, iostat=io_stat) cfg%nwriters
+        if (io_stat /= 0 .or. cfg%nwriters < 1) then
+          write(*,*) 'Error reading nwriters at line ', line_no
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+      case ('log_level')
+        if (seen_log_level) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': log_level'
+          status = -193
+          close(unit_cfg)
+          return
+        end if
+        seen_log_level = .true.
+        cfg%log_level = trim(lower_ascii(val))
+      case ('timing_enabled')
+        if (seen_timing_enabled) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_enabled'
+          status = -194
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_enabled = .true.
+        cfg%timing_enabled = flag_from_value(val)
+      case ('timing_tile_enabled')
+        if (seen_timing_tile_enabled) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_tile_enabled'
+          status = -195
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_tile_enabled = .true.
+        cfg%timing_tile_enabled = flag_from_value(val)
+      case ('timing_io_enabled')
+        if (seen_timing_io_enabled) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_io_enabled'
+          status = -196
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_io_enabled = .true.
+        cfg%timing_io_enabled = flag_from_value(val)
+      case ('log_output_file')
+        if (seen_log_output_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': log_output_file'
+          status = -197
+          close(unit_cfg)
+          return
+        end if
+        seen_log_output_file = .true.
+        cfg%log_output_file = trim(val)
+      case ('timing_csv_file')
+        if (seen_timing_csv_file) then
+          write(*,*) 'Duplicate key in cfg at line ', line_no, ': timing_csv_file'
+          status = -199
+          close(unit_cfg)
+          return
+        end if
+        seen_timing_csv_file = .true.
+        cfg%timing_csv_file = trim(val)
+      case default
+        write(*,*) 'Unknown key in cfg at line ', line_no, ': ', trim(key)
+        status = -131
+        close(unit_cfg)
+        return
+      end select
+    end do
+
+    if (ios > 0) then
+      write(*,*) 'Error while reading cfg file: ', trim(cfgfile)
+      status = -132
+      close(unit_cfg)
+      return
+    end if
+
+    if (.not. seen_path) then
+      write(*,*) 'Missing required cfg key: path'
+      status = -133
+    else if (.not. seen_infileQ) then
+      write(*,*) 'Missing required cfg key: infileQ'
+      status = -134
+    else if (.not. seen_infileU) then
+      write(*,*) 'Missing required cfg key: infileU'
+      status = -135
+    else if (.not. seen_outfile) then
+      write(*,*) 'Missing required cfg key: outfile'
+      status = -136
+    else if (.not. seen_subim) then
+      write(*,*) 'Missing required cfg key: subim'
+      status = -139
+    else if (.not. seen_rem_mean) then
+      write(*,*) 'Missing required cfg key: rem_mean'
+      status = -141
+    else if (.not. seen_remove_qu_bias) then
+      write(*,*) 'Missing required cfg key: remove_qu_bias'
+      status = -142
+    else if (.not. seen_resiQ) then
+      write(*,*) 'Missing required cfg key: resiQ'
+      status = -143
+    else if (.not. seen_slopeQ) then
+      write(*,*) 'Missing required cfg key: slopeQ'
+      status = -144
+    else if (.not. seen_resiU) then
+      write(*,*) 'Missing required cfg key: resiU'
+      status = -145
+    else if (.not. seen_slopeU) then
+      write(*,*) 'Missing required cfg key: slopeU'
+      status = -146
+    else if (.not. seen_ofac) then
+      write(*,*) 'Missing required cfg key: ofac'
+      status = -149
+    else if (.not. seen_fac) then
+      write(*,*) 'Missing required cfg key: fac'
+      status = -150
+    else if (.not. seen_use_auto_rm_range) then
+      write(*,*) 'Missing required cfg key: use_auto_rm_range'
+      status = -153
+    end if
+
+    if (status == 0 .and. cfg%use_auto_rm_range /= 0 .and. cfg%use_auto_rm_range /= 1) then
+      write(*,*) 'Invalid use_auto_rm_range: expected 0 or 1'
+      status = -154
+    end if
+    if (status == 0 .and. cfg%output_mode /= 0 .and. cfg%output_mode /= 1) then
+      write(*,*) 'Invalid output_mode: expected ap or ri'
+      status = -170
+    end if
+    if (status == 0 .and. trim(cfg%lsq_ref_mode) == 'fixed' .and.&
+    &.not. seen_lsq_ref_fixed_value) then
+      write(*,*) 'lsq_ref_mode=fixed requires lsq_ref_fixed_value to be set'
+      status = -243
+    end if
+    if (status == 0 .and. cfg%ofac < 1) then
+      write(*,*) 'Invalid ofac: expected >= 1'
+      status = -155
+    end if
+    if (status == 0 .and. cfg%tile_ra < 0) then
+      write(*,*) 'Invalid tile_ra: expected >= 0 (0 means auto)'
+      status = -185
+    end if
+    if (status == 0 .and. cfg%tile_dec < 0) then
+      write(*,*) 'Invalid tile_dec: expected >= 0 (0 means auto)'
+      status = -186
+    end if
+    if (status == 0 .and. (cfg%mem_frac_ram <= 0.0_sp .or. cfg%mem_frac_ram > 0.95_sp)) then
+      write(*,*) 'Invalid mem_frac_ram: expected 0 < mem_frac_ram <= 0.95'
+      status = -187
+    end if
+    if (status == 0 .and. (cfg%mem_frac_vram <= 0.0_sp .or. cfg%mem_frac_vram > 0.95_sp)) then
+      write(*,*) 'Invalid mem_frac_vram: expected 0 < mem_frac_vram <= 0.95'
+      status = -190
+    end if
+    if (status == 0 .and. cfg%gpu_vram_mib < 0) then
+      write(*,*) 'Invalid gpu_vram_mib: expected >= 0 (0 means auto-detect)'
+      status = -191
+    end if
+    if (status == 0) then
+      if (trim(cfg%log_level) /= 'error' .and. trim(cfg%log_level) /= 'warn' .and. &
+          trim(cfg%log_level) /= 'info' .and. trim(cfg%log_level) /= 'debug') then
+        write(*,*) 'Invalid log_level: expected error|warn|info|debug'
+        status = -198
+      end if
+    end if
+    if (status == 0 .and. cfg%nrm_out_par < 1) then
+      write(*,*) 'Invalid nrm: expected >= 1'
+      status = -156
+    end if
+    if (status == 0 .and. cfg%use_auto_rm_range == 0) then
+      if (.not. seen_beg_rm) then
+        write(*,*) 'Missing required cfg key: beg_rm (needed for use_auto_rm_range=0)'
+        status = -165
+      else if (.not. seen_end_rm) then
+        write(*,*) 'Missing required cfg key: end_rm (needed for use_auto_rm_range=0)'
+        status = -166
+      else if (.not. seen_nrm_out) then
+        write(*,*) 'Missing required cfg key: nrm (needed for use_auto_rm_range=0)'
+        status = -167
+      else if (cfg%end_rm <= cfg%beg_rm) then
+        write(*,*) 'Invalid end_rm: expected end_rm > beg_rm'
+        status = -168
+      end if
+    end if
+
+    ! I-cube is only needed when Q/U bias correction is enabled.
+    if (status == 0 .and. cfg%remove_qu_bias) then
+      if (.not. seen_path_I) then
+        write(*,*) 'Missing required cfg key: path_I (needed for remove_qu_bias=1)'
+        status = -157
+      else if (.not. seen_infileI) then
+        write(*,*) 'Missing required cfg key: infileI (needed for remove_qu_bias=1)'
+        status = -158
+      end if
+    end if
+
+    ! Multi-band tomography (T1 ticket, plan Sec 5): assemble cfg%band(:)
+    ! from the raw comma-separated per-band keys captured above. Band count
+    ! is derived from infileQ's list length -- there is no separate nbands
+    ! cfg key. A comma-free infileQ (the ordinary single-band case) yields
+    ! n_bands_local=1, and the "populate legacy scalars" step below then
+    ! copies that one band's values straight back into
+    ! cfg%infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I --
+    ! bit-identical to what today's direct cfg%infileQ = trim(val)
+    ! assignment produced, just via one extra hop through cfg%band(1).
+    if (status == 0) then
+      n_bands_local = csv_count(raw_infileQ)
+      if (n_bands_local < 1) then
+        write(*,*) 'Invalid infileQ: empty value'
+        status = -200
+      end if
+    end if
+    if (status == 0 .and. csv_count(raw_infileU) /= n_bands_local) then
+      write(*,*) 'infileQ/infileU band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_infileU)
+      status = -201
+    end if
+    ! T35 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): badchan_file/
+    ! global_badchan_file is optional. When given, it must list exactly
+    ! n_bands_local entries, same as infileQ/infileU.
+    if (status == 0 .and. len_trim(raw_badchan_file) > 0 .and. &
+    & csv_count(raw_badchan_file) /= n_bands_local) then
+      write(*,*) 'infileQ/badchan_file band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_badchan_file)
+      status = -238
+    end if
+    if (status == 0 .and. csv_count(raw_resiQ) /= n_bands_local) then
+      write(*,*) 'infileQ/resiQ band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_resiQ)
+      status = -202
+    end if
+    if (status == 0 .and. csv_count(raw_slopeQ) /= n_bands_local) then
+      write(*,*) 'infileQ/slopeQ band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_slopeQ)
+      status = -203
+    end if
+    if (status == 0 .and. csv_count(raw_resiU) /= n_bands_local) then
+      write(*,*) 'infileQ/resiU band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_resiU)
+      status = -204
+    end if
+    if (status == 0 .and. csv_count(raw_slopeU) /= n_bands_local) then
+      write(*,*) 'infileQ/slopeU band-count mismatch: ', &
+      & n_bands_local, ' vs ', csv_count(raw_slopeU)
+      status = -205
+    end if
+    if (status == 0 .and. seen_infileI) then
+      if (csv_count(raw_infileI) /= n_bands_local) then
+        write(*,*) 'infileQ/infileI band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_infileI)
+        status = -206
+      end if
+    end if
+    if (status == 0 .and. seen_path_I) then
+      if (csv_count(raw_path_I) /= n_bands_local) then
+        write(*,*) 'infileQ/path_I band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_path_I)
+        status = -207
+      end if
+    end if
+    ! T6: subim_chan_blc/trc/inc are optional per-band keys -- only
+    ! band-count-validated if the key was given at all (absent means every
+    ! band defaults to 0/0/1, matching today's "key absent" behaviour).
+    if (status == 0 .and. seen_subim_chan_blc) then
+      if (csv_count(raw_subim_chan_blc) /= n_bands_local) then
+        write(*,*) 'infileQ/subim_chan_blc band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_subim_chan_blc)
+        status = -232
+      end if
+    end if
+    if (status == 0 .and. seen_subim_chan_trc) then
+      if (csv_count(raw_subim_chan_trc) /= n_bands_local) then
+        write(*,*) 'infileQ/subim_chan_trc band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_subim_chan_trc)
+        status = -233
+      end if
+    end if
+    if (status == 0 .and. seen_subim_chan_inc) then
+      if (csv_count(raw_subim_chan_inc) /= n_bands_local) then
+        write(*,*) 'infileQ/subim_chan_inc band-count mismatch: ', &
+        & n_bands_local, ' vs ', csv_count(raw_subim_chan_inc)
+        status = -234
+      end if
+    end if
+    if (status == 0) then
+      if (cfg%reference_band < 1 .or. cfg%reference_band > n_bands_local) then
+        write(*,*) 'Invalid reference_band: ', cfg%reference_band, &
+        & ' (must be between 1 and ', n_bands_local, ')'
+        status = -208
+      end if
+    end if
+
+    if (status == 0) then
+      allocate(cfg%band(n_bands_local))
+      do ib = 1, n_bands_local
+        call csv_get_item(raw_infileQ, ib, cfg%band(ib)%infileQ)
+        call csv_get_item(raw_infileU, ib, cfg%band(ib)%infileU)
+
+        call csv_get_item(raw_resiQ, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%resiQ
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for resiQ, band ', ib
+          status = -210
+          exit
+        end if
+        call csv_get_item(raw_slopeQ, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%slopeQ
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for slopeQ, band ', ib
+          status = -211
+          exit
+        end if
+        call csv_get_item(raw_resiU, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%resiU
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for resiU, band ', ib
+          status = -212
+          exit
+        end if
+        call csv_get_item(raw_slopeU, ib, csv_item)
+        read(csv_item, *, iostat=ios) cfg%band(ib)%slopeU
+        if (ios /= 0) then
+          write(*,*) 'Invalid real for slopeU, band ', ib
+          status = -213
+          exit
+        end if
+
+        if (seen_infileI) then
+          call csv_get_item(raw_infileI, ib, cfg%band(ib)%infileI)
+        else
+          cfg%band(ib)%infileI = ' '
+        end if
+        ! path_I defaults to cfg%path (same as the pre-T1 scalar default,
+        ! rmsynth.cfg line "cfg%path_I = cfg%path" above) when not given.
+        if (seen_path_I) then
+          call csv_get_item(raw_path_I, ib, cfg%band(ib)%path_I)
+        else
+          cfg%band(ib)%path_I = trim(cfg%path)
+        end if
+
+        ! T6: per-band channel sub-range, defaults 0/0/1 ("full band") when
+        ! the key was not given at all -- same as the legacy scalar default.
+        if (seen_subim_chan_blc) then
+          call csv_get_item(raw_subim_chan_blc, ib, csv_item)
+          read(csv_item, *, iostat=ios) cfg%band(ib)%chan_blc
+          if (ios /= 0) then
+            write(*,*) 'Invalid integer for subim_chan_blc, band ', ib
+            status = -235
+            exit
+          end if
+          if (cfg%band(ib)%chan_blc < 0) then
+            write(*,*) 'Error: subim_chan_blc must be >= 0, band ', ib
+            status = -235
+            exit
+          end if
+        else
+          cfg%band(ib)%chan_blc = 0
+        end if
+        if (seen_subim_chan_trc) then
+          call csv_get_item(raw_subim_chan_trc, ib, csv_item)
+          read(csv_item, *, iostat=ios) cfg%band(ib)%chan_trc
+          if (ios /= 0) then
+            write(*,*) 'Invalid integer for subim_chan_trc, band ', ib
+            status = -236
+            exit
+          end if
+          if (cfg%band(ib)%chan_trc > 0 .and. &
+          & cfg%band(ib)%chan_trc < cfg%band(ib)%chan_blc) then
+            write(*,*) 'Error: subim_chan_trc must be >= subim_chan_blc, band ', ib
+            status = -236
+            exit
+          end if
+        else
+          cfg%band(ib)%chan_trc = 0
+        end if
+        if (seen_subim_chan_inc) then
+          call csv_get_item(raw_subim_chan_inc, ib, csv_item)
+          read(csv_item, *, iostat=ios) cfg%band(ib)%chan_inc
+          if (ios /= 0) then
+            write(*,*) 'Invalid integer for subim_chan_inc, band ', ib
+            status = -237
+            exit
+          end if
+          if (cfg%band(ib)%chan_inc < 1) then
+            write(*,*) 'Error: subim_chan_inc must be >= 1, band ', ib
+            status = -237
+            exit
+          end if
+        else
+          cfg%band(ib)%chan_inc = 1
+        end if
+
+        ! T35 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): badchan_file is
+        ! optional. When raw_badchan_file is blank, every band's
+        ! badchan_file stays at its default (blank), meaning no removal.
+        if (len_trim(raw_badchan_file) > 0) then
+          call csv_get_item(raw_badchan_file, ib, cfg%band(ib)%badchan_file)
+        end if
+      end do
+    end if
+
+    ! T35 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): remove_badchan is not
+    ! a separate cfg key. cfg%remove_badchan is set here from whether
+    ! badchan_file/global_badchan_file was given at all -- the same
+    ! convention convolve_cubes/match_cubes already use for their own
+    ! badchan_file.
+    cfg%remove_badchan = (len_trim(raw_badchan_file) > 0)
+    ! T33 (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md): once badchan_file is
+    ! given, every band needs a real file path or the literal value
+    ! 'none'. A blank entry is rejected instead of treated as "nothing to
+    ! list" -- blank previously reached rm_synthesis.f90's own open()
+    ! calls, disabling removal for every band if it hit the reference
+    ! band, or stopping with a generic error if it hit any other band.
+    if (status == 0 .and. cfg%remove_badchan) then
+      do ib = 1, n_bands_local
+        if (len_trim(cfg%band(ib)%badchan_file) == 0) then
+          write(*,*) 'Error: badchan_file/global_badchan_file is blank for band ', ib
+          write(*,*) '  a value was given for this key, so every band needs a real'
+          write(*,*) '  file path or the literal value ''none'' -- blank is not'
+          write(*,*) '  accepted.'
+          status = -239
+          exit
+        end if
+      end do
+    end if
+
+    ! Populate the legacy scalar fields from the reference band, so every
+    ! existing single-band code path in rm_synthesis.f90 (which reads
+    ! cfg%infileQ/infileU/resiQ/slopeQ/resiU/slopeU/infileI/path_I
+    ! directly, unchanged) keeps working exactly as before, for any band
+    ! count.
+    if (status == 0) then
+      cfg%infileQ = cfg%band(cfg%reference_band)%infileQ
+      cfg%infileU = cfg%band(cfg%reference_band)%infileU
+      cfg%resiQ = cfg%band(cfg%reference_band)%resiQ
+      cfg%slopeQ = cfg%band(cfg%reference_band)%slopeQ
+      cfg%resiU = cfg%band(cfg%reference_band)%resiU
+      cfg%slopeU = cfg%band(cfg%reference_band)%slopeU
+      cfg%infileI = cfg%band(cfg%reference_band)%infileI
+      cfg%path_I = cfg%band(cfg%reference_band)%path_I
+      cfg%subim_chan_blc = cfg%band(cfg%reference_band)%chan_blc
+      cfg%subim_chan_trc = cfg%band(cfg%reference_band)%chan_trc
+      cfg%subim_chan_inc = cfg%band(cfg%reference_band)%chan_inc
+      cfg%badchan_file = cfg%band(cfg%reference_band)%badchan_file
+    end if
+
+    close(unit_cfg)
+  end subroutine read_cfg_keyval
+
+  subroutine plan_tile(plan)
+    !! Compute the RAM tile size and VRAM sub-block size for tomography.
+    !! T2 encapsulation ticket: moved verbatim from rm_synthesis.f90's former
+    !! inline planner block -- the arithmetic (RAM byte-budget accounting,
+    !! auto-tiling policy, safety-shrink loop, VRAM sub-block planning) is
+    !! otherwise unchanged, just addressed as plan%field instead of a bare
+    !! local. Caller resolves mem_avail_kb (the /proc/meminfo read) itself
+    !! and passes it in; this routine does no file I/O of its own, only the
+    !! informational VRAM-size prints that were already part of this block.
+    implicit none
+    type(tile_plan_t), intent(inout) :: plan
+
+    integer :: env_len, env_stat, ios_env
+    character(len=128) :: env_vram
+    integer(kind=int64) :: vram_bytes_avail, vram_safe_bytes
+    integer(kind=int64) :: sub_px_max
+    real(dp) :: vram_budget_total_bytes, vram_budget_per_slot_bytes
+
+     ! RAM tile planner budget (bytes per output pixel).
+     !
+     ! Count arrays that are allocated at tile_ra*tile_dec scale in this run,
+     ! plus non-staging full-tile prep buffers (CPU or GPU path). Do NOT charge
+     ! staging-strip buffers here; they are sized by ny_sub and handled via the
+     ! VRAM planner. This avoids over-shrinking tile_dec for CPU/non-staging jobs.
+     !
+     ! bytes_per_tile_pixel_ram_out tracks only the OUTPUT-side arrays (p/phi,
+     ! mask, nvalid, cubestat maps) -- the ones io_overlap double-buffers so a
+     ! tile's write can run on a background thread while the next tile's
+     ! read/mask/prep/compute reuses the other buffer. Everything else (specQ/
+     ! specU/specMask/specI and the non-staging prep buffers) is read/populated
+     ! fresh every tile regardless of io_overlap and is never double-buffered.
+    plan%bytes_per_tile_pixel_ram = 0_int64
+    plan%bytes_per_tile_pixel_ram_out = 0_int64
+
+     ! Always allocated full-tile arrays: specQ/specU (input) + p/phi (output).
+    plan%bytes_per_tile_pixel_ram = plan%bytes_per_tile_pixel_ram +&
+    &int(4,kind=int64)*int(2,kind=int64)*int(plan%nz_out,kind=int64)
+    plan%bytes_per_tile_pixel_ram_out = plan%bytes_per_tile_pixel_ram_out +&
+    &int(4,kind=int64)*int(2,kind=int64)*int(plan%nrm_out,kind=int64)
+
+     ! Optional full-tile inputs.
+    if(plan%use_input_mask)then
+       plan%bytes_per_tile_pixel_ram = plan%bytes_per_tile_pixel_ram +&
+       &int(4,kind=int64)*int(plan%nz_out,kind=int64)
+    endif
+    if(plan%need_icube)then
+       plan%bytes_per_tile_pixel_ram = plan%bytes_per_tile_pixel_ram +&
+       &int(4,kind=int64)*int(plan%nz_out,kind=int64)
+    endif
+
+     ! Full-tile mask and valid-channel count outputs.
+    plan%bytes_per_tile_pixel_ram_out = plan%bytes_per_tile_pixel_ram_out +&
+    &int(1,kind=int64)*int(plan%nz_out,kind=int64) + int(2,kind=int64)
+
+     ! Optional cubestat maps (peak/rm_peak/ang_peak/snr), 4 float maps.
+    if(plan%cubestat)then
+       plan%bytes_per_tile_pixel_ram_out = plan%bytes_per_tile_pixel_ram_out +&
+       &int(4,kind=int64)*int(4,kind=int64)
+    endif
+
+     ! Non-staging prep buffers (full tile): Q/U/wts + wsum (+ means if enabled).
+    plan%bytes_per_tile_pixel_ram = plan%bytes_per_tile_pixel_ram + int(4,kind=int64) * (&
+    &int(3,kind=int64)*int(plan%nz_out,kind=int64) + int(1,kind=int64))
+    if(plan%rem_mean.gt.0)then
+       plan%bytes_per_tile_pixel_ram = plan%bytes_per_tile_pixel_ram +&
+       &int(4,kind=int64)*int(2,kind=int64)
+    endif
+
+     ! io_overlap keeps two copies of the output-side arrays alive at once
+     ! (the tile being written + the tile being computed into the other slot).
+    if(plan%io_overlap)then
+       plan%bytes_per_tile_pixel_ram_out = plan%bytes_per_tile_pixel_ram_out * 2_int64
+    endif
+    plan%bytes_per_tile_pixel_ram = plan%bytes_per_tile_pixel_ram + plan%bytes_per_tile_pixel_ram_out
+
+     ! VRAM sub-block budget (bytes per sub-block pixel). This is separate from
+     ! RAM planning and should reflect per-offload working sets only.
+    plan%bytes_per_vram_pixel = int(4,kind=int64) * (&
+    &int(3,kind=int64)*int(plan%nz_out,kind=int64) +&
+    &int(2,kind=int64)*int(plan%nrm_out,kind=int64) +&
+    &int(1,kind=int64))
+    if(plan%rem_mean.gt.0)then
+       plan%bytes_per_vram_pixel = plan%bytes_per_vram_pixel +&
+       &int(4,kind=int64)*int(2,kind=int64)
+    endif
+
+    plan%mem_safe_bytes = int(plan%mem_frac_ram *&
+    &real(plan%mem_avail_kb,kind=dp) * 1024.0_dp,&
+    &kind=int64)
+    if(plan%mem_safe_bytes.le.plan%bytes_per_tile_pixel_ram)then
+       plan%mem_safe_bytes = plan%bytes_per_tile_pixel_ram
+    endif
+    plan%tile_pixels_max = plan%mem_safe_bytes / plan%bytes_per_tile_pixel_ram
+    if(plan%tile_pixels_max.lt.1_int64)plan%tile_pixels_max = 1_int64
+    plan%image_pixels_total = plan%nx_out
+    plan%image_pixels_total = plan%image_pixels_total * plan%ny_out
+
+    plan%tile_ra = plan%tile_ra_in
+    plan%tile_dec = plan%tile_dec_in
+
+     ! Auto tiling policy (IO-optimal for FITS RA-fastest layout):
+     ! RA (NAXIS1) is the contiguous axis on disk, so we read FULL-RA
+     ! "Dec strips" -- each plane read is then one contiguous block of
+     ! nx_out RA samples x a contiguous range of Dec rows. We keep
+     ! tile_ra = nx_out and pack as many Dec rows as mem_frac_ram allows.
+     ! Only if a single full-RA Dec row does not fit do we fall back to
+     ! subdividing RA (rare; extremely wide images).
+    if(plan%tile_auto .or. plan%tile_ra.le.0 .or. plan%tile_dec.le.0)then
+       if(plan%tile_pixels_max.ge.plan%image_pixels_total)then
+          plan%tile_ra = plan%nx_out
+          plan%tile_dec = plan%ny_out
+       else if(plan%tile_pixels_max.ge.int(plan%nx_out,kind=int64))then
+          ! At least one full-RA Dec row fits -> Dec strips.
+          plan%tile_ra = plan%nx_out
+          plan%tile_dec = int(plan%tile_pixels_max /&
+          &int(plan%nx_out,kind=int64))
+          if(plan%tile_dec.lt.1)plan%tile_dec = 1
+          if(plan%tile_dec.gt.plan%ny_out)plan%tile_dec = plan%ny_out
+       else
+          ! A single full-RA row exceeds the budget; fall back
+          ! to RA-subtiled single Dec rows.
+          plan%tile_dec = 1
+          plan%tile_ra = int(plan%tile_pixels_max)
+          if(plan%tile_ra.lt.1)plan%tile_ra = 1
+          if(plan%tile_ra.gt.plan%nx_out)plan%tile_ra = plan%nx_out
+       endif
+    else
+       plan%tile_ra = max(1,min(plan%tile_ra,plan%nx_out))
+       plan%tile_dec = max(1,min(plan%tile_dec,plan%ny_out))
+    endif
+
+     ! Safety shrink: reduce Dec rows first (keep full RA contiguous);
+     ! only shrink RA once the strip is already a single Dec row.
+    plan%tile_bytes_est = int(plan%tile_ra,kind=int64) *&
+    &int(plan%tile_dec,kind=int64) * plan%bytes_per_tile_pixel_ram
+    do while(plan%tile_bytes_est.gt.plan%mem_safe_bytes .and.&
+    &(plan%tile_ra.gt.1 .or. plan%tile_dec.gt.1))
+       if(plan%tile_dec.gt.1)then
+          plan%tile_dec = max(1,plan%tile_dec/2)
+       else
+          plan%tile_ra = max(1,plan%tile_ra/2)
+       endif
+       plan%tile_bytes_est = int(plan%tile_ra,kind=int64) *&
+       &int(plan%tile_dec,kind=int64) * plan%bytes_per_tile_pixel_ram
+    enddo
+
+     !----------------------------------------------------
+     ! VRAM sub-block planning (Phase-1 two-level tiling).
+     ! The RAM block (tile_ra x tile_dec) is the disk-read unit.
+     ! Each RAM block is processed in Dec-strip sub-blocks sized to
+     ! fit a fraction (mem_frac_vram) of GPU VRAM, so the per-offload
+     ! device footprint is bounded independently of the read size.
+     !
+     ! VRAM size precedence: gpu_vram_mib (cfg) -> device query
+     ! (TODO: cudaMemGetInfo, nvfortran only) -> GPU_MEM_MIB env ->
+     ! default. On CPU-only runs with nothing specified, no
+     ! subdivision occurs (sub-block == RAM block) so output is
+     ! bit-identical to the single-level path.
+    plan%gpu_vram_mib_eff = 0
+    if(plan%gpu_vram_mib.gt.0)then
+       plan%gpu_vram_mib_eff = plan%gpu_vram_mib
+       write(*,*)" VRAM size from cfg gpu_vram_mib (MiB): ",&
+       &plan%gpu_vram_mib_eff
+    else
+       ! TODO(device-query): when built with nvfortran, call
+       ! cudaMemGetInfo here to auto-detect free VRAM. Not
+       ! available via gfortran/libgomp offload; fall back.
+       env_vram = ' '
+       env_len = 0
+       env_stat = 0
+       call get_environment_variable('GPU_MEM_MIB',&
+       &env_vram,env_len,env_stat)
+       if(env_stat.eq.0 .and. env_len.gt.0)then
+          read(env_vram(1:env_len),*,iostat=ios_env)&
+          &plan%gpu_vram_mib_eff
+          if(ios_env.ne.0 .or. plan%gpu_vram_mib_eff.le.0)then
+             plan%gpu_vram_mib_eff = 0
+          else
+             write(*,*)" VRAM size from env "//&
+             &"GPU_MEM_MIB (MiB): ",plan%gpu_vram_mib_eff
+          endif
+       endif
+       if(plan%gpu_vram_mib_eff.le.0)then
+          if(plan%use_gpu_actual)then
+             plan%gpu_vram_mib_eff = 4096
+             write(*,*)" WARNING: VRAM size not "//&
+             &"specified; assuming (MiB): ",&
+             &plan%gpu_vram_mib_eff
+             write(*,*)" Set gpu_vram_mib in cfg or "//&
+             &"GPU_MEM_MIB env to match your card."
+          else
+             plan%gpu_vram_mib_eff = 0
+          endif
+       endif
+    endif
+
+     ! cos/sin templates stay resident on the device across sub-blocks.
+     ! Templates are full-size (nz_out, nrm_out), not (ngood_chan, nrm_out)
+    plan%template_bytes = int(4,kind=int64)*int(plan%nz_out,kind=int64)*&
+    &int(plan%nrm_out,kind=int64)*int(2,kind=int64)
+    plan%inflight_slots_planned = 1
+    if(plan%use_gpu_actual .and. plan%tile_dec.gt.1)then
+       ! Ping-pong staging can keep two sub-blocks resident/in-flight.
+       ! Treat mem_frac_vram as TOTAL in-flight budget and split per slot.
+       plan%inflight_slots_planned = 2
+    endif
+    plan%mem_frac_vram_per_slot = plan%mem_frac_vram /&
+    &real(plan%inflight_slots_planned,kind=dp)
+    if(plan%gpu_vram_mib_eff.gt.0)then
+       vram_bytes_avail = int(plan%gpu_vram_mib_eff,kind=int64)*&
+       &1024_int64*1024_int64
+       vram_budget_total_bytes = plan%mem_frac_vram *&
+       &real(vram_bytes_avail,kind=dp)
+       vram_budget_per_slot_bytes = (vram_budget_total_bytes -&
+       &real(plan%template_bytes,kind=dp)) /&
+       &real(plan%inflight_slots_planned,kind=dp)
+       if(vram_budget_per_slot_bytes.lt.&
+       &real(plan%bytes_per_vram_pixel,kind=dp))then
+          vram_budget_per_slot_bytes = real(plan%bytes_per_vram_pixel,kind=dp)
+       endif
+       vram_safe_bytes = int(vram_budget_per_slot_bytes,kind=int64)
+       if(vram_safe_bytes.lt.plan%bytes_per_vram_pixel)then
+          vram_safe_bytes = plan%bytes_per_vram_pixel
+       endif
+       sub_px_max = vram_safe_bytes / plan%bytes_per_vram_pixel
+       if(sub_px_max.lt.1_int64)sub_px_max = 1_int64
+       plan%ny_sub = int(sub_px_max / int(plan%tile_ra,kind=int64))
+       if(plan%ny_sub.lt.1)plan%ny_sub = 1
+       if(plan%ny_sub.gt.plan%tile_dec)plan%ny_sub = plan%tile_dec
+    else
+       plan%ny_sub = plan%tile_dec
+    endif
+     ! We should stage only on the gpu:
+    plan%use_staging = (plan%ny_sub.lt.plan%tile_dec) .and. plan%use_gpu_actual
+  end subroutine plan_tile
+
+  integer(kind=int64) function compute_tile_read_bytes(pixels_per_plane, &
+  &nz_total, use_input_mask, need_icube) result(nbytes)
+    !! T3a I/O orchestration ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+    !! estimated bytes moved by one tile's parallel FITS read (Q+U always,
+    !! plus input mask and/or I cube if enabled) -- moved verbatim from the
+    !! tile loop, used only for the tile_read log line's byte-count field,
+    !! not for any actual read logic.
+    implicit none
+    integer(kind=int64), intent(in) :: pixels_per_plane, nz_total
+    logical, intent(in) :: use_input_mask, need_icube
+
+    nbytes = pixels_per_plane*nz_total*4_int64*2_int64
+    if(use_input_mask) nbytes = nbytes + pixels_per_plane*nz_total*4_int64
+    if(need_icube) nbytes = nbytes + pixels_per_plane*nz_total*4_int64
+  end function compute_tile_read_bytes
+
+  subroutine split_channels_across_threads(nz_total, n_threads, base, rem)
+    !! T3a I/O orchestration ticket: per-thread channel-count split for the
+    !! parallel channel-chunked FITS read in the tile loop -- moved verbatim,
+    !! only var -> argument. n_threads threads each read base channels, with
+    !! the first rem threads (per the per-thread merge() below the call site)
+    !! reading one extra channel to cover the remainder.
+    implicit none
+    integer(kind=int64), intent(in) :: nz_total
+    integer, intent(in) :: n_threads
+    integer(kind=int64), intent(out) :: base, rem
+
+    base = nz_total / int(n_threads,kind=int64)
+    rem  = mod(nz_total, int(n_threads,kind=int64))
+  end subroutine split_channels_across_threads
+
+  subroutine write_runtime_estimate(report_file, npix_total, nchan_total, nchan_good, &
+                                    nbad_chan, nrm_out, output_mode, tile_ra, tile_dec, &
+                                    nx_out, ny_out, tile_bytes_est, mem_frac_ram, status)
+    !! Write a dry-run runtime estimate table.
+    implicit none
+    character(len=*), intent(in) :: report_file
+    integer(int64), intent(in) :: npix_total
+    integer(int32), intent(in) :: nchan_total, nchan_good, nbad_chan, nrm_out, output_mode
+    integer(int32), intent(in) :: tile_ra, tile_dec, nx_out, ny_out
+    integer(int64), intent(in) :: tile_bytes_est
+    real(sp), intent(in) :: mem_frac_ram
+    integer(int32), intent(out) :: status
+
+    integer(int32) :: unit_out, i
+    integer(int64) :: tiles_x, tiles_y, total_tiles
+    real(dp) :: pix_dp, nchan_dp, nrm_dp
+    real(dp) :: flops_total, flops_kernel, flops_per_term, flops_per_rm
+    real(dp) :: gflops_rates(5), hours_est(5), seconds_est(5)
+    character(len=16) :: mode_name
+
+    status = 0
+    unit_out = 97
+    open(unit_out, file=report_file, status='replace', action='write', iostat=status)
+    if (status /= 0) return
+
+    pix_dp = real(npix_total, dp)
+    nchan_dp = real(nchan_good, dp)
+    nrm_dp = real(nrm_out, dp)
+
+    ! Lower-bound arithmetic model for the current implementation.
+    ! Dot products dominate, so we count 8 FLOPs per channel/RM term.
+    flops_per_term = 8.0_dp
+    if (output_mode == 1) then
+      mode_name = 'RI'
+      flops_per_rm = 4.0_dp
+    else
+      mode_name = 'AP'
+      flops_per_rm = 12.0_dp
+    end if
+
+    flops_kernel = pix_dp * nchan_dp * nrm_dp * flops_per_term
+    flops_total = flops_kernel + pix_dp * nrm_dp * flops_per_rm
+
+    gflops_rates = [1.0_dp, 2.0_dp, 4.0_dp, 8.0_dp, 12.0_dp]
+    do i = 1, size(gflops_rates)
+      seconds_est(i) = flops_total / (gflops_rates(i) * 1.0d9)
+      hours_est(i) = seconds_est(i) / 3600.0_dp
+    end do
+
+    write(unit_out,'(A)') 'RM-synthesis dry-run runtime estimate'
+    write(unit_out,'(A)') '-------------------------------------'
+    write(unit_out,'(A,1X,I0)') 'Total pixels:', npix_total
+    write(unit_out,'(A,1X,I0)') 'Total frequency channels in cube:', nchan_total
+    write(unit_out,'(A,1X,I0)') 'Good frequency channels used:', nchan_good
+    write(unit_out,'(A,1X,I0)') 'Explicit bad channels masked:', nbad_chan
+    write(unit_out,'(A,1X,I0)') 'RM samples:', nrm_out
+    write(unit_out,'(A,1X,A)') 'Output mode:', trim(mode_name)
+    write(unit_out,'(A,1X,F8.3)') 'RAM memory fraction target (mem_frac_ram):', mem_frac_ram
+    write(unit_out,'(A,1X,I0,1X,A,1X,I0)') 'Tile size (x by y):', tile_ra, 'x', tile_dec
+    write(unit_out,'(A,1X,ES16.6)') 'Tile memory (bytes):', real(tile_bytes_est,dp)
+    tiles_x = (int(nx_out,kind=int64) + int(tile_ra,kind=int64) - 1_int64) / &
+              int(tile_ra,kind=int64)
+    tiles_y = (int(ny_out,kind=int64) + int(tile_dec,kind=int64) - 1_int64) / &
+              int(tile_dec,kind=int64)
+    total_tiles = tiles_x * tiles_y
+    write(unit_out,'(A,1X,I0,1X,A,1X,I0,1X,A,1X,I0)') 'Tiles across x/y/total:', &
+      tiles_x, 'x', tiles_y, '=>', total_tiles
+    write(unit_out,'(A)') ' '
+    if (nchan_good < nchan_total) then
+      write(unit_out,'(A)') 'Channel reduction comes from explicit masking or channel selection.'
+    else
+      write(unit_out,'(A)') 'All channels in the selected span are used.'
+    end if
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A,1X,ES16.6)') 'Kernel FLOPs (dot products):', flops_kernel
+    write(unit_out,'(A,1X,ES16.6)') 'Total estimated FLOPs:', flops_total
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'Estimated wall time at sustained throughput:'
+    write(unit_out,'(A)') '   GFLOP/s        seconds          hours'
+    do i = 1, size(gflops_rates)
+      write(unit_out,'(F8.1,2X,F12.3,2X,F10.3)') gflops_rates(i), seconds_est(i), hours_est(i)
+    end do
+
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'RAM read tiling (full-RA Dec strips)'
+    write(unit_out,'(A)') '------------------------------------'
+    write(unit_out,'(A)') 'The cube is read in full-RA Dec strips (RA is the'
+    write(unit_out,'(A)') 'contiguous FITS axis), sized so one strip fits the'
+    write(unit_out,'(A)') 'mem_frac_ram budget. These are the ACTUAL values for'
+    write(unit_out,'(A)') 'this run:'
+    write(unit_out,'(A,1X,F8.3)') '  mem_frac_ram:', mem_frac_ram
+    write(unit_out,'(A,1X,I0,1X,A,1X,I0)') '  RAM strip (RA x Dec) px:', &
+      tile_ra, 'x', tile_dec
+    write(unit_out,'(A,1X,ES12.5,1X,A)') '  RAM strip size:', &
+      real(tile_bytes_est,dp)/(1024.0_dp*1024.0_dp), 'MB'
+    write(unit_out,'(A,1X,I0)') '  Dec strips to cover image:', int(tiles_y)
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'To use larger/smaller strips, change mem_frac_ram'
+    write(unit_out,'(A)') '(fraction of total system RAM) or set tile_auto=n with'
+    write(unit_out,'(A)') 'explicit tile_ra/tile_dec.'
+
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'GPU memory advisory (two-level tiling)'
+    write(unit_out,'(A)') '--------------------------------------'
+    write(unit_out,'(A)') 'Under two-level tiling the read tile and the GPU'
+    write(unit_out,'(A)') 'offload unit are DECOUPLED, so the read tile does'
+    write(unit_out,'(A)') 'NOT need to fit in VRAM:'
+    write(unit_out,'(A)') '  - tile_ra / tile_dec size the host RAM read block'
+    write(unit_out,'(A)') '    (bigger is better for disk I/O). Control it with'
+    write(unit_out,'(A)') '    mem_frac_ram (or set tile_auto=n, tile_ra/tile_dec).'
+    write(unit_out,'(A)') '  - The GPU footprint is bounded SEPARATELY by the VRAM'
+    write(unit_out,'(A)') '    sub-block, controlled by mem_frac_vram and gpu_vram_mib.'
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'If you hit a GPU out-of-memory (nvptx_alloc error):'
+    write(unit_out,'(A)') '  - do NOT shrink tile_ra/tile_dec for VRAM;'
+    write(unit_out,'(A)') '  - lower mem_frac_vram (e.g. 0.4), and/or'
+    write(unit_out,'(A)') '  - set gpu_vram_mib to your card size in MiB'
+    write(unit_out,'(A)') '    (cfg > GPU_MEM_MIB env > built-in default).'
+    write(unit_out,'(A)') ' '
+    write(unit_out,'(A)') 'See the "Two-level memory tiling (RAM -> VRAM)" section'
+    write(unit_out,'(A)') 'appended below for the actual RAM-block and VRAM'
+    write(unit_out,'(A)') 'sub-block sizes computed for this run.'
+
+    close(unit_out)
+  end subroutine write_runtime_estimate
+
+  subroutine split_key_value(raw_line, key, val, has_kv)
+    implicit none
+    character(len=*), intent(in) :: raw_line
+    character(len=*), intent(out) :: key, val
+    logical, intent(out) :: has_kv
+    character(len=len(raw_line)) :: line
+    integer(int32) :: p1, p2, peq, pcut
+
+    key = ' '
+    val = ' '
+    has_kv = .false.
+
+    line = raw_line
+    p1 = index(line, ';')
+    p2 = index(line, '#')
+    if (p1 > 0 .and. p2 > 0) then
+      pcut = min(p1, p2)
+    else if (p1 > 0) then
+      pcut = p1
+    else
+      pcut = p2
+    end if
+    if (pcut > 0) line = line(1:pcut - 1)
+
+    line = adjustl(line)
+    if (len_trim(line) == 0) return
+
+    peq = index(line, '=')
+    if (peq <= 1) return
+
+    key = adjustl(line(1:peq - 1))
+    val = adjustl(line(peq + 1:))
+    if (len_trim(key) == 0 .or. len_trim(val) == 0) return
+
+    key = trim(key)
+    val = trim(val)
+    has_kv = .true.
+  end subroutine split_key_value
+
+  function lower_ascii(str) result(out)
+    implicit none
+    character(len=*), intent(in) :: str
+    character(len=len(str)) :: out
+    integer(int32) :: i, c
+
+    out = str
+    do i = 1, len(out)
+      c = iachar(out(i:i))
+      if (c >= iachar('A') .and. c <= iachar('Z')) then
+        out(i:i) = achar(c + 32)
+      end if
+    end do
+  end function lower_ascii
+
+  logical function flag_from_value(val)
+    implicit none
+    character(len=*), intent(in) :: val
+    character(len=64) :: t
+
+    t = lower_ascii(adjustl(trim(val)))
+    flag_from_value = .false.
+    if (len_trim(t) == 0) return
+
+    if (t(1:1) == '1' .or. t(1:1) == 'y' .or. t(1:1) == 't') then
+      flag_from_value = .true.
+    end if
+  end function flag_from_value
+
+  !===========================================================================
+  ! Comma-separated-list helpers (multi-band-tomography plan, T1 ticket).
+  !===========================================================================
+  ! A comma-free string is a length-1 list -- csv_count/csv_get_item make
+  ! no distinction between "one value" and "a list of one", which is the
+  ! whole point of the unified single-value/multi-band cfg design (plan
+  ! Sec 5): every per-band key is parsed by the same code regardless of
+  ! band count.
+  function csv_count(str) result(n)
+    !! Number of comma-separated items in str (1 if no comma present,
+    !! 0 for a blank/empty string).
+    implicit none
+    character(len=*), intent(in) :: str
+    integer(int32) :: n
+    integer(int32) :: i
+
+    n = 0
+    if (len_trim(str) == 0) return
+    n = 1
+    do i = 1, len_trim(str)
+      if (str(i:i) == ',') n = n + 1
+    end do
+  end function csv_count
+
+  subroutine csv_get_item(str, idx, item)
+    !! Extract the idx-th (1-based) comma-separated item from str, trimmed
+    !! of surrounding blanks. item is blank if idx is out of range.
+    implicit none
+    character(len=*), intent(in) :: str
+    integer(int32), intent(in) :: idx
+    character(len=*), intent(out) :: item
+    integer(int32) :: i, cur, p0, n
+
+    item = ' '
+    n = len_trim(str)
+    if (n == 0) return
+
+    cur = 1
+    p0 = 1
+    do i = 1, n
+      if (str(i:i) == ',') then
+        if (cur == idx) then
+          item = adjustl(str(p0:i - 1))
+          return
+        end if
+        cur = cur + 1
+        p0 = i + 1
+      end if
+    end do
+    if (cur == idx) item = adjustl(str(p0:n))
+  end subroutine csv_get_item
+
+  !===========================================================================
+  ! Safe intra-write parallelism for nwriters>1 (T6).
+  !===========================================================================
+  ! nwriters>1 used to open N CFITSIO handles onto the same output
+  ! file, which CFITSIO silently aliases onto one shared internal buffer
+  ! (fits_already_open() -- see the T4 postmortem in
+  ! planning/IO_PARALLEL_OPTIMISATION_PLAN.md), corrupting that buffer
+  ! under concurrent ftpsse() calls and hard-clamped to 1 as a result.
+  !
+  ! The three routines below make N>1 safe by never asking CFITSIO to
+  ! touch the output file concurrently at all: write_rm_chunk_raw() writes
+  ! pixel data directly to the file's *path* via plain Fortran STREAM I/O,
+  ! completely bypassing CFITSIO's handle/buffer machinery for the pixel
+  ! data. Each call opens its own OS-level file descriptor (via
+  ! `newunit=`), so concurrent calls from different threads -- each
+  ! writing a disjoint byte range -- rely only on the POSIX guarantee that
+  ! writes to disjoint byte ranges of one file are safe from multiple
+  ! threads/processes, not on any assumption about CFITSIO's internals.
+  ! CFITSIO itself is only ever used, on a single handle, to create the
+  ! file and write its header (before this code runs) and to close it
+  ! (after) -- see the "Parallel write handle setup" section in
+  ! rm_synthesis.f90 for how the byte offset these routines need is
+  ! obtained (FTGHAD, called once).
+
+  logical function host_is_big_endian() result(is_be)
+    !! True if the host's native byte order is big-endian. FITS mandates
+    !! big-endian (IEEE-754) for all binary data; every realistic
+    !! deployment target for this tool (x86_64, ARM64 -- Setonix included)
+    !! is little-endian, so write_rm_chunk_raw always ends up swapping in
+    !! practice. Checking at runtime rather than hard-coding "always swap"
+    !! means this is also *correct* (a no-op) on the rare big-endian host,
+    !! instead of silently double-swapping and corrupting the output --
+    !! this is the one piece of this feature where "assume the common
+    !! case" would be an actual portability bug, not just a missed
+    !! optimisation.
+    implicit none
+    integer(int32) :: probe
+    integer(int8) :: bytes(4)
+
+    probe = 1_int32
+    bytes = transfer(probe, bytes)
+    is_be = (bytes(1) == 0_int8)
+  end function host_is_big_endian
+
+  subroutine swap_bytes_r4_inplace(buf, n)
+    !! Reverses the 4 bytes of every real(sp) element of buf, in place.
+    !! Self-inverse (applying it twice restores the original bytes), so
+    !! the same routine converts host-native -> big-endian and back --
+    !! only ever called in the host-native -> big-endian direction here.
+    implicit none
+    integer(kind=int64), intent(in) :: n
+    real(sp), intent(inout) :: buf(n)
+    integer(kind=int64) :: i
+    integer(int8) :: b(4), t
+
+    do i = 1_int64, n
+      b = transfer(buf(i), b)
+      t = b(1); b(1) = b(4); b(4) = t
+      t = b(2); b(2) = b(3); b(3) = t
+      buf(i) = transfer(b, buf(i))
+    end do
+  end subroutine swap_bytes_r4_inplace
+
+  subroutine write_rm_chunk_raw(file_path, datastart, nx_out, ny_out,&
+       &ix_out_beg, ix_out_end, iy_out_beg, iy_out_end,&
+       &rm_beg, rm_end, data)
+    !! Writes one contiguous RM-bin range [rm_beg,rm_end] of one tile's
+    !! output data directly to disk, bypassing CFITSIO's ftpsse for the
+    !! pixel data entirely -- see the module-level comment above for why.
+    !!
+    !! BYTE-OFFSET MATH: `datastart` is the 0-based byte offset of the
+    !! start of this HDU's pixel data (from CFITSIO's FTGHAD, fetched once
+    !! by the caller). For output cube shape (nx_out, ny_out, nrm_out),
+    !! pixel (ix,iy,irm) [1-based] sits at 0-based pixel index
+    !! (irm-1)*ny_out*nx_out + (iy-1)*nx_out + (ix-1) from datastart, i.e.
+    !! byte offset datastart + 4*(that index) for real*4 (BITPIX=-32)
+    !! data -- matching the FITS convention (x fastest, then y, then RM
+    !! slowest) that p_tile_arr/phi_tile_arr already use in memory.
+    !!
+    !! TWO WRITE PATTERNS, chosen by whether the tile spans the cube's
+    !! full RA width (ix_out_beg=1 .and. ix_out_end=nx_out):
+    !!   - full width (the normal/recommended tiling mode -- see the RAM
+    !!     tile planner in rm_synthesis.f90): consecutive output rows
+    !!     follow each other with no gap on disk, so one RM-plane's worth
+    !!     of tile rows is a SINGLE contiguous run -- one write per plane.
+    !!   - partial width (rare: only reached via an explicit tile_ra
+    !!     override, or the "single Dec row still too big" auto-tiler
+    !!     fallback): rows are contiguous in *memory* (p_tile_arr has x as
+    !!     the fastest-varying dimension) but NOT contiguous on *disk*
+    !!     with the next row (the columns outside this tile belong to a
+    !!     different tile and sit in between) -- one write per row.
+    !! Both patterns share one buffer, sized for a single RM-plane and
+    !! reused across the whole chunk; only the number of writes issued
+    !! from it differs.
+    !!
+    !! ENDIANNESS: byte-swapped via swap_bytes_r4_inplace on a *copy*
+    !! (plane_buf) before writing -- the caller's data array (the live
+    !! tile-output buffer) is never modified.
+    implicit none
+    character(len=*), intent(in) :: file_path
+    integer(kind=int64), intent(in) :: datastart
+    integer, intent(in) :: nx_out, ny_out
+    integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
+    integer, intent(in) :: rm_beg, rm_end
+    real(sp), intent(in) :: data(:)
+      !! This thread's contiguous (x,y,rm) chunk: nx_tile*ny_tile reals
+      !! per RM-plane, planes back-to-back -- exactly how p_tile_arr/
+      !! phi_tile_arr are laid out, so the caller just passes a section
+      !! starting at this chunk's first element.
+
+    integer :: u, ios
+    logical :: full_width, need_swap
+    integer(kind=int64) :: row_len, n_rows, plane_elems, plane_stride
+    integer(kind=int64) :: irm, iy_local, mem_off, byte_pos
+    real(sp), allocatable :: plane_buf(:)
+
+    full_width = (ix_out_beg == 1 .and. ix_out_end == nx_out)
+    need_swap  = .not. host_is_big_endian()
+    row_len      = int(ix_out_end - ix_out_beg + 1, kind=int64)
+    n_rows       = int(iy_out_end - iy_out_beg + 1, kind=int64)
+    plane_elems  = row_len * n_rows
+    plane_stride = int(nx_out, kind=int64) * int(ny_out, kind=int64)
+
+    ! status='old' because CFITSIO has already created and header-written
+    ! this file before any raw write is ever dispatched.
+    !
+    ! newunit=, guarded by a named critical section: the Fortran standard
+    ! does not guarantee ANY I/O statement -- open() included, newunit=
+    ! or not -- is safe to call concurrently without explicit
+    ! synchronization. Confirmed the hard way: this call is reached
+    ! concurrently (once per nwriters worker, each opening the
+    ! SAME file path for its own disjoint byte range) from do_tile_write's
+    ! own `!$omp parallel do`, and a first attempt at fixing a real,
+    ! observed corruption here (planning/RMCLEAN_INTEGRATION_PLAN.md
+    ! ticket T4c) used fixed, pre-assigned per-thread unit numbers instead
+    ! -- which fixed the observed race but only by manual, cross-file
+    ! bookkeeping (every other unit-number range in this codebase has to
+    ! stay disjoint from it by inspection, not by anything the compiler or
+    ! runtime enforces). This critical section makes unit allocation
+    ! itself atomic instead: genuinely unique (real newunit= semantics,
+    ! no manual range to maintain), while the actual write below still
+    ! runs fully in parallel per thread -- only the brief "grab a unit"
+    ! step is serialized, not the I/O itself. Named (not a bare `!$omp
+    ! critical`) so it doesn't share a lock with unrelated critical
+    ! sections elsewhere in this module (e.g. logger_write_lock).
+    !$omp critical (raw_write_open_lock)
+    open(newunit=u, file=trim(file_path), access='stream',&
+    &form='unformatted', status='old', action='write', iostat=ios)
+    !$omp end critical (raw_write_open_lock)
+    if(ios .ne. 0)then
+      call log_message('error','tile_write',&
+      &'write_rm_chunk_raw: failed to open '//trim(file_path))
+      return
+    endif
+
+    allocate(plane_buf(plane_elems))
+    mem_off = 1_int64
+    do irm = int(rm_beg,kind=int64), int(rm_end,kind=int64)
+      plane_buf = data(mem_off : mem_off+plane_elems-1_int64)
+      if(need_swap) call swap_bytes_r4_inplace(plane_buf, plane_elems)
+
+      if(full_width)then
+        byte_pos = datastart&
+        &+ (irm-1_int64)*plane_stride*4_int64&
+        &+ int(iy_out_beg-1,kind=int64)*int(nx_out,kind=int64)*4_int64&
+        &+ 1_int64
+        write(u, pos=byte_pos, iostat=ios) plane_buf
+        if(ios .ne. 0) call log_message('error','tile_write',&
+        &'write_rm_chunk_raw: write failed (full-width) for '//trim(file_path))
+      else
+        do iy_local = 0_int64, n_rows-1_int64
+          byte_pos = datastart&
+          &+ (irm-1_int64)*plane_stride*4_int64&
+          &+ (int(iy_out_beg,kind=int64)-1_int64+iy_local)*int(nx_out,kind=int64)*4_int64&
+          &+ int(ix_out_beg-1,kind=int64)*4_int64 + 1_int64
+          write(u, pos=byte_pos, iostat=ios)&
+          &plane_buf(iy_local*row_len+1_int64 : iy_local*row_len+row_len)
+          if(ios .ne. 0) call log_message('error','tile_write',&
+          &'write_rm_chunk_raw: write failed (row) for '//trim(file_path))
+        enddo
+      endif
+      mem_off = mem_off + plane_elems
+    enddo
+    deallocate(plane_buf)
+    close(u)
+  end subroutine write_rm_chunk_raw
+
+  subroutine populate_write_job(job, par_wunit_amp, par_wunit_pha, &
+  &path_amp, path_pha, datastart_amp, datastart_pha, n_write_threads, &
+  &out_mask_open, out_nvalid_open, out_peak_open, out_rmpeak_open, &
+  &out_angpeak_open, out_snr_open, group, naxes_out_in, naxes_mask, &
+  &naxes_nvalid, naxes_stat, ix_out_beg, ix_out_end, iy_out_beg, &
+  &iy_out_end, nrm_out, nx_tile, ny_tile, nz_out, ix_tile_beg, &
+  &ix_tile_end, iy_tile_beg, iy_tile_end, p_tile_arr, phi_tile_arr, &
+  &mask_tile_arr, nvalid_tile_arr, cubestat, peak_tile_arr, &
+  &rm_peak_tile_arr, ang_peak_tile_arr, snr_tile_arr)
+    !! T3b I/O orchestration ticket (planning/ENCAPSULATION_REFACTOR_PLAN.md):
+    !! the per-tile write_job(cur_slot)%field = local data assembly, moved
+    !! verbatim out of the tile loop into one call -- only the mechanical
+    !! assignment block, none of the surrounding synchronisation (the
+    !! join-before-reuse / join-before-dispatch statements in rm_synthesis.f90
+    !! stay completely untouched, in their exact original order, in the main
+    !! program). job is whichever ping-pong slot (write_job(cur_slot)) the
+    !! caller is about to (re)populate.
+    implicit none
+    type(tile_write_job_t), intent(inout) :: job
+    integer, intent(in) :: par_wunit_amp, par_wunit_pha
+    character(len=*), intent(in) :: path_amp, path_pha
+    integer(kind=int64), intent(in) :: datastart_amp, datastart_pha
+    integer, intent(in) :: n_write_threads
+    logical, intent(in) :: out_mask_open, out_nvalid_open, out_peak_open
+    logical, intent(in) :: out_rmpeak_open, out_angpeak_open, out_snr_open
+    integer, intent(in) :: group
+    integer, intent(in) :: naxes_out_in(3), naxes_mask(3)
+    integer, intent(in) :: naxes_nvalid(2), naxes_stat(2)
+    integer, intent(in) :: ix_out_beg, ix_out_end, iy_out_beg, iy_out_end
+    integer, intent(in) :: nrm_out, nx_tile, ny_tile, nz_out
+    integer, intent(in) :: ix_tile_beg, ix_tile_end, iy_tile_beg, iy_tile_end
+    real(sp), pointer, intent(in) :: p_tile_arr(:), phi_tile_arr(:)
+    integer(int8), pointer, intent(in) :: mask_tile_arr(:)
+    integer(int16), pointer, intent(in) :: nvalid_tile_arr(:)
+    logical, intent(in) :: cubestat
+    real(sp), pointer, intent(in) :: peak_tile_arr(:), rm_peak_tile_arr(:)
+    real(sp), pointer, intent(in) :: ang_peak_tile_arr(:), snr_tile_arr(:)
+
+    job%unit_amp = par_wunit_amp
+    job%unit_pha = par_wunit_pha
+    job%path_amp = path_amp
+    job%path_pha = path_pha
+    job%datastart_amp = datastart_amp
+    job%datastart_pha = datastart_pha
+    job%n_write_threads = n_write_threads
+    job%use_raw_write = (n_write_threads .gt. 1)
+    job%unit_mask    = 43
+    job%unit_nvalid  = 44
+    job%unit_peak    = 46
+    job%unit_rmpeak  = 47
+    job%unit_angpeak = 48
+    job%unit_snr     = 49
+    job%out_mask_open    = out_mask_open
+    job%out_nvalid_open  = out_nvalid_open
+    job%out_peak_open    = out_peak_open
+    job%out_rmpeak_open  = out_rmpeak_open
+    job%out_angpeak_open = out_angpeak_open
+    job%out_snr_open     = out_snr_open
+    job%group        = group
+    job%naxes_out    = naxes_out_in
+    job%naxes_mask   = naxes_mask
+    job%naxes_nvalid = naxes_nvalid
+    job%naxes_stat   = naxes_stat
+    job%ix_out_beg = ix_out_beg
+    job%ix_out_end = ix_out_end
+    job%iy_out_beg = iy_out_beg
+    job%iy_out_end = iy_out_end
+    job%nrm_out  = nrm_out
+    job%nx_tile  = nx_tile
+    job%ny_tile  = ny_tile
+    job%nz_out   = nz_out
+    job%ix_tile_beg = ix_tile_beg
+    job%ix_tile_end = ix_tile_end
+    job%iy_tile_beg = iy_tile_beg
+    job%iy_tile_end = iy_tile_end
+    job%p_tile_arr      => p_tile_arr
+    job%phi_tile_arr    => phi_tile_arr
+    job%mask_tile_arr   => mask_tile_arr
+    job%nvalid_tile_arr => nvalid_tile_arr
+    if(cubestat)then
+       job%peak_tile_arr     => peak_tile_arr
+       job%rm_peak_tile_arr  => rm_peak_tile_arr
+       job%ang_peak_tile_arr => ang_peak_tile_arr
+       job%snr_tile_arr      => snr_tile_arr
+    endif
+  end subroutine populate_write_job
+
+  subroutine do_tile_write(job)
+    !! Writes one tile's AMP/PHA (RM-chunked, parallel if n_write_threads>1)
+    !! plus optional MASK/NVALID/PEAK/RM_PEAK/ANG_PEAK/SNR outputs. Callable
+    !! either inline (io_overlap off) or as a pthread entry point's payload
+    !! (io_overlap on) -- identical logic either way, so output is bit-for-bit
+    !! the same regardless of which mode dispatched it.
+    implicit none
+    type(tile_write_job_t), intent(inout) :: job
+    integer :: status, wpar_k
+    integer(int64) :: wpar_base, wpar_rem, wpar_nrm_k, wpar_rm_off_k, wpar_buf_off
+    integer :: wpar_rm_beg, wpar_rm_end
+    integer :: fpixels_out(3), lpixels_out(3)
+    integer :: fpixels_nvalid(2), lpixels_nvalid(2)
+    real(dp) :: t_stage
+    integer(int64) :: nbytes_write, tile_pix
+    character(len=272) :: message
+
+    ! Bytes this call will write, for the swim-lane plotter's throughput
+    ! panel. AMP/PHA are always written (real*4); the rest are optional,
+    ! gated by the same out_*_open flags that gate the ftpsse/ftpssb/ftpssi
+    ! calls below them, so this total tracks exactly what actually hits
+    ! disk in this call, tile-shape and cfg-dependent.
+    tile_pix = int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64)
+    nbytes_write = 2_int64*tile_pix*int(job%nrm_out,kind=int64)*4_int64
+    if(job%out_mask_open) nbytes_write = nbytes_write + &
+    &tile_pix*int(job%nz_out,kind=int64)*1_int64
+    if(job%out_nvalid_open) nbytes_write = nbytes_write + tile_pix*2_int64
+    if(job%out_peak_open) nbytes_write = nbytes_write + tile_pix*4_int64
+    if(job%out_rmpeak_open) nbytes_write = nbytes_write + tile_pix*4_int64
+    if(job%out_angpeak_open) nbytes_write = nbytes_write + tile_pix*4_int64
+    if(job%out_snr_open) nbytes_write = nbytes_write + tile_pix*4_int64
+
+    write(message,'(A,I0,A,I0,A,I0,A,I0,A,I0)')&
+    &'tile write start x:[',job%ix_tile_beg,',',job%ix_tile_end,&
+    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,'] bytes=',nbytes_write
+    call log_message('debug','tile_write',trim(message))
+    t_stage = wall_time_seconds()
+
+    fpixels_out(1) = job%ix_out_beg
+    lpixels_out(1) = job%ix_out_end
+    fpixels_out(2) = job%iy_out_beg
+    lpixels_out(2) = job%iy_out_end
+    fpixels_out(3) = 1
+    lpixels_out(3) = job%nrm_out
+
+    ! --- AMP/PHA write: two mutually-exclusive mechanisms ---
+    ! n_write_threads==1 (default, always safe): a single ftpsse() call
+    ! through the one CFITSIO handle already open for this file. There is
+    ! only ever one handle in this branch, so CFITSIO's handle-aliasing
+    ! behaviour (T4 postmortem) has nothing to conflict with.
+    !
+    ! n_write_threads>1: split nrm_out RM bins into n_write_threads
+    ! disjoint chunks and write each with write_rm_chunk_raw(), bypassing
+    ! CFITSIO's ftpsse/handle machinery entirely for the pixel data -- see
+    ! that routine's header comment for why this is what actually makes
+    ! N>1 safe (CFITSIO is never asked to touch the file concurrently from
+    ! more than one place, so its aliasing behaviour never enters into it).
+    if(.not. job%use_raw_write)then
+       status = 0
+       call ftpsse(job%unit_amp,job%group,3,job%naxes_out,&
+       &fpixels_out,lpixels_out,job%p_tile_arr(1),status)
+       status = 0
+       call ftpsse(job%unit_pha,job%group,3,job%naxes_out,&
+       &fpixels_out,lpixels_out,job%phi_tile_arr(1),status)
+    else
+       wpar_base = int(job%nrm_out,kind=int64) / int(job%n_write_threads,kind=int64)
+       wpar_rem  = mod(int(job%nrm_out,kind=int64), int(job%n_write_threads,kind=int64))
+!$omp parallel do num_threads(job%n_write_threads) default(none)&
+!$omp& shared(job,wpar_base,wpar_rem)&
+!$omp& private(wpar_k,wpar_nrm_k,wpar_rm_off_k,wpar_rm_beg,wpar_rm_end,wpar_buf_off)
+       do wpar_k = 0, job%n_write_threads-1
+          wpar_nrm_k = wpar_base + &
+          &merge(1_int64,0_int64,int(wpar_k,kind=int64).lt.wpar_rem)
+          wpar_rm_off_k = int(wpar_k,kind=int64)*wpar_base + &
+          &min(int(wpar_k,kind=int64),wpar_rem)
+          wpar_rm_beg = int(wpar_rm_off_k) + 1
+          wpar_rm_end = int(wpar_rm_off_k + wpar_nrm_k)
+          wpar_buf_off = wpar_rm_off_k * &
+          &int(job%nx_tile,kind=int64)*int(job%ny_tile,kind=int64) + 1_int64
+
+          call write_rm_chunk_raw(job%path_amp, job%datastart_amp,&
+          &job%naxes_out(1), job%naxes_out(2),&
+          &job%ix_out_beg, job%ix_out_end, job%iy_out_beg, job%iy_out_end,&
+          &wpar_rm_beg, wpar_rm_end, job%p_tile_arr(wpar_buf_off:))
+
+          call write_rm_chunk_raw(job%path_pha, job%datastart_pha,&
+          &job%naxes_out(1), job%naxes_out(2),&
+          &job%ix_out_beg, job%ix_out_end, job%iy_out_beg, job%iy_out_end,&
+          &wpar_rm_beg, wpar_rm_end, job%phi_tile_arr(wpar_buf_off:))
+       enddo
+!$omp end parallel do
+    endif
+
+    if(job%out_mask_open)then
+       fpixels_out(3) = 1
+       lpixels_out(3) = job%nz_out
+       status = 0
+       call ftpssb(job%unit_mask,job%group,3,job%naxes_mask,&
+       &fpixels_out,lpixels_out,job%mask_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_nvalid_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpssi(job%unit_nvalid,job%group,2,job%naxes_nvalid,&
+       &fpixels_nvalid,lpixels_nvalid,job%nvalid_tile_arr,status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_peak_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_peak,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%peak_tile_arr(1),status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_rmpeak_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_rmpeak,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%rm_peak_tile_arr(1),status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_angpeak_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_angpeak,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%ang_peak_tile_arr(1),status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    if(job%out_snr_open)then
+       fpixels_nvalid(1) = job%ix_out_beg
+       lpixels_nvalid(1) = job%ix_out_end
+       fpixels_nvalid(2) = job%iy_out_beg
+       lpixels_nvalid(2) = job%iy_out_end
+       status = 0
+       call ftpsse(job%unit_snr,job%group,2,job%naxes_stat,&
+       &fpixels_nvalid,lpixels_nvalid,job%snr_tile_arr(1),status)
+       if(status.gt.0) call printerror(status)
+    endif
+
+    call timer_add(STAGE_TILE_WRITE, wall_time_seconds()-t_stage)
+    write(message,'(A,I0,A,I0,A,I0,A,I0,A,I0)')&
+    &'tile write done x:[',job%ix_tile_beg,',',job%ix_tile_end,&
+    &'] y:[',job%iy_tile_beg,',',job%iy_tile_end,'] bytes=',nbytes_write
+    call log_message('debug','tile_write',trim(message))
+  end subroutine do_tile_write
+
+  function tile_write_thread_entry(arg) bind(C) result(res)
+    !! pthread start routine. Unpacks the opaque context pointer back into
+    !! the tile_write_job_t it was created from (same process, same build,
+    !! so the round-trip through c_loc/c_f_pointer is safe even though
+    !! tile_write_job_t is not a bind(C) type) and runs the write.
+    type(c_ptr), value :: arg
+    type(c_ptr) :: res
+    type(tile_write_job_t), pointer :: job
+
+    call c_f_pointer(arg, job)
+    call do_tile_write(job)
+    res = c_null_ptr
+  end function tile_write_thread_entry
+
+  subroutine tile_write_dispatch_async(job, thread_id, dispatched)
+    !! Launches do_tile_write(job) on a background pthread. `job` must have
+    !! the TARGET attribute at the call site and must remain valid --
+    !! untouched and undeallocated -- until tile_write_join(thread_id) has
+    !! returned. On pthread_create failure this runs the write synchronously
+    !! right here instead (safe fallback: a write is never silently
+    !! dropped), and reports dispatched=.false. so the caller knows there is
+    !! nothing to join later.
+    implicit none
+    type(tile_write_job_t), intent(inout), target :: job
+    integer(c_long), intent(out) :: thread_id
+    logical, intent(out) :: dispatched
+    integer(c_int) :: rc
+
+    rc = c_pthread_create(thread_id, c_null_ptr, &
+         c_funloc(tile_write_thread_entry), c_loc(job))
+    if (rc /= 0_c_int) then
+      call log_message('warn','tile_write', &
+           'pthread_create failed for async tile write; running inline')
+      call do_tile_write(job)
+      dispatched = .false.
+    else
+      dispatched = .true.
+    end if
+  end subroutine tile_write_dispatch_async
+
+  subroutine tile_write_join(thread_id)
+    implicit none
+    integer(c_long), intent(in) :: thread_id
+    integer(c_int) :: rc
+    rc = c_pthread_join(thread_id, c_null_ptr)
+  end subroutine tile_write_join
+
+end module rm_synthesis_mod

@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "rmtool"
+abstract: "A portable HPC toolkit for Faraday rotation measure (RM) synthesis of large radio polarization data cubes, supporting multi-band tomography."
+type: software
+authors:
+  - family-names: "Raja"
+    given-names: "Wasim"
+    orcid: "https://orcid.org/0000-0002-6155-9962"
+    affiliation: "Raman Research Institute, Bengaluru, India (original development); CSIRO, Australia (subsequent development)"
+  # Duplicate this block for each additional author, in citation order:
+  # - family-names: "FILL IN"
+  #   given-names: "FILL IN"
+  #   orcid: "https://orcid.org/0000-0000-0000-0000"
+  #   affiliation: "FILL IN"
+version: "R1.0-beta.2"
+date-released: "2026-09-09"
+identifiers:
+  - type: doi
+    value: "FILL IN: 10.xxxx/xxxxx once the repo's own DOI is minted"
+    description: "DOI for the rmtool repository as a whole (fixed -- not tied to any single release/version artefact)"
+repository-code: "https://github.com/wasimraja81/rmtool"
+license: MIT
+keywords:
+  - radio astronomy
+  - polarimetry
+  - Faraday rotation
+  - RM synthesis
+  - RM-CLEAN

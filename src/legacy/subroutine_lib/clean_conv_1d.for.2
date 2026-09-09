@@ -1,0 +1,185 @@
+
+
+             
+      subroutine convolve_1d(a_in,b_in,npts,out_data)
+
+      implicit none
+
+      real*4      a_in(*),
+     -            b_in(*),
+     -            out_data(*)
+
+      integer*4   npts
+
+
+
+c+
+c_name       convolve_1d
+c
+c_function   To convolve a_in with b_in and return the result in 
+c            out_data  ( This is one-D operation)
+c           
+c           
+c_           call convolve_1d(a_in,b_in,npts,out_data)
+c           
+c
+c                           
+c_/a_in()    r*4    input data array a
+c_/b_in()    r*4    input data array b
+c_/npts      i*4    no. of points in each of the arrays a_in, b_in and out_data
+c_/out_data  r*4    the convolved output array
+c
+c_author      desh
+c_created     28-Jul-1993
+c_latest      28-Jul-1993
+c_refe        Maths, GBD, one dimentional scans, convolution
+c-
+
+
+        integer*4   i, k, k1
+
+c       
+
+	write(*,*)'Convolving...'
+
+        do i=1,npts
+          out_data(i)=0.0
+          do k=1,npts
+            k1 = k + npts - i
+            out_data(i) = out_data(i) + a_in(k)*b_in(k1)
+          end do
+        end do
+
+	write(*,*)'Finished Convolving !'
+        return
+        end
+
+
+
+
+
+      subroutine clean_1d(obs_scan,dirty_beam,npts,out_clean)
+             
+      real*4      obs_scan(*),
+     -            dirty_beam(*),
+     -            out_clean(*)
+
+      integer*4   npts
+
+
+
+c+
+c_name       clean_1d
+c
+c_function   To deconvolve obs_scan with dirty_beam using the CLEAN algorithm
+c            and return the clean components in out_clean array
+c            ( This is one-D operation)
+c           
+c           
+c_           call clean_1d(obs_scan,dirty_beam,npts,out_clean)
+c           
+c
+c                           
+c_/obs_scan()    r*4    input data to be CLEANed
+c_/dirty_beam()  r*4    input array of the dirty beam to be used for CLEANing
+c_/npts          i*4    no. of points in each of the arrays 
+c                       obs_scan,dirty_beam etc.
+c_/out_clean()   r*4    the array containing the cleaned components
+c
+c_author      desh
+c_created     28-Jul-1993
+c_latest      28-Jul-1993
+c_refe        Maths, GBD, one dimentional scans, CLEAN, deconvolution
+c-
+
+
+c
+      integer*4  maxpts, i, i1, niter_required, niter_done
+      parameter  (maxpts = 4000)
+      real*4     residual(maxpts),
+     -           max_residue, stop_at_residue, loop_g
+      logical*4  over
+c
+
+
+
+      write(*,*)'Begining cleaning'
+
+      
+c     first copy the input obs_scan to residual  and initialise 
+c     out_clean and other parameters
+      do i=1,npts
+        residual(i)=obs_scan(i)
+        out_clean(i)=0.0
+      end do
+      over = .false.
+      niter_done = 0
+c     do 50 iterations at a time
+      niter_required = 50
+
+
+      do while (.not.over)
+
+        max_residue=0.
+        i_at_max = 0
+c       find the absolute peak value in the residual   
+        do i=1,nr
+          if(abs(residual(i)).gt.abs(max_residue)) then
+            max_residue = residual(i)
+            i_at_max = i
+          end if
+        end do
+
+        if(niter_done.eq.0) then
+c     accept the starting choice of the loop_gain and the level
+c     upto which clean is to performed
+
+          write(*,*)'max_residue=',max_residue
+          write(*,*)'enter residue limit for cleaning  & loop gain'
+          read(*,*) stop_at_residue,loop_g
+        end if
+
+c       see if we have reached the level stop_at_residue already
+        if(abs(max_residue).gt.stop_at_residue) then
+c                 NO !
+c         see if have finished the requested no. of iterations
+          if(niter_done.ge.niter_required) then
+c                 YES !
+c              find out whether to continue or not           
+            write(*,*)' residue level reached =', max_residue
+            write(*,*)' after ', niter_done,' iterations'
+            write(*,*)' want to continue ? '
+            write(*,*)' Enter a positive loop gain to continue'
+            read(*,*)loop_g          
+            if(loop_g.gt.0.0)then
+              niter_required = niter_required + 50
+            else
+              over = .true.
+            end if
+          end if
+
+          if(.not.over) then
+
+c         subtract a scaled version of the dirty_beam from the
+c         residual scan
+            do i=1,npts
+              i1 = i - i_at_max + npts
+              residual(i) = residual(i) - 
+     -                    loop_g*max_residue*dirty_beam(i1)
+            end do
+c         note the new cleaned component
+            out_clean(ne)=out_clean(ne)+g*max_residue
+c         update the counter
+            niter_done = niter_done + 1
+          end if
+        else
+          write(*,*)' STOPPING Clean as we have reached the'
+          write(*,*)' specified level in the residuals (',
+     -              max_residual,')'
+          write(*,*)' after ',niter_done,' iterations'
+          over = .true.
+        end if
+      end do
+
+      return
+      end

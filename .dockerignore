@@ -1,0 +1,24 @@
+# ==========================================
+# 1. Ignore Local Scratch & Data Folders
+# ==========================================
+scratch/
+
+# ==========================================
+# 2. Ignore Local Compiled Binaries and Build Artifacts
+# ==========================================
+build/
+bin/
+
+# ==========================================
+# 3. Ignore Version Control & Images
+# ==========================================
+.git/
+.gitignore
+*.tar
+docker/
+
+# ==========================================
+# 4. Optional: Ignore large log/txt file outputs 
+# ==========================================
+*.log
+runtime_estimate.txt

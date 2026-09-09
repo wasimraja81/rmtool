@@ -1,0 +1,444 @@
+# Makefile for rm_synthesis (Fortran RM-synthesis package)
+# Targets: make, make clean, make install
+
+.PHONY: all clean clean-all install uninstall help build_dir
+
+# Compiler and flags
+FC := gfortran
+GPU_FC ?= nvfortran
+NVFORTRAN_PATH := $(shell command -v nvfortran 2>/dev/null)
+GFORTRAN_PATH := $(shell command -v gfortran 2>/dev/null)
+CPPFLAGS := -cpp
+BASEFLAGS := $(CPPFLAGS) -std=gnu -fallow-argument-mismatch -ffree-line-length-none
+CPU_OPTFLAGS := -O3 -march=native
+CPU_DEBUGFLAGS := -g -fbacktrace -fbounds-check
+CPU_PROFILEFLAGS := -O3 -march=native -g -fno-omit-frame-pointer
+CPU_OMPFLAGS := -fopenmp
+GPU_NVFLAGS := -cpp -O3 -mp=gpu -gpu=cc80,managed -DUSE_GPU
+GPU_GNUFLAGS := $(BASEFLAGS) -O3 -fopenmp -foffload=nvptx-none -foffload="-lm" -ffast-math -fno-finite-math-only -DUSE_GPU
+
+FFLAGS := $(BASEFLAGS)
+
+# Build mode: release, profile, or debug
+MODE ?= release
+# Optional OpenMP support (set OMP=1 to enable)
+OMP ?= 0
+OMP_EFFECTIVE := $(OMP)
+HOST_OMP_CPP := -DHOST_OMP=$(OMP_EFFECTIVE)
+
+# Optional GPU/offload build (set GPU=1 to enable)
+GPU ?= 0
+
+# Auto-select GPU compiler only when user did not explicitly set GPU_FC.
+# Preference order: nvfortran, then gfortran.
+ifeq ($(GPU),1)
+  ifeq ($(origin GPU_FC),file)
+    ifneq ($(NVFORTRAN_PATH),)
+      GPU_FC := nvfortran
+    else ifneq ($(GFORTRAN_PATH),)
+      GPU_FC := gfortran
+    endif
+  endif
+endif
+
+ifeq ($(GPU_FC),gfortran)
+  GPUFLAGS := $(GPU_GNUFLAGS)
+else
+  GPUFLAGS := $(GPU_NVFLAGS)
+endif
+
+ifeq ($(GPU),1)
+  FC := $(GPU_FC)
+  FFLAGS := $(GPUFLAGS)
+else
+  ifeq ($(MODE),debug)
+    FFLAGS += $(CPU_DEBUGFLAGS)
+	else ifeq ($(MODE),profile)
+		FFLAGS += $(CPU_PROFILEFLAGS)
+  else
+    FFLAGS += $(CPU_OPTFLAGS)
+  endif
+  ifeq ($(OMP_EFFECTIVE),1)
+    FFLAGS += $(CPU_OMPFLAGS)
+  endif
+endif
+FFLAGS += $(HOST_OMP_CPP)
+
+# Human-readable build flavor naming
+ifeq ($(GPU),0)
+	ifeq ($(OMP_EFFECTIVE),1)
+		FLAVOR := cpu_omp
+	else
+		FLAVOR := cpu_serial
+	endif
+else
+	ifeq ($(OMP_EFFECTIVE),1)
+		FLAVOR := gpu_offload_hostomp
+	else
+		FLAVOR := gpu_offload
+	endif
+endif
+
+# Mode/flavor specific artifact tag so build outputs do not conflict
+BUILD_TAG := $(MODE)_$(FLAVOR)
+
+# Directories
+SRCDIR := src
+BUILDDIR := build/$(BUILD_TAG)
+BINDIR ?= bin
+MODDIR := $(BUILDDIR)/modules
+PROFILE_BINDIR := scratch/profiles/bin
+
+# Profile builds default to a dedicated scratch binary directory.
+# Users can still override BINDIR explicitly on the command line.
+ifeq ($(MODE),profile)
+ifneq ($(origin BINDIR),command line)
+BINDIR := $(PROFILE_BINDIR)
+endif
+endif
+
+# Default bin directory (used to decide whether to update the convenience symlink)
+DEFAULT_BINDIR := bin
+
+# CFITSIO library
+CFITSIO_LIB ?= -lcfitsio
+# -lpthread: async tile-write (io_overlap) dispatches writes on a raw POSIX
+# thread outside the OpenMP runtime. A no-op on glibc >= 2.34 (pthread is
+# folded into libc there) but kept explicit for portability to older libc.
+LIBS := $(CFITSIO_LIB) -lpthread
+
+# Source files
+MODSRC := $(SRCDIR)/rm_synthesis_mod.f90
+MAINSRC := $(SRCDIR)/rm_synthesis.f90
+# Pulled into MAINSRC via Fortran `include` statements (not separately
+# compiled) -- listed as prerequisites below so editing either one triggers
+# a rebuild of rm_synthesis.o.
+INCSRC := $(SRCDIR)/myfits_info.f90 $(SRCDIR)/printerror.f90
+
+OBJFILES := $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/wcs_match_mod.o $(BUILDDIR)/thread_safety_mod.o $(BUILDDIR)/rm_synthesis.o
+
+# Target executable (mode-specific plus default convenience path)
+EXECUTABLE_MODE := $(BINDIR)/rm_synthesis_$(BUILD_TAG)
+EXECUTABLE := $(BINDIR)/rm_synthesis
+
+# Default target
+all: $(EXECUTABLE)
+
+ifeq ($(GPU),1)
+CHECK_GPU_COMPILER := check_gpu_compiler
+else
+CHECK_GPU_COMPILER :=
+endif
+
+check_gpu_compiler:
+	@command -v $(FC) >/dev/null 2>&1 || \
+	  { echo "ERROR: GPU compiler '$(FC)' not found in PATH."; \
+	    echo "       Auto-select order (when GPU_FC not set): nvfortran -> gfortran"; \
+	    echo "       Set GPU_FC=<compiler> explicitly, e.g. GPU_FC=gfortran or GPU_FC=nvfortran."; \
+	    echo "       nvfortran uses flags: $(GPU_NVFLAGS)"; \
+	    echo "       gfortran uses flags:  $(GPU_GNUFLAGS)"; \
+	    exit 127; }
+
+$(BUILDDIR):
+	@mkdir -p $(BUILDDIR) $(MODDIR)
+
+$(BINDIR):
+	@mkdir -p $(BINDIR)
+
+# Module compilation
+$(BUILDDIR)/rm_synthesis_mod.o: $(MODSRC) | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
+
+# wcs_match_mod: shared with match_cubes/reproject_cubes (T36, docs/dev/
+# MULTI_BAND_TOMOGRAPHY_PLAN.md) -- the first module rm_synthesis's own
+# build has ever shared with the other tools' own build graphs.
+$(BUILDDIR)/wcs_match_mod.o: $(SRCDIR)/wcs_match_mod.f90 | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
+
+# thread_safety_mod: OMP_NUM_THREADS-vs-hardware sanity check called at
+# each of the 5 tools' own entry points -- shared across all 5 build
+# graphs, one compiled copy per BUILDDIR since .mod files are
+# directory-scoped. No-op at runtime when this build doesn't define
+# _OPENMP (OMP=0 here), so it's safe to always compile+link in.
+$(BUILDDIR)/thread_safety_mod.o: $(SRCDIR)/thread_safety_mod.f90 | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+	$(FC) $(FFLAGS) -J$(MODDIR) -c $< -o $@
+
+# Main program compilation
+$(BUILDDIR)/rm_synthesis.o: $(MAINSRC) $(INCSRC) $(BUILDDIR)/rm_synthesis_mod.o $(BUILDDIR)/wcs_match_mod.o $(BUILDDIR)/thread_safety_mod.o | $(BUILDDIR) $(CHECK_GPU_COMPILER)
+	$(FC) $(FFLAGS) -I$(MODDIR) -J$(MODDIR) -c $< -o $@
+
+# Linking
+$(EXECUTABLE_MODE): $(OBJFILES) | $(BINDIR) $(CHECK_GPU_COMPILER)
+	$(FC) $(FFLAGS) -o $@ $^ $(LIBS)
+	@echo "✓ Executable created: $@"
+ifeq ($(BINDIR),$(DEFAULT_BINDIR))
+	@cp -f $@ $(EXECUTABLE)
+	@echo "✓ Updated default executable: $(EXECUTABLE)"
+else
+	@echo "  (default bin/rm_synthesis not updated; BINDIR=$(BINDIR))"
+endif
+
+$(EXECUTABLE): $(EXECUTABLE_MODE)
+	@:
+
+clean:
+	@rm -rf $(BUILDDIR)
+	@rm -f $(EXECUTABLE_MODE) $(EXECUTABLE)
+	@echo "✓ Cleaned artifacts for build tag: $(BUILD_TAG)"
+
+clean-all:
+	@rm -rf build
+	@rm -f $(BINDIR)/rm_synthesis $(BINDIR)/rm_synthesis_*
+	@echo "✓ Cleaned all build artifacts for every mode"
+
+# reproject_cubes: standalone pre-rm-synthesis geometry-matching tool
+# (docs/dev/MULTI_BAND_TOMOGRAPHY_PLAN.md). Reprojects two or more FITS
+# cubes onto a common grid -- not tied to the multi-band-tomography "band"
+# concept specifically, minimum input is just two cubes. Independent of
+# the main rm_synthesis build graph -- own binary, own AST/OpenMP
+# dependency, not linked into rm_synthesis itself. Proof-of-concept stage:
+# single source file, always built with OpenMP (the tool's per-channel
+# resampling is the intended parallelism target).
+# No -I/-L needed: apt installed headers/libs into standard system paths
+# (/usr/include, /usr/lib/x86_64-linux-gnu) that gfortran/ld already search
+# by default. AST_PAR itself (the vendor Fortran constants file) is never
+# `include`d -- it's fixed-form F77 and can't be pulled into a free-form
+# .f90 file, so the handful of symbols needed are declared directly in
+# reproject_cubes.f90 instead.
+# libstarlink_ast_grf3d: dummy stub satisfying AST's plotting-subsystem
+# symbol references (astGLine/astGMark/etc) that this tool never calls --
+# required to link even though nothing here does any graphics.
+AST_LIBS := -lstarlink_ast -lstarlink_ast_err -lstarlink_ast_grf3d
+REPROJECT_BINDIR ?= bin
+REPROJECT_BUILDDIR := build/reproject_cubes
+REPROJECT_EXECUTABLE := $(REPROJECT_BINDIR)/reproject_cubes
+
+reproject_cubes: $(REPROJECT_EXECUTABLE)
+
+$(REPROJECT_BUILDDIR):
+	@mkdir -p $(REPROJECT_BUILDDIR)
+
+$(REPROJECT_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/wcs_match_mod.o: $(SRCDIR)/wcs_match_mod.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/thread_safety_mod.o: $(SRCDIR)/thread_safety_mod.f90 | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+$(REPROJECT_BUILDDIR)/reproject_cubes.o: $(SRCDIR)/reproject_cubes.f90 $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/wcs_match_mod.o $(REPROJECT_BUILDDIR)/thread_safety_mod.o | $(REPROJECT_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(REPROJECT_BUILDDIR) -J$(REPROJECT_BUILDDIR) -c $< -o $@
+
+# ast_grf_stub.c: no-op AST GRF (graphics-primitive) callbacks -- the AST
+# shared library references these (its Plot class) but does not define
+# them; reproject_cubes never uses Plot, but the symbols must still exist
+# to link.
+$(REPROJECT_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(REPROJECT_BUILDDIR)
+	$(CC) -O2 -c $< -o $@
+
+$(REPROJECT_EXECUTABLE): $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/wcs_match_mod.o $(REPROJECT_BUILDDIR)/thread_safety_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(REPROJECT_BUILDDIR)/logging_mod.o $(REPROJECT_BUILDDIR)/fitsio_unit_mod.o $(REPROJECT_BUILDDIR)/wcs_match_mod.o $(REPROJECT_BUILDDIR)/thread_safety_mod.o $(REPROJECT_BUILDDIR)/reproject_cubes.o $(REPROJECT_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(AST_LIBS)
+	@echo "✓ Executable created: $@"
+
+# convolve_cubes: standalone common-resolution convolution tool (the
+# "main program" for gaussft_mod/commonbeam_mod -- see those modules' own
+# header comments). Independent of the main rm_synthesis build graph and
+# of reproject_cubes' own AST dependency -- own binary, own FFTW3
+# dependency, always built with OpenMP (its per-plane convolution is the
+# intended parallelism target, mirroring reproject_cubes' own per-plane
+# resampling). No -I/-L needed for FFTW3, same reasoning as AST_LIBS
+# above: apt installs fftw3.f/libfftw3.so into standard system paths
+# gfortran/ld already search by default.
+# -lfftw3f (single-precision FFTW, a separate library from -lfftw3)
+# added alongside it: gaussft_mod's convolve_to_beam does its own FFT
+# work in single precision internally (T27, docs/dev/
+# MULTI_BAND_TOMOGRAPHY_PLAN.md) via the sfftw_* legacy Fortran entry
+# points, which live in libfftw3f, not libfftw3. Harmless to also link
+# into rmclean_cubes (the other consumer of FFTW_LIBS, via rmclean_mod's
+# own double-precision-only FFTW calls) -- an unused library on the link
+# line costs nothing at runtime. -lfftw3f_omp (T28, docs/dev/
+# MULTI_BAND_TOMOGRAPHY_PLAN.md): the OpenMP-backed threaded-FFT
+# library (sfftw_init_threads/sfftw_plan_with_nthreads), chosen over
+# the separate pthreads-backed -lfftw3f_threads for consistency with
+# the rest of this project's own -fopenmp threading model -- both
+# expose the identical legacy Fortran entry points (confirmed via nm
+# -D on both .so files), so this is purely a "stay consistent with
+# what's already used everywhere else" choice, not a functional one.
+FFTW_LIBS := -lfftw3 -lfftw3f -lfftw3f_omp
+CONVOLVE_BINDIR ?= bin
+CONVOLVE_BUILDDIR := build/convolve_cubes
+CONVOLVE_EXECUTABLE := $(CONVOLVE_BINDIR)/convolve_cubes
+
+convolve_cubes: $(CONVOLVE_EXECUTABLE)
+
+$(CONVOLVE_BUILDDIR):
+	@mkdir -p $(CONVOLVE_BUILDDIR)
+
+# gaussft_mod and commonbeam_mod must compile before convolve_cubes.o
+# (which `use`s both) -- order-only prerequisites below via explicit .o
+# dependencies, not just directory creation, so `make -j` never races
+# convolve_cubes.o ahead of the .mod files it needs.
+$(CONVOLVE_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/thread_safety_mod.o: $(SRCDIR)/thread_safety_mod.f90 | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_BUILDDIR)/convolve_cubes.o: $(SRCDIR)/convolve_cubes.f90 $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/thread_safety_mod.o | $(CONVOLVE_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(CONVOLVE_BUILDDIR) -J$(CONVOLVE_BUILDDIR) -c $< -o $@
+
+$(CONVOLVE_EXECUTABLE): $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/thread_safety_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(SRCDIR)/printerror.f90 | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(CONVOLVE_BUILDDIR)/gaussft_mod.o $(CONVOLVE_BUILDDIR)/commonbeam_mod.o $(CONVOLVE_BUILDDIR)/logging_mod.o $(CONVOLVE_BUILDDIR)/fitsio_unit_mod.o $(CONVOLVE_BUILDDIR)/thread_safety_mod.o $(CONVOLVE_BUILDDIR)/convolve_cubes.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS)
+	@echo "✓ Executable created: $@"
+
+# match_cubes: consolidates reproject_cubes and convolve_cubes into one
+# tool that can run either stage alone or both chained THROUGH MEMORY
+# (no intermediate FITS file) -- see src/match_cubes.f90's own top
+# comment. Neither reproject_cubes.f90 nor convolve_cubes.f90 is touched
+# by this -- match_cubes.f90 duplicates (adapts) what it needs from both
+# rather than sharing a module, a deliberate choice to keep both existing
+# tools fully independent and unregressed. Needs both AST_LIBS (reproject
+# side) and FFTW_LIBS (convolve side), plus ast_grf_stub.o (same dummy
+# GRF stub reproject_cubes needs to link, for the same reason -- see that
+# target's own comment) and gaussft_mod/commonbeam_mod.
+MATCH_BINDIR ?= bin
+MATCH_BUILDDIR := build/match_cubes
+MATCH_EXECUTABLE := $(MATCH_BINDIR)/match_cubes
+
+match_cubes: $(MATCH_EXECUTABLE)
+
+$(MATCH_BUILDDIR):
+	@mkdir -p $(MATCH_BUILDDIR)
+
+$(MATCH_BUILDDIR)/gaussft_mod.o: $(SRCDIR)/gaussft.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/commonbeam_mod.o: $(SRCDIR)/commonbeam.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/wcs_match_mod.o: $(SRCDIR)/wcs_match_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/thread_safety_mod.o: $(SRCDIR)/thread_safety_mod.f90 | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/match_cubes.o: $(SRCDIR)/match_cubes.f90 $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/wcs_match_mod.o $(MATCH_BUILDDIR)/thread_safety_mod.o | $(MATCH_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(MATCH_BUILDDIR) -J$(MATCH_BUILDDIR) -c $< -o $@
+
+$(MATCH_BUILDDIR)/ast_grf_stub.o: $(SRCDIR)/ast_grf_stub.c | $(MATCH_BUILDDIR)
+	$(CC) -O2 -c $< -o $@
+
+$(MATCH_EXECUTABLE): $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/wcs_match_mod.o $(MATCH_BUILDDIR)/thread_safety_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(MATCH_BUILDDIR)/gaussft_mod.o $(MATCH_BUILDDIR)/commonbeam_mod.o $(MATCH_BUILDDIR)/logging_mod.o $(MATCH_BUILDDIR)/fitsio_unit_mod.o $(MATCH_BUILDDIR)/wcs_match_mod.o $(MATCH_BUILDDIR)/thread_safety_mod.o $(MATCH_BUILDDIR)/match_cubes.o $(MATCH_BUILDDIR)/ast_grf_stub.o $(SRCDIR)/printerror.f90 $(CFITSIO_LIB) $(FFTW_LIBS) $(AST_LIBS)
+	@echo "✓ Executable created: $@"
+
+# rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
+# rmclean.f90, pure computation, no FITS I/O of its own -- mirrors
+# gaussft_mod/commonbeam_mod's own split) against real dirty AMP/PHA
+# cubes rm_synthesis itself wrote. docs/dev/RMCLEAN_INTEGRATION_PLAN.md
+# T2. Needs FFTW_LIBS (rmclean_mod's own restore/interp FFTW calls) plus
+# CFITSIO_LIB -- no AST dependency, this tool never resamples anything.
+RMCLEAN_CUBES_BINDIR ?= bin
+RMCLEAN_CUBES_BUILDDIR := build/rmclean_cubes
+RMCLEAN_CUBES_EXECUTABLE := $(RMCLEAN_CUBES_BINDIR)/rmclean_cubes
+
+rmclean_cubes: $(RMCLEAN_CUBES_EXECUTABLE)
+
+$(RMCLEAN_CUBES_BUILDDIR):
+	@mkdir -p $(RMCLEAN_CUBES_BUILDDIR)
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o: $(SRCDIR)/rmclean.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o: $(SRCDIR)/logging_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o: $(SRCDIR)/fitsio_unit_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o: $(SRCDIR)/rmclean_io_mod.f90 $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(RMCLEAN_CUBES_BUILDDIR) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o: $(SRCDIR)/rmclean_cache_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/thread_safety_mod.o: $(SRCDIR)/thread_safety_mod.f90 | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o: $(SRCDIR)/rmclean_cubes.f90 $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o $(RMCLEAN_CUBES_BUILDDIR)/thread_safety_mod.o | $(RMCLEAN_CUBES_BUILDDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -I$(RMCLEAN_CUBES_BUILDDIR) -J$(RMCLEAN_CUBES_BUILDDIR) -c $< -o $@
+
+$(RMCLEAN_CUBES_EXECUTABLE): $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o $(RMCLEAN_CUBES_BUILDDIR)/thread_safety_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o | $(BINDIR)
+	$(FC) $(BASEFLAGS) $(CPU_OPTFLAGS) $(CPU_OMPFLAGS) -o $@ $(RMCLEAN_CUBES_BUILDDIR)/rmclean_mod.o $(RMCLEAN_CUBES_BUILDDIR)/logging_mod.o $(RMCLEAN_CUBES_BUILDDIR)/fitsio_unit_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_io_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cache_mod.o $(RMCLEAN_CUBES_BUILDDIR)/thread_safety_mod.o $(RMCLEAN_CUBES_BUILDDIR)/rmclean_cubes.o $(CFITSIO_LIB) $(FFTW_LIBS) -lpthread
+	@echo "✓ Executable created: $@"
+
+install: $(EXECUTABLE)
+	@install -d /usr/local/bin
+	@install -m 755 $(EXECUTABLE) /usr/local/bin/
+	@install -d /usr/local/share/rm_synthesis
+	@cp -r cfg /usr/local/share/rm_synthesis/
+	@echo "✓ Installed to /usr/local/bin/rm_synthesis"
+
+uninstall:
+	@rm -f /usr/local/bin/rm_synthesis
+	@rm -rf /usr/local/share/rm_synthesis
+	@echo "✓ Uninstalled"
+
+help:
+	@echo "RM-Synthesis Build System"
+	@echo "========================="
+	@echo "Usage: make [target] [MODE=release|profile|debug] [OMP=0|1] [GPU=0|1]"
+	@echo ""
+	@echo "Targets:"
+	@echo "  make                         - Build executable (default, release mode)"
+	@echo "  make MODE=profile            - Build profiling binary (optimized + symbols + frame pointers)"
+	@echo "  make MODE=debug              - Build with debug symbols and checks"
+	@echo "  make OMP=1                   - Build with OpenMP enabled CPU backend"
+	@echo "  make GPU=1                   - Build GPU/offload backend (auto: nvfortran -> gfortran)"
+	@echo "  make GPU=1 GPU_FC=gfortran   - Build GPU/offload backend with GNU offload"
+	@echo "  make clean [MODE=.. OMP=.. GPU=..] - Remove artifacts for selected mode/OMP/GPU"
+	@echo "  make clean-all               - Remove all mode/OMP/GPU build artifacts"
+	@echo "  make install      - Install to /usr/local/bin"
+	@echo "  make uninstall    - Remove installation"
+	@echo "  make help         - Show this message"
+	@echo ""
+	@echo "Note: Artifacts are mode-specific under build/<mode>_<flavor>."
+	@echo "      Flavors: cpu_serial, cpu_omp, gpu_offload, gpu_offload_hostomp."
+	@echo "      MODE=profile defaults binaries to scratch/profiles/bin (unless BINDIR=... is provided)."
+	@echo "      GPU=1 OMP=0/1 sets HOST_OMP=0/1; host OpenMP regions are gated accordingly."
+	@echo "      GPU and OMP can be enabled together (e.g., GPU=1 OMP=1)."
+	@echo "      Switching MODE/OMP/GPU does not require make clean."
+	@echo ""
+	@echo "Examples:"
+	@echo "  make                            # Build release version"
+	@echo "  make MODE=profile               # Build CPU profiling-friendly version"
+	@echo "  make MODE=debug                 # Build debug version"
+	@echo "  make MODE=release OMP=1         # Build OpenMP-enabled CPU release version"
+	@echo "  make MODE=profile OMP=1         # Build OpenMP-enabled CPU profiling version"
+	@echo "  make MODE=debug OMP=1           # Build OpenMP-enabled CPU debug version"
+	@echo "  make GPU=1                      # Build GPU/offload binary (auto compiler)"
+	@echo "  make GPU=1 GPU_FC=nvfortran     # Select GPU compiler explicitly"
+	@echo "  make GPU=1 GPU_FC=gfortran      # Use GNU OpenMP offload backend"
+	@echo "  make clean MODE=debug OMP=1 GPU=0 # Clean only debug+OMP CPU artifacts"
+	@echo "  make clean-all                  # Clean everything"
+	@echo "  make install                    # Install to system"
+	@echo "  CFITSIO_LIB=-lcfitsio make  # Specify CFITSIO library"

@@ -1,0 +1,110 @@
+# Step 1: Use a clean base with all compiler tools
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG RMTOOL_GIT_TAG=unknown
+LABEL org.opencontainers.image.title="rmtool" \
+    org.opencontainers.image.version="${RMTOOL_GIT_TAG}" \
+    org.opencontainers.image.description="RM synthesis toolchain image built from a tagged source snapshot"
+
+# Install dependencies needed for compiling the Fortran/C code
+# and running Python plotting scripts in-container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gfortran \
+    gcc-offload-nvptx \
+    nvptx-tools \
+    make \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-matplotlib \
+    python3-numpy \
+    python3-astropy \
+    python3-requests \
+    libcfitsio-dev \
+    libcurl4-openssl-dev \
+    libnghttp2-dev \
+    libstarlink-ast-dev \
+    libstarlink-ast-err9 \
+    libstarlink-ast-grf3d9 \
+    libstarlink-pal-dev \
+    libfftw3-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# astroquery/pyvo (scripts/casda_fetch.py's own two non-apt-packaged
+# dependencies -- everything else it imports is already covered above)
+# aren't in Ubuntu's own repos, so pip installs them directly into the
+# system python3 above. --break-system-packages overrides Ubuntu
+# 24.04's PEP 668 guard, which exists to protect a persistent host
+# install from an unmanaged pip clobbering apt-owned packages -- a
+# guard that doesn't apply here, since this image IS the isolated
+# environment already.
+RUN pip3 install --no-cache-dir --break-system-packages astroquery pyvo
+
+# Fix working directory to guarantee relative paths work
+WORKDIR /app/rmtool
+
+# Copy everything from the build context root directory into /app/rmtool
+COPY . .
+
+# Run sequenced builds for all OMP/GPU combinations.
+# The Makefile emits names like rm_synthesis_release_cpu_serial, etc.
+RUN set -eux; \
+    mkdir -p bin build; \
+    make clean OMP=0 GPU=0; \
+    make -j2 OMP=0 GPU=0; \
+    cp -f bin/rm_synthesis_release_cpu_serial bin/rm_synthesis_OMP0_GPU0; \
+    make clean OMP=1 GPU=0; \
+    make -j2 OMP=1 GPU=0; \
+    cp -f bin/rm_synthesis_release_cpu_omp bin/rm_synthesis_OMP1_GPU0; \
+    make clean OMP=0 GPU=1; \
+    make -j2 OMP=0 GPU=1; \
+    cp -f bin/rm_synthesis_release_gpu_offload bin/rm_synthesis_OMP0_GPU1; \
+    make clean OMP=1 GPU=1; \
+    make -j2 OMP=1 GPU=1; \
+    cp -f bin/rm_synthesis_release_gpu_offload_hostomp bin/rm_synthesis_OMP1_GPU1
+
+# reproject_cubes: independent of the rm_synthesis build graph above (own
+# binary, own AST dependency -- see the Makefile's own comment), so it
+# isn't touched by any of the `make clean OMP=... GPU=...` calls above
+# (those only remove rm_synthesis-specific build artifacts). Built once,
+# ends up at bin/reproject_cubes.
+RUN make reproject_cubes
+
+# convolve_cubes: common-resolution convolution tool (gaussft_mod +
+# commonbeam_mod -- see the Makefile's own comment), likewise independent
+# of the rm_synthesis build graph and of reproject_cubes' own AST
+# dependency (own binary, own FFTW3 dependency via libfftw3-dev above).
+# Built once, ends up at bin/convolve_cubes.
+RUN make convolve_cubes
+
+# match_cubes: consolidates reproject_cubes and convolve_cubes into one
+# tool that can chain both stages through memory with no intermediate
+# FITS file (see src/match_cubes.f90's own top comment) -- needs no new
+# apt packages, since its dependencies (Starlink AST, FFTW3) are already
+# installed above for reproject_cubes/convolve_cubes individually. Built
+# once, ends up at bin/match_cubes.
+RUN make match_cubes
+
+# rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
+# rmclean.f90) against real dirty AMP/PHA cubes rm_synthesis itself wrote
+# (planning/RMCLEAN_INTEGRATION_PLAN.md T2) -- needs FFTW3 (already
+# installed above for convolve_cubes) plus CFITSIO, no AST dependency
+# (this tool never resamples anything). Built once, ends up at
+# bin/rmclean_cubes.
+RUN make rmclean_cubes
+
+# scripts/*.py and scripts/*.sh (casda_fetch.py, run_pipeline.sh,
+# plot_tile_async_swimlane.py, etc.) all use #!/usr/bin/env python3 or
+# #!/usr/bin/env bash already, resolving to whichever interpreter is
+# first on PATH -- inside this image that's the apt-get python3/bash
+# installed above (with matplotlib/numpy/astropy/astroquery/pyvo
+# already on it), so none of them need rewriting. Their executable
+# bits are tracked directly in git (not fixed up here), so this is
+# just PATH exposure, not a permissions workaround.
+ENV PATH="/app/rmtool/bin:/app/rmtool/scripts:${PATH}"
+
+CMD ["/bin/bash"]

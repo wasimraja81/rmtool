@@ -1,0 +1,25 @@
+# Comma-separated equivalent of cfg/example_beamLog.txt -- same data,
+# same rules (1-indexed channel, '#'-prefixed/blank lines skipped). See
+# that file's own header for the full explanation; this one just shows
+# the same format written as plain CSV, e.g. for a file exported
+# straight from a spreadsheet.
+#
+# A channel is bad two ways: never listed at all (161/178 below), or
+# listed but with BMAJ or BMIN equal to 0 (200/201 below -- either one
+# alone is enough, illustrative values, not real).
+#
+# channel,bmaj_arcsec,bmin_arcsec,bpa_deg
+1,16.60,14.80,80.99
+2,16.60,14.80,80.53
+3,16.60,14.80,81.00
+4,16.60,14.80,80.94
+5,16.60,14.80,81.26
+#161 -- omitted: no valid restoring beam for this channel (bad)
+#178 -- omitted: no valid restoring beam for this channel (bad)
+200,0.00,13.10,12.00
+201,15.20,0.00,-8.00
+284,12.50,11.20,80.79
+285,12.60,11.40,75.90
+286,14.80,13.20,-32.24
+287,14.80,13.10,-32.32
+288,15.70,14.40,-6.43
