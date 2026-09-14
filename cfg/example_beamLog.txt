@@ -1,0 +1,65 @@
+# Example per-channel PSF ("beam log") file for convolve_cubes' beamfiles=
+# ASCII fallback route -- used when a cube has no CASA-style BEAMS binary
+# table extension (beamfiles=auto reads that instead), or when a user
+# wants to override/hand-supply per-channel beams without editing a FITS
+# binary table. See src/convolve_cubes.f90's own top-of-file comment and
+# --help for the full picture; this file exists so nobody has to
+# reinvent the format from that description alone.
+#
+# Format: one row per channel --
+#   channel   bmaj_arcsec   bmin_arcsec   bpa_deg
+# 1-indexed channel (matching this project's own bad-channel-file
+# convention). Whitespace- OR comma-separated -- Fortran's list-directed
+# read treats both the same way, so this aligned-column style and the
+# plain comma-separated cfg/example_beamLog.csv are just two ways of
+# writing the exact same thing; use whichever is easier to produce or
+# read for your own workflow. Any line starting with '#' is a comment
+# (including this whole header block); blank lines are skipped too.
+#
+# A channel is treated as BAD -- no usable PSF for it, so its output
+# plane is written as all-NaN, not convolved -- in TWO distinct ways,
+# both shown below (same policy as a degenerate BEAMS-table entry, and
+# rm_synthesis then excludes that NaN plane automatically too, no
+# separate badchan_file needed -- see src/convolve_cubes.f90 and
+# src/rm_synthesis.f90's own comments):
+#
+#   1. Channel number never listed here at all (an omitted row). The
+#      real cube this example is drawn from (/data1/tmp/cutout-
+#      stokesQ.fits, 288 channels) has exactly this kind of gap at
+#      channels 161 and 178 -- both omitted below on purpose, not just
+#      left out for brevity, to show what this looks like: the channel
+#      simply never appears as a row.
+#
+#   2. Channel number IS listed, but with BMAJ or BMIN (or both) equal
+#      to 0 -- present, but explicitly degenerate. Channels 200 and 201
+#      below are illustrative (not real values from the cube this
+#      example otherwise draws from) added specifically to show this
+#      second case: 200 has BMAJ=0 (BMIN nonzero), 201 has BMIN=0
+#      (BMAJ nonzero) -- either one alone is enough to flag the whole
+#      channel bad, not just an AND of both being zero.
+#
+# Values below, apart from channels 200/201, are genuine per-channel
+# restoring beams read from that real cube's own BEAMS table (a
+# representative extract: its first 5 and last 5 good channels, out of
+# 288 total -- '...' marks the omitted middle, not a literal line to
+# copy into your own file).
+#
+# channel   bmaj_arcsec   bmin_arcsec   bpa_deg
+        1         16.60         14.80          80.99
+        2         16.60         14.80          80.53
+        3         16.60         14.80          81.00
+        4         16.60         14.80          80.94
+        5         16.60         14.80          81.26
+#      ...
+#     161  -- omitted: no valid restoring beam for this channel (bad)
+#      ...
+#     178  -- omitted: no valid restoring beam for this channel (bad)
+#      ...
+      200          0.00         13.10          12.00
+      201         15.20          0.00          -8.00
+#      ...
+      284         12.50         11.20          80.79
+      285         12.60         11.40          75.90
+      286         14.80         13.20         -32.24
+      287         14.80         13.10         -32.32
+      288         15.70         14.40          -6.43
