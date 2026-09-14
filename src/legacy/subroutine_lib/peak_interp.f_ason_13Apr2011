@@ -1,0 +1,124 @@
+chelp+
+      !-------------------------------------------------
+      ! Routine to find the exact location of the peak 
+      ! in a spectral bin. 
+      ! Several schemes are allowed:
+      ! Interp Type = 1 --> Fourier Interolation (in use)
+      ! Interp Type = 2 --> Sinc Interpolation (in prep.)
+      ! Interp Type = 3 --> Quadratic Interpolation(in use) 
+      ! ------------------------------------------------
+chelp-
+
+
+      subroutine peak_interp(InArrRe,InArrIm,narr,RM1, RM2, 
+     -                       ofac,peak_loc, peak_val,OutPha, 
+     -                       interp_type)
+
+
+      implicit none
+
+
+      real*4      InArrRe(*), InArrIm(*), peak_loc
+      integer*4   narr, nout, ofac, interp_type
+      real*4      tmpInArrRe(narr), tmpInArrIm(narr)
+      real*4      InArr(narr)
+      real*4      peak_val 
+      real*4      OutArr(narr*ofac*2), dh, RM1, RM2, dh_in, dh_out 
+      real*4      OutArrRe(narr*ofac*2), OutArrIm(narr*ofac*2)
+      integer*4   i, imax
+      real*4      RM0, samp1, samp2, RMshift, band_start, band_stop
+      real*4      OutPha
+
+
+      do i = 1,narr
+         tmpInArrRe(i) = InArrRe(i)
+         tmpInArrIm(i) = InArrIm(i)
+
+         InArr(i) = sqrt(tmpInArrRe(i)**2 + tmpInArrIm(i)**2)
+      enddo
+      
+      if(interp_type.eq.1)then ! Parabolic Interpolation
+              dh = (RM2 - RM1)/real(narr-1)
+              call quad_interp(InArr,narr,peak_loc,peak_val)
+              peak_loc = RM1 + (peak_loc - 1.0)*dh
+      else if(interp_type.eq.2)then ! Fourier interpolation on Amp
+              call fourier_interp_re(InArr, OutArr, narr, ofac, nout)
+              call maxima_index(OutArr,nout,imax)
+
+              dh_in = (RM2 - RM1)/real(narr-1)
+              dh_out = dh_in*real(narr)/real(nout)
+              RM0 = 0.5*(RM1 + RM2) ! mid RM
+
+              ! Locate the 1st and last pts in the resampled 
+              ! abscissa: 
+              band_start = RM0 - 0.5*dh_in*real(narr)
+              band_stop = RM0 + 0.5*dh_in*real(narr)
+
+              samp1 = band_start + 0.5*dh_out
+              samp2 = band_stop - 0.5*dh_out
+
+              ! Fix the abscissa to include the midpoint:
+              if(mod(nout,2).eq.0)then
+                  RMshift = RM0 - (samp1 + real(nout/2)*dh_out)
+                  samp1 = samp1 - RMshift + 0.5*(dh_in-dh_out) - dh_out
+                  samp2 = samp2 - RMshift + 0.5*(dh_in-dh_out) - dh_out
+              else
+                      write(*,*)"Warning: nout is odd!!"
+                      write(*,*)"We want nout to be even"
+                      write(*,*)"Quitting now..."
+                      stop
+              endif
+              peak_loc = samp1 + real(imax - 1)*dh_out
+              peak_val = OutArr(imax)
+      else if(interp_type.ne.4.and.interp_type.ge.3)then ! Fourier interpolation Cmplx
+              call fourier_interp(tmpInArrRe,tmpInArrIm,
+     -                            OutArrRe,OutArrIm,narr, 
+     -                            ofac, nout)
+              do i = 1,nout
+                 OutArr(i) = sqrt(OutArrRe(i)**2 + OutArrIm(i)**2)
+              enddo
+              call maxima_index(OutArr,nout,imax)
+
+              dh_in = (RM2 - RM1)/real(narr-1)
+              dh_out = dh_in*real(narr)/real(nout)
+              RM0 = 0.5*(RM1 + RM2) ! mid RM
+
+              ! Locate the 1st and last pts in the resampled 
+              ! abscissa: 
+              band_start = RM0 - 0.5*dh_in*real(narr)
+              band_stop = RM0 + 0.5*dh_in*real(narr)
+
+              samp1 = band_start + 0.5*dh_out
+              samp2 = band_stop - 0.5*dh_out
+
+              ! Fix the abscissa to include the midpoint:
+              if(mod(nout,2).eq.0)then
+                  RMshift = RM0 - (samp1 + real(nout/2)*dh_out)
+                  samp1 = samp1 - RMshift + 0.5*(dh_in-dh_out) - dh_out
+                  samp2 = samp2 - RMshift + 0.5*(dh_in-dh_out) - dh_out
+                  !write(*,*)"RM1,RM2,samp1,samp2: ",RM1,RM2,samp1,samp2
+              else
+                      write(*,*)"Warning: nout is odd!!"
+                      write(*,*)"We want nout to be even"
+                      write(*,*)"Quitting now..."
+                      stop
+              endif
+
+              peak_loc = samp1 + real(imax - 1)*dh_out
+              peak_val = OutArr(imax)
+              OutPha = atan2(OutArrIm(imax),OutArrRe(imax))
+      else if(interp_type.eq.4)then ! Sinc Interpolation
+              call sinc_interp(InArr,OutArr,narr,ofac,nout)
+              call maxima_index(OutArr,nout,imax)
+              dh = (RM2 - RM1)/real(nout-1)
+              peak_loc = RM1 + real(imax - 1)*dh
+              peak_val = OutArr(imax)
+      else    ! Parabolic Interpolation as default
+              dh = (RM2 - RM1)/real(narr-1)
+              call quad_interp(InArr,narr,peak_loc,peak_val)
+              peak_loc = RM1 + (peak_loc - 1.0)*dh
+      endif
+
+      return
+      end
+
