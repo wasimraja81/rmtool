@@ -1,0 +1,1335 @@
+c         This file is a collection of subroutines that are 
+c         very often required by various Fortran codes
+
+
+c   1)    SUBROUTINE: LINSPACE
+
+c         Author: Wasim Raja
+c         Date: 07-08-2007
+c         Last modified on: 07-08-2007
+
+c         linspace(BASE,LIMIT,N,V) is a subroutine that 
+c         generates a vector V of N linearly spaced elements 
+c         between BASE and LIMIT. N has to be greater 
+c         than 1. Base and LIMIT are always included in the 
+c         range. If LIMIT < BASE, then the elements are 
+c         stored in descending order. If N is not a natural,
+c         number, a default value of N = 100 is used!
+c         If N = 1, the output vector V is forced to a 
+c         scalar containing the value of LIMIT.
+c
+c         latest as on 12 Nov, 2009: wasim raja
+
+c
+          subroutine linspace(BASE,LIMIT,N,V)
+          real*4 BASE, LIMIT, V(*)
+          integer*4 N
+          integer*4 i
+          real*4 h
+c         if N has been specified correctly, then N = N 
+c         else N = 100
+          if (N.lt.1)then
+               write(*,*)'----------------- WARNING -------------------'
+               write(*,*)'----------- SUBROUTINE "LINSPACE"------------'
+               write(*,*)'    Wrong vector length, N changed to 100'
+               write(*,*)'---------------------------------------------'
+               N = 100
+          end if
+          if(N.eq.1)then
+                  V(N) = LIMIT
+          else if(BASE.eq.LIMIT)then
+                  do i = 1,N
+                     V(i) = LIMIT
+                  end do
+          else if(N.gt.1.and.BASE.ne.LIMIT)then
+                  h = (LIMIT - BASE)/(N-1)
+                  do i = 1,N
+                     V(i) = BASE + (i-1)*h
+                  end do
+          endif
+          end
+
+
+c   1a)    SUBROUTINE: LINSPACED
+
+c         Author: Wasim Raja
+c         Date: 08-11-2010
+c         
+
+c         linspaced(BASE,LIMIT,N,V) is a subroutine that 
+c         generates a vector V of N linearly spaced elements 
+c         between BASE and LIMIT. N has to be greater 
+c         than 1. Base and LIMIT are always included in the 
+c         range. If LIMIT < BASE, then the elements are 
+c         stored in descending order. If N is not a natural,
+c         number, a default value of N = 100 is used!
+c         If N = 1, the output vector V is forced to a 
+c         scalar containing the value of LIMIT.
+c
+c         latest as on 12 Nov, 2009: wasim raja
+c
+c         DOUBLE PRECISION routine
+c
+          subroutine linspaced(BASE,LIMIT,N,V)
+          real*8 BASE, LIMIT, V(*)
+          integer*4 N
+          integer*4 i
+          real*8 h
+c         if N has been specified correctly, then N = N 
+c         else N = 100
+          if (N.lt.1)then
+               write(*,*)'----------------- WARNING -------------------'
+               write(*,*)'----------- SUBROUTINE "LINSPACE"------------'
+               write(*,*)'    Wrong vector length, N changed to 100'
+               write(*,*)'---------------------------------------------'
+               N = 100
+          end if
+          if(N.eq.1)then
+                  V(N) = LIMIT
+          else if(BASE.eq.LIMIT)then
+                  do i = 1,N
+                     V(i) = LIMIT
+                  end do
+          else if(N.gt.1.and.BASE.ne.LIMIT)then
+                  h = (LIMIT - BASE)/(N-1)
+                  do i = 1,N
+                     V(i) = BASE + (i-1)*h
+                  end do
+          endif
+          end
+
+
+
+c   2a)    SUBROUTINE: DOTPRODUCT
+
+
+c         Author: Wasim Raja
+c         Date: 14-11-2007
+c         Last modified on: 14-11-2007
+
+c         dotproduct(A,B,P,m) is a subroutine that 
+c         multiplies two vectors A and B of dimensions 
+c         m, and calculates the dot product P of A and B.
+c         
+c
+          subroutine dotproduct(A,B,P,m)
+          real*4 A(*), B(*), P
+          integer*4 m
+          integer*4 i
+          real*4 accum
+
+          accum = 0.0
+          do i = 1,m
+               accum = accum + A(i)*B(i)
+          end do
+          P = accum
+          end
+
+c   2b)    SUBROUTINE: DOTPRODUCTD
+
+c         DOUBLE PRECISION VERSION
+
+c         Author: Wasim Raja
+c         Date: 04-11-2010
+c         Last modified on: 04-11-2010
+
+c         dotproductd(A,B,P,m) is a subroutine that 
+c         multiplies two vectors A and B of dimensions 
+c         m, and calculates the dot product P of A and B.
+c         
+c
+          subroutine dotproductd(A,B,P,m)
+          real*8 A(*), B(*), P
+          integer*4 m
+          integer*4 i
+          real*8 accum
+
+          accum = 0.0
+          do i = 1,m
+               accum = accum + A(i)*B(i)
+          end do
+          P = accum
+          end
+
+
+
+
+c   2c)   SUBROUTINE: DOTPRODUCT_Complex
+
+
+c         Author: Wasim Raja
+c         Date: 14-11-2007
+c         Last modified on: 14-11-2007
+
+c         dotproduct_c(A,B,P,m) is a subroutine that 
+c         multiplies two complex vectors A and B of dimensions 
+c         m, and calculates the dot product P of A and B.
+c         
+c         This code has been modified to compute the corr-coeff
+c         between 2 one-d arrays and uses the following 
+c         definition in computing the correlation coefficients: 
+
+          !               cov(A,B)
+          ! corr = ----------------------
+          !        sqrt((var(A)*var(B)))
+c         
+c         where the covariance and th variance are calculated about 
+c         the respective means of the arrays!
+c         --wasim, 27 NOV, 2008
+c           Ooty Radio Telescope
+
+          subroutine dotproduct_c(A,B,P,m)
+
+
+          complex A(*), B(*), A_conj,B_conj
+          complex A_mean, B_mean, anow, bnow
+          real*4 P
+          integer*4 m
+          integer*4 i
+          real*4 accum,norm,A_sq,B_sq
+
+          accum = 0.0
+          A_mean = complex(0.0,0.0)
+          B_mean = complex(0.0,0.0)
+          A_sq = 0.0
+          B_sq = 0.0
+          do i = 1,m
+             A_mean = A_mean + A(i)
+             B_mean = B_mean + B(i)
+          enddo
+
+          A_mean = A_mean/real(m)
+          B_mean = B_mean/real(m)
+
+          do i = 1,m
+               !A(i) = A(i) - A_mean
+               !B(i) = B(i) - B_mean
+               anow = A(i) - A_mean
+               bnow = B(i) - B_mean
+               A_conj = complex(real(anow),-imag(anow))
+               B_conj = complex(real(bnow),-imag(bnow))
+               accum = accum + real(A_conj*B(i))
+               A_sq = A_sq + real(A_conj*anow)
+               B_sq = B_sq + real(B_conj*bnow)
+               !accum = accum + A(i)*B(i)
+          end do
+          norm = sqrt(A_sq * B_sq)
+          P = accum/norm
+          end
+
+c   3)   SUBROUTINE: RM_res_from_BW
+
+c         Author: Wasim Raja
+c         Date: 17-12-2007
+c         Last modified on: 17-12-2007
+
+C         This subroutine determines the RM-resolution 
+C         and the RM_span that can be obtained given the 
+C         Bandwidth and the channel-width respectively.
+
+C         subroutine RM_res_from_BW(center-freq(Hz),BW(Hz),n_chan,
+C     -                                      RM_resolution,RM_span)
+
+          subroutine RM_res_from_BW(nu_c,BW,n_chan,d_RM,RM_span)
+          real*4 c_light_sr, pi_sr
+          real*4 nu_c, BW
+          integer*4 n_chan
+          real*4 d_RM, RM_span
+          
+          c_light_sr = 3.0e8; ! speed of light in metres/sec
+          pi_sr = acos(-1.0)
+          !chan_BW = BW/n_chan !Hz
+     
+          d_RM = pi_sr*nu_c**3/(2*(c_light_sr**2)*BW)
+          !RM_span = 0.5*pi_sr*nu_c**3/(2*(c_light_sr**2)*chan_BW)
+          RM_span = d_RM*n_chan  ! -- wasim, 25 SEP,2008
+
+          end
+
+
+c   4)   SUBROUTINE: mean(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 13-02-2008
+c         
+c         This subroutine calculates the mean "x" of a vector "V" 
+c         given its length "N". 
+
+          subroutine mean(V,N,x)
+          real*4 V(*), x
+          integer*4 N
+          integer*4 i
+          real*4 accum
+
+          accum = 0.0
+          do i = 1,N
+               accum = accum + V(i)
+          end do
+          x = accum/N
+          end
+
+
+c   4a)   SUBROUTINE: meand(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 08-11-2010
+c         
+c         This subroutine calculates the mean "x" of a vector "V" 
+c         given its length "N". 
+c         DOUBLE PRECISION routine
+
+          subroutine meand(V,N,x)
+          real*8 V(*), x
+          integer*4 N
+          integer*4 i
+          real*8 accum
+
+          accum = 0.0
+          do i = 1,N
+               accum = accum + V(i)
+          end do
+          x = accum/N
+          end
+
+c   5)   SUBROUTINE: rms(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 13-02-2008
+c         
+c         This subroutine calculates the rms "x" about mean 
+c         of a vector "V" given its length "N". 
+
+          subroutine rms(V,N,x)
+          real*4 V(*), x, mu
+          integer*4 N
+          integer*4 i
+          real*4 accum
+
+          call mean(V,N,mu)
+          accum = 0.0
+          do i = 1,N
+               accum = accum + (V(i) - mu)**2
+          end do
+          x = sqrt(accum/real(N))
+          end
+
+
+c   5a)   SUBROUTINE: rmsd(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 08-11-2010
+c         
+c         This subroutine calculates the rms "x" about mean 
+c         of a vector "V" given its length "N". 
+c         DOUBLE PRECISION routine
+
+          subroutine rmsd(V,N,x)
+          real*8 V(*), x, mu
+          integer*4 N
+          integer*4 i
+          real*8 accum
+
+          call meand(V,N,mu)
+          accum = 0.0
+          do i = 1,N
+               accum = accum + (V(i) - mu)**2
+          end do
+          x = sqrt(accum/N)
+          end
+
+c    6)  SUBROUTINE: vec2array_file(A,n_row,n_col,outfile,aorb)
+
+
+C        This subroutine writes out a one-dimensional 
+C        array , "A" into a file, "outfile" having 
+C        n_row rows and n_col columns. The length of A 
+C        is expected to be: n_row X n_col
+C        If it is less than that, the code will crib. 
+C        If the length of A is greater than n_row X n_col, 
+C        elements of A beyond index n_row X n_col will be 
+C        ignored in the file!
+
+C        Author: Wasim Raja
+C        Date: 06-03-2008
+C          
+C        LAST MODIFICATION: 
+C        Additionally, now, you ought to specify the outfile 
+C        type -- ie., ASCII or BINARY using the variable 
+C        "aorb" -- 'a' will force ASCII outfile, while 
+C        'b' will force binary. Any other character will 
+C        force an ASCII output file.
+C        The default (and presently only the default exists)
+C        precision is 4 Bytes.
+C        --wasim raja
+C          Date: 09-12-2009
+
+          subroutine vec2array_file(A,n_row,n_col,outfile,aorb)
+         integer*4 max_dim
+         parameter (max_dim = 16777216)
+         real*4 A(*)
+         integer*4 i,j,k
+         integer*4 n_row, n_col
+         character*72 outfile
+         character*1 aorb
+         integer*4 buffsize
+
+         !k = 0
+         !do i = 1,n_row
+         !   do j = 1,n_col
+         !      k = k + 1
+         !      tmp(k) = A(i,j)
+         !   enddo
+         !enddo
+
+         if(aorb.ne.'b'.and.aorb.ne.'B')then
+                 open(911, file = outfile,status='new')
+                 k = 0
+                 do i = 1,n_row
+                    j = k+1
+                    write(911,*)(A(k),k = j,j+n_col-1)         
+                    !write(*,*)(A(k),k = j,j+n_col-1)         
+                    k = k-1
+                 enddo
+                 close(911)
+         else
+                 buffsize = 4*n_col
+                 open(911, file=outfile,form='unformatted',
+     -                     access='direct', recl=buffsize,
+     -                     status='new')
+                 k = 0
+                 do i = 1,n_row
+                    j = k+1
+                    write(911,rec=i)(A(k),k = j,j+n_col-1)         
+                    !write(*,*)(A(k),k = j,j+n_col-1)         
+                    k = k-1
+                 enddo
+                 close(911)
+         endif
+         end
+
+c   7)   SUBROUTINE: CORR_Complex
+
+
+c         Author: Wasim Raja
+c         Date: 27-11-2008
+c         Last modified on: 27-11-2008
+
+c         
+c         This code is modified from the original dotproduct_c 
+c         subroutine to compute the corr-coeff
+c         between 2 one-d arrays and uses the following 
+c         definition in computing the correlation coefficients: 
+
+          !               cov(A,B)
+          ! corr = ----------------------
+          !        sqrt((var(A)*var(B)))
+c         
+c         where the covariance and th variance are calculated about 
+c         the respective means of the arrays!
+c
+c         Please forgive me for keeping 2 Sub-routines with 
+c         different names doing exactly the same job! But you will 
+c         hopefully appreciate that deleting the subroutine 
+c         "dotproduct_c" would have asked of me tremendous effort 
+c         in terms of renaming the subroutine calls referring to 
+c         "dotproduct_c" made in all the programs written before 
+c         the latest modification in this "corr_c" subroutine. 
+c         Thus as a precaution I have kept the older subroutine as 
+c         well, but appropriately modified. 
+c         Moreover, I can now, at my own sweet will, change the 
+c         subroutine calls in the older programs and call it as 
+c         "corr_c", whenever I visit those routines and encounter 
+c         any subroutine call to "dotproduct_c" -- any new programs 
+c         written henceforth, will be calling "corr_c" when required!
+
+c         --wasim, 27 NOV, 2008
+c           Ooty Radio Telescope
+
+          subroutine corr_c(A,B,P,m)
+
+
+          complex A(*), B(*), A_conj,B_conj
+          complex A_mean, B_mean
+          real*4 P
+          integer*4 m
+          integer*4 i
+          real*4 accum,norm,A_sq,B_sq
+
+          accum = 0.0
+          A_mean = complex(0.0,0.0)
+          B_mean = complex(0.0,0.0)
+          A_sq = 0.0
+          B_sq = 0.0
+          do i = 1,m
+             A_mean = A_mean + A(i)
+             B_mean = B_mean + B(i)
+          enddo
+
+          A_mean = A_mean/m
+          B_mean = B_mean/m
+
+          do i = 1,m
+               A(i) = A(i) - A_mean
+               B(i) = B(i) - B_mean
+               A_conj = complex(real(A(i)),-imag(A(i)))
+               B_conj = complex(real(B(i)),-imag(B(i)))
+               accum = accum + real(A_conj*B(i))
+               A_sq = A_sq + real(A_conj*A(i))
+               B_sq = B_sq + real(B_conj*B(i))
+               !accum = accum + A(i)*B(i)
+          end do
+          norm = sqrt(A_sq * B_sq)
+C ------ taking care of division by zero --------
+          if(norm.eq.0.0)then ! i.e, if corrcoeff is NAN or INF
+               accum = 0.0
+               norm = 1.0
+          else
+               norm = norm
+               accum = accum
+          endif
+C ------------------------------------------------
+          P = accum/norm
+          end
+
+c   7b)   SUBROUTINE: CORR
+
+
+c         Author: Wasim Raja
+c         Date: 02-12-2008
+c         Last modified on: 02-12-2008
+c         Last modified on: 23-12-2009  WR
+c             -- Took care to NOT modify the 
+c                input variables A and B
+c         
+
+          !               cov(A,B)
+          ! corr = ----------------------
+          !        sqrt((var(A)*var(B)))
+c         
+c         where the covariance and the variance are calculated about 
+c         the respective means of the arrays!
+c
+
+
+          subroutine corr(A,B,P,m)
+
+
+          real*4 A(*), B(*)
+          real*4 A_mean, B_mean
+          real*4 anow, bnow
+          real*4 P
+          integer*4 m
+          integer*4 i
+          real*4 accum,norm,A_sq,B_sq
+
+          A_mean = 0.0
+          B_mean = 0.0
+          do i = 1,m
+             A_mean = A_mean + A(i)
+             B_mean = B_mean + B(i)
+          enddo
+
+          A_mean = A_mean/real(m)
+          B_mean = B_mean/real(m)
+
+          accum = 0.0
+          A_sq = 0.0
+          B_sq = 0.0
+          do i = 1,m
+               !A(i) = A(i) - A_mean
+               !B(i) = B(i) - B_mean
+               !accum = accum + real(A(i)*B(i))
+               anow = A(i) - A_mean
+               bnow = B(i) - B_mean
+               accum = accum + real(anow*bnow)
+               A_sq = A_sq + real(anow*anow)
+               B_sq = B_sq + real(bnow*bnow)
+
+               !accum = accum + real(anow*bnow)
+               !A_sq = A_sq + real(anow*anow)
+               !B_sq = B_sq + real(bnow*bnow)
+          end do
+          norm = sqrt(A_sq * B_sq)
+C ------ taking care of division by zero --------
+          if(norm.eq.0.0)then ! i.e, if corrcoeff is NAN or INF
+               accum = 0.0
+               norm = 1.0
+          else
+               norm = norm
+               accum = accum
+          endif
+C ------------------------------------------------
+          P = accum/norm
+          end
+
+
+
+c   8)   SUBROUTINE: minima(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine calculates the minimum "x"  
+c         of a vector "V" given its length "N". 
+
+          subroutine minima(V,N,minx)
+          real*4 V(*), minx
+          integer*4 N
+          integer*4 i
+
+          minx = V(1)
+          do i = 1,N
+               if(V(i).le.minx)then
+                       minx = V(i)
+               else
+                       minx = minx
+               endif
+          end do
+          end
+
+c   8a)   SUBROUTINE: minimad(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine calculates the minimum "x"  
+c         of a vector "V" given its length "N". 
+
+          subroutine minimad(V,N,minx)
+          real*8 V(*), minx
+          integer*4 N
+          integer*4 i
+
+          minx = V(1)
+          do i = 1,N
+               if(V(i).le.minx)then
+                       minx = V(i)
+               else
+                       minx = minx
+               endif
+          end do
+          end
+
+
+c   9)   SUBROUTINE: maxima(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine calculates the maximum "x"  
+c         of a vector "V" given its length "N". 
+
+          subroutine maxima(V,N,maxx)
+          real*4 V(*), maxx
+          integer*4 N
+          integer*4 i
+
+          maxx = V(1)
+          do i = 1,N
+               if(V(i).ge.maxx)then
+                       maxx = V(i)
+               else
+                       maxx = maxx
+               endif
+          end do
+          end
+
+c   9a)   SUBROUTINE: maximad(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine calculates the maximum "x"  
+c         of a vector "V" given its length "N" for 
+c         double precision x
+
+          subroutine maximad(V,N,maxx)
+          real*8 V(*), maxx
+          integer*4 N
+          integer*4 i
+
+          maxx = V(1)
+          do i = 1,N
+               if(V(i).ge.maxx)then
+                       maxx = V(i)
+               else
+                       maxx = maxx
+               endif
+          end do
+          end
+
+c   10)   SUBROUTINE: sort_ascending(V,N,S)
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine sorts the elements of a 
+c         vector "V" in ascending order given the 
+C         length "N" of the vector V. The sorted 
+c         elements are kept in the vector S
+
+          subroutine sort_ascending(V,N,S)
+          real*4 V(*), S(*), tmp_num
+          integer*4 N
+          integer*4 i, j
+
+          do i=1,N
+             S(i) = V(i)
+          enddo
+
+          do i = 1,N
+             tmp_num = S(i)
+             do j = i,N
+                if (tmp_num.ge.S(j))then
+                        tmp_num = S(j)
+                        S(j) = S(i)
+                        S(i) = tmp_num
+                endif
+             enddo
+          end do
+          end
+
+
+
+c   10b)   SUBROUTINE: sort_descending(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 26-05-2009
+c         
+c         This subroutine sorts the elements of a 
+c         vector "V" in descending order given the 
+C         length "N" of the vector V. The sorted 
+c         elements are kept in the vector S
+
+          subroutine sort_descending(V,N,S)
+          real*4 V(*), S(*), tmp_num
+          integer*4 N
+          integer*4 i, j
+
+          do i=1,N
+             S(i) = V(i)
+          enddo
+
+          do i = 1,N
+             tmp_num = S(i)
+             do j = i,N
+                if (tmp_num.le.S(j))then
+                        tmp_num = S(j)
+                        S(j) = S(i)
+                        S(i) = tmp_num
+                endif
+             enddo
+          end do
+          end
+
+
+
+c   11)   SUBROUTINE: histo_conservative(V,N,nbin,bad_frac,mu,sigma,out_x,out_y) 
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+
+C         This subroutine computes the HISTOGRAM of a data set. The word 
+C         "conservative" is appended to it because of historical reasons. 
+C         This subroutine was first written to assess data quality-- data from
+C         a telescope. The idea is to separate data coming from the sky from the
+C         data attributed to Radio Frequency Interferences (RFIs). While 
+C         astronomical data necessarily has to follow a Gaussian 
+C         distribution, RFI does not follow such a distribution. In the most
+C         simple of cases, RFI's would populate the tail of the Gaussian
+C         distribution thereby making the distribution deviate significantly
+C         from the original Gaussian. 
+
+C         Hence by plotting the histogram we wish to find how much the 
+C         distribution function looks different from a Gaussian. 
+
+C         The intention however is clear -- we are not talking about monitoring
+C         the deviation from a Gaussian with the aid of our EYEs(plots). We are 
+C         talking of implementing similar schemes to quantify such a deviation, 
+C         if any, by means of a robust program! Followimg is the underlying 
+C         philosopy:
+
+C         As we are talking of only strong RFIs (corrupt data) that populate the
+C         tail of the Gaussian, we shall therefore be biased(+vely) on our estimate 
+C         of the mean and sigma if we include the tail-values of the distribution
+C         in the estimation. However if we compute the mean and sigma by discarding 
+C         a judicious percentage of tail-values, we shall be closer to the true
+C         mean and the true sigma of the original signal. One may think that
+C         this scheme would produce errorneous mean and sigma in the ABSENCE of
+C         corrupt data. We would like to point out however that the mean and
+C         sigma calculated in this CONSERVATIVE way will only be used as TRIAL
+C         values required as the initial guess values by further fit-routines
+C         that we shall use to determine the robust mean and sigma of the sky
+C         signal.
+        
+
+          subroutine histo_conservative(V,N,nbin,bad_frac,mu,
+     -sigma,out_x,out_y) 
+
+
+          integer*4 N, nbin, n1, n2
+          real*4    V(*), out_x(*), out_y(*)
+          real*4    bad_frac, mu, sigma
+          real*4    maxx, minx
+          real*4    S(5000)
+
+          integer*4 ii, jj, cnt, npts_in_n_minus_1_bins
+ 
+          do ii = 1,5000
+             S(ii) = 0.0  ! temprary array used to store sorted values
+          enddo
+          !n_used = floor(1.0*bad_frac*N/100)
+          n_used = N - int(0.5*bad_frac*N/100)
+                            !CAUTION: "int" works as "floor" ONLY for 
+                            !          +ve arguments
+  
+          call sort_ascending(V,N,S)
+          maxx = S(n_used)
+          !call maxima(S,n_used,maxx)
+
+
+          call sort_descending(V,N,S)
+          minx = S(n_used)
+          !call minima(S,n_used,minx)
+
+          call linspace(minx,maxx,nbin,out_x)
+          !----------------------------------------------
+          npts_in_n_minus_1_bins = 0
+
+          do ii = 1,nbin-1
+              cnt = 0
+              do jj = 1,N
+                   if(V(jj).ge.out_x(ii).and.V(jj).lt.out_x(ii+1))then
+                           cnt = cnt+1
+                           npts_in_n_minus_1_bins = 
+     -npts_in_n_minus_1_bins + 1
+                   endif
+              enddo
+              out_y(ii) = cnt
+          enddo
+          out_y(nbin) = N - npts_in_n_minus_1_bins ! All outliers dumped
+                                                   ! in last bin by hand...
+  
+          ! HISTOGRAM COMPLETED...
+          !-----------------------------------------------
+
+          ! NOW find out the CONSERVATIVE mean and sigma i.e.,do not use 
+          ! the elements specified by bad_frac!
+  
+ 
+          n1 = int(0.5*bad_frac*N/100)
+          n2 = N - int(0.5*bad_frac*N/100)
+          n_used = 0
+          do ii = n1,n2
+             n_used = n_used + 1
+             S(n_used) = V(ii)
+          enddo
+          call mean(S,n_used,mu)
+          call rms(S,n_used,sigma)
+  
+          end
+
+
+c   12)   SUBROUTINE: get_seed_for_rand(seed)
+
+c         Author: Wasim Raja
+c         Date: 12-10-2009
+c         
+c         This subroutine generates a seed that
+c         may be used as an argument for "rand".
+c         The seed generated is merely the sum 
+c         of YYYY+mm+dd+HH+MM+SS+ns and provides a 
+c         convenient way of getting different 
+c         sets of random numbers each time rand is 
+c         called with a new seed (generated using 
+c         this subroutine). 
+c         NOTE: 
+c             1) The seed gets updated only if 
+c                the delay between the calls to 
+c                this subroutine is > 1 nano-sec
+c             2) There is a finite though feeble 
+c                possibility that any 2 calls will
+c                generate the same seed for all 
+c                practical purposes.
+
+          subroutine get_seed_for_rand(seed)
+
+          integer*4 seed
+          character*1 tmp_char
+          character*120 temp_line
+          integer*4 yy,mon,day,hh,mm,ss,ns
+                  ! TEST-1 BEGINS
+          call system('rm -f rand_seed.tmp')
+          call system('gdate +%Y-%m-%d-%H-%M-%S-%N >rand_seed.tmp')
+
+          seed = 0
+          open(921,file='rand_seed.tmp',status='old')
+          read(921,'(a)')temp_line
+          read(temp_line,fmt=101)yy,tmp_char,mon,tmp_char,day,
+     -tmp_char,hh,tmp_char,mm,tmp_char,ss,tmp_char,ns
+101       format(I4,A1,I2,A1,I2,A1,I2,A1,I2,A1,I2,A1,I9)
+          !seed = yy+mon+day+hh+mm+ss+ns
+          seed = ns
+          close(921)
+          !call system('rm -f rand_seed.tmp')
+
+          end
+
+
+c   13)    SUBROUTINE: COVAR
+
+
+c         Author: Wasim Raja
+c         Date: 12-11-2009
+c         Last modified on: 12-11-2009
+
+c         covar(A,B,P,m) is a subroutine that computes
+c         the covariance of 2 vectors A and B of dime-
+c         nsions m : 
+c                      sum[{A(i) - A0} x {B(i) - B0})
+c         cov(A,B) = ----------------------------------
+c                                 m - 1
+c
+          subroutine covar(A,B,P,m)
+          real*4 A(*), B(*), P
+          integer*4 m
+          integer*4 i
+          real*4 accum
+          real*4 anow, bnow
+          real*4 A_mean, B_mean
+
+          A_mean = 0.0
+          B_mean = 0.0
+          do i = 1,m
+             A_mean = A_mean + A(i)
+             B_mean = B_mean + B(i)
+          enddo
+
+          A_mean = A_mean/m
+          B_mean = B_mean/m
+
+          accum = 0.0
+          do i = 1,m
+               anow = A(i) - A_mean
+               bnow = B(i) - B_mean
+               accum = accum + real(anow*bnow)
+          end do
+
+          !P = accum/(m-1)
+          P = accum/int(m/300)
+          !write(*,*)P
+          
+          end
+
+c   14)    SUBROUTINE: DOTP
+
+c         Author: Wasim Raja
+c         Date: 17-11-2009
+c         Last modified on: 17-11-2009
+
+c         dotp(A,B,P,m) is a subroutine that computes
+c         the dot-product of 2 vectors A and B of dime-
+c         nsions m : 
+c                      sum[A(i) x B(i))
+c         dotp(A,B) = ------------------
+c                           m - 1
+c
+          subroutine dotp(A,B,P,m)
+          real*4 A(*), B(*), P
+          integer*4 m
+          integer*4 i
+          real*4 accum
+
+          accum = 0.0
+          do i = 1,m
+               accum = accum + real(A(i)*B(i))
+          end do
+
+          P = accum/real(m)
+          
+          end
+
+c   15)    SUBROUTINE: BYTESWAP_r4
+          subroutine byteswap_r4(num)
+
+c         Author: Wasim Raja
+c         (adapted from examples in www)
+c
+c         Date: 24-03-2010
+c         Last modified on: 24-03-2010
+
+c         "byteswap_r4" swaps the bytes of a
+c         real*4 number. 
+c         
+c         Necessity:
+c         Certain machines store the value
+c         of a number in the memory units 
+c         in a left-to-right fashion while
+c         certain others store in a reverse
+c         sense, ie., right-to-left (right 
+c         and left are just indicators for
+c         understanding, and may not have 
+c         a physical significance). 
+c         eg., AB in one machine may appear 
+c         as   BA in another.
+c         
+c         Hence byte swapping may be necessary
+c         if the data you want to analyse 
+c         in YOUR machine had been written 
+c         using a machine whose sense of storing
+c         the numbers in memory is opposite 
+c         to that of the convention followed 
+c         in YOUR MACHINE
+c         
+
+          integer*1 i(4), j(4)
+          real*4 num, tmp_num, swap_num
+          equivalence (tmp_num,i)
+          equivalence (swap_num,j)
+    
+          tmp_num = num
+    
+          j(1) = i(4)
+          j(2) = i(3)
+          j(3) = i(2)
+          j(4) = i(1)
+    
+          num = swap_num
+          end
+    
+
+c   16)   SUBROUTINE: median(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 01-05-2010
+c         
+c         This subroutine calculates the median "x" of a 
+c         vector "V" given its length "N". 
+
+          subroutine median(V,N,x)
+          real*4 V(*), x, S(65536)
+          integer*4 N
+          integer*4 i
+
+          do i = 1,N
+             S(i) = V(i)
+          enddo
+
+          call sort_ascending(V,N,S)
+          x = S(int(N/2)+1)
+          end
+
+c  17a)   subroutine maxima_index(V,N,imax)
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine locates the "index" of maxima of 
+c         the elements of a vector "V" given its length "N". 
+
+          subroutine maxima_index(V,N,imax)
+
+          implicit none
+          real*4    V(*), maxx  
+          integer*4 N
+          integer*4 i, imax
+
+          maxx = V(1)
+          imax = 1
+          do i = 1,N
+               if(maxx.lt.V(i))then
+                       maxx = V(i)
+                       imax = i 
+               endif
+          end do
+
+          return
+          end 
+
+
+c  17b)   subroutine maxima_indexd(V,N,imax)
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine locates the "index" of maxima of 
+c         the elements of a vector "V" given its length "N". 
+
+          subroutine maxima_indexd(V,N,imax)
+
+          implicit none
+          real*8    V(*), maxx  
+          integer*4 N
+          integer*4 i, imax
+
+          maxx = V(1)
+          imax = 1
+          do i = 1,N
+               if(maxx.lt.V(i))then
+                       maxx = V(i)
+                       imax = i 
+               endif
+          end do
+
+          return
+          end 
+
+
+c  18)   subroutine fit_linear(X,Y,N,A,B)
+c         Author: Wasim Raja
+c         Date: 27-12-2011
+c         
+c         This subroutine fits a straight line 
+c                    Y = A + B*X 
+c         given vectors X, Y and their length 
+c         N. 
+
+          subroutine fit_linear(X,Y,N,A,B)
+
+          implicit none
+          real*4    X(*), Y(*),A,B  
+          integer*4 N
+          integer*4 i 
+
+          real*4    mean_xx, mean_xy, mean_x, mean_y 
+
+          mean_xx = 0.0
+          mean_xy = 0.0
+          mean_x = 0.0
+          mean_y = 0.0
+
+          do i = 1,N
+             mean_xx = mean_xx + X(i)*X(i) 
+             mean_xy = mean_xy + X(i)*Y(i)
+
+             mean_x = mean_x + X(i)
+             mean_y = mean_y + Y(i)
+          enddo
+          mean_xx = mean_xx/real(N)
+          mean_xy = mean_xy/real(N)
+          mean_x = mean_x/real(N)
+          mean_y = mean_y/real(N)
+
+          B = (mean_xy - mean_x*mean_y)/(mean_xx - mean_x**2) 
+          A = mean_y - B*mean_x 
+
+          return
+          end 
+
+c  19)   subroutine transpose_2d(Ain,Nx,Ny,dimx,dimy,Aout)
+c         Author: Wasim Raja
+c         Date: 31-12-2011
+c         
+c         This subroutine transposes a 2D matrix
+c         "Ain" into the output 2D array "Aout" 
+c         given the array Ain, its sizes and its max 
+c         dimensions as defined in the calling 
+c         routine. 
+          subroutine transpose_2d(Ain,Nx,Ny,dimx,dimy,Aout)
+
+          implicit none 
+          integer*4   dimx, dimy, Nx, Ny 
+          real*4      Ain(dimx,dimy), Aout(dimy,dimx)
+
+          integer*4   i, j 
+          !real*4      aold 
+
+          do i = 1,Nx
+             do j = 1,Ny
+                !Aout(i,j) = Ain(i,j)
+                Aout(j,i) = Ain(i,j)
+             enddo
+          enddo
+
+
+!          do i = 2,max(Nx,Ny) 
+!              do j = 1,i-1 
+!                 aold = Aout(i,j)
+!                 Aout(i,j) = Aout(j,i)
+!                 Aout(j,i) = aold
+!              enddo
+!          enddo
+
+          return
+          end 
+
+c  20)   subroutine matmult_2d(A,Nax,Nay,dim_ax,dim_ay, 
+c                              B,Nbx,Nby,dim_bx,dim_by, 
+c                              -> P) 
+c         Author: Wasim Raja 
+c         Date: 31-12-2011 
+c         
+c         This subroutine computes the "Product" of 2 
+c         2D matrix "A(Nax,Nay)" & "B(Nbx,Nby)" into 
+c         the output 2D array "P(Nax,Nby)" 
+c         
+c         It is required that Nay and Nbx are equal. 
+c         
+          subroutine matmult_2d(A,Nax,Nay,dim_ax,dim_ay,
+     -                          B,Nbx,Nby,dim_bx,dim_by,
+     -                          P) 
+
+          implicit none 
+          integer*4   dim_ax, dim_ay,dim_bx, dim_by, Nax, Nay, 
+     -                Nbx, Nby  
+          real*4      A(dim_ax,dim_ay), B(dim_bx,dim_by), 
+     -                P(dim_ax,dim_by) 
+
+          integer*4   i, j, k, imax, jmax, kmax 
+
+          ! Some sanity checks: 
+          if(Nay .ne. Nbx)then
+                  write(*,*)"Input matrix dimension mismatch!"
+                  write(*,*)"Can't perform multiplication!!"
+                  write(*,*)"Quitting now..."
+                  stop
+          endif
+          imax = Nax
+          kmax = Nby
+          jmax = Nbx ! or Nay
+          do i = 1,imax
+             do k = 1,kmax
+                P(i,k) = 0.0 
+                do j = 1,jmax
+                   P(i,k) = P(i,k) + A(i,j)*B(j,k)
+                enddo
+             enddo
+          enddo
+
+          return 
+          end
+          
+          
+c  21) SUBROUTINE  GET_UNIT(iunit,active_lun,nactive) 
+c          
+c      Author: Wasim Raja
+c        Date: 31 May, 2012 
+c      [ Adapted from John Burkardt's 02 March 1999 version ] 
+c      
+c      This subroutine finds out FREE unit numbers that 
+c      could be used during opening of a file. Additionally 
+c      it updates the array "active_lun" with a "1" if a 
+c      new FREE unit number is found. 
+
+
+        subroutine get_unit ( iunit, active_lun, nactive )
+
+        implicit none
+        integer i
+        integer ios
+        integer iunit
+        logical lopen
+        integer nactive 
+        integer active_lun(*) 
+
+        iunit = 0
+        do i = 1, nactive
+           if ( i.ne.5.and.i.ne.6 )then ! reserved unit numbers 
+              inquire (unit=i,opened=lopen,iostat=ios)
+              if(ios.eq.0)then
+                if(.not.lopen)then
+                  iunit = i
+                  active_lun(iunit) = 1 
+                  return
+                end if
+              end if
+           end if
+        end do
+        if (iunit .eq. 0)then
+                write(*,*)"No free unit available in range [1,99]..."
+                write(*,*)"Quitting now!!!"
+                stop 
+        endif
+        return
+        end
+c  21a) SUBROUTINE  GET_LUN(iunit) 
+c          
+c      Author: Wasim Raja
+c        Date: 31 May, 2012 
+c      [ Adapted from John Burkardt's 02 March 1999 version ] 
+c      
+c      This subroutine finds out FREE unit numbers that 
+c      could be used during opening of a file. 
+
+
+        subroutine get_lun ( iunit )
+
+        implicit none
+        integer i
+        integer ios
+        integer iunit
+        logical lopen
+
+        iunit = 0
+        do i = 1, 99 
+           if ( i.ne.5.and.i.ne.6 )then ! reserved unit numbers 
+              inquire (unit=i,opened=lopen,iostat=ios)
+              if(ios.eq.0)then
+                if(.not.lopen)then
+                  iunit = i
+                  return
+                end if
+              end if
+           end if
+        end do
+        if (iunit .eq. 0)then
+                write(*,*)"No free unit available in range [1,99]..."
+                write(*,*)"Quitting now!!!"
+                stop 
+        endif
+        return
+        end
+!*********************************************************************
+
+
+c  22)   subroutine my_close(iunit,active_lun) 
+c        
+c         Author: Wasim Raja 
+c         Date: 31-05-2012 
+c         
+c         This subroutine closes a file with unit number 
+c         "iunit". Additionally, it updates the array of  
+c         active unit numbers "active_lun". 
+c         
+c         
+          subroutine my_close(iunit, active_lun) 
+
+          implicit none 
+
+          integer*4     iunit, ios 
+          integer*4     active_lun(*) 
+          logical       lopen 
+
+          inquire (unit=iunit,opened=lopen,iostat=ios) 
+          if (ios.eq.0)then 
+                  if(lopen)then 
+                          close(iunit) 
+                          active_lun(iunit) = 0 
+                  endif 
+          endif 
+
+          return 
+
+          end 
+
+
+
+c   23)   SUBROUTINE: maxima_abs(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine calculates the maximum "|x|"  
+c         of a vector "V" given its length "N". 
+
+          subroutine maxima_abs(V,N,maxx)
+          real*4 V(*), maxx
+          integer*4 N
+          integer*4 i
+
+          maxx = abs(V(1))
+          do i = 1,N
+               if(abs(V(i)).ge.maxx)then
+                       maxx = abs(V(i))
+               else
+                       maxx = maxx
+               endif
+          end do
+          end
