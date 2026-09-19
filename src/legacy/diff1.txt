@@ -1,0 +1,483 @@
+4c4,16
+<       ! cubes. 
+---
+>       ! cubes.
+>       ! Currently, the tomography is done by reading the input image 
+>       ! pixel-by-pixel, rather than in one go. That is, the input 
+>       ! FITS file has to be accessed as many times as the number of 
+>       ! image-pixels required in the output image. This, although 
+>       ! is memory efficient, may be highly inefficient in time. 
+>       ! An alternative would be to read an optimum number of data 
+>       ! points from the data-array in the input file and keep it in 
+>       ! memory. The hassle however, in such an attempt would lie in 
+>       ! interpreting the sequence in which the data-array has been 
+>       ! written in the input file, since the order of axes in the 
+>       ! input data is not guaranteed to be consistently followed by 
+>       ! authors of FITS files.
+8a21,31
+>       ! TODO: KEYWORDS for the output FITS files in cases 
+>       !       when only a subimage is required, has to be 
+>       !       appropriately inserted... Currently the keywords 
+>       !       are read from the INPUT files and copied to the 
+>       !       output files. Any mismatches encountered thus (for
+>       !       example, if the output image does not contain 
+>       !       the reference pixel as defined in the input file),
+>       !       has been taken care of by writing the FULL image 
+>       !       with pixels outside the range specified by the 
+>       !       subimage remaining UNDEFINED (NaN).
+>       !       -- wasim, 09 Sep, 2009
+15a39,40
+>       logical simple, extend
+>       integer*4 decimals
+38c63,64
+<       real*4 spec(max_chan),specQ(max_chan),specU(max_chan)
+---
+>       real*4 specQ(max_chan),specU(max_chan)
+>       real*4 L_sq(max_chan),Q_now(max_chan),U_now(max_chan)
+44a71,74
+>       character*64 ctype 
+>       character*72 comment
+>       real*4 cval,dRM
+> 
+46a77
+>       character*72 outfile, outfileRM, outfilePA
+59a91,92
+>       real*4 conv_fac ! freq-to-lambda conversion factor
+>       logical MHz
+62a96,99
+>       integer*4 cnt1
+> 
+>       integer*4 cnt2, tmp_index, null_cnt(max_chan)
+>       real*4 tmp_avgQ, tmp_avgU
+63a101,106
+>       ! Variables/Parameters for RM-extraction:
+>       real*4 fac
+>       integer*4 ofac
+>       real*4 RM(max_chan),p_ex(max_chan),phi_ex(max_chan)
+>       real*4 rp_ex(max_chan),rphi_ex(max_chan)
+>       real*4 ip_ex(max_chan),iphi_ex(max_chan)
+75c118
+<       if(iargc().lt.2)then
+---
+>       if(iargc().lt.3)then
+78,79c121,122
+<               write(*,*)' myfits_spec2rm <infileQ> <infileU> <subim-req>
+<      - <subim-parfile>'
+---
+>               write(*,*)' myfits_spec2rm <infileQ> <infileU>  <outfile> 
+>      -<subim-req> <subim-parfile>'
+83,84c126,128
+<               write(*,*)' This file is expected by default '
+<               write(*,*)' to be in the DATA/ directory. '
+---
+>               write(*,*)' The path to this file is expected '
+>               write(*,*)' to be defined in the "datadir.par"'
+>               write(*,*)' file kept in the PAR/ directory '
+88,89c132,144
+<               write(*,*)' This file is expected by default '
+<               write(*,*)' to be in the DATA/ directory. '
+---
+>               write(*,*)' The path to this file is expected '
+>               write(*,*)' to be defined in the "datadir.par"'
+>               write(*,*)' file kept in the PAR/ directory '
+>               write(*,*)'  '
+>               write(*,*)'outfile [NO DEFAULT]: '
+>               write(*,*)' Generic name for outfiles (w/o PATH) '
+>               write(*,*)' Two cubes -- one for the RM and the '
+>               write(*,*)' other for the Polarisation Angle '
+>               write(*,*)' will be written out with appropriate '
+>               write(*,*)' extensions appended to the generic '
+>               write(*,*)' name. '
+>               write(*,*)' These files will be written to the '
+>               write(*,*)' DATA/ directory by default.'
+104a160,162
+>               write(*,*)' You can have a blind run command as...'
+>               write(*,*)' myfits_spec2rm <infileQ> <infileU>  <outfile> 
+>      -<subim-req> <subim-parfile>'
+112a171,173
+>               write(*,*)'Name of output Fits File:'
+>               write(*,*)' '
+>               read(*,'(a)')outfile
+123,124c184,188
+<       else if(iargc().eq.3)then
+<               call getarg(3,yorn)
+---
+>       else if(iargc().eq.4)then
+>               call getarg(1,infileQ)
+>               call getarg(2,infileU)
+>               call getarg(3,outfile)
+>               call getarg(4,yorn)
+133c197
+<       else if(iargc().eq.4)then
+---
+>       else if(iargc().eq.5)then
+136c200,201
+<               call getarg(3,yorn)
+---
+>               call getarg(3,outfile)
+>               call getarg(4,yorn)
+138c203
+<                       call getarg(4,subim_parfile)
+---
+>                       call getarg(5,subim_parfile)
+141c206
+<                       write(*,*)"Ignoring Arg(4) since Arg(3) indicates 
+---
+>                       write(*,*)"Ignoring Arg(5) since Arg(4) indicates 
+146c211
+<       else if(iargc().eq.2)then
+---
+>       else if(iargc().eq.3)then
+148a214
+>               call getarg(3,outfile)
+151a218
+>       ! Read the PATH-to-DATA from a file:
+190a258,283
+>       outfileRM(1:) = '../DATA/'//outfile(1:nchar(outfile))//'.RMCUBE'
+>       outfilePA(1:) = '../DATA/'//outfile(1:nchar(outfile))//'.PACUBE'
+> 
+>       ! Read the parameters required for the RM-EXTRACTION
+>       open(31,file='../PAR/extract_rm.par',status='old',err=601)
+>       goto 602
+> 601   continue
+>       write(*,*)" "
+>       write(*,*)"Error opening file: extract_rm.par"
+>       write(*,*)" Ensure that you have defined "
+>       write(*,*)" the parameters needed for the "
+>       write(*,*)" extraction in a file named: "
+>       write(*,*)" 'extract_rm.par kept in the 'PAR/ "
+>       write(*,*)" directory and re-run the code."
+>       write(*,*)" "
+>       write(*,*)"Quitting now... "
+>       stop
+> 
+> 602   continue
+>       read(31,*)ofac  ! Reading the oversampling factor
+>       read(31,*)fac  ! Reading the uncertainty factor
+> 
+>       close(31)
+> 
+> 
+>       ! Extract Some basic INFO from the FITS files:
+660,662c753,755
+<         ! We assume that the z-reference value is tagged to the 1st
+<         ! pixel (referred in some FITS file as 0-th or 1st pixel)
+<         ! However we also keep a provision to check if the central 
+---
+>         ! I observe that usually the z-reference value is tagged to the
+>         ! 1st pixel (referred in some FITS file as 0-th or 1st pixel)
+>         ! However I also keep a provision to check if the central 
+783a877,882
+>       !  Create the new RM FITS files. The blocksize parameter is a
+>       !  historical artifact and the value is ignored by FITSIO.
+>       call ftinit(41,outfileRM,blocksize,status)
+>       call ftinit(42,outfilePA,blocksize,status)
+> 
+> 
+953a1053,1106
+> 
+>       ! However, determine the units of Frequency Hz/MHz here...
+> 
+>       ! In the absence of the Frequency-unit information in the 
+>       ! FITS file, it is a bit tricky to assume it. Here, I 
+>       ! use a rather BAD trick to tackle the problem:
+> 
+>       MHz = .false.  ! Default
+> 
+>       if (czval_im.ge.30.and.czval_im.le.1.0e4)then ! MHz units assumed
+>               MHz = .true.
+>               conv_fac = 300.0
+>               write(*,*)" "
+>               write(*,*)"centre-frequency: ",czval_im
+>               write(*,*)"Assuming frequency in MHz"
+>               write(*,*)" "
+>               write(*,*)" "
+>       else if (czval_im.ge.30.0e6.and.czval_im.le.10.0e9)then ! Hz units assumed
+>               MHz = .false.
+>               conv_fac = 3.0e8
+>               write(*,*)" "
+>               write(*,*)'centre-frequency: ',czval_im
+>               write(*,*)"Assuming frequency in Hz"
+>               write(*,*)" "
+>       else
+>               write(*,*)" "
+>               write(*,*)'centre-frequency: ',czval_im
+>               write(*,*)"Confusing magnitude for centre-frequency... "
+>               write(*,*)" "
+>               write(*,*)"Currently we assume that Hz and MHz are the"
+>               write(*,*)"ONLY units allowed for Frequency."
+>               write(*,*)" "
+>               write(*,*)"Also the observation frequency band is assumed"
+>               write(*,*)"to be between 30MHz and 10 GHz -- well within"
+>               write(*,*)"the range of present day Synthesis Radio "
+>               write(*,*)"Telescopes! "
+>               write(*,*)" "
+>               write(*,*)"It would have been a happy situation to "
+>               write(*,*)"have been able to determine the units from"
+>               write(*,*)"the FITS file itself. Unfortunately that  "
+>               write(*,*)"did not seem to be the case for the files"
+>               write(*,*)"being analysed during the development of "
+>               write(*,*)"this code :-( "
+>               write(*,*)"Programmers writing FITS file seem not to "
+>               write(*,*)"worry about the UNITS of the Axes!! "
+>               write(*,*)" "
+>               write(*,*)"If you encounter this message, or feel that "
+>               write(*,*)"the bug can be removed in a more appealing way"
+>               write(*,*)",do drop a few lines at:   wasim@rri.res.in  "
+>               write(*,*)" "
+>               write(*,*)"Closing the opened FITS files... "
+>               write(*,*)"Good bye for now... "
+>               goto 9999
+>       endif
+957a1111,1128
+>       do i = 1,nz_out
+>          L_sq(i) = (conv_fac/zval(nz_out-i+1))**2  
+>          write(13,*)L_sq(i)
+>          Q_now(i) = 0.0
+>          U_now(i) = 0.0
+>       enddo
+> 
+>       ! Make a dummy call to extract general to get the 
+>       ! RM-values. We need to write the reference pixel 
+>       ! and its corresponding value in the output FITS 
+>       ! file for the RM-cube...
+>       call extract_general(L_sq,Q_now,U_now,nz_out,fac,ofac,
+>      -                           RM,
+>      -                           p_ex,phi_ex,
+>      -                           rp_ex,rphi_ex,
+>      -                           ip_ex,iphi_ex)
+> 
+>       dRM = (RM(nz_out) - RM(1))/(nz_out - 1)
+991a1163,1280
+> 
+>       !  Initialize parameters about the output FITS CUBES
+>       !  The EXTEND = TRUE parameter indicates that the FITS file
+>       !  may contain extensions following the primary array.
+>       !  Other parameters like BITPIX, naxis, naxes etc., are taken 
+>       !  to be the same as derived from the input images.
+> 
+>       !  Write the required header keywords to the file
+> 
+> !  subroutine ftphpr(ounit,simple,bitpix,naxis,naxes,pcount,gcount,extend,status)
+> 
+> !! FTPHPR writes required primary header keywords.
+> !
+> !       ounit   i  fortran output unit number
+> !       simple  l  does file conform to FITS standard?
+> !       bitpix  i  number of bits per data value
+> !       naxis   i  number of axes in the data array
+> !       naxes   i  array giving the length of each data axis
+> !       pcount  i  number of group parameters
+> !       gcount  i  number of random groups
+> !       extend  l  may extensions be present in the FITS file?
+> !       OUTPUT PARAMETERS:
+> !       status  i  output error status (0=OK)
+> 
+>       extend= .false.
+>       simple = .true.
+>       call ftphpr(41,simple,bitpix,naxis,naxes,0,1,extend,status)
+>       call ftphpr(42,simple,bitpix,naxis,naxes,0,1,extend,status)
+> 
+> !  Put (append) a new keyword of the appropriate datatype into the CHU
+> !  subroutine ftpky[e,d,f,g](ounit,keywrd,rval,decim,comm,status)
+> !                              OR
+> !  subroutine ftpky[j,k,l,s](ounit,keywrd,keyval,comment,status)
+> !
+> !*******************************************************************************
+> !
+> !! FTPKYE writes a real*4 value to a header record in E format.
+> !
+> !       ounit   i  fortran output unit number
+> !       keywrd  c  keyword name    ( 8 characters, cols.  1- 8)
+> !       rval    r  keyword value
+> !       decim   i  number of decimal places to display in value field
+> !       comm    c  keyword comment (47 characters, cols. 34-80)
+> !       OUTPUT PARAMETERS:
+> !       status  i  output error status (0 = ok)
+> 
+>       decimals = 11
+>       call ftgkys(21,"ctype1",ctype,comment,status)
+>       call ftpkys(41,"ctype1",ctype(1:nchar(ctype)),comment(1:nchar(comm
+>      -ent)),status)
+>       call ftpkys(42,"ctype1",ctype(1:nchar(ctype)),comment(1:nchar(comm
+>      -ent)),status)
+> 
+>       call ftgkye(21,"crval1",cval,comment,status)
+>       call ftpkye(41,"crval1",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+>       call ftpkye(42,"crval1",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+> 
+>       call ftgkye(21,"crpix1",cval,comment,status)
+>       call ftpkye(41,"crpix1",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+>       call ftpkye(42,"crpix1",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+> 
+>       call ftgkye(21,"cdelt1",cval,comment,status)
+>       call ftpkye(41,"cdelt1",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+>       call ftpkye(42,"cdelt1",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+> 
+>       call ftgkys(21,"ctype2",ctype,comment,status)
+>       call ftpkys(41,"ctype2",ctype(1:nchar(ctype)),comment(1:nchar(comm
+>      -ent)),status)
+>       call ftpkys(42,"ctype2",ctype(1:nchar(ctype)),comment(1:nchar(comm
+>      -ent)),status)
+> 
+>       call ftgkye(21,"crval2",cval,comment,status)
+>       call ftpkye(41,"crval2",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+>       call ftpkye(42,"crval2",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+> 
+>       call ftgkye(21,"crpix2",cval,comment,status)
+>       call ftpkye(41,"crpix2",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+>       call ftpkye(42,"crpix2",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+> 
+>       call ftgkye(21,"cdelt2",cval,comment,status)
+>       call ftpkye(41,"cdelt2",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+>       call ftpkye(42,"cdelt2",cval,decimals,comment(1:nchar(comment)),
+>      -status)
+> 
+>       call ftpkys(41,"ctype3","RM--rad/m2","3rd axis type",status)
+>       call ftpkys(42,"ctype3","RM--rad/m2","3rd axis type",status)
+> 
+>       call ftpkye(41,"crval3",RM(1),decimals,"Reference Pixel value",
+>      -status)
+>       call ftpkye(42,"crval3",RM(1),decimals,"Reference Pixel value",
+>      -status)
+> 
+>       call ftpkye(41,"crpix3",1.0,decimals,"Reference Pixel",status)
+>       call ftpkye(42,"crpix3",1.0,decimals,"Reference Pixel",status)
+> 
+>       call ftpkye(41,"cdelt3",dRM,decimals,"Pixel size in world coordina
+>      -te units",status)
+>       call ftpkye(42,"cdelt3",dRM,decimals,"Pixel size in world coordina
+>      -te units",status)
+> 
+>       call ftgkys(21,"BUNIT",ctype,comment,status)
+>       call ftpkys(41,"BUNIT",ctype(1:nchar(ctype)),"Units of Pixel Data"
+>      -,status)
+>       call ftpkys(42,"BUNIT","radians","Units of Pixel Data",status)
+> 
+> 
+>       cnt1 = 0
+995a1285
+>             cnt1 = cnt1 + 1
+997c1287
+<             ! initialise the spec()
+---
+>             ! initialise the spec*() arrays
+999c1289,1290
+<                spec(i) = nullval
+---
+>                specQ(i) = 0.0
+>                specU(i) = 0.0
+1028a1320,1323
+>               do i = 1,nz_out
+>                write(*,*)specQ(i),specU(i)
+>               enddo
+>               stop
+1037,1038c1332,1333
+<                write(*,*)specQ(nz_out-i+1),specU(nz_out-i+1)
+<                !write(*,*)(3.0e8/zval(nz_out-i+1))**2
+---
+>                Q_now(i) = 0.0   ! Initialise the arrays
+>                U_now(i) = 0.0
+1040a1336,1366
+>             !----------------------------------------------------
+>             ! Replace the pixels containing nullval with the mean
+>             ! of the "good" data pixels
+>             ! Dubious mistake (not serious for GOOD data) caught!
+>             ! Proper replacement of BAD data was not being done.
+>             ! Hopefully corrected!
+>             ! WR, 22 Dec, 2009
+>             cnt2 = 0
+>             do i = 1,nz_out
+>                !if(Q_now(i).ne.nullval.and.U_now(i).ne.nullval)then
+>                if(specQ(i).eq.nullval.or.specU(i).eq.nullval)then
+>                        cnt2 = cnt2 + 1
+>                        null_cnt(cnt2) = i
+>                else
+>                        Q_now(i) = specQ(nz_out-i+1) 
+>                        U_now(i) = specU(nz_out-i+1)
+>                endif
+>             enddo
+>             write(*,*)cnt2,' out of',nz_out,'channels are bad...'
+>             call mean(Q_now,nz_out,tmp_avgQ)
+>             call mean(U_now,nz_out,tmp_avgU)
+>             tmp_avgQ = tmp_avgQ*nz_out/(nz_out-cnt2)
+>             tmp_avgU = tmp_avgU*nz_out/(nz_out-cnt2)
+> 
+>             do i = 1,cnt2
+>                tmp_index = null_cnt(i)
+>                Q_now(tmp_index) = tmp_avgQ
+>                U_now(tmp_index) = tmp_avgU
+>             enddo
+>             !----------------------------------------------------
+> 
+1042,1044c1368,1403
+<             !call extract_general()
+<          enddo
+<       enddo
+---
+>             ! subroutine extract_general(t,ryt,iyt,npts,fac,ofac, 
+> !     -               > omega,
+> !     -               p_ex,phi_ex,
+> !     -               rp_ex, rphi_ex, 
+> !     -               ip_ex, iphi_ex)
+>             call extract_general(L_sq,Q_now,U_now,nz_out,fac,ofac,
+>      -                           RM,
+>      -                           p_ex,phi_ex,
+>      -                           rp_ex,rphi_ex,
+>      -                           ip_ex,iphi_ex)
+> 
+>             ! Write the FITS RM-CUBE now:
+>             call ftpsse(41,group,naxis,naxes,fpixels,lpixels,p_ex,
+>      -status)
+>             call ftpsse(42,group,naxis,naxes,fpixels,lpixels,phi_ex,
+>      -status)
+> 
+> 
+>             ! Test-1 start
+>             do i = 1,nz_out
+>                write(14,*)RM(i),p_ex(i),phi_ex(i)
+>                write(15,*)L_sq(i),Q_now(i), U_now(i)
+>             enddo
+>             ! Test-1 stop
+> 
+>          enddo     ! end of iy loop
+>          if(mod(cnt1,100).eq.0)then
+>                  write(*,*)cnt1," out of",nx_out*ny_out," pixels done"
+>                  write(*,*)"------------------------------ "
+>                  write(*,*)"Warning: "
+>                  write(*,*)"Test mode on..."
+>                  write(*,*)"Comment the lines to suppress "
+>                  write(*,*)"unnecessary file-writing! "
+>                  write(*,*)"------------------------------ "
+>          endif
+>       enddo        ! end of ix loop
+1069a1429,1438
+>       call FTCLOS(41,status)
+>       if (status .gt. 0)then
+>               write(*,*)"Problem closing RM-file"
+>               call printerror(status)
+>       endif
+>       call FTCLOS(42,status)
+>       if (status .gt. 0)then
+>               write(*,*)"Problem closing PA-file"
+>               call printerror(status)
+>       endif
+1075a1445
+>       !include '/usr/lib/subroutine_lib/nchar.f'
+1077a1448
+>       include 'extract_general.f'
+1079c1450
+<       include '/home/wasim/subroutine_lib/fort_lib.f'
+---
+>       include '/usr/lib/subroutine_lib/fort_lib.f'
