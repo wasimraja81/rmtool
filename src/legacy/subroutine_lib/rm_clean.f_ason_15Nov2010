@@ -1,0 +1,181 @@
+chelp+
+      ! -------------------------------------------- 
+      ! Subroutine to clean the DIRTY RM spectra. 
+      ! This, in its present form is the crudest 
+      ! clean algorithm without any optimisation. 
+      ! 
+      ! It requires as input :
+      ! 1)              nrm --> integer number
+      ! 2)  Dirty RM-ampMAP --> array: nrm points
+      ! 3)  Dirty RM-phaMAP --> array: nrm points
+      ! 4) Re-Dirty RM-beam --> array: (nrm x nrm) 
+      ! 5) Im-Dirty RM-beam --> array: (nrm x nrm) 
+      ! 6)            niter --> integer number
+      ! 7)           thresh --> real*8 
+      ! 8)             gain --> real*4 
+      ! 
+      ! and outputs: 
+      ! 9)  Clean RM-ampMAP --> array: nrm points
+      !10)  Clean RM-phaMAP --> array: nrm points
+      !
+      !                       --wr, 08 Nov, 2010
+      ! -------------------------------------------- 
+chelp-
+
+
+      subroutine rm_clean(DtyMAP_RMamp, DtyMAP_RMpha, 
+     -                    DtyBEAM_reRM, DtyBEAM_imRM,
+     -                    nrm, niter, gain, thresh,
+     -                    ClnMAP_RMamp, ClnMAP_RMpha)
+
+      implicit none
+
+      integer*4  maxrm
+      parameter  (maxrm = 1024)
+      integer*4  nrm, niter 
+      real*8     DtyMAP_RMamp(*), DtyMAP_RMpha(*) 
+      real*8     DtyBEAM_reRM(maxrm,maxrm), DtyBEAM_imRM(maxrm,maxrm)
+      real*8     ClnMAP_RMamp(*), ClnMAP_RMpha(*)
+      integer*4  ClnComp(maxrm)
+      real*8     ClnFlux(maxrm), ResiAmp(maxrm)
+      real*8     gain, thresh 
+      real*8     beam_now(maxrm), avg_absMAP, rms_MAP
+      real*8     peak_val, frac 
+
+      integer*4  i, imax, iter 
+      logical    over
+
+
+      over = .false.
+      iter = 0
+      ! Initialise the clean component aaray as well 
+      ! as the Residual array: 
+      do i = 1,nrm
+         ClnComp(i) = 0
+         ResiAmp(i) = DtyMAP_RMamp(i)
+         ClnFlux(i) = 0.0
+      enddo
+
+      do while(.not.over)
+         iter = iter + 1
+         ! Locate the peak of the |amplitude|: 
+         !call meanrms(ResiAmp,rms_MAP,avg_absMAP,nrm)
+         call rmsd(ResiAmp,nrm, rms_MAP)
+         call index_absmax(ResiAmp,nrm,imax,avg_absMAP)
+
+         ! Get the RM-dependent beam:
+         do i = 1,nrm
+            beam_now(i) = sqrt(DtyBEAM_reRM(imax,i)**2 + 
+     -                      DtyBEAM_imRM(imax,i)**2)
+         enddo
+
+         peak_val = abs(ResiAmp(imax))
+         !if(peak_val.gt.thresh*avg_absMAP.and.iter.lt.niter)then
+         if(peak_val.gt.thresh*rms_MAP.and.iter.lt.niter)then
+                 frac = gain*peak_val 
+                 ! Accumulate the Clean Components at peak location:
+                 ClnComp(imax) = ClnComp(imax) + 1
+                 ClnFlux(imax) = ClnFlux(imax) + frac
+
+                 ! Obtain the residual Map: 
+                 do i = 1,nrm 
+                    ResiAmp(i) = ResiAmp(i) - frac*beam_now(i) ! cause of negatives
+                    !ResiAmp(i) = ResiAmp(i)*(1.0 - gain*beam_now(i)) ! cause of negatives
+                 enddo 
+         else
+                 ! Stop Clean and Restore the Cleaned Map: 
+                 do i = 1,nrm
+                    ClnMAP_RMamp(i) = ClnFlux(i) + ResiAmp(i) 
+                    ClnMAP_RMpha(i) = ResiAmp(i) ! TEST plotting -- remove later
+                 enddo
+                 over = .true. 
+                 write(*,*)"     niter: ",iter
+                 write(*,*)"|peak-res|: ",peak_val
+                 write(*,*)" |avg_res|: ",avg_absMAP
+                 write(*,*)" |rms_res|: ",rms_MAP
+         endif
+      enddo
+      return
+
+      end
+
+
+
+
+
+
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine locates the "index" of maxima of 
+c         the absolute values of the elements of a vector 
+c         "V" given its length "N". It also returns the avg 
+c         of the absolute values. 
+
+          subroutine index_absmax(V,N,imax,avg_abs)
+
+          implicit none
+          real*8    V(*), avg_abs, maxx, absV 
+          integer*4 N
+          integer*4 i, imax
+
+          maxx = abs(V(1))
+          imax = 1
+          avg_abs = 0.0d0
+          do i = 1,N
+               absV = abs(V(i))
+               avg_abs = avg_abs + absV
+               if(absV.ge.maxx)then
+                       maxx = absV
+                       imax = i 
+               endif
+          end do
+          avg_abs = avg_abs/dble(N)
+
+          return
+          end 
+
+
+        SUBROUTINE MEANRMS(A,RMS,AMEAN,NP)
+C	TO COMPUTE MEAN AND RMS OF 'A' BY EXCLUDING WHAT MAY BE
+C	SOME CONTRIBUTION FROM INTERFERENCE
+C
+        implicit none
+        real*8 A(*)
+        real*8 RMS,AMEAN, AN, DIFF, AMEAN0, RMS0  
+        integer*4 NP, I, ITER  
+C
+        ITER=0
+C
+101     ITER=ITER+1
+        AMEAN=0.0
+        AN=0.0
+C
+        DO I=1,NP
+         IF(ITER.EQ.1)GO TO 1
+         DIFF=ABS(A(I)-AMEAN0)
+         IF(DIFF.LE.(4.*RMS))GO TO 1
+         GO TO 2
+1        AMEAN=A(I)+AMEAN
+         AN=AN+1.
+2        CONTINUE
+        END DO
+C
+        RMS0=RMS
+        if(an.gt.0)AMEAN=AMEAN/AN
+C
+        RMS=0.0
+        AN=0.0
+        DO I=1,NP
+         DIFF=ABS(A(I)-AMEAN)
+         IF(ITER.EQ.1)GO TO 11
+         IF(DIFF.LE.(4.*RMS0))GO TO 11
+         GO TO 12
+11       RMS=RMS+DIFF*DIFF
+         AN=AN+1.
+12       CONTINUE
+        END DO
+
+        end
+

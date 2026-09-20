@@ -1,0 +1,1 @@
+f77 -o /usr/lib/subroutine_lib/get_help /usr/lib/subroutine_lib/get_help.f

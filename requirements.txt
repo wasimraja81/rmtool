@@ -1,0 +1,7 @@
+astropy
+astroquery
+keyring
+matplotlib
+numpy
+pyvo
+requests
