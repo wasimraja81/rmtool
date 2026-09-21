@@ -1,0 +1,242 @@
+chelp+
+      ! -------------------------------------------- 
+      ! Subroutine to clean the DIRTY RM spectra. 
+      ! This, in its present form is the crudest 
+      ! clean algorithm without any optimisation. 
+      ! 
+      ! It requires as input :
+      ! 1)              nrm --> integer number
+      ! 2)  Dirty RM-ampMAP --> array: nrm points
+      ! 3)  Dirty RM-phaMAP --> array: nrm points
+      ! 4) Re-Dirty RM-beam --> array: (nrm x nrm) 
+      ! 5) Im-Dirty RM-beam --> array: (nrm x nrm) 
+      ! 6)            niter --> integer number
+      ! 7)           thresh --> real*8 
+      ! 8)             gain --> real*4 
+      ! 
+      ! and outputs: 
+      ! 9)  Clean RM-ampMAP --> array: nrm points
+      !10)  Clean RM-phaMAP --> array: nrm points
+      !
+      !                       --wr, 08 Nov, 2010
+      ! -------------------------------------------- 
+chelp-
+
+
+      subroutine rm_clean(DtyMAP_RMamp, DtyMAP_RMpha, 
+     -                    DtyBEAM_reRM, DtyBEAM_imRM,
+     -                    maxrm,nrm, niter, gain, thresh,
+     -                    ClnMAP_RMamp, ClnMAP_RMpha)
+
+      implicit none
+
+      integer*4  maxrm
+      integer*4  nrm, niter 
+      real*8     DtyMAP_RMamp(*), DtyMAP_RMpha(*) 
+      real*8     DtyBEAM_reRM(maxrm,maxrm), DtyBEAM_imRM(maxrm,maxrm)
+      real*8     ClnMAP_RMamp(*), ClnMAP_RMpha(*)
+      integer*4  ClnComp(nrm)
+      real*8     ClnFlux(nrm), ResiAmp(nrm)
+      real*8     ResiQ(nrm), ResiU(nrm),
+     -           fracQ, fracU, ClnFluxQ(nrm),ClnFluxU(nrm)
+      real*8     gain, thresh 
+      real*8     beam_now(nrm), avg_absMAP, rms_MAP
+      real*8     peak_val, frac 
+
+      integer*4  i, imax, iter 
+      logical    over
+      ! Plotting related:
+      real*4     xarr(nrm), yarr(nrm)
+      character*120 xlabel, ylabel, title
+      character*1 yorn
+
+
+
+      over = .false.
+      iter = 0
+      ! Initialise the clean component aaray as well 
+      ! as the Residual array: 
+      do i = 1,nrm
+         ClnComp(i) = 0
+         ResiAmp(i) = DtyMAP_RMamp(i)
+
+         ClnFlux(i) = 0.0d0
+         ClnFluxQ(i) = 0.0d0
+         ClnFluxU(i) = 0.0d0
+
+         ResiQ(i) = ResiAmp(i)*cos(DtyMAP_RMpha(i))
+         ResiU(i) = ResiAmp(i)*sin(DtyMAP_RMpha(i))
+      enddo
+
+      do while(.not.over)
+         iter = iter + 1
+         ! Locate the peak of the |amplitude|: 
+         !call meanrms(ResiAmp,rms_MAP,avg_absMAP,nrm)
+         call rmsd(ResiAmp,nrm, rms_MAP)
+         call index_absmax(ResiAmp,nrm,imax,avg_absMAP)
+
+         ! Get the RM-dependent beam:
+         do i = 1,nrm
+            beam_now(i) = sqrt(DtyBEAM_reRM(imax,i)**2 + 
+     -                      DtyBEAM_imRM(imax,i)**2)
+         enddo
+
+         !peak_val = abs(ResiAmp(imax))
+         peak_val = ResiAmp(imax) ! Forces stop at first encounter of 
+                                  ! negative, if cleaning is done using 
+                                  ! residual amplitude obtained from 
+                                  ! subtracting gain x peak x amplitude.
+                                  ! Irrelevant if resiQ and resiU is 
+                                  ! used to derive the resiAmp
+         !if(peak_val.gt.thresh*avg_absMAP.and.iter.lt.niter)then
+         if(peak_val.gt.thresh*rms_MAP.and.iter.lt.niter)then
+                 frac = gain*peak_val 
+                 fracQ = gain*ResiQ(imax)
+                 fracU = gain*ResiU(imax)
+
+
+                 ! Accumulate the Clean Components at peak location:
+                 ClnComp(imax) = ClnComp(imax) + 1
+                 ClnFlux(imax) = ClnFlux(imax) + frac 
+
+                 ClnFluxQ(imax) = ClnFluxQ(imax) + fracQ
+                 ClnFluxU(imax) = ClnFluxU(imax) + fracU
+
+                 !write(18,*)frac,fracQ,fracU,ResiQ(imax),ResiU(imax)
+                 ! Obtain the residual Map: 
+                 do i = 1,nrm 
+                    ResiQ(i) = ResiQ(i) - (fracQ*DtyBEAM_reRM(imax,i)
+     -                                   - fracU*DtyBEAM_imRM(imax,i))
+                    ResiU(i) = ResiU(i) - (fracU*DtyBEAM_reRM(imax,i)
+     -                                   + fracQ*DtyBEAM_imRM(imax,i)) 
+
+                    ResiAmp(i) = sqrt(ResiQ(i)*ResiQ(i) + 
+     -                                ResiU(i)*ResiU(i)) 
+!                    ResiAmp(i) = ResiAmp(i) - frac*beam_now(i) ! cause of negatives
+                 enddo 
+                 write(19,*)imax,ResiAmp(imax),sqrt(ResiQ(imax)*
+     -                                              ResiQ(imax) + 
+     -                                              ResiU(imax)*
+     -                                              ResiU(imax))
+                 ! Some plotting 
+                 call pgbeg(0,'/xs',1,1)
+                 xlabel = 'RM bin num'
+                 ylabel = 'Residual Amplitude'
+                 title = 'Diagnosis of RMclean'
+                 do i = 1,nrm
+                    xarr(i) = real(i)
+                    yarr(i) = real(ResiAmp(i))
+                 enddo
+                 call myplot1(xarr,yarr,nrm,xlabel,ylabel,title,2)
+                 call pgend
+                 do i = 1,nrm
+                    xarr(i) = real(i)
+                    yarr(i) = real(ClnFlux(i))
+                 enddo
+                 write(*,*)"Iteration number: ",iter,"Max Loc:",imax
+                 write(*,*)"Press any key to continue..."
+                 read(*,*)yorn
+         else
+                 ! Stop Clean and Restore the Cleaned Map: 
+                 do i = 1,nrm
+                    !ClnMAP_RMamp(i) = ClnFlux(i) + ResiAmp(i) 
+                    !write(19,*)ClnFluxQ(i),ResiQ(i),ClnFluxU(i),ResiU(i)
+                    ClnFluxQ(i) = ClnFluxQ(i) + ResiQ(i) 
+                    ClnFluxU(i) = ClnFluxU(i) + ResiU(i) 
+!                    ClnMAP_RMamp(i) = sqrt(ClnFluxQ(i)*ClnFluxQ(i) + 
+!     -                                     ClnFluxU(i)*ClnFluxU(i))
+                    ClnMAP_RMamp(i) = ClnFlux(i) + ResiAmp(i) 
+                    ClnMAP_RMpha(i) = atan2(ClnFluxU(i),ClnFluxQ(i)) 
+                    ClnMAP_RMpha(i) = ResiAmp(i) ! TEST plotting -- remove later
+                 enddo
+                 over = .true. 
+                 write(*,*)"     niter: ",iter
+                 write(*,*)" |max-res|: ",peak_val
+                 write(*,*)" |avg_res|: ",avg_absMAP
+                 write(*,*)" |rms_res|: ",rms_MAP
+         endif
+      enddo
+      return
+
+      end
+
+
+
+
+
+
+
+c         Author: Wasim Raja
+c         Date: 12-05-2009
+c         
+c         This subroutine locates the "index" of maxima of 
+c         the absolute values of the elements of a vector 
+c         "V" given its length "N". It also returns the avg 
+c         of the absolute values. 
+
+          subroutine index_absmax(V,N,imax,avg_abs)
+
+          implicit none
+          real*8    V(*), avg_abs, maxx, absV 
+          integer*4 N
+          integer*4 i, imax
+
+          maxx = abs(V(1))
+          imax = 1
+          avg_abs = 0.0d0
+          do i = 1,N
+               absV = abs(V(i))
+               avg_abs = avg_abs + absV
+               if(absV.ge.maxx)then
+                       maxx = absV
+                       imax = i 
+               endif
+          end do
+          avg_abs = avg_abs/dble(N)
+
+          return
+          end 
+
+
+        SUBROUTINE MEANRMS(A,RMS,AMEAN,NP)
+C	TO COMPUTE MEAN AND RMS OF 'A' BY EXCLUDING WHAT MAY BE
+C	SOME CONTRIBUTION FROM INTERFERENCE
+C
+        implicit none
+        real*8 A(*)
+        real*8 RMS,AMEAN, AN, DIFF, AMEAN0, RMS0  
+        integer*4 NP, I, ITER  
+C
+        ITER=0
+C
+101     ITER=ITER+1
+        AMEAN=0.0
+        AN=0.0
+C
+        DO I=1,NP
+         IF(ITER.EQ.1)GO TO 1
+         DIFF=ABS(A(I)-AMEAN0)
+         IF(DIFF.LE.(4.*RMS))GO TO 1
+         GO TO 2
+1        AMEAN=A(I)+AMEAN
+         AN=AN+1.
+2        CONTINUE
+        END DO
+C
+        RMS0=RMS
+        if(an.gt.0)AMEAN=AMEAN/AN
+C
+        RMS=0.0
+        AN=0.0
+        DO I=1,NP
+         DIFF=ABS(A(I)-AMEAN)
+         IF(ITER.EQ.1)GO TO 11
+         IF(DIFF.LE.(4.*RMS0))GO TO 11
+         GO TO 12
+11       RMS=RMS+DIFF*DIFF
+         AN=AN+1.
+12       CONTINUE
+        END DO
+
+        end
+
