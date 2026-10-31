@@ -1,0 +1,168 @@
+c         This file is a collection of subroutines that are 
+c         very often required by various Fortran codes
+
+
+c   1)    SUBROUTINE: LINSPACE
+
+c         Author: Wasim Raja
+c         Date: 07-08-2007
+c         Last modified on: 07-08-2007
+
+c         linspace(BASE,LIMIT,N,V) is a subroutine that 
+c         generates a vector V of N linearly spaced elements 
+c         between BASE and LIMIT. N has to be greater 
+c         than 1. Base and LIMIT are always included in the 
+c         range. If LIMIT < BASE, then the elements are 
+c         stored in descending order. If N is not a natural,
+c         number, a default value of N = 100 is used!
+c
+c         THE LINSPACE SUBROUTINE DOES NOT MODIFY ANY INPUT 
+c         ARGUMENT!
+          subroutine linspace(BASE,LIMIT,N,V)
+          real*4 BASE, LIMIT, V(*)
+          integer*4 N
+          integer*4 i
+          real*4 h
+c         if N has been specified correctly, then N = N 
+c         else N = 100
+          if (N.lt.1)then
+               write(*,*)'----------------- WARNING -------------------'
+               write(*,*)' Wrong vector length, N will be forced to 100'
+               write(*,*)'---------------------------------------------'
+               N = 100
+          end if
+          h = (LIMIT - BASE)/(N-1)
+          do i = 1,N
+               V(i) = BASE + (i-1)*h
+          end do
+          end
+
+
+
+c   2a)    SUBROUTINE: DOTPRODUCT
+
+
+c         Author: Wasim Raja
+c         Date: 14-11-2007
+c         Last modified on: 14-11-2007
+
+c         dotproduct(A,B,P,m) is a subroutine that 
+c         multiplies two vectors A and B of dimensions 
+c         m, and calculates the dot product P of A and B.
+c         
+c
+          subroutine dotproduct(A,B,P,m)
+          real*4 A(*), B(*), P
+          integer*4 m
+          integer*4 i
+          real*4 accum
+
+          accum = 0.0
+          do i = 1,m
+               accum = accum + A(i)*B(i)
+          end do
+          P = accum
+          end
+
+
+
+c   2b)   SUBROUTINE: DOTPRODUCT_Complex
+
+
+c         Author: Wasim Raja
+c         Date: 14-11-2007
+c         Last modified on: 14-11-2007
+
+c         dotproduct_c(A,B,P,m) is a subroutine that 
+c         multiplies two complex vectors A and B of dimensions 
+c         m, and calculates the dot product P of A and B.
+c         
+c
+          subroutine dotproduct_c(A,B,P,m)
+          complex A(*), B(*), A_conj
+          real*4 P
+          integer*4 m
+          integer*4 i
+          real*4 accum
+
+          accum = 0.0
+          do i = 1,m
+               A_conj = complex(real(A(i)),-imag(A(i)))
+               accum = accum + real(A_conj*B(i))
+               !accum = accum + A(i)*B(i)
+          end do
+          P = accum
+          end
+
+c   3)   SUBROUTINE: RM_res_from_BW
+
+c         Author: Wasim Raja
+c         Date: 17-12-2007
+c         Last modified on: 17-12-2007
+
+C         This subroutine determines the RM-resolution 
+C         and the RM_span that can be obtained given the 
+C         Bandwidth and the channel-width respectively.
+
+C         subroutine RM_res_from_BW(center-freq(Hz),BW(Hz),n_chan,
+C     -                                      RM_resolution,RM_span)
+
+          subroutine RM_res_from_BW(nu_c,BW,n_chan,d_RM,RM_span)
+          real*4 c_light_sr, pi_sr
+          real*4 nu_c, BW
+          integer*4 n_chan
+          real*4 chan_BW, d_RM, RM_span
+          
+          c_light_sr = 3.0e8; ! speed of light in metres/sec
+          pi_sr = acos(-1.0)
+          chan_BW = BW/n_chan !Hz
+     
+          d_RM = pi_sr*nu_c**3/(2*(c_light_sr**2)*BW)
+          RM_span = 0.5*pi_sr*nu_c**3/(2*(c_light_sr**2)*chan_BW)
+
+          end
+
+
+c   4)   SUBROUTINE: mean(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 13-02-2008
+c         
+c         This subroutine calculates the mean "x" of a vector "V" 
+c         given its length "N". 
+
+          subroutine mean(V,N,x)
+          real*4 V(*), x
+          integer*4 N
+          integer*4 i
+          real*4 accum
+
+          accum = 0.0
+          do i = 1,N
+               accum = accum + V(i)
+          end do
+          x = accum/N
+          end
+
+
+c   5)   SUBROUTINE: rms(V,N,x)
+
+c         Author: Wasim Raja
+c         Date: 13-02-2008
+c         
+c         This subroutine calculates the rms "x" about mean 
+c         of a vector "V" given its length "N". 
+
+          subroutine rms(V,N,x)
+          real*4 V(*), x, mu
+          integer*4 N
+          integer*4 i
+          real*4 accum
+
+          call mean(V,N,mu)
+          accum = 0.0
+          do i = 1,N
+               accum = accum + (V(i) - mu)**2
+          end do
+          x = sqrt(accum/N)
+          end

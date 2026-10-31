@@ -1,0 +1,60 @@
+name: Build and verify Docker image
+
+# Reusable workflow (workflow_call only -- no other trigger surface,
+# so this cannot execute on its own even if this file ends up present
+# in a repo other than rmtool-dev, e.g. via the orphan snapshot that
+# eventually reaches rmtool's main). Holds the Docker-build +
+# verification steps shared by cut-release.yml's own orchestrated
+# pipeline, kept as one copy so there is never a second copy of this
+# logic to drift out of sync with it.
+#
+# ref is required and must be passed explicitly by every caller --
+# without it, actions/checkout would default to whatever ref triggered
+# the *calling* workflow's own run, not necessarily the commit this
+# check is meant to verify (this bit a first draft of
+# cut-release.yml during design: a manually-triggered run defaults
+# checkout to the branch selected at trigger time, not the
+# release-candidate branch built moments earlier in the same run).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out and verify'
+        required: true
+        type: string
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Every docker command lives in docker/ci_run.sh, which is also
+      # what gets run locally before a cut -- see its header.
+      - name: Build the image, check PATH, run tests/run_tests.sh inside it
+        run: bash docker/ci_run.sh suite rmtool-verify:${{ github.sha }}
+
+  # Separate job, separate image: the job above pre-installs Python
+  # deps at the system level and builds via plain `make` calls -- a
+  # maintainer-curated path that exercises the compiled tools but not
+  # the documented one. This job installs ONLY what BUILD.md/
+  # QUICKSTART.md tell a human to type, then drives ./build.sh and
+  # scripts/setup_venv.sh exactly as a new user would, so a doc/
+  # build.sh change that breaks that path fails here before it ships.
+  # See docker/dockerfile.docs-verify's own header for how this
+  # already caught a real gap once (BUILD.md/QUICKSTART.md never
+  # having said to install python3 at all).
+  docs-fresh-install-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Build docs-verify image, walk the documented build/test/fetch/preprocessing/rmsynth/rmclean path
+        run: bash docker/ci_run.sh fresh-install rmtool-docs-verify:${{ github.sha }}

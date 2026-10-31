@@ -1,0 +1,177 @@
+# Step 1: Use a clean base with all compiler tools
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# src/thread_safety_mod.f90's host_topology honors $TMPDIR for its own
+# lscpu scratch-capture file (no real output path is known at the
+# point it runs, so it can't anchor to one the way the dry-run/
+# disk-space checks elsewhere do) -- this image's own /tmp is private
+# and always writable regardless of which UID runs the container,
+# unlike the shared-HPC-node /tmp that convention exists to avoid.
+ENV TMPDIR=/tmp
+
+# src/gaussft.f90's FFTW wisdom cache defaults to a CWD-relative wisdom/,
+# which a UID other than the one owning /app/rmtool (e.g. CI's
+# --user "$(id -u):$(id -g)") cannot create. Without saved wisdom every
+# run re-measures its FFT plans, so separate runs of the same input can
+# differ in the last bits. /tmp is writable by any UID; each container
+# starts with an empty cache, which every later run in that container
+# then reuses.
+ENV RMTOOL_WISDOM_DIR=/tmp/rmtool_wisdom
+
+ARG RMTOOL_GIT_TAG=unknown
+LABEL org.opencontainers.image.title="rmtool" \
+    org.opencontainers.image.version="${RMTOOL_GIT_TAG}" \
+    org.opencontainers.image.description="RM synthesis toolchain image built from a tagged source snapshot"
+
+# Default UID/GID is the conventional single-user-Linux-desktop default
+# (also Docker's own usual non-root convention) -- override at build
+# time with --build-arg RMTOOL_UID=$(id -u) --build-arg
+# RMTOOL_GID=$(id -g) so files this container writes into a
+# bind-mounted host directory (e.g. tests/output, tests/data) come back
+# owned by the host user running the build, not a mismatched one.
+ARG RMTOOL_UID=1000
+ARG RMTOOL_GID=1000
+
+# Install dependencies needed for compiling the Fortran/C code
+# and running Python plotting scripts in-container. Python packages
+# themselves are intentionally not apt-installed below -- see the pip
+# step, which installs the identical pinned set scripts/setup_venv.sh
+# installs into its own venv. Mixing apt's own python3-numpy/
+# matplotlib/astropy with a separate pip install of other packages
+# previously produced two independent dependency resolutions of
+# overlapping packages in the same site-packages, which breaks at
+# import time (apt's python3-matplotlib ships compiled C extensions
+# linked against apt's numpy ABI; pip pulling in a newer numpy for an
+# unrelated package then shadows it).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gfortran \
+    gcc-offload-nvptx \
+    nvptx-tools \
+    make \
+    python3 \
+    python3-pip \
+    python3-venv \
+    libcfitsio-dev \
+    libcurl4-openssl-dev \
+    libnghttp2-dev \
+    libstarlink-ast-dev \
+    libstarlink-ast-err9 \
+    libstarlink-ast-grf3d9 \
+    libstarlink-pal-dev \
+    libfftw3-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# A non-root runtime user: building/running as root means anything
+# this container writes into a bind-mounted host directory comes back
+# root-owned, unremovable by the host user without sudo (hit directly
+# while developing this image against tests/output and tests/data
+# bind mounts). Also better practice for an image others will pull and
+# run, not just build. Ubuntu's own 24.04 base image already ships a
+# non-root `ubuntu` user/group at UID/GID 1000 for this same purpose --
+# reusing it instead of creating a second, colliding one; groupmod/
+# usermod to RMTOOL_UID/GID is a no-op when they match the 1000/1000
+# default already baked into the base image.
+RUN groupmod --gid "${RMTOOL_GID}" ubuntu \
+    && usermod --uid "${RMTOOL_UID}" --gid "${RMTOOL_GID}" ubuntu \
+    && chown -R ubuntu:ubuntu /home/ubuntu
+
+# Fix working directory to guarantee relative paths work
+WORKDIR /app/rmtool
+RUN chown ubuntu:ubuntu /app/rmtool
+
+# requirements-lock.txt pins the exact dependency versions
+# scripts/setup_venv.sh installs into its own venv -- installing the
+# same lock file here, into the system python3, keeps this image, the
+# venv, and CI's verify run on one identical, reproducible dependency
+# set instead of each resolving independently with whatever pip
+# considers current on the day it's built. Regenerate the lock file
+# (see scripts/setup_venv.sh's own comment) after changing
+# requirements.txt, then rebuild this image.
+#
+# --break-system-packages overrides Ubuntu 24.04's PEP 668 guard,
+# which protects a persistent host install from an unmanaged pip --
+# doesn't apply here, since this image IS the isolated environment
+# already.
+#
+# --ignore-installed: pip's dependency resolution (reproject pulls in
+# dask/zarr/scipy, which want a newer `packaging` than Ubuntu's own
+# python3-pip drags in via its own `packaging` apt dependency) can't
+# uninstall that apt-owned `packaging` to replace it (no RECORD file --
+# it was installed by debian, not pip; confirmed directly, this is the
+# exact failure mode, not a hypothetical). --ignore-installed skips
+# that uninstall-first step and installs pip's own resolved versions
+# straight into site-packages instead -- the standard fix for this
+# apt/pip conflict.
+COPY requirements-lock.txt requirements-lock.txt
+RUN pip3 install --no-cache-dir --break-system-packages --ignore-installed \
+    -r requirements-lock.txt
+
+# Copy everything from the build context root directory into /app/rmtool
+COPY --chown=ubuntu:ubuntu . .
+
+# Everything below (builds, and the container's default runtime user)
+# runs as the non-root user above, not root.
+USER ubuntu
+
+# Run sequenced builds for all OMP/GPU combinations.
+# The Makefile emits names like rm_synthesis_release_cpu_serial, etc.
+RUN set -eux; \
+    mkdir -p bin build; \
+    make clean OMP=0 GPU=0; \
+    make -j2 OMP=0 GPU=0; \
+    cp -f bin/rm_synthesis_release_cpu_serial bin/rm_synthesis_OMP0_GPU0; \
+    make clean OMP=1 GPU=0; \
+    make -j2 OMP=1 GPU=0; \
+    cp -f bin/rm_synthesis_release_cpu_omp bin/rm_synthesis_OMP1_GPU0; \
+    make clean OMP=0 GPU=1; \
+    make -j2 OMP=0 GPU=1; \
+    cp -f bin/rm_synthesis_release_gpu_offload bin/rm_synthesis_OMP0_GPU1; \
+    make clean OMP=1 GPU=1; \
+    make -j2 OMP=1 GPU=1; \
+    cp -f bin/rm_synthesis_release_gpu_offload_hostomp bin/rm_synthesis_OMP1_GPU1
+
+# reproject_cubes: independent of the rm_synthesis build graph above (own
+# binary, own AST dependency -- see the Makefile's own comment), so it
+# isn't touched by any of the `make clean OMP=... GPU=...` calls above
+# (those only remove rm_synthesis-specific build artifacts). Built once,
+# ends up at bin/reproject_cubes.
+RUN make reproject_cubes
+
+# convolve_cubes: common-resolution convolution tool (gaussft_mod +
+# commonbeam_mod -- see the Makefile's own comment), likewise independent
+# of the rm_synthesis build graph and of reproject_cubes' own AST
+# dependency (own binary, own FFTW3 dependency via libfftw3-dev above).
+# Built once, ends up at bin/convolve_cubes.
+RUN make convolve_cubes
+
+# match_cubes: consolidates reproject_cubes and convolve_cubes into one
+# tool that can chain both stages through memory with no intermediate
+# FITS file (see src/match_cubes.f90's own top comment) -- needs no new
+# apt packages, since its dependencies (Starlink AST, FFTW3) are already
+# installed above for reproject_cubes/convolve_cubes individually. Built
+# once, ends up at bin/match_cubes.
+RUN make match_cubes
+
+# rmclean_cubes: standalone RM-CLEAN tool driving rmclean_mod (src/
+# rmclean.f90) against dirty AMP/PHA cubes rm_synthesis itself wrote
+# (docs/dev/RMCLEAN_INTEGRATION_PLAN.md T2) -- needs FFTW3 (already
+# installed above for convolve_cubes) plus CFITSIO, no AST dependency
+# (this tool never resamples anything). Built once, ends up at
+# bin/rmclean_cubes.
+RUN make rmclean_cubes
+
+# scripts/*.py and scripts/*.sh (casda_fetch.py, run_pipeline.sh,
+# plot_tile_async_swimlane.py, etc.) all use #!/usr/bin/env python3 or
+# #!/usr/bin/env bash already, resolving to whichever interpreter is
+# first on PATH -- inside this image that's the apt-get python3/bash
+# installed above (with matplotlib/numpy/astropy/astroquery/pyvo
+# already on it), so none of them need rewriting. Their executable
+# bits are tracked directly in git (not fixed up here), so this is
+# just PATH exposure, not a permissions workaround.
+ENV PATH="/app/rmtool/bin:/app/rmtool/scripts:${PATH}"
+
+CMD ["/bin/bash"]
