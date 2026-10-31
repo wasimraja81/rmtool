@@ -1,0 +1,44 @@
+# ==========================================
+# 1. Ignore Local Scratch & Data Folders
+# ==========================================
+# Everything here is gitignored, so CI's checkout never has it. Leaving it
+# in a local build context makes a local image differ from CI's (e.g. a
+# stale tests/data/ fixture or output file baked in), and would ship
+# local editor settings in an image published from this machine.
+scratch/
+tests/data/
+tests/output/
+.claude/
+**/__pycache__
+
+# ==========================================
+# 2. Ignore Local Compiled Binaries and Build Artifacts
+# ==========================================
+build/
+bin/
+
+# ==========================================
+# 3. Ignore Version Control & Images
+# ==========================================
+.git/
+.gitignore
+*.tar
+docker/
+
+# ==========================================
+# 4. Optional: Ignore large log/txt file outputs
+# ==========================================
+*.log
+runtime_estimate.txt
+
+# Host-side run output that COPY . . would otherwise bake into the image
+# (COPY doesn't consult .gitignore). A stray file in the image is owned
+# by the build-time user, so a different runtime UID can read it but
+# not overwrite it. sampled_*.txt: rm_synthesis diagnostics, which
+# older builds wrote to the CWD.
+sampled_*.txt
+# FFTW wisdom (src/gaussft.f90): specific to the host CPU that measured
+# it. Copying it in also hides a non-writable wisdom location in local
+# Docker test runs: the copied file still imports, so every run gets the
+# same plans, while CI (fresh checkout, no wisdom/) does not.
+wisdom/
