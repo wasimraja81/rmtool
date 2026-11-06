@@ -1,0 +1,9 @@
+astropy
+astropy_healpix
+astroquery
+keyring
+matplotlib
+numpy
+pyvo
+reproject
+requests

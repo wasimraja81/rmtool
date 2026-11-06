@@ -1,0 +1,49 @@
+name: Publish Docker image to GHCR
+
+# Meaningful on rmtool (public) only -- guarded explicitly below,
+# since this file also rides along, dormant, inside rmtool-dev's own
+# release-candidate branch: that branch is an exact tree-snapshot of
+# develop, and this file has to be present in that tree so it reaches
+# rmtool once promoted, since a new file can only ever land on rmtool
+# by being part of an orphan snapshot. The guard makes it code-level
+# incapable of doing anything outside rmtool, rather than relying on
+# "release: published" just not naturally firing on rmtool-dev.
+#
+# Triggers when a GitHub Release is published (not on draft creation
+# -- confirmed directly against GitHub's own docs that a workflow
+# using this trigger does not fire for a draft, only for a
+# publish action). Builds docker/dockerfile from the exact tagged
+# commit and pushes to ghcr.io/wasimraja81/rmtool using this repo's
+# own automatic GITHUB_TOKEN -- no separate registry credentials to
+# create or store.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    if: github.repository == 'wasimraja81/rmtool'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg RMTOOL_GIT_TAG="${{ github.event.release.tag_name }}" \
+            -f docker/dockerfile \
+            -t "ghcr.io/wasimraja81/rmtool:${{ github.event.release.tag_name }}" \
+            .
+          docker push "ghcr.io/wasimraja81/rmtool:${{ github.event.release.tag_name }}"
